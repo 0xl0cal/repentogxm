@@ -27,7 +27,7 @@ Output is the Vita's native 960x544 with no resolution downgrade. Game logic
 runs at its normal 30 updates per second (measured 29.85 to 30.00); the port
 shows up to 60 frames per second.
 
-[Video of v0.1.0-alpha](https://www.youtube.com/watch?v=R6Imi5NVfwI)
+[Video of v0.1.0-alpha](https://www.youtube.com/watch?v=R6Imi5NVfwI) (at first lags cause of EID warning, sorry)
 
 Measured on one PS Vita on 2026-09-04 with the External Item Descriptions
 (EID) mod loaded:
