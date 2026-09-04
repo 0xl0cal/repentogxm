@@ -27,6 +27,8 @@ Output is the Vita's native 960x544 with no resolution downgrade. Game logic
 runs at its normal 30 updates per second (measured 29.85 to 30.00); the port
 shows up to 60 frames per second.
 
+[Video of v0.1.0-alpha](https://www.youtube.com/watch?v=R6Imi5NVfwI)
+
 Measured on one PS Vita on 2026-09-04 with the External Item Descriptions
 (EID) mod loaded:
 
@@ -65,6 +67,12 @@ Vita's native GXM graphics API), its audio to OpenAL Soft, and its Lua 5.3.3
 is built from a source tree you supply. Selected hot functions are replaced by
 native code; each replacement falls back to the translated code when its
 preconditions are not met.
+
+## Why this exists
+
+Rebirth is the only Isaac the Vita ever got, and it stayed that way: no Afterbirth, no Afterbirth+, no Repentance. I wanted to play Repentance on my Vita and I was bored. And, I guess, nobody else was going to do it. So I decided to burn a frankly stupid amount of LLM tokens on the problem and see whether the PC exe could be statically recompiled into something that runs on a 2011 handheld. Turns out it can, mostly.
+
+It's a fun project, it runs well enough that I actually play it, and now you can too.
 
 ## You must supply the game
 
