@@ -1,0 +1,23 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1463,10 +1463,19 @@
+ TARGET_COMPILE_DEFINITIONS(${IMPL_TARGET}
+     PRIVATE AL_BUILD_LIBRARY AL_ALEXT_PROTOTYPES ${CPP_DEFS})
+ TARGET_INCLUDE_DIRECTORIES(${IMPL_TARGET}
+     PRIVATE "${OpenAL_SOURCE_DIR}/OpenAL32/Include" "${OpenAL_SOURCE_DIR}/Alc" ${INC_PATHS})
+ TARGET_COMPILE_OPTIONS(${IMPL_TARGET} PRIVATE ${C_FLAGS})
++IF(ISAAC_VITA_OPENAL_POOL_REDIRECT_HEADER AND ISAAC_VITA_OPENAL_POOL_RUNTIME_DIR)
++    # Keep the allocator redirect on the archive target.  Applying it through
++    # CMAKE_C_FLAGS also changes configure-time feature probes (notably the
++    # aligned_alloc check), which can silently remove the path being audited.
++    TARGET_INCLUDE_DIRECTORIES(${IMPL_TARGET}
++        PRIVATE "${ISAAC_VITA_OPENAL_POOL_RUNTIME_DIR}")
++    TARGET_COMPILE_OPTIONS(${IMPL_TARGET}
++        PRIVATE -include "${ISAAC_VITA_OPENAL_POOL_REDIRECT_HEADER}")
++ENDIF()
+ TARGET_LINK_LIBRARIES(${IMPL_TARGET}
+     PRIVATE ${LINKER_FLAGS} ${COMMON_LIB} ${EXTRA_LIBS} ${MATH_LIB})
+ IF(TARGET build_version)
+     ADD_DEPENDENCIES(${IMPL_TARGET} build_version)
+ ENDIF()

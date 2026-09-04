@@ -1,0 +1,2430 @@
+{
+  "abi_sha256": "98db326f375eb1eef7ea941bd92bcc8f70a91eb3db98ac11683135591d1568ed",
+  "authority": {
+    "commit": "e8f7cd0e35ac8d6f5667a021ff83d04b1fec41ef",
+    "gl_xml_sha256": "d76ff1730ba90801a0c901fa38f643fcd1ad9da475a9c5a8344010be41c30687",
+    "repository": "https://github.com/KhronosGroup/OpenGL-Registry"
+  },
+  "commands": [
+    {
+      "name": "glActiveTexture",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "texture",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e1f5017",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glAlphaFunc",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "func",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "f32",
+          "callback_type": "guest_gl_float",
+          "ctype": "GLfloat",
+          "name": "ref",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e03ac69",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glAttachShader",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "program",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "shader",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ec5ca07",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glBindFramebuffer",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "framebuffer",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7eed2b3c",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glBindRenderbuffer",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "renderbuffer",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e9bfd5c",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glBindTexture",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "texture",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ecd2b7e",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glBlendFuncSeparate",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "sfactorRGB",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "dfactorRGB",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "sfactorAlpha",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "dfactorAlpha",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e30124a",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glCheckFramebufferStatus",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "u32",
+        "callback_type": "guest_gl_enum",
+        "ctype": "GLenum"
+      },
+      "token": "0x7e38042d",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glClampColorARB",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "clamp",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7eb2c82e",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glClear",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_bitfield",
+          "ctype": "GLbitfield",
+          "name": "mask",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e194b2b",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glClearColor",
+      "params": [
+        {
+          "abi_kind": "f32",
+          "callback_type": "guest_gl_float",
+          "ctype": "GLfloat",
+          "name": "red",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "f32",
+          "callback_type": "guest_gl_float",
+          "ctype": "GLfloat",
+          "name": "green",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "f32",
+          "callback_type": "guest_gl_float",
+          "ctype": "GLfloat",
+          "name": "blue",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "f32",
+          "callback_type": "guest_gl_float",
+          "ctype": "GLfloat",
+          "name": "alpha",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e9e5cb0",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glClearDepth",
+      "params": [
+        {
+          "abi_kind": "f64",
+          "callback_type": "guest_gl_double",
+          "ctype": "GLdouble",
+          "name": "depth",
+          "stack_bytes": 8
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e6b0830",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glCompileShader",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "shader",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7edbdc55",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glCreateProgram",
+      "params": [],
+      "return": {
+        "abi_kind": "u32",
+        "callback_type": "guest_gl_uint",
+        "ctype": "GLuint"
+      },
+      "token": "0x7e2c4d40",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 0
+    },
+    {
+      "name": "glCreateShader",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "type",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "u32",
+        "callback_type": "guest_gl_uint",
+        "ctype": "GLuint"
+      },
+      "token": "0x7e8e2dff",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glCullFace",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "mode",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e326165",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glDeleteFramebuffers",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "n",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLuint *",
+          "name": "framebuffers",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e892c7d",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glDeleteProgram",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "program",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e79d194",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glDeleteRenderbuffers",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "n",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLuint *",
+          "name": "renderbuffers",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7efa9491",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glDeleteShader",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "shader",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e226ffe",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glDeleteTextures",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "n",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLuint *",
+          "name": "textures",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e5f3dd4",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glDepthFunc",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "func",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7edf529c",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glDisableVertexAttribArray",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "index",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ea27a94",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glDrawElements",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "mode",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "type",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const void *",
+          "name": "indices",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e302306",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glEnable",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "cap",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ed43cfd",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glEnableVertexAttribArray",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "index",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e4df411",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glFramebufferRenderbuffer",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "attachment",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "renderbuffertarget",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "renderbuffer",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e8a2af9",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glFramebufferTexture2D",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "attachment",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "textarget",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "texture",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "level",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e122133",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 20
+    },
+    {
+      "name": "glGenFramebuffers",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "n",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLuint *",
+          "name": "framebuffers",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e98408f",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glGenRenderbuffers",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "n",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLuint *",
+          "name": "renderbuffers",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e9316cd",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glGenTextures",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "n",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLuint *",
+          "name": "textures",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e63264a",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glGetAttribLocation",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "program",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLchar *",
+          "name": "name",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "i32",
+        "callback_type": "guest_gl_int",
+        "ctype": "GLint"
+      },
+      "token": "0x7e307ce3",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glGetIntegerv",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "pname",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLint *",
+          "name": "data",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ee6ba14",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glGetProgramInfoLog",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "program",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "bufSize",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLsizei *",
+          "name": "length",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLchar *",
+          "name": "infoLog",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ecd5414",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glGetProgramiv",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "program",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "pname",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLint *",
+          "name": "params",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7eced544",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glGetRenderbufferParameteriv",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "pname",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLint *",
+          "name": "params",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e7972ca",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glGetShaderInfoLog",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "shader",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "bufSize",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLsizei *",
+          "name": "length",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLchar *",
+          "name": "infoLog",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e5ec92d",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glGetShaderiv",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "shader",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "pname",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "GLint *",
+          "name": "params",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e60aeb1",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glGetString",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "name",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "guest_addr",
+        "callback_type": "guest_gl_addr",
+        "ctype": "const GLubyte *"
+      },
+      "token": "0x7ebcf4bc",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glGetStringi",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "name",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "index",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "guest_addr",
+        "callback_type": "guest_gl_addr",
+        "ctype": "const GLubyte *"
+      },
+      "token": "0x7e707522",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glGetUniformLocation",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "program",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLchar *",
+          "name": "name",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "i32",
+        "callback_type": "guest_gl_int",
+        "ctype": "GLint"
+      },
+      "token": "0x7e488552",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glLinkProgram",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "program",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e106822",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glReadPixels",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "x",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "y",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "width",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "height",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "format",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "type",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "void *",
+          "name": "pixels",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e038504",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 28
+    },
+    {
+      "name": "glRenderbufferStorage",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "internalformat",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "width",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "height",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7eca621d",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glShaderSource",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "shader",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLchar *const *",
+          "name": "string",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLint *",
+          "name": "length",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ea2cbd7",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glTexImage2D",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "level",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "internalformat",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "width",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "height",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "border",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "format",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "type",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const void *",
+          "name": "pixels",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ee84ab1",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 36
+    },
+    {
+      "name": "glTexParameteri",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "pname",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "param",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ec17871",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glTexSubImage2D",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "target",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "level",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "xoffset",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "yoffset",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "width",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "height",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "format",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "type",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const void *",
+          "name": "pixels",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7eb9db1e",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 36
+    },
+    {
+      "name": "glUniform1fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e1b2413",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform1i",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "v0",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7efc8bde",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 8
+    },
+    {
+      "name": "glUniform1iv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLint *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e8338dc",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform1uiv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLuint *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e6d72c9",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform2fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e5d9a4a",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform2iv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLint *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ec58685",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform2uiv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLuint *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ed8dd27",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform3fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e9ff07d",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform3iv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLint *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e07ecb2",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform3uiv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLuint *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e64ba42",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform4fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ed0e6f8",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform4iv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLint *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e48fa37",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniform4uiv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLuint *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7eb382fb",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 12
+    },
+    {
+      "name": "glUniformMatrix2fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e9430bd",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUniformMatrix2x3fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e3db19d",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUniformMatrix2x4fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e72a718",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUniformMatrix3fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e565a8a",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUniformMatrix3x2fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e9ff21a",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUniformMatrix3x4fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e128ea8",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUniformMatrix4fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e194c0f",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUniformMatrix4x2fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ebf2e0a",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUniformMatrix4x3fv",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "location",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "count",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "transpose",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const GLfloat *",
+          "name": "value",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e7d443d",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    },
+    {
+      "name": "glUseProgram",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "program",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ef5cab2",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 4
+    },
+    {
+      "name": "glVertexAttribPointer",
+      "params": [
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_uint",
+          "ctype": "GLuint",
+          "name": "index",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "size",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u32",
+          "callback_type": "guest_gl_enum",
+          "ctype": "GLenum",
+          "name": "type",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "u8_slot",
+          "callback_type": "guest_gl_boolean",
+          "ctype": "GLboolean",
+          "name": "normalized",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "stride",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "guest_addr",
+          "callback_type": "guest_gl_addr",
+          "ctype": "const void *",
+          "name": "pointer",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7ec4fcb9",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 24
+    },
+    {
+      "name": "glViewport",
+      "params": [
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "x",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_int",
+          "ctype": "GLint",
+          "name": "y",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "width",
+          "stack_bytes": 4
+        },
+        {
+          "abi_kind": "i32",
+          "callback_type": "guest_gl_sizei",
+          "ctype": "GLsizei",
+          "name": "height",
+          "stack_bytes": 4
+        }
+      ],
+      "return": {
+        "abi_kind": "void",
+        "callback_type": "void",
+        "ctype": "void"
+      },
+      "token": "0x7e9fd65e",
+      "x86_api_entry": "stdcall",
+      "x86_stack_bytes": 16
+    }
+  ],
+  "measurement": {
+    "distinct_names": 73,
+    "original_measured_distinct_names": 51,
+    "pe_sha256": "31846486979cfa07c8c968221553052c3ff603518681ca11912d445f96ca9404",
+    "pe_size": 8650240,
+    "static_call_sites_lower_bound": 171,
+    "supplemental_direct_generated_distinct_names": 22,
+    "supplemental_gl_gen_framebuffers_evidence": {
+      "arguments": [
+        "n",
+        "framebuffers"
+      ],
+      "call_rva": "0x00561a9d",
+      "name": "glGenFramebuffers",
+      "resolver_slot": "0x307c1ab4"
+    },
+    "supplemental_gl_get_stringi_evidence": {
+      "arguments": [
+        "GL_EXTENSIONS",
+        "index"
+      ],
+      "call_rva": "0x005992a6",
+      "name": "glGetStringi",
+      "resolver_slot": "0x307bfe78"
+    },
+    "undecoded_candidate_roots": 45
+  },
+  "schema": 1,
+  "surface_complete": false,
+  "warning": "Measured conservative registry only; 45 candidate roots were undecoded, so an absent symbol is unsupported, not unreachable. Counts distinguish 51 original measured names from 22 supplemental direct-generated names."
+}

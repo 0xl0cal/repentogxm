@@ -1,0 +1,33 @@
+{
+  "schema": "isaac-vita-archive-validation-corpus-v1",
+  "pe_sha256": "31846486979cfa07c8c968221553052c3ff603518681ca11912d445f96ca9404",
+  "descriptor_table_rva": 8039232,
+  "expected": {
+    "archives": 18,
+    "entries": 21283,
+    "data_bytes": 1034148878,
+    "skipped_entries": 18635,
+    "skipped_data_bytes": 888222052,
+    "original_validation_entries": 2648
+  },
+  "archives": [
+    {"name":"animations.a","size":660301,"mode":1,"index_offset":660281,"entries":1,"index_sha256":"567ec7e883489ceb948abd54fbaab4604500da613b1589922cbf2bad8666610b","archive_sha256":"182e071934fc2d4600506bb326bb8d3946861bfa7ce3c4404d524d68ada8abf5"},
+    {"name":"config.a","size":130681,"mode":1,"index_offset":130201,"entries":24,"index_sha256":"31cb841f8e999da88809de8ef74c47f0e86a903eaf4cd21ef8ccbc779b8c6957","archive_sha256":"618ff65ed855381f7e7184dcc0ce8f8b1473334cc7da94bd4f4db42b362e4479"},
+    {"name":"fonts.a","size":15061,"mode":1,"index_offset":14861,"entries":10,"index_sha256":"2860c6e3706198fdfebe12d331f95292c3e06b4cea2e65bb87d26f254d080897","archive_sha256":"f6f0a9280b0c066cafddc0e9ab6b59522ac4401d9168a6be81ae978d075f6f6f"},
+    {"name":"graphics.a","size":17554022,"mode":0,"index_offset":17508022,"entries":2300,"index_sha256":"f6d2c9616a41fa5f03d2759ed66709f50b7c353eb61faf5c3c73991f9921b739","archive_sha256":"b1286fcfc4f3dd899cd225d46db9132a787352b4169b9de56a5d2c65e43ee23e"},
+    {"name":"music.a","size":182744758,"mode":0,"index_offset":182743098,"entries":83,"index_sha256":"dc86d119fb7c4a1d9556d35d52df89ec3db9b0f7625180db03c654a534435aa9","archive_sha256":"0e8288bf503246e0c57b6a37d6d9d87ba5a07680cc120e926b3327371f305bec"},
+    {"name":"rooms.a","size":655906,"mode":1,"index_offset":655646,"entries":13,"index_sha256":"ebb3cc894cda72206c2064a739890f4b50831ab41106fb54e557165b7f3139c6","archive_sha256":"c6e4495b77a4ceb6742d7efeaf60a205844c08d739bcea7a95cda0d10428634e"},
+    {"name":"sfx.a","size":25333050,"mode":0,"index_offset":25327030,"entries":301,"index_sha256":"e51deee3447758812e4a054676b4ce96c88240ea2cd620b5d10e653bab2cb16a","archive_sha256":"1f66a8e6695edd332ab7b94378b0c9625deae2e04f4c95539ad5682d52a44273"},
+    {"name":"videos.a","size":93004538,"mode":0,"index_offset":93004198,"entries":17,"index_sha256":"6656e5669a0a1aa21d4453b924a7d489e1d9cf5affb958694b38f59c497d2649","archive_sha256":"e7a025789a2c0b3f5de974e701039d46867e469e9b20cf68fa15fda3c41e9400"},
+    {"name":"afterbirth.a","size":145319513,"mode":2,"index_offset":145266573,"entries":2647,"index_sha256":"37af248855e60b946cb6efe1989af573f0e7833422d7ddc75d87282685f66837","archive_sha256":"ee400c960d9b6854f612f15baededbb8221920795961ba422253893557d64d8c"},
+    {"name":"afterbirthp.a","size":134156485,"mode":2,"index_offset":134046245,"entries":5512,"index_sha256":"dc5302bf210151f781a7ddf503ddf493e38b47b271f73055da4144c8ba5d3392","archive_sha256":"2ce8f89c72e8a0f40835636c88e1e03314dabf450edc7740e518423f7c8951d9"},
+    {"name":"repentance.a","size":385003320,"mode":2,"index_offset":384919720,"entries":4180,"index_sha256":"1c5a1214c5f1563087bc276c4ffcd3c7e3e188178e4a05be7fd7ea5c942f0a8e","archive_sha256":"b58a2c74f49f106be54021961b5bb11a8428861e125d7430efa24ded652187ea"},
+    {"name":"repentance_de.a","size":4069880,"mode":2,"index_offset":4052080,"entries":890,"index_sha256":"1dea589a93dd336726dc8f0818192d4db483733f2ba5a6289e41d7ab2cfbd438","archive_sha256":"b50ca963231c9932b81eb5ab62fa20d206120a6807f57f65efcb395946fce477"},
+    {"name":"repentance_es.a","size":4509288,"mode":2,"index_offset":4492568,"entries":836,"index_sha256":"1c51f8a89de5595cf039520b4a9b910fd52d14e50716cc356874905aede461a8","archive_sha256":"7b39ffd3a0dbd59e7029ae3f82e943b4c2acbff464237558653b9cfb11dcbd11"},
+    {"name":"repentance_jp.a","size":4200214,"mode":2,"index_offset":4183274,"entries":847,"index_sha256":"12276950eee489d76b99107c3ef0f0aebb7129cdfeabe928b2cf5447bc92e2ad","archive_sha256":"a9e2d25903f451670ccb03b520175c6f43c3448ac27883465379f98c02cf866e"},
+    {"name":"repentance_kr.a","size":6849762,"mode":2,"index_offset":6831802,"entries":898,"index_sha256":"b941ad38551338049f375a87c4e65f4e3782887183e15f0c19ecac6793bd1458","archive_sha256":"eaf4a26989b7751057876584fb1e666bd6ae6e684b3a1e56cac3c380165b996a"},
+    {"name":"repentance_ru.a","size":5843869,"mode":2,"index_offset":5826329,"entries":877,"index_sha256":"dc65da7012906ae1cf23fc1374bf771bda75608b33f5c6d7e1d930364b77af32","archive_sha256":"5167ea16613d522572401ef500c58cec793d6797cd032eee4b34694c05bfc7cd"},
+    {"name":"repentance_zh.a","size":17899476,"mode":2,"index_offset":17880616,"entries":943,"index_sha256":"e701378d63a9b35df5cea3c100f93268b3ffeaceeda46552a4017e3263a4471a","archive_sha256":"e93595f02d9d1d8a5fa92448edba870fa690dfde9b4299262d51c715b8e5252b"},
+    {"name":"repentance_fr.a","size":6624666,"mode":2,"index_offset":6606586,"entries":904,"index_sha256":"cad8d9b621bf047182c0102d9a0d19cf79f869dda40673bf77b6ef28aeb199ce","archive_sha256":"baa8d05c36e9d5b082a9c69074d80cdc797345699b415a87e8e66ddc8e0d76ec"}
+  ]
+}

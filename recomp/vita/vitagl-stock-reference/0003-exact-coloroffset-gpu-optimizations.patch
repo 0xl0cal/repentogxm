@@ -1,0 +1,749 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index e9160cb74d1247b5834a452d88cccbb4e2b1a2ba..5842ab595a31a8b55f6a3cfacea98af040dec52b 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -43,6 +43,13 @@
+ #else
+ #define ISAAC_NOTE_VERTEX_COPY(vertices, stride) ((void)0)
+ #endif
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++#ifndef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++#error "Isaac ColorOffset optimization requires the exact draw layout policy"
++#endif
++#include "isaac_coloroffset_gpu_policy.h"
++#define ISAAC_COLOROFFSET_FRAGMENT_CACHE_CAPACITY 4u
++#endif
+ _Static_assert(VERTEX_ATTRIBS_NUM == ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES,
+ 	"Isaac GPU draw policy attribute ceiling drifted");
+ _Static_assert(sizeof(SceGxmVertexAttribute) ==
+@@ -308,6 +315,10 @@ typedef struct {
+ typedef struct isaac_vertex_program_cache_entry
+ 	isaac_vertex_program_cache_entry;
+ #endif
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++typedef struct isaac_coloroffset_fragment_cache_entry
++	isaac_coloroffset_fragment_cache_entry;
++#endif
+ 
+ #ifdef STRICT_UNIFORMS_COMPLIANCE
+ typedef union {
+@@ -415,6 +426,15 @@ typedef struct {
+ 	isaac_vertex_program_cache_entry *isaac_vertex_cache;
+ 	uint8_t isaac_vertex_cache_count;
+ #endif
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	isaac_coloroffset_fragment_cache_entry *isaac_coloroffset_fragment_cache;
++	uint8_t isaac_coloroffset_fragment_cache_count;
++	SceGxmShaderPatcherId isaac_coloroffset_link_fragment_id;
++	const SceGxmProgram *isaac_coloroffset_link_vertex_program;
++	uint32_t isaac_coloroffset_link_source_generation;
++	uint32_t isaac_coloroffset_link_vertex_generation;
++	uint8_t isaac_coloroffset_link_vertex_exact;
++#endif
+ } program;
+ 
+ // Internal shaders and array
+@@ -648,6 +668,459 @@ void vglGetIsaacGpuDrawStats(vglIsaacGpuDrawStats *stats) {
+ }
+ #endif
+ 
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++struct isaac_coloroffset_fragment_cache_entry {
++	isaac_coloroffset_fragment_cache_entry *next;
++	isaac_coloroffset_cache_key key;
++	SceGxmFragmentProgram *fragment_program;
++};
++
++static uint8_t isaac_coloroffset_source_exact[MAX_CUSTOM_SHADERS];
++static uint8_t isaac_coloroffset_compile_exact[MAX_CUSTOM_SHADERS];
++static uint32_t isaac_coloroffset_source_generation[MAX_CUSTOM_SHADERS];
++static uint32_t isaac_coloroffset_compiled_generation[MAX_CUSTOM_SHADERS];
++static vglIsaacColorOffsetStats isaac_coloroffset_stats = {
++	.abi_version = 1,
++	.enabled = 1,
++};
++#ifdef HAVE_ISAAC_PHASE_PROFILE
++#define ISAAC_COLOROFFSET_COUNT(field) (isaac_coloroffset_stats.field++)
++#define ISAAC_COLOROFFSET_ADD(field, value) \
++	(isaac_coloroffset_stats.field += (value))
++#else
++#define ISAAC_COLOROFFSET_COUNT(field) ((void)0)
++#define ISAAC_COLOROFFSET_ADD(field, value) ((void)0)
++#endif
++
++static uint32_t isaac_coloroffset_fnv1a(const void *data, uint32_t size) {
++	const uint8_t *bytes = (const uint8_t *)data;
++	uint32_t hash = 0x811c9dc5u;
++	uint32_t index;
++	for (index = 0; index < size; ++index) {
++		hash ^= bytes[index];
++		hash *= 0x01000193u;
++	}
++	return hash;
++}
++
++static int32_t isaac_coloroffset_shader_index(const shader *s) {
++	uintptr_t address;
++	uintptr_t base;
++	uintptr_t offset;
++	if (!s)
++		return -1;
++	address = (uintptr_t)s;
++	base = (uintptr_t)&shaders[0];
++	if (address < base || address >= (uintptr_t)&shaders[MAX_CUSTOM_SHADERS])
++		return -1;
++	offset = address - base;
++	if (offset % sizeof(shader))
++		return -1;
++	return (int32_t)(offset / sizeof(shader));
++}
++
++static void isaac_coloroffset_advance_shader_generation(uint32_t index) {
++	if (index >= MAX_CUSTOM_SHADERS)
++		return;
++	isaac_coloroffset_source_generation[index] =
++		isaac_coloroffset_next_generation(
++			isaac_coloroffset_source_generation[index]);
++}
++
++static GLboolean isaac_coloroffset_fragment_shader_is_exact(const shader *s) {
++	return s && s->prog &&
++		sceGxmProgramGetSize(s->prog) == ISAAC_COLOROFFSET_FRAGMENT_GXP_SIZE &&
++		isaac_coloroffset_fnv1a(
++			s->prog, ISAAC_COLOROFFSET_FRAGMENT_GXP_SIZE) ==
++			ISAAC_COLOROFFSET_FRAGMENT_GXP_FNV1A &&
++		isaac_coloroffset_fnv1a(s->prog, 512u) ==
++			ISAAC_COLOROFFSET_FRAGMENT_GXP_FIRST512_FNV1A;
++}
++
++void vglIsaacMarkColorOffsetShader(
++		uint32_t handle, uint32_t source_fnv1a,
++		uint32_t source_first512_fnv1a, uint32_t source_size) {
++	shader *s;
++	uint32_t index;
++	if (!handle || handle > MAX_CUSTOM_SHADERS)
++		return;
++	index = handle - 1u;
++	s = &shaders[index];
++	isaac_coloroffset_source_exact[index] = 0;
++	isaac_coloroffset_compile_exact[index] = 0;
++	isaac_coloroffset_compiled_generation[index] = 0;
++	if (!isaac_coloroffset_source_generation[index] ||
++			!s->valid || !s->is_glsl || s->type != GL_FRAGMENT_SHADER ||
++			!s->source || source_size != ISAAC_COLOROFFSET_SOURCE_SIZE ||
++			source_fnv1a != ISAAC_COLOROFFSET_SOURCE_FNV1A ||
++			source_first512_fnv1a !=
++				ISAAC_COLOROFFSET_SOURCE_FIRST512_FNV1A ||
++			s->size != source_size ||
++			isaac_coloroffset_fnv1a(s->source, s->size) != source_fnv1a ||
++			isaac_coloroffset_fnv1a(s->source, 512u) !=
++				source_first512_fnv1a) {
++		ISAAC_COLOROFFSET_COUNT(source_mark_rejected);
++		return;
++	}
++	isaac_coloroffset_source_exact[index] = 1;
++	ISAAC_COLOROFFSET_COUNT(source_selected);
++}
++
++static void isaac_coloroffset_note_compile(shader *s) {
++	int32_t index = isaac_coloroffset_shader_index(s);
++	GLboolean binary_exact;
++	if (index < 0)
++		return;
++	isaac_coloroffset_compile_exact[index] = 0;
++	isaac_coloroffset_compiled_generation[index] = 0;
++	isaac_coloroffset_advance_shader_generation((uint32_t)index);
++	if (!isaac_coloroffset_source_exact[index])
++		return;
++	binary_exact =
++		isaac_coloroffset_source_generation[index] &&
++		isaac_coloroffset_fragment_shader_is_exact(s);
++	isaac_coloroffset_compile_exact[index] = binary_exact ? 1 : 0;
++	isaac_coloroffset_compiled_generation[index] = binary_exact ?
++		isaac_coloroffset_source_generation[index] : 0u;
++	if (binary_exact)
++		ISAAC_COLOROFFSET_COUNT(compile_successes);
++	else
++		ISAAC_COLOROFFSET_COUNT(compile_failures);
++}
++
++static GLboolean isaac_coloroffset_vertex_shader_is_exact(const shader *s) {
++	static const char *const names[ISAAC_COLOROFFSET_ATTRIBUTE_COUNT] = {
++		"Position", "Color", "TexCoord", "ColorizeIn", "ColorOffsetIn",
++		"TextureSize", "PixelationAmount", "ClipPlane"
++	};
++	uint32_t index;
++	const SceGxmProgramParameter *transform;
++	if (!s || !s->prog ||
++			sceGxmProgramGetSize(s->prog) != ISAAC_COLOROFFSET_VERTEX_GXP_SIZE ||
++			isaac_coloroffset_fnv1a(s->prog, ISAAC_COLOROFFSET_VERTEX_GXP_SIZE) !=
++				ISAAC_COLOROFFSET_VERTEX_GXP_FNV1A ||
++			isaac_coloroffset_fnv1a(s->prog, 512u) !=
++				ISAAC_COLOROFFSET_VERTEX_GXP_FIRST512_FNV1A ||
++			sceGxmProgramGetParameterCount(s->prog) != 9u)
++		return GL_FALSE;
++	for (index = 0; index < ISAAC_COLOROFFSET_ATTRIBUTE_COUNT; ++index) {
++		const SceGxmProgramParameter *param =
++			sceGxmProgramFindParameterByName(s->prog, names[index]);
++		if (!param ||
++				sceGxmProgramParameterGetCategory(param) !=
++					SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE ||
++				sceGxmProgramParameterGetResourceIndex(param) != index * 4u ||
++				sceGxmProgramParameterGetComponentCount(param) != 4u ||
++				sceGxmProgramParameterGetArraySize(param) != 1u)
++			return GL_FALSE;
++	}
++	transform = sceGxmProgramFindParameterByName(s->prog, "Transform");
++	return transform &&
++		sceGxmProgramParameterGetCategory(transform) ==
++			SCE_GXM_PARAMETER_CATEGORY_UNIFORM &&
++		sceGxmProgramParameterGetResourceIndex(transform) == 0u &&
++		sceGxmProgramParameterGetComponentCount(transform) == 4u &&
++		sceGxmProgramParameterGetArraySize(transform) == 4u &&
++		sceGxmProgramParameterGetContainerIndex(transform) == 14u;
++}
++
++static GLboolean isaac_coloroffset_fragment_program_is_exact(
++		const program *p) {
++	const SceGxmProgramParameter *texture0;
++	int32_t shader_index;
++	int32_t vertex_index;
++	if (!p || p->status != PROG_LINKED || !p->fshader || !p->fshader->prog ||
++			!p->vshader || !p->vshader->prog)
++		return GL_FALSE;
++	shader_index = isaac_coloroffset_shader_index(p->fshader);
++	vertex_index = isaac_coloroffset_shader_index(p->vshader);
++	if (shader_index < 0 || !isaac_coloroffset_source_exact[shader_index] ||
++			!isaac_coloroffset_compile_exact[shader_index] ||
++			!isaac_coloroffset_source_generation[shader_index] ||
++			isaac_coloroffset_compiled_generation[shader_index] !=
++				isaac_coloroffset_source_generation[shader_index] ||
++			p->isaac_coloroffset_link_source_generation !=
++				isaac_coloroffset_source_generation[shader_index] ||
++			p->isaac_coloroffset_link_fragment_id != p->fshader->id ||
++			p->isaac_coloroffset_link_vertex_program != p->vshader->prog ||
++			vertex_index < 0 ||
++			!isaac_coloroffset_source_generation[vertex_index] ||
++			p->isaac_coloroffset_link_vertex_generation !=
++				isaac_coloroffset_source_generation[vertex_index] ||
++			sceGxmProgramGetParameterCount(p->fshader->prog) != 1u)
++		return GL_FALSE;
++	texture0 = sceGxmProgramFindParameterByName(p->fshader->prog, "Texture0");
++	return texture0 &&
++		sceGxmProgramParameterGetCategory(texture0) ==
++			SCE_GXM_PARAMETER_CATEGORY_SAMPLER &&
++		sceGxmProgramParameterGetResourceIndex(texture0) == 0u &&
++		sceGxmProgramParameterGetArraySize(texture0) == 1u;
++}
++
++static void isaac_coloroffset_record_link(program *p) {
++	int32_t index = p ? isaac_coloroffset_shader_index(p->fshader) : -1;
++	int32_t vertex_index = p ?
++		isaac_coloroffset_shader_index(p->vshader) : -1;
++	if (index >= 0 && vertex_index >= 0 && p->vshader && p->vshader->prog &&
++			isaac_coloroffset_source_generation[vertex_index] &&
++			isaac_coloroffset_fragment_shader_is_exact(p->fshader) &&
++			isaac_coloroffset_vertex_shader_is_exact(p->vshader) &&
++			isaac_coloroffset_source_exact[index] &&
++			isaac_coloroffset_compile_exact[index] &&
++			isaac_coloroffset_source_generation[index] &&
++			isaac_coloroffset_compiled_generation[index] ==
++				isaac_coloroffset_source_generation[index]) {
++		p->isaac_coloroffset_link_fragment_id = p->fshader->id;
++		p->isaac_coloroffset_link_vertex_program = p->vshader->prog;
++		p->isaac_coloroffset_link_source_generation =
++			isaac_coloroffset_source_generation[index];
++		p->isaac_coloroffset_link_vertex_generation =
++			isaac_coloroffset_source_generation[vertex_index];
++		p->isaac_coloroffset_link_vertex_exact = 1;
++	} else if (p) {
++		p->isaac_coloroffset_link_fragment_id = 0;
++		p->isaac_coloroffset_link_vertex_program = NULL;
++		p->isaac_coloroffset_link_source_generation = 0;
++		p->isaac_coloroffset_link_vertex_generation = 0;
++		p->isaac_coloroffset_link_vertex_exact = 0;
++	}
++}
++
++static void isaac_coloroffset_note_failure(enum isaac_coloroffset_failure reason) {
++	switch (reason) {
++	case ISAAC_COLOROFFSET_FAIL_PROGRAM:
++		ISAAC_COLOROFFSET_COUNT(fail_program);
++		break;
++	case ISAAC_COLOROFFSET_FAIL_BLEND:
++		ISAAC_COLOROFFSET_COUNT(fail_blend);
++		break;
++	case ISAAC_COLOROFFSET_FAIL_SAMPLER:
++		ISAAC_COLOROFFSET_COUNT(fail_sampler);
++		break;
++	case ISAAC_COLOROFFSET_FAIL_LAYOUT:
++		ISAAC_COLOROFFSET_COUNT(fail_layout);
++		break;
++	case ISAAC_COLOROFFSET_FAIL_VERTEX_RANGE:
++		ISAAC_COLOROFFSET_COUNT(fail_vertex_range);
++		break;
++	case ISAAC_COLOROFFSET_FAIL_VERTEX_VALUE:
++		ISAAC_COLOROFFSET_COUNT(fail_vertex_value);
++		break;
++	case ISAAC_COLOROFFSET_FAIL_OUTPUT:
++		ISAAC_COLOROFFSET_COUNT(fail_output);
++		break;
++	case ISAAC_COLOROFFSET_FAIL_CACHE:
++		ISAAC_COLOROFFSET_COUNT(fail_cache);
++		break;
++	default:
++		break;
++	}
++}
++
++static GLboolean isaac_coloroffset_blend_is_exact(void) {
++	return blend_state &&
++		blend_info.info.colorMask == SCE_GXM_COLOR_MASK_ALL &&
++		blend_info.info.colorFunc == SCE_GXM_BLEND_FUNC_ADD &&
++		blend_info.info.alphaFunc == SCE_GXM_BLEND_FUNC_ADD &&
++		/* Physical raw 0x5151110f uses ONE here.  With the separately
++		 * proven source alpha of one, ONE and SRC_ALPHA are identical. */
++		(blend_info.info.colorSrc == SCE_GXM_BLEND_FACTOR_ONE ||
++		 blend_info.info.colorSrc == SCE_GXM_BLEND_FACTOR_SRC_ALPHA) &&
++		blend_info.info.colorDst ==
++			SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
++		(blend_info.info.alphaSrc == SCE_GXM_BLEND_FACTOR_ONE ||
++		 blend_info.info.alphaSrc == SCE_GXM_BLEND_FACTOR_SRC_ALPHA) &&
++		blend_info.info.alphaDst ==
++			SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++}
++
++static SceGxmFragmentProgram *isaac_coloroffset_find_or_create_fragment(
++		program *p, const isaac_coloroffset_cache_key *key) {
++	isaac_coloroffset_fragment_cache_entry *entry =
++		p->isaac_coloroffset_fragment_cache;
++	SceGxmBlendInfo opaque;
++	int result;
++	while (entry) {
++		if (isaac_coloroffset_cache_key_equal(&entry->key, key)) {
++			ISAAC_COLOROFFSET_COUNT(cache_hits);
++			return entry->fragment_program;
++		}
++		entry = entry->next;
++	}
++	if (p->isaac_coloroffset_fragment_cache_count >=
++			ISAAC_COLOROFFSET_FRAGMENT_CACHE_CAPACITY)
++		return NULL;
++	entry = vglMalloc(sizeof(*entry));
++	if (!entry)
++		return NULL;
++	opaque = blend_info.info;
++	opaque.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
++	opaque.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
++	opaque.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
++	opaque.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
++	opaque.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
++	opaque.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
++	result = sceGxmShaderPatcherCreateFragmentProgram(
++		gxm_shader_patcher, p->fshader->id,
++		(SceGxmOutputRegisterFormat)key->output_format,
++		(SceGxmMultisampleMode)key->multisample_mode, &opaque,
++		p->vshader->prog, &entry->fragment_program);
++	if (result) {
++		vgl_free(entry);
++		return NULL;
++	}
++	entry->key = *key;
++	entry->next = p->isaac_coloroffset_fragment_cache;
++	p->isaac_coloroffset_fragment_cache = entry;
++	p->isaac_coloroffset_fragment_cache_count++;
++	ISAAC_COLOROFFSET_COUNT(cache_creates);
++	return entry->fragment_program;
++}
++
++static void isaac_coloroffset_release_fragment_cache(program *p) {
++	isaac_coloroffset_fragment_cache_entry *entry =
++		p->isaac_coloroffset_fragment_cache;
++	while (entry) {
++		isaac_coloroffset_fragment_cache_entry *next = entry->next;
++		sceGxmShaderPatcherReleaseFragmentProgram(
++			gxm_shader_patcher, entry->fragment_program);
++		ISAAC_COLOROFFSET_COUNT(cache_releases);
++		vgl_free(entry);
++		entry = next;
++	}
++	p->isaac_coloroffset_fragment_cache = NULL;
++	p->isaac_coloroffset_fragment_cache_count = 0;
++}
++
++static SceGxmFragmentProgram *isaac_coloroffset_select_opaque_fragment(
++		program *p, texture *tex, const SceGxmVertexAttribute *attributes,
++		const SceGxmVertexStream *streams, const void *vertices,
++		uint32_t vertex_bytes, const void *indices, uint32_t index_bytes,
++		GLboolean single_stream, GLboolean staged,
++		GLsizei count, uint32_t top_idx, uint32_t base_idx,
++		SceGxmIndexSource index_type) {
++	isaac_coloroffset_attribute_key
++		attribute_keys[ISAAC_COLOROFFSET_ATTRIBUTE_COUNT];
++	uint16_t strides[ISAAC_COLOROFFSET_ATTRIBUTE_COUNT];
++	isaac_coloroffset_cache_key key;
++	SceGxmTextureFormat descriptor_format;
++	uint32_t width, height, index;
++	SceGxmFragmentProgram *fragment;
++
++	if (!isaac_coloroffset_fragment_program_is_exact(p))
++		return NULL;
++	ISAAC_COLOROFFSET_COUNT(exact_draw_requests);
++	if (!p->isaac_coloroffset_link_vertex_exact ||
++			p->attr_num != ISAAC_COLOROFFSET_ATTRIBUTE_COUNT ||
++			p->max_frag_texunit_idx != 1u || p->max_vert_texunit_idx != 0u ||
++			!p->frag_texunits[0] ||
++			p->frag_texunits[0]->type != UNIFORM_SAMPLER) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_PROGRAM);
++		return NULL;
++	}
++	if (!isaac_coloroffset_blend_is_exact()) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_BLEND);
++		return NULL;
++	}
++	if (!tex || tex->status != TEX_VALID || !tex->data ||
++			tex->format != SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_SAMPLER);
++		return NULL;
++	}
++	descriptor_format = vglGetTexFormat(&tex->gxm_tex);
++	vglGetTexSizes(&tex->gxm_tex, &width, &height);
++	if (descriptor_format != SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR ||
++			width != ISAAC_COLOROFFSET_TEXTURE_WIDTH ||
++			height != ISAAC_COLOROFFSET_TEXTURE_HEIGHT) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_SAMPLER);
++		return NULL;
++	}
++	if (!single_stream || !attributes || !streams) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_LAYOUT);
++		return NULL;
++	}
++	for (index = 0; index < ISAAC_COLOROFFSET_ATTRIBUTE_COUNT; ++index) {
++		attribute_keys[index].stream_index = attributes[index].streamIndex;
++		attribute_keys[index].offset = attributes[index].offset;
++		attribute_keys[index].format = attributes[index].format;
++		attribute_keys[index].component_count = attributes[index].componentCount;
++		attribute_keys[index].reg_index = attributes[index].regIndex;
++		strides[index] = streams[index].stride;
++		if (p->attr_map[index] != index) {
++			isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_LAYOUT);
++			return NULL;
++		}
++	}
++	if (!isaac_coloroffset_layout_is_exact(
++			attribute_keys, strides, p->attr_num,
++			cur_vao->vertex_attrib_state, SCE_GXM_ATTRIBUTE_FORMAT_F32)) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_LAYOUT);
++		return NULL;
++	}
++	if (!staged || count != ISAAC_COLOROFFSET_INDEX_COUNT ||
++			top_idx != ISAAC_COLOROFFSET_VERTEX_COUNT || base_idx != 0u ||
++			index_type != SCE_GXM_INDEX_SOURCE_INDEX_16BIT ||
++			vertex_bytes != ISAAC_COLOROFFSET_VERTEX_COUNT *
++				ISAAC_COLOROFFSET_VERTEX_STRIDE) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_VERTEX_RANGE);
++		return NULL;
++	}
++	if (!isaac_coloroffset_contiguous_vertices_are_opaque(
++			vertices, vertex_bytes, top_idx,
++			ISAAC_COLOROFFSET_VERTEX_STRIDE)) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_VERTEX_VALUE);
++		return NULL;
++	}
++	if (!isaac_coloroffset_indexed_vertices_are_opaque(
++			vertices, vertex_bytes, ISAAC_COLOROFFSET_VERTEX_STRIDE,
++			indices, index_bytes, (uint32_t)count, sizeof(uint16_t),
++			base_idx)) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_VERTEX_RANGE);
++		return NULL;
++	}
++	if (is_fbo_float || gl_viewport.x != 0 || gl_viewport.y != 0 ||
++			gl_viewport.w != ISAAC_COLOROFFSET_VIEWPORT_WIDTH ||
++			gl_viewport.h != ISAAC_COLOROFFSET_VIEWPORT_HEIGHT) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_OUTPUT);
++		return NULL;
++	}
++
++	key.fragment_shader_id = p->fshader->id;
++	key.source_generation =
++		isaac_coloroffset_source_generation[
++			isaac_coloroffset_shader_index(p->fshader)];
++	key.vertex_program = (uintptr_t)p->vshader->prog;
++	key.source_blend_raw = blend_info.raw;
++	key.output_format = SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4;
++	key.multisample_mode = msaa_mode;
++	key.texture_format = descriptor_format;
++	key.texture_width = (uint16_t)width;
++	key.texture_height = (uint16_t)height;
++	key.viewport_x = (int16_t)gl_viewport.x;
++	key.viewport_y = (int16_t)gl_viewport.y;
++	key.viewport_width = (uint16_t)gl_viewport.w;
++	key.viewport_height = (uint16_t)gl_viewport.h;
++	ISAAC_COLOROFFSET_COUNT(opaque_eligible);
++	fragment = isaac_coloroffset_find_or_create_fragment(p, &key);
++	if (!fragment) {
++		isaac_coloroffset_note_failure(ISAAC_COLOROFFSET_FAIL_CACHE);
++		return NULL;
++	}
++	ISAAC_COLOROFFSET_COUNT(opaque_hits);
++	/* CPU-visible upper bound, not a GPU fragment counter: clip/depth/scissor
++	 * may reduce the number of fragments which actually reach blending. */
++	ISAAC_COLOROFFSET_ADD(opaque_viewport_pixels,
++		ISAAC_COLOROFFSET_VIEWPORT_WIDTH *
++		ISAAC_COLOROFFSET_VIEWPORT_HEIGHT);
++	return fragment;
++}
++
++void vglGetIsaacColorOffsetStats(vglIsaacColorOffsetStats *stats) {
++	if (stats)
++		*stats = isaac_coloroffset_stats;
++}
++#endif
++
+ #ifdef HAVE_SHARK_LOG
+ static char *shark_log = NULL;
+ #endif
+@@ -1445,6 +1919,10 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 			(uint32_t)((uint64_t)(uint32_t)count * index_width));
+ 	}
+ #endif
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	texture *isaac_coloroffset_texture = NULL;
++	SceGxmIndexSource isaac_coloroffset_original_index_type = index_type;
++#endif
+ 
+ 	// Check if a blend info rebuild is required and upload fragment program
+ 	setup_frag_program();
+@@ -1457,6 +1935,10 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 			texture_unit *tex_unit = &texture_units[(int)p->frag_texunits[i]->sampler_index];
+ 			uint8_t tex_type = p->frag_texunits[i]->type == UNIFORM_CUBE_SAMPLER ? 2 : tex2d_override;
+ 			texture *tex = &texture_slots[tex_unit->tex_id[tex_type]];
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++			if (i == 0)
++				isaac_coloroffset_texture = tex;
++#endif
+ #ifdef HAVE_TEX_CACHE
+ 			restore_tex_cache(tex);
+ #endif
+@@ -1712,6 +2193,29 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 		draw_stream_count = 1;
+ #endif
+ 
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	{
++		void *isaac_vertices = NULL;
++		uint32_t isaac_vertex_bytes = 0;
++		GLboolean isaac_staged = GL_FALSE;
++		SceGxmFragmentProgram *isaac_opaque_fragment;
++		if (p->attr_num && streams[0].stride && is_packed && !target_vbo &&
++				top_idx <= UINT32_MAX / streams[0].stride) {
++			isaac_vertices = ptrs[0];
++			isaac_vertex_bytes = top_idx * streams[0].stride;
++			isaac_staged = GL_TRUE;
++		}
++		isaac_opaque_fragment = isaac_coloroffset_select_opaque_fragment(
++			p, isaac_coloroffset_texture, attributes, streams,
++			isaac_vertices, isaac_vertex_bytes, idx_buf,
++			(uint32_t)count * sizeof(uint16_t), isaac_single_stream,
++			isaac_staged, count, top_idx, base_idx,
++			isaac_coloroffset_original_index_type);
++		if (isaac_opaque_fragment)
++			sceGxmSetFragmentProgram(gxm_context, isaac_opaque_fragment);
++	}
++#endif
++
+ 	// Uploading new vertex program
+ #ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
+ 	isaac_patch_vertex_program_cached(
+@@ -1950,6 +2454,12 @@ GLuint glCreateShader(GLenum shaderType) {
+ 	shaders[res - 1].prog = NULL;
+ 	shaders[res - 1].valid = GL_TRUE;
+ 	shaders[res - 1].source = NULL;
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	isaac_coloroffset_source_exact[res - 1] = 0;
++	isaac_coloroffset_compile_exact[res - 1] = 0;
++	isaac_coloroffset_source_generation[res - 1] = 1u;
++	isaac_coloroffset_compiled_generation[res - 1] = 0;
++#endif
+ 
+ 	return res;
+ }
+@@ -2044,6 +2554,12 @@ void glShaderSource(GLuint handle, GLsizei count, const GLchar *const *string, c
+ #endif
+ 	// Grabbing passed shader
+ 	shader *s = &shaders[handle - 1];
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	isaac_coloroffset_source_exact[handle - 1] = 0;
++	isaac_coloroffset_compile_exact[handle - 1] = 0;
++	isaac_coloroffset_compiled_generation[handle - 1] = 0;
++	isaac_coloroffset_advance_shader_generation(handle - 1u);
++#endif
+ 	
+ 	uint32_t size = 1;
+ 	size_t lengths[32];
+@@ -2073,6 +2589,12 @@ void glShaderBinary(GLsizei count, const GLuint *handles, GLenum binaryFormat, c
+ 
+ 	// Grabbing passed shader
+ 	shader *s = &shaders[handles[0] - 1];
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	isaac_coloroffset_source_exact[handles[0] - 1] = 0;
++	isaac_coloroffset_compile_exact[handles[0] - 1] = 0;
++	isaac_coloroffset_compiled_generation[handles[0] - 1] = 0;
++	isaac_coloroffset_advance_shader_generation(handles[0] - 1u);
++#endif
+ 
+ 	unserialize_shader((void *)binary, length, s, GL_FALSE);
+ }
+@@ -2106,6 +2628,9 @@ void glCompileShader(GLuint handle) {
+ 		sceIoClose(f);
+ 		unserialize_shader(buf, sz, s, GL_FALSE);
+ 		vgl_free(buf);
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++		isaac_coloroffset_note_compile(s);
++#endif
+ 		return;
+ 	}
+ #endif
+@@ -2114,6 +2639,9 @@ void glCompileShader(GLuint handle) {
+ 		glsl_translator_process(s);
+ 	}
+ 	vgl_compile_shader(s, GL_FALSE);
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	isaac_coloroffset_note_compile(s);
++#endif
+ }
+ 
+ void glDeleteShader(GLuint shad) {
+@@ -2244,6 +2772,15 @@ GLuint glCreateProgram(void) {
+ #ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
+ 			progs[i].isaac_vertex_cache = NULL;
+ 			progs[i].isaac_vertex_cache_count = 0;
++#endif
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++			progs[i].isaac_coloroffset_fragment_cache = NULL;
++			progs[i].isaac_coloroffset_fragment_cache_count = 0;
++			progs[i].isaac_coloroffset_link_fragment_id = 0;
++			progs[i].isaac_coloroffset_link_vertex_program = NULL;
++			progs[i].isaac_coloroffset_link_source_generation = 0;
++			progs[i].isaac_coloroffset_link_vertex_generation = 0;
++			progs[i].isaac_coloroffset_link_vertex_exact = 0;
+ #endif
+ 			for (j = 0; j < VERTEX_ATTRIBS_NUM; j++) {
+ 				progs[i].attr[j].regIndex = 0xDEAD;
+@@ -2338,6 +2875,9 @@ void glDeleteProgram(GLuint prog) {
+ 		sceGxmFinish(gxm_context);
+ #ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
+ 		isaac_release_vertex_program_cache(p);
++#endif
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++		isaac_coloroffset_release_fragment_cache(p);
+ #endif
+ 		if (p->vert_uniforms) {
+ 			vgl_free(p->vert_uniforms);
+@@ -2492,6 +3032,9 @@ void glLinkProgram(GLuint progr) {
+ 				sceIoClose(f);
+ 				unserialize_shader(buf, sz, p->vshader, GL_TRUE);
+ 				vgl_free(buf);
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++				isaac_coloroffset_note_compile(p->vshader);
++#endif
+ 			}
+ 		}
+ 		if (!p->fshader->prog) {
+@@ -2505,6 +3048,9 @@ void glLinkProgram(GLuint progr) {
+ 				sceIoClose(f);
+ 				unserialize_shader(buf, sz, p->fshader, GL_TRUE);
+ 				vgl_free(buf);
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++				isaac_coloroffset_note_compile(p->fshader);
++#endif
+ 			}
+ 		}
+ #endif
+@@ -2517,12 +3063,18 @@ void glLinkProgram(GLuint progr) {
+ 				fname = vert_fname;
+ #endif
+ 				vgl_compile_shader(p->vshader, GL_TRUE);
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++				isaac_coloroffset_note_compile(p->vshader);
++#endif
+ 			}
+ 			if (!p->fshader->prog) {
+ #ifdef HAVE_SHADER_CACHE
+ 				fname = frag_fname;
+ #endif
+ 				vgl_compile_shader(p->fshader, GL_TRUE);
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++				isaac_coloroffset_note_compile(p->fshader);
++#endif
+ 			}
+ 		}
+ 
+@@ -2757,6 +3309,9 @@ void glLinkProgram(GLuint progr) {
+ 			}
+ 		}
+ 	}
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	isaac_coloroffset_record_link(p);
++#endif
+ }
+ 
+ void glUseProgram(GLuint prog) {
+@@ -3974,6 +4529,12 @@ void vglShaderGxpBinary(GLsizei count, const GLuint *handles, const void *binary
+ 
+ 	// Grabbing passed shader
+ 	shader *s = &shaders[handles[0] - 1];
++#ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++	isaac_coloroffset_source_exact[handles[0] - 1] = 0;
++	isaac_coloroffset_compile_exact[handles[0] - 1] = 0;
++	isaac_coloroffset_compiled_generation[handles[0] - 1] = 0;
++	isaac_coloroffset_advance_shader_generation(handles[0] - 1u);
++#endif
+ 	
+ 	s->size = length;
+ 	s->prog = (SceGxmProgram *)vglMalloc(s->size);
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index b4b26161f73c5932b195a795eae0fee88b1894a3..43c6be5cd8029ea7a84e89cce91b2e417a32e061 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -65,6 +65,40 @@ typedef struct vglIsaacGpuDrawStats {
+ void vglGetIsaacGpuDrawStats(vglIsaacGpuDrawStats *stats);
+ uint8_t vglIsaacDrawCanonicalQuads(int32_t count);
+ 
++/* Separate ABI so the ColorOffset experiment remains independently gated and
++ * the established draw-cache counters do not change shape. */
++typedef struct vglIsaacColorOffsetStats {
++	uint32_t abi_version;
++	uint32_t enabled;
++	uint32_t source_selected;
++	uint32_t source_mark_rejected;
++	uint32_t compile_successes;
++	uint32_t compile_failures;
++	uint32_t exact_draw_requests;
++	uint32_t opaque_eligible;
++	uint32_t opaque_hits;
++	uint32_t opaque_viewport_pixels;
++	uint32_t fail_program;
++	uint32_t fail_blend;
++	uint32_t fail_sampler;
++	uint32_t fail_layout;
++	uint32_t fail_vertex_range;
++	uint32_t fail_vertex_value;
++	uint32_t fail_output;
++	uint32_t fail_cache;
++	uint32_t cache_hits;
++	uint32_t cache_creates;
++	uint32_t cache_releases;
++	uint32_t static_eligible;
++	uint32_t static_hits;
++	uint32_t static_pixels;
++} vglIsaacColorOffsetStats;
++
++void vglIsaacMarkColorOffsetShader(
++	uint32_t shader, uint32_t source_fnv1a,
++	uint32_t source_first512_fnv1a, uint32_t source_size);
++void vglGetIsaacColorOffsetStats(vglIsaacColorOffsetStats *stats);
++
+ #ifndef HAVE_GL_HEADERS
+ // clang-format off
+ #define GLbitfield    uint32_t

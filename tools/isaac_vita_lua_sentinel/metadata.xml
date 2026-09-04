@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+    <name>repentogxm Lua Sentinel</name>
+    <directory>repentogxm_lua_sentinel</directory>
+    <description>One-shot Lua startup and callback markers for the Vita port.</description>
+    <version>1.0.0</version>
+    <visibility>Private</visibility>
+    <tag id="Lua"/>
+</metadata>

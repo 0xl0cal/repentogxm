@@ -1,0 +1,315 @@
+From 054720622f983086e851eb8e52681d0c70cfc59f Mon Sep 17 00:00:00 2001
+From: repentogxm <repentogxm@local>
+Date: Fri, 28 Aug 2026 10:01:49 +0300
+Subject: [PATCH] add Isaac hardened shader-cache integration hooks
+
+---
+ source/custom_shaders.c | 150 +++++++++++++++++++++++++++++++++++++++-
+ source/vitaGL.h         |  39 ++++++++++
+ 2 files changed, 186 insertions(+), 3 deletions(-)
+
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index f84d9c6..499fec3 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -613,7 +613,17 @@ void unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings)
+ 	}
+ }
+ 
+-#ifdef HAVE_SHADER_CACHE
++#ifdef HAVE_ISAAC_SHADER_CACHE
++#include "isaac_shader_cache_vitagl.h"
++#endif
++
++#if defined(HAVE_ISAAC_SHADER_CACHE)
++#define vgl_compile_shader(shd, sv) \
++	compile_shader(shd, sv, isaac_cache_key)
++static inline __attribute__((always_inline)) void compile_shader(
++	shader *s, GLboolean save_bindings,
++	const isaac_shader_cache_key *isaac_cache_key) {
++#elif defined(HAVE_SHADER_CACHE)
+ #define vgl_compile_shader(shd, sv) compile_shader(shd, sv, fname)
+ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings, const char *cache_fname) {
+ #else
+@@ -621,17 +631,56 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings) {
+ #endif
+ 	// Compiling shader source
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	uint64_t compile_start = isaac_shader_cache_now_us();
++	uint32_t source_size = s->size;
++	const SceGxmProgram *compiled = shark_compile_shader_extended((const char *)s->source, &s->size, s->type == GL_FRAGMENT_SHADER ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
++	GLboolean cache_metadata_complete = GL_TRUE;
++	isaac_shader_cache_note_native_compile(
++		isaac_shader_cache_now_us() - compile_start);
++	s->prog = NULL;
++#else
+ 	s->prog = shark_compile_shader_extended((const char *)s->source, &s->size, s->type == GL_FRAGMENT_SHADER ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
++#endif
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	if (compiled) {
++#else
+ 	if (s->prog) {
+-		vgl_free(s->source);
+-		s->source = NULL;
++#endif
+ 		SceGxmProgram *res = (SceGxmProgram *)vglMalloc(s->size);
++#ifdef HAVE_ISAAC_SHADER_CACHE
++		int r = -1;
++		uint64_t register_start;
++		if (res)
++			vgl_fast_memcpy((void *)res, (const void *)compiled, s->size);
++		register_start = isaac_shader_cache_now_us();
++		if (res)
++			r = sceGxmShaderPatcherRegisterProgram(
++				gxm_shader_patcher, res, &s->id);
++		isaac_shader_cache_note_register(
++			isaac_shader_cache_now_us() - register_start, r != 0);
++		if (r) {
++			if (res)
++				vgl_free(res);
++			res = NULL;
++		}
++#else
+ 		vgl_fast_memcpy((void *)res, (void *)s->prog, s->size);
+ 		int r = sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, res, &s->id);
++#endif
+ #ifdef LOG_ERRORS
+ 		if (r) {
+ 			vgl_log("%s:%d %s: Program failed to register on sceGxm (%s).\n", __FILE__, __LINE__, __func__, get_gxm_error_literal(r));
+ 		}
++#endif
++#ifdef HAVE_ISAAC_SHADER_CACHE
++		if (!res)
++			goto isaac_compile_done;
++		vgl_free(s->source);
++		s->source = NULL;
++#else
++		vgl_free(s->source);
++		s->source = NULL;
+ #endif
+ 		s->unif_buf_size = sceGxmProgramGetDefaultUniformBufferSize(res);
+ 		s->prog = res;
+@@ -640,11 +689,25 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ 		while (param) {
+ 			if (sceShaccCgGetParameterClass(param) == SCE_SHACCCG_PARAMETERCLASS_MATRIX) {
+ 				matrix_uniform *m = (matrix_uniform *)vglMalloc(sizeof(matrix_uniform));
++				if (!m) {
++#ifdef HAVE_ISAAC_SHADER_CACHE
++					cache_metadata_complete = GL_FALSE;
++#endif
++					param = sceShaccCgGetNextParameter(param);
++					continue;
++				}
+ 				m->ptr = sceGxmProgramFindParameterByName(s->prog, sceShaccCgGetParameterName(param));
+ 				m->chain = s->mat;
+ 				s->mat = m;
+ 			} else if (sceShaccCgGetParameterClass(param) == SCE_SHACCCG_PARAMETERCLASS_UNIFORMBLOCK) {
+ 				block_uniform *b = (block_uniform *)vglMalloc(sizeof(block_uniform));
++				if (!b) {
++#ifdef HAVE_ISAAC_SHADER_CACHE
++					cache_metadata_complete = GL_FALSE;
++#endif
++					param = sceShaccCgGetNextParameter(param);
++					continue;
++				}
+ 				b->idx = sceShaccCgGetParameterBufferIndex(param);
+ 				strcpy(b->name, sceShaccCgGetParameterName(param));
+ 				b->chain = s->unif_blk;
+@@ -653,6 +716,11 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ 			param = sceShaccCgGetNextParameter(param);
+ 		}
+ 	}
++#ifdef HAVE_ISAAC_SHADER_CACHE
++isaac_compile_done:
++	if (!s->prog && s->source)
++		s->size = source_size;
++#endif
+ #ifdef HAVE_SHARK_LOG
+ 	if (s->log)
+ 		vgl_free(s->log);
+@@ -660,6 +728,12 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ 	shark_log = NULL;
+ #endif
+ 	shark_clear_output();
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	if (s->prog && isaac_cache_key)
++		(void)isaac_shader_cache_publish_shader(
++			s, isaac_cache_key, save_bindings,
++			cache_metadata_complete);
++#endif
+ #ifdef HAVE_SHADER_CACHE
+ 	SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+ 	size_t sz;
+@@ -674,2 +748,5 @@ void reset_custom_shaders(void) {
+ 	// Init custom shaders
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	memset(isaac_shader_sources, 0, sizeof isaac_shader_sources);
++#endif
+ 	for (int i = 0; i < MAX_CUSTOM_SHADERS; i++) {
+@@ -1615,2 +1692,5 @@ GLuint glCreateShader(GLenum shaderType) {
+ 	shaders[res - 1].valid = GL_TRUE;
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	isaac_shader_cache_forget_source(&shaders[res - 1]);
++#endif
+ 	shaders[res - 1].source = NULL;
+@@ -1712,2 +1792,5 @@ void glShaderSource(GLuint handle, GLsizei count, const GLchar *const *string, c
+ 	uint32_t size = 1;
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	isaac_shader_cache_forget_source(s);
++#endif
+ 	size_t lengths[32];
+@@ -1730,6 +1813,9 @@ void glShaderSource(GLuint handle, GLsizei count, const GLchar *const *string, c
+ 	}
+ 
+ 	s->size = size - 1;
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	isaac_shader_cache_capture_source(s);
++#endif
+ }
+ 
+ void glShaderBinary(GLsizei count, const GLuint *handles, GLenum binaryFormat, const void *binary, GLsizei length) {
+@@ -1741,2 +1827,5 @@ void glShaderBinary(GLsizei count, const GLuint *handles, GLenum binaryFormat, c
+ 	unserialize_shader((void *)binary, length, s, GL_FALSE);
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	isaac_shader_cache_forget_source(s);
++#endif
+ }
+@@ -1744,17 +1833,37 @@ void glCompileShader(GLuint handle) {
+ void glCompileShader(GLuint handle) {
+ 	THREAD_SAFE()
+ 
++#ifndef HAVE_ISAAC_SHADER_CACHE
+ 	// If vitaShaRK is not enabled, we try to initialize it
+ 	if (!is_shark_online && !start_shader_compiler()) {
+ 		SET_GL_ERROR(GL_INVALID_OPERATION)
+ 	}
++#endif
+ 	
+ 	// Grabbing passed shader
+ 	shader *s = &shaders[handle - 1];
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	isaac_shader_cache_key isaac_cache_key_storage;
++	const isaac_shader_cache_key *isaac_cache_key = NULL;
++#endif
+ 	
+ 	// If we use VGL_MODE_POSTPONED, we compile shaders in glLinkProgram
+ 	if (s->is_glsl && glsl_sema_mode == VGL_MODE_POSTPONED)
+ 		return;
++
++#ifdef HAVE_ISAAC_SHADER_CACHE
++	if (isaac_shader_cache_key_for(&isaac_cache_key_storage, s, NULL,
++			(uint32_t)glsl_sema_mode, GL_FALSE)) {
++		isaac_cache_key = &isaac_cache_key_storage;
++		if (isaac_shader_cache_load_shader(s, isaac_cache_key, GL_FALSE))
++			return;
++	}
++	/* A valid hit needs no runtime compiler at all.  Initialize vitaShaRK only
++	 * after the persistent record has failed closed to native compilation. */
++	if (!is_shark_online && !start_shader_compiler()) {
++		SET_GL_ERROR(GL_INVALID_OPERATION)
++	}
++#endif
+ 	
+ #ifdef HAVE_SHADER_CACHE
+ 	char fname[256];
+@@ -2132,6 +2241,29 @@ void glLinkProgram(GLuint progr) {
+ 	// With VGL_MODE_POSTPONED we perform shaders translation+compilation and attributes binding prior actual program linking
+ 	if (glsl_sema_mode == VGL_MODE_POSTPONED && (p->vshader->is_glsl || p->fshader->is_glsl)) {
+ 		glsl_sema_mode = VGL_MODE_SHADER_PAIR;
++#ifdef HAVE_ISAAC_SHADER_CACHE
++		isaac_shader_cache_key isaac_vertex_key_storage;
++		isaac_shader_cache_key isaac_fragment_key_storage;
++		const isaac_shader_cache_key *isaac_vertex_key = NULL;
++		const isaac_shader_cache_key *isaac_fragment_key = NULL;
++		const isaac_shader_cache_key *isaac_cache_key = NULL;
++		/* Build both identities before a successful hit releases its source and
++		 * changes is_glsl.  Each pair key covers both original sources. */
++		if (!p->vshader->prog && isaac_shader_cache_key_for(
++				&isaac_vertex_key_storage, p->vshader, p->fshader,
++				(uint32_t)VGL_MODE_SHADER_PAIR, GL_TRUE))
++			isaac_vertex_key = &isaac_vertex_key_storage;
++		if (!p->fshader->prog && isaac_shader_cache_key_for(
++				&isaac_fragment_key_storage, p->fshader, p->vshader,
++				(uint32_t)VGL_MODE_SHADER_PAIR, GL_TRUE))
++			isaac_fragment_key = &isaac_fragment_key_storage;
++		if (isaac_vertex_key)
++			(void)isaac_shader_cache_load_shader(
++				p->vshader, isaac_vertex_key, GL_TRUE);
++		if (isaac_fragment_key)
++			(void)isaac_shader_cache_load_shader(
++				p->fshader, isaac_fragment_key, GL_TRUE);
++#endif
+ #ifdef HAVE_SHADER_CACHE
+ 		char frag_fname[256], vert_fname[256];
+ 		char *fname;
+@@ -2165,2 +2297,8 @@ void glLinkProgram(GLuint progr) {
+ 		if (!p->vshader->prog || !p->fshader->prog) {
++#ifdef HAVE_ISAAC_SHADER_CACHE
++			if (!is_shark_online && !start_shader_compiler()) {
++				glsl_sema_mode = VGL_MODE_POSTPONED;
++				SET_GL_ERROR(GL_INVALID_OPERATION)
++			}
++#endif
+ 			if (p->vshader->is_glsl || p->fshader->is_glsl) {
+@@ -2169,2 +2307,5 @@ void glLinkProgram(GLuint progr) {
+ 			if (!p->vshader->prog) {
++#ifdef HAVE_ISAAC_SHADER_CACHE
++				isaac_cache_key = isaac_vertex_key;
++#endif
+ #ifdef HAVE_SHADER_CACHE
+@@ -2175,2 +2316,5 @@ void glLinkProgram(GLuint progr) {
+ 			if (!p->fshader->prog) {
++#ifdef HAVE_ISAAC_SHADER_CACHE
++				isaac_cache_key = isaac_fragment_key;
++#endif
+ #ifdef HAVE_SHADER_CACHE
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index f045fd2..a2fa479 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1243,5 +1243,44 @@ void vglSetParamBufferSize(uint32_t size);
+ // Change the currently used semantics binding resolution mode for the GLSL translator. Default value: VGL_MODE_POSTPONED.
+ void vglSetSemanticBindingMode(GLenum mode);
+ 
++#ifdef HAVE_ISAAC_SHADER_CACHE
++typedef struct vglIsaacShaderCacheStats {
++	uint64_t serial;
++	uint64_t attempts;
++	uint64_t hits;
++	uint64_t misses;
++	uint64_t corrupt;
++	uint64_t removes;
++	uint64_t remove_failures;
++	uint64_t read_failures;
++	uint64_t alloc_failures;
++	uint64_t oversize;
++	uint64_t native_compiles;
++	uint64_t register_failures;
++	uint64_t write_ok;
++	uint64_t write_failures;
++	uint64_t bytes_read;
++	uint64_t bytes_written;
++	uint64_t read_us;
++	uint64_t hash_us;
++	uint64_t register_us;
++	uint64_t compile_us;
++	uint64_t write_us;
++	uint64_t publish_attempts;
++	uint64_t publish_with_block_list;
++	uint64_t publish_ready;
++	uint64_t publish_block_records;
++	uint64_t publish_reject_shape;
++	uint64_t publish_reject_semantics;
++	uint64_t publish_reject_matrices;
++	uint64_t publish_reject_blocks;
++	uint64_t publish_reject_incomplete;
++	uint64_t publish_reject_alloc;
++} vglIsaacShaderCacheStats;
++
++// Snapshot Isaac's aggregate persistent shader-cache counters and timings.
++void vglGetIsaacShaderCacheStats(vglIsaacShaderCacheStats *stats);
++#endif
++
+ // Overloads the shader cache path when HAVE_SHADER_CACHE=1 is used. Must be called before vglInit*. Default value: ux0:data/shader_cache.
+ void vglSetShaderCachePath(const char *path);

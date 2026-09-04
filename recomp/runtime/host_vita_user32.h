@@ -1,0 +1,110 @@
+#ifndef ISAAC_HOST_VITA_USER32_H
+#define ISAAC_HOST_VITA_USER32_H
+
+#include <stdint.h>
+
+#include "guest.h"
+
+/* PC coverage reached the original window-decoration imports.  Their physical
+ * site lists/hashes came from the working PC full_test oracle, with indirect
+ * GetWindowLongA sites recovered from the frozen generated corpus.  The added
+ * SetWindowPos list is a complete direct-call census of the same frozen PE;
+ * only its exact SetFullScreen request is owned below.  Vita KAGE owns
+ * the display and has no HWND, so the policy is deliberately limited to the
+ * measured NULL-window/icon requests and a fixed Vita virtual desktop. */
+#define ISAAC_VITA_USER32_IMPORT_COUNT 6U
+#define ISAAC_VITA_USER32_PHYSICAL_CALL_COUNT 31U
+
+#define ISAAC_VITA_USER32_GET_WINDOW_LONG_NAME \
+    "USER32.dll!GetWindowLongA"
+#define ISAAC_VITA_USER32_GET_WINDOW_LONG_IAT_RVA 0x006063b8U
+#define ISAAC_VITA_USER32_GET_WINDOW_LONG_CALL_COUNT 5U
+#define ISAAC_VITA_USER32_GET_WINDOW_LONG_CALL_FNV64 \
+    UINT64_C(0xb34e76088b4186a1)
+#define ISAAC_VITA_USER32_GET_WINDOW_LONG_CALLS(X) \
+    X(0x004afc43U) X(0x00561429U) X(0x0056168bU) \
+    X(0x005619a3U) X(0x005971e1U)
+
+#define ISAAC_VITA_USER32_LOAD_IMAGE_NAME "USER32.dll!LoadImageA"
+#define ISAAC_VITA_USER32_LOAD_IMAGE_IAT_RVA 0x006063bcU
+#define ISAAC_VITA_USER32_LOAD_IMAGE_CALL_COUNT 3U
+#define ISAAC_VITA_USER32_LOAD_IMAGE_CALL_FNV64 \
+    UINT64_C(0x795e1b7c41f8a24b)
+#define ISAAC_VITA_USER32_LOAD_IMAGE_CALLS(X) \
+    X(0x004a4ba6U) X(0x004a4be2U) X(0x004a4c04U)
+
+#define ISAAC_VITA_USER32_SEND_MESSAGE_NAME "USER32.dll!SendMessageA"
+#define ISAAC_VITA_USER32_SEND_MESSAGE_IAT_RVA 0x006063c0U
+#define ISAAC_VITA_USER32_SEND_MESSAGE_CALL_COUNT 2U
+#define ISAAC_VITA_USER32_SEND_MESSAGE_CALL_FNV64 \
+    UINT64_C(0xe4c7dc2ff8a1ac40)
+#define ISAAC_VITA_USER32_SEND_MESSAGE_CALLS(X) \
+    X(0x004a4c18U) X(0x004a4c25U)
+
+#define ISAAC_VITA_USER32_SET_WINDOW_POS_NAME \
+    "USER32.dll!SetWindowPos"
+#define ISAAC_VITA_USER32_SET_WINDOW_POS_IAT_RVA 0x006063c4U
+#define ISAAC_VITA_USER32_SET_WINDOW_POS_CALL_COUNT 5U
+#define ISAAC_VITA_USER32_SET_WINDOW_POS_CALL_FNV64 \
+    UINT64_C(0x089fbc7a744be00a)
+#define ISAAC_VITA_USER32_SET_WINDOW_POS_CALLS(X) \
+    X(0x0048115dU) X(0x00561225U) X(0x00561547U) \
+    X(0x00598382U) X(0x00598455U)
+
+/* Only OptionsConfig::SetFullScreen is owned by the Vita compatibility
+ * policy.  The other four physical SetWindowPos sites remain loud until a
+ * concrete windowless-hardware path reaches and proves them. */
+#define ISAAC_VITA_USER32_FULLSCREEN_RETURN_RVA 0x00481163U
+#define ISAAC_VITA_USER32_FULLSCREEN_WIDTH 961U
+#define ISAAC_VITA_USER32_FULLSCREEN_HEIGHT 544U
+#define ISAAC_VITA_USER32_SWP_FRAMECHANGED 0x0020U
+
+#define ISAAC_VITA_USER32_GET_SYSTEM_METRICS_NAME \
+    "USER32.dll!GetSystemMetrics"
+#define ISAAC_VITA_USER32_GET_SYSTEM_METRICS_IAT_RVA 0x006063c8U
+#define ISAAC_VITA_USER32_GET_SYSTEM_METRICS_CALL_COUNT 10U
+#define ISAAC_VITA_USER32_GET_SYSTEM_METRICS_CALL_FNV64 \
+    UINT64_C(0x3332eed930aa3203)
+#define ISAAC_VITA_USER32_GET_SYSTEM_METRICS_CALLS(X) \
+    X(0x00481137U) X(0x0048113dU) X(0x004a4b89U) \
+    X(0x004a4b8eU) X(0x004a4bafU) X(0x004a4bb8U) \
+    X(0x004a4bc5U) X(0x004a4bcaU) X(0x004a4bebU) \
+    X(0x004a4bf4U)
+
+#define ISAAC_VITA_USER32_SET_WINDOW_LONG_NAME \
+    "USER32.dll!SetWindowLongA"
+#define ISAAC_VITA_USER32_SET_WINDOW_LONG_IAT_RVA 0x006063ccU
+#define ISAAC_VITA_USER32_SET_WINDOW_LONG_CALL_COUNT 6U
+#define ISAAC_VITA_USER32_SET_WINDOW_LONG_CALL_FNV64 \
+    UINT64_C(0x85f22d9b92565b84)
+#define ISAAC_VITA_USER32_SET_WINDOW_LONG_CALLS(X) \
+    X(0x00481149U) X(0x004811b6U) X(0x00561521U) \
+    X(0x005616c0U) X(0x005619d7U) X(0x00597223U)
+
+#define ISAAC_VITA_USER32_SM_CXSCREEN 0U
+#define ISAAC_VITA_USER32_SM_CYSCREEN 1U
+#define ISAAC_VITA_USER32_SM_CXICON 11U
+#define ISAAC_VITA_USER32_SM_CYICON 12U
+#define ISAAC_VITA_USER32_SM_CXSMICON 49U
+#define ISAAC_VITA_USER32_SM_CYSMICON 50U
+#define ISAAC_VITA_USER32_SCREEN_WIDTH 960U
+#define ISAAC_VITA_USER32_SCREEN_HEIGHT 544U
+#define ISAAC_VITA_USER32_ICON_WIDTH 32U
+#define ISAAC_VITA_USER32_ICON_HEIGHT 32U
+#define ISAAC_VITA_USER32_SMALL_ICON_WIDTH 16U
+#define ISAAC_VITA_USER32_SMALL_ICON_HEIGHT 16U
+
+#define ISAAC_VITA_USER32_IMAGE_ICON 1U
+#define ISAAC_VITA_USER32_WM_SETICON 0x0080U
+#define ISAAC_VITA_USER32_ICON_SMALL 0U
+#define ISAAC_VITA_USER32_ICON_BIG 1U
+#define ISAAC_VITA_USER32_GWL_STYLE UINT32_C(0xfffffff0)
+#define ISAAC_VITA_USER32_HICON_ISAAC UINT32_C(0x7f100065)
+#define ISAAC_VITA_USER32_HICON_ISAAC_ALT UINT32_C(0x7f100068)
+#define ISAAC_VITA_USER32_HICON_SMALL_BIAS UINT32_C(0x00010000)
+
+int isaac_vita_user32_import(CPU *__restrict c, const char *name);
+int isaac_vita_user32_import_counted(CPU *__restrict c, const char *name,
+                                     unsigned *call_count);
+
+#endif

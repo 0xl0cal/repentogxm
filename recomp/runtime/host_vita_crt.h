@@ -1,0 +1,1098 @@
+#ifndef ISAAC_HOST_VITA_CRT_H
+#define ISAAC_HOST_VITA_CRT_H
+
+#include <stdint.h>
+
+#include "guest.h"
+
+/* The measured calls after the first four Vita clock/identity imports.
+ * Keep IAT, call, and return RVAs beside the exact PE import name: this is
+ * executable evidence for the order, not a guessed collection of CRT APIs. */
+#define ISAAC_VITA_CRT_INITTERM_E_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_initterm_e"
+#define ISAAC_VITA_CRT_INITTERM_E_IAT_RVA     0x00606584U
+#define ISAAC_VITA_CRT_INITTERM_E_CALL_RVA    0x005eb70dU
+#define ISAAC_VITA_CRT_INITTERM_E_RETURN_RVA  0x005eb712U
+
+#define ISAAC_VITA_CRT_INITTERM_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_initterm"
+#define ISAAC_VITA_CRT_INITTERM_IAT_RVA     0x00606580U
+#define ISAAC_VITA_CRT_INITTERM_IAT_VA      0x98606580U
+#define ISAAC_VITA_CRT_INITTERM_CALL_RVA    0x005eb733U
+#define ISAAC_VITA_CRT_INITTERM_RETURN_RVA  0x005eb738U
+#define ISAAC_VITA_CRT_INITTERM_TABLE_START 0x986066e0U
+#define ISAAC_VITA_CRT_INITTERM_TABLE_END   0x98606890U
+
+#define ISAAC_VITA_CRT_SET_APP_TYPE_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_set_app_type"
+#define ISAAC_VITA_CRT_SET_APP_TYPE_IAT_RVA     0x00606588U
+#define ISAAC_VITA_CRT_SET_APP_TYPE_CALL_RVA    0x005eb5faU
+#define ISAAC_VITA_CRT_SET_APP_TYPE_RETURN_RVA  0x005eb5ffU
+
+#define ISAAC_VITA_CRT_SET_FMODE_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!_set_fmode"
+#define ISAAC_VITA_CRT_SET_FMODE_IAT_RVA     0x0060660cU
+#define ISAAC_VITA_CRT_SET_FMODE_CALL_RVA    0x005eb605U
+#define ISAAC_VITA_CRT_SET_FMODE_RETURN_RVA  0x005eb60aU
+
+#define ISAAC_VITA_CRT_P_COMMODE_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!__p__commode"
+#define ISAAC_VITA_CRT_P_COMMODE_IAT_RVA     0x006065f8U
+#define ISAAC_VITA_CRT_P_COMMODE_CALL_RVA    0x005eb611U
+#define ISAAC_VITA_CRT_P_COMMODE_RETURN_RVA  0x005eb616U
+
+#define ISAAC_VITA_CRT_ATEXIT_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_crt_atexit"
+#define ISAAC_VITA_CRT_ATEXIT_IAT_RVA     0x006065a0U
+#define ISAAC_VITA_CRT_ATEXIT_CALL_RVA    0x005eb05bU
+#define ISAAC_VITA_CRT_ATEXIT_RETURN_RVA  0x005eb060U
+#define ISAAC_VITA_CRT_ATEXIT_FIRST_CALLBACK_VA      0x985ec102U
+#define ISAAC_VITA_CRT_ATEXIT_PRE_MEMORY_CALLBACK_VA 0x985eb1e5U
+#define ISAAC_VITA_CRT_ATEXIT_POST_MEMORY_CALLBACK_VA 0x985e6e80U
+
+/* Process-exit family actually imported by the frozen PE.  ExitProcess is
+ * intentionally absent: the native Vita entry owns the final kernel handoff
+ * after guest_exit unwinds the translated stack. */
+#define ISAAC_VITA_CRT_TLS_EXIT_REGISTER_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_register_thread_local_exe_atexit_callback"
+#define ISAAC_VITA_CRT_TLS_EXIT_REGISTER_IAT_RVA    0x00606578U
+#define ISAAC_VITA_CRT_TLS_EXIT_REGISTER_CALL_RVA   0x005eb794U
+#define ISAAC_VITA_CRT_TLS_EXIT_REGISTER_RETURN_RVA 0x005eb799U
+
+#define ISAAC_VITA_CRT__EXIT_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_exit"
+#define ISAAC_VITA_CRT__EXIT_IAT_RVA     0x0060659cU
+#define ISAAC_VITA_CRT__EXIT_CALL_RVA    0x005eb838U
+#define ISAAC_VITA_CRT__EXIT_RETURN_RVA  0x005eb83dU
+
+#define ISAAC_VITA_CRT_EXIT_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!exit"
+#define ISAAC_VITA_CRT_EXIT_IAT_RVA                 0x006065a8U
+#define ISAAC_VITA_CRT_EXIT_CALL_RVA                0x005eb830U
+#define ISAAC_VITA_CRT_EXIT_RETURN_RVA              0x005eb835U
+#define ISAAC_VITA_CRT_EXIT_PHYSICAL_CALL_COUNT     4U
+#define ISAAC_VITA_CRT_EXIT_CALL_SITES(X) \
+    X(0x005990edU, 0x005990f3U) \
+    X(0x005991b7U, 0x005991bdU) \
+    X(0x005d3f75U, 0x005d3f7bU) \
+    X(0x005eb830U, 0x005eb835U)
+
+#define ISAAC_VITA_CRT_CONFIGURE_ARGV_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_configure_narrow_argv"
+#define ISAAC_VITA_CRT_CONFIGURE_ARGV_IAT_RVA     0x006065d0U
+#define ISAAC_VITA_CRT_CONFIGURE_ARGV_CALL_RVA    0x005eb63eU
+#define ISAAC_VITA_CRT_CONFIGURE_ARGV_RETURN_RVA  0x005eb643U
+
+#define ISAAC_VITA_CRT_INITIALIZE_SLIST_NAME \
+    "KERNEL32.dll!InitializeSListHead"
+#define ISAAC_VITA_CRT_INITIALIZE_SLIST_IAT_RVA     0x0060602cU
+#define ISAAC_VITA_CRT_INITIALIZE_SLIST_CALL_RVA    0x005eb547U
+#define ISAAC_VITA_CRT_INITIALIZE_SLIST_RETURN_RVA  0x005eb54dU
+
+#define ISAAC_VITA_CRT_CONTROLFP_S_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_controlfp_s"
+#define ISAAC_VITA_CRT_CONTROLFP_S_IAT_RVA     0x0060657cU
+#define ISAAC_VITA_CRT_CONTROLFP_S_CALL_RVA    0x005ec08cU
+#define ISAAC_VITA_CRT_CONTROLFP_S_RETURN_RVA  0x005ec091U
+
+#define ISAAC_VITA_CRT_CONFIGTHREADLOCALE_NAME \
+    "api-ms-win-crt-locale-l1-1-0.dll!_configthreadlocale"
+#define ISAAC_VITA_CRT_CONFIGTHREADLOCALE_IAT_RVA     0x00606514U
+#define ISAAC_VITA_CRT_CONFIGTHREADLOCALE_CALL_RVA    0x005eb677U
+#define ISAAC_VITA_CRT_CONFIGTHREADLOCALE_RETURN_RVA  0x005eb67cU
+
+#define ISAAC_VITA_CRT_INITIALIZE_ENVIRONMENT_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_initialize_narrow_environment"
+#define ISAAC_VITA_CRT_INITIALIZE_ENVIRONMENT_IAT_RVA     0x006065ccU
+#define ISAAC_VITA_CRT_INITIALIZE_ENVIRONMENT_CALL_RVA    0x005eb686U
+#define ISAAC_VITA_CRT_INITIALIZE_ENVIRONMENT_RETURN_RVA  0x005eb68bU
+
+/* The post-initializer handoff into main.  These three cdecl accessors are
+ * consecutive in exe_common.inl's exact generated path.  The ordinals count
+ * every live import call, including the nested initializer calls. */
+#define ISAAC_VITA_CRT_GET_INITIAL_ENVIRONMENT_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_get_initial_narrow_environment"
+#define ISAAC_VITA_CRT_GET_INITIAL_ENVIRONMENT_IAT_RVA     0x00606574U
+#define ISAAC_VITA_CRT_GET_INITIAL_ENVIRONMENT_CALL_RVA    0x005eb79aU
+#define ISAAC_VITA_CRT_GET_INITIAL_ENVIRONMENT_RETURN_RVA  0x005eb79fU
+#define ISAAC_VITA_CRT_GET_INITIAL_ENVIRONMENT_BOOT_ORDINAL 263U
+
+#define ISAAC_VITA_CRT_P_ARGV_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!__p___argv"
+#define ISAAC_VITA_CRT_P_ARGV_IAT_RVA     0x006065d4U
+#define ISAAC_VITA_CRT_P_ARGV_CALL_RVA    0x005eb7a1U
+#define ISAAC_VITA_CRT_P_ARGV_RETURN_RVA  0x005eb7a6U
+#define ISAAC_VITA_CRT_P_ARGV_BOOT_ORDINAL 264U
+
+#define ISAAC_VITA_CRT_P_ARGC_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!__p___argc"
+#define ISAAC_VITA_CRT_P_ARGC_IAT_RVA     0x006065b8U
+#define ISAAC_VITA_CRT_P_ARGC_CALL_RVA    0x005eb7a8U
+#define ISAAC_VITA_CRT_P_ARGC_RETURN_RVA  0x005eb7adU
+#define ISAAC_VITA_CRT_P_ARGC_BOOT_ORDINAL 265U
+
+/* Complete errno/doserrno census from the frozen 8,650,240-byte PE.  It
+ * imports the cdecl `_errno(void)` pointer accessor and
+ * `_set_errno(int)`, but no `__doserrno`, `_get_doserrno`, or
+ * `_set_doserrno` entry.  The seven direct IAT calls below are every
+ * reference to either imported slot: four set ENOENT, one sets EBADF, and
+ * the two pointer callers store EINVAL/ENOMEM through the returned cell. */
+#define ISAAC_VITA_CRT_ERRNO_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_errno"
+#define ISAAC_VITA_CRT_ERRNO_IAT_RVA              0x006065a4U
+#define ISAAC_VITA_CRT_ERRNO_IAT_VA               0x986065a4U
+#define ISAAC_VITA_CRT_ERRNO_CALL1_OWNER_RVA      0x005965d0U
+#define ISAAC_VITA_CRT_ERRNO_CALL1_RVA            0x0059662eU
+#define ISAAC_VITA_CRT_ERRNO_RETURN1_RVA          0x00596634U
+#define ISAAC_VITA_CRT_ERRNO_CALL1_STORE_VALUE    22U
+#define ISAAC_VITA_CRT_ERRNO_CALL2_OWNER_RVA      0x005e1e90U
+#define ISAAC_VITA_CRT_ERRNO_CALL2_RVA            0x005e1f5cU
+#define ISAAC_VITA_CRT_ERRNO_RETURN2_RVA          0x005e1f62U
+#define ISAAC_VITA_CRT_ERRNO_CALL2_STORE_VALUE    12U
+#define ISAAC_VITA_CRT_ERRNO_DIRECT_CALL_COUNT    2U
+
+#define ISAAC_VITA_CRT_SET_ERRNO_NAME \
+    "api-ms-win-crt-runtime-l1-1-0.dll!_set_errno"
+#define ISAAC_VITA_CRT_SET_ERRNO_IAT_RVA          0x006065d8U
+#define ISAAC_VITA_CRT_SET_ERRNO_IAT_VA           0x986065d8U
+#define ISAAC_VITA_CRT_SET_ERRNO_OWNER1_RVA       0x00562ef0U
+#define ISAAC_VITA_CRT_SET_ERRNO_CALL1_RVA        0x0056305cU
+#define ISAAC_VITA_CRT_SET_ERRNO_RETURN1_RVA      0x00563062U
+#define ISAAC_VITA_CRT_SET_ERRNO_CALL2_RVA        0x005630a8U
+#define ISAAC_VITA_CRT_SET_ERRNO_RETURN2_RVA      0x005630aeU
+#define ISAAC_VITA_CRT_SET_ERRNO_CALL3_RVA        0x005630bdU
+#define ISAAC_VITA_CRT_SET_ERRNO_RETURN3_RVA      0x005630c3U
+#define ISAAC_VITA_CRT_SET_ERRNO_CALL4_RVA        0x005630efU
+#define ISAAC_VITA_CRT_SET_ERRNO_RETURN4_RVA      0x005630f5U
+#define ISAAC_VITA_CRT_SET_ERRNO_OWNER2_RVA       0x00563200U
+#define ISAAC_VITA_CRT_SET_ERRNO_CALL5_RVA        0x005634e5U
+#define ISAAC_VITA_CRT_SET_ERRNO_RETURN5_RVA      0x005634ebU
+#define ISAAC_VITA_CRT_SET_ERRNO_ENOENT_VALUE     2U
+#define ISAAC_VITA_CRT_SET_ERRNO_ENOENT_CALL_COUNT 4U
+#define ISAAC_VITA_CRT_SET_ERRNO_EBADF_VALUE      9U
+#define ISAAC_VITA_CRT_SET_ERRNO_EBADF_CALL_COUNT 1U
+#define ISAAC_VITA_CRT_SET_ERRNO_DIRECT_CALL_COUNT 5U
+#define ISAAC_VITA_CRT_ERRNO_FAMILY_IMPORT_COUNT  2U
+#define ISAAC_VITA_CRT_DOSERRNO_IMPORT_COUNT      0U
+#define ISAAC_VITA_CRT_ERRNO_FAMILY_DIRECT_CALL_COUNT 7U
+
+/* Complete time-family census from the frozen 8,650,240-byte PE.  These are
+ * the only five api-ms-win-crt-time imports and they occupy one contiguous
+ * IAT run.  A load followed by an indirect register call is recorded as one
+ * call site, just like a direct `call [iat]`; the 22 physical sites below are
+ * deduplicated across overlapping translated roots.
+ *
+ * The first live post-resource frontier is `_time64` at 0x0050b7f9.  All
+ * three `_time64` callers push NULL, although the handler preserves the full
+ * optional-output ABI.  Microsoft x86 `struct tm` is exactly nine dwords and
+ * `_gmtime64`/`_localtime64` share one CRT-owned result cell. */
+#define ISAAC_VITA_CRT_STRFTIME_NAME \
+    "api-ms-win-crt-time-l1-1-0.dll!strftime"
+#define ISAAC_VITA_CRT_STRFTIME_IAT_RVA          0x00606660U
+#define ISAAC_VITA_CRT_STRFTIME_IAT_VA           0x98606660U
+#define ISAAC_VITA_CRT_STRFTIME_OWNER_RVA        0x003f65d0U
+#define ISAAC_VITA_CRT_STRFTIME_CALL_RVA         0x003f71d6U
+#define ISAAC_VITA_CRT_STRFTIME_RETURN_RVA       0x003f71dcU
+#define ISAAC_VITA_CRT_STRFTIME_FORMAT_VA        0x9874f08cU
+#define ISAAC_VITA_CRT_STRFTIME_FORMAT           "%a, %m/%d/%Y"
+#define ISAAC_VITA_CRT_STRFTIME_CAPACITY         0x48U
+#define ISAAC_VITA_CRT_STRFTIME_CALL_COUNT       1U
+
+#define ISAAC_VITA_CRT_GMTIME64_NAME \
+    "api-ms-win-crt-time-l1-1-0.dll!_gmtime64"
+#define ISAAC_VITA_CRT_GMTIME64_IAT_RVA          0x00606664U
+#define ISAAC_VITA_CRT_GMTIME64_IAT_VA           0x98606664U
+#define ISAAC_VITA_CRT_GMTIME64_OWNER1_RVA       0x0001ee50U
+#define ISAAC_VITA_CRT_GMTIME64_LOAD1_RVA        0x0001eea9U
+#define ISAAC_VITA_CRT_GMTIME64_CALL1_RVA        0x0001eebaU
+#define ISAAC_VITA_CRT_GMTIME64_RETURN1_RVA      0x0001eebcU
+#define ISAAC_VITA_CRT_GMTIME64_OWNER2_RVA       0x0001fb20U
+#define ISAAC_VITA_CRT_GMTIME64_CALL2_RVA        0x0001fcdaU
+#define ISAAC_VITA_CRT_GMTIME64_RETURN2_RVA      0x0001fce0U
+#define ISAAC_VITA_CRT_GMTIME64_OWNER3_RVA       0x003f5090U
+#define ISAAC_VITA_CRT_GMTIME64_LOAD3_RVA        0x003f50dcU
+#define ISAAC_VITA_CRT_GMTIME64_CALL3_RVA        0x003f50e8U
+#define ISAAC_VITA_CRT_GMTIME64_RETURN3_RVA      0x003f50eaU
+#define ISAAC_VITA_CRT_GMTIME64_OWNER4_RVA       0x003f5240U
+#define ISAAC_VITA_CRT_GMTIME64_LOAD4_RVA        0x003f528cU
+#define ISAAC_VITA_CRT_GMTIME64_CALL4_RVA        0x003f5298U
+#define ISAAC_VITA_CRT_GMTIME64_RETURN4_RVA      0x003f529aU
+#define ISAAC_VITA_CRT_GMTIME64_OWNER5_RVA       0x003f65d0U
+#define ISAAC_VITA_CRT_GMTIME64_CALL5_RVA        0x003f718cU
+#define ISAAC_VITA_CRT_GMTIME64_RETURN5_RVA      0x003f7192U
+#define ISAAC_VITA_CRT_GMTIME64_OWNER6_RVA       0x003f85d0U
+#define ISAAC_VITA_CRT_GMTIME64_CALL6_RVA        0x003f85f8U
+#define ISAAC_VITA_CRT_GMTIME64_RETURN6_RVA      0x003f85feU
+#define ISAAC_VITA_CRT_GMTIME64_OWNER7_RVA       0x00466270U
+#define ISAAC_VITA_CRT_GMTIME64_CALL7_RVA        0x00466af8U
+#define ISAAC_VITA_CRT_GMTIME64_RETURN7_RVA      0x00466afeU
+#define ISAAC_VITA_CRT_GMTIME64_OWNER8_RVA       0x004b3590U
+#define ISAAC_VITA_CRT_GMTIME64_CALL8_RVA        0x004b35d6U
+#define ISAAC_VITA_CRT_GMTIME64_RETURN8_RVA      0x004b35dcU
+#define ISAAC_VITA_CRT_GMTIME64_OWNER9_RVA       0x00566e40U
+#define ISAAC_VITA_CRT_GMTIME64_CALL9_RVA        0x00566e8dU
+#define ISAAC_VITA_CRT_GMTIME64_RETURN9_RVA      0x00566e93U
+#define ISAAC_VITA_CRT_GMTIME64_CALL10_RVA       0x00566eb8U
+#define ISAAC_VITA_CRT_GMTIME64_RETURN10_RVA     0x00566ebeU
+#define ISAAC_VITA_CRT_GMTIME64_CALL_COUNT       10U
+
+#define ISAAC_VITA_CRT_TIME64_NAME \
+    "api-ms-win-crt-time-l1-1-0.dll!_time64"
+#define ISAAC_VITA_CRT_TIME64_IAT_RVA            0x00606668U
+#define ISAAC_VITA_CRT_TIME64_IAT_VA             0x98606668U
+#define ISAAC_VITA_CRT_TIME64_OWNER1_RVA         0x00484660U
+#define ISAAC_VITA_CRT_TIME64_CALL1_RVA          0x00484681U
+#define ISAAC_VITA_CRT_TIME64_RETURN1_RVA        0x00484687U
+#define ISAAC_VITA_CRT_TIME64_OWNER2_RVA         0x0050b240U
+#define ISAAC_VITA_CRT_TIME64_CALL2_RVA          0x0050b7f9U
+#define ISAAC_VITA_CRT_TIME64_RETURN2_RVA        0x0050b7ffU
+#define ISAAC_VITA_CRT_TIME64_OWNER3_RVA         0x00566e40U
+#define ISAAC_VITA_CRT_TIME64_CALL3_RVA          0x00566e74U
+#define ISAAC_VITA_CRT_TIME64_RETURN3_RVA        0x00566e7aU
+#define ISAAC_VITA_CRT_TIME64_FRONTIER_CALL_RVA  ISAAC_VITA_CRT_TIME64_CALL2_RVA
+#define ISAAC_VITA_CRT_TIME64_FRONTIER_RETURN_RVA ISAAC_VITA_CRT_TIME64_RETURN2_RVA
+#define ISAAC_VITA_CRT_TIME64_CALL_COUNT         3U
+#define ISAAC_VITA_CRT_TIME64_NULL_CALL_COUNT    3U
+#define ISAAC_VITA_CRT_TIME64_FRONTIER_BEFORE_COUNT 2774U
+#define ISAAC_VITA_CRT_TIME64_FRONTIER_ORDINAL   2775U
+
+#define ISAAC_VITA_CRT_MKGMTIME64_NAME \
+    "api-ms-win-crt-time-l1-1-0.dll!_mkgmtime64"
+#define ISAAC_VITA_CRT_MKGMTIME64_IAT_RVA        0x0060666cU
+#define ISAAC_VITA_CRT_MKGMTIME64_IAT_VA         0x9860666cU
+#define ISAAC_VITA_CRT_MKGMTIME64_OWNER1_RVA     0x0001ee50U
+#define ISAAC_VITA_CRT_MKGMTIME64_LOAD1_RVA      0x0001ee81U
+#define ISAAC_VITA_CRT_MKGMTIME64_CALL1_RVA      0x0001ee92U
+#define ISAAC_VITA_CRT_MKGMTIME64_RETURN1_RVA    0x0001ee94U
+#define ISAAC_VITA_CRT_MKGMTIME64_OWNER2_RVA     0x0001fb20U
+#define ISAAC_VITA_CRT_MKGMTIME64_CALL2_RVA      0x0001fcbfU
+#define ISAAC_VITA_CRT_MKGMTIME64_RETURN2_RVA    0x0001fcc5U
+#define ISAAC_VITA_CRT_MKGMTIME64_OWNER3_RVA     0x003f5090U
+#define ISAAC_VITA_CRT_MKGMTIME64_LOAD3_RVA      0x003f50c1U
+#define ISAAC_VITA_CRT_MKGMTIME64_CALL3_RVA      0x003f50cdU
+#define ISAAC_VITA_CRT_MKGMTIME64_RETURN3_RVA    0x003f50cfU
+#define ISAAC_VITA_CRT_MKGMTIME64_OWNER4_RVA     0x003f5240U
+#define ISAAC_VITA_CRT_MKGMTIME64_LOAD4_RVA      0x003f5271U
+#define ISAAC_VITA_CRT_MKGMTIME64_CALL4_RVA      0x003f527dU
+#define ISAAC_VITA_CRT_MKGMTIME64_RETURN4_RVA    0x003f527fU
+#define ISAAC_VITA_CRT_MKGMTIME64_OWNER5_RVA     0x003f65d0U
+#define ISAAC_VITA_CRT_MKGMTIME64_CALL5_RVA      0x003f7166U
+#define ISAAC_VITA_CRT_MKGMTIME64_RETURN5_RVA    0x003f716cU
+#define ISAAC_VITA_CRT_MKGMTIME64_OWNER6_RVA     0x003f85d0U
+#define ISAAC_VITA_CRT_MKGMTIME64_CALL6_RVA      0x003f85deU
+#define ISAAC_VITA_CRT_MKGMTIME64_RETURN6_RVA    0x003f85e4U
+#define ISAAC_VITA_CRT_MKGMTIME64_OWNER7_RVA     0x00466270U
+#define ISAAC_VITA_CRT_MKGMTIME64_CALL7_RVA      0x00466addU
+#define ISAAC_VITA_CRT_MKGMTIME64_RETURN7_RVA    0x00466ae3U
+#define ISAAC_VITA_CRT_MKGMTIME64_CALL_COUNT     7U
+
+#define ISAAC_VITA_CRT_LOCALTIME64_NAME \
+    "api-ms-win-crt-time-l1-1-0.dll!_localtime64"
+#define ISAAC_VITA_CRT_LOCALTIME64_IAT_RVA       0x00606670U
+#define ISAAC_VITA_CRT_LOCALTIME64_IAT_VA        0x98606670U
+#define ISAAC_VITA_CRT_LOCALTIME64_OWNER_RVA     0x00484660U
+#define ISAAC_VITA_CRT_LOCALTIME64_CALL_RVA      0x00484697U
+#define ISAAC_VITA_CRT_LOCALTIME64_RETURN_RVA    0x0048469dU
+#define ISAAC_VITA_CRT_LOCALTIME64_CALL_COUNT    1U
+
+#define ISAAC_VITA_CRT_TIME_IMPORT_COUNT         5U
+#define ISAAC_VITA_CRT_TIME_CALL_COUNT           22U
+#define ISAAC_VITA_CRT_TM_DWORD_COUNT            9U
+#define ISAAC_VITA_CRT_FILETIME_UNIX_EPOCH \
+    UINT64_C(116444736000000000)
+#define ISAAC_VITA_CRT_FILETIME_TICKS_PER_SECOND UINT64_C(10000000)
+#define ISAAC_VITA_CRT_TIME64_MAX                INT64_C(32535215999)
+
+/* Complete utility-DLL census from the frozen 8,650,240-byte PE.  qsort is
+ * reached through seven direct IAT calls and no register-mediated call.  Two
+ * sites share comparator 0x005d2d40, leaving six physical comparators.  The
+ * second row is the live Vita frontier from 2026-08-22; current generation
+ * emits its owner in guest_0157.c.
+ *
+ * X(owner RVA, call RVA, return RVA, comparator-push RVA, comparator RVA,
+ *   element width)
+ */
+#define ISAAC_VITA_CRT_QSORT_NAME \
+    "api-ms-win-crt-utility-l1-1-0.dll!qsort"
+#define ISAAC_VITA_CRT_QSORT_IAT_RVA              0x00606678U
+#define ISAAC_VITA_CRT_QSORT_IAT_VA               0x98606678U
+#define ISAAC_VITA_CRT_QSORT_CALLBACK_RETURN      0xfff25047U
+#define ISAAC_VITA_CRT_QSORT_LIVE_OWNER_RVA       0x005b6e10U
+#define ISAAC_VITA_CRT_QSORT_LIVE_CALL_RVA        0x005b6f5aU
+#define ISAAC_VITA_CRT_QSORT_LIVE_RETURN_RVA      0x005b6f60U
+#define ISAAC_VITA_CRT_QSORT_LIVE_PUSH_RVA        0x005b6f4cU
+#define ISAAC_VITA_CRT_QSORT_LIVE_COMPARATOR_RVA  0x005b6df0U
+#define ISAAC_VITA_CRT_QSORT_LIVE_WIDTH           4U
+#define ISAAC_VITA_CRT_QSORT_LIVE_GENERATED_UNIT  157U
+#define ISAAC_VITA_CRT_QSORT_CALL_SITES(X) \
+    X(0x005a60e0U, 0x005a614fU, 0x005a6155U, 0x005a6146U, \
+      0x0059b480U, 32U) \
+    X(ISAAC_VITA_CRT_QSORT_LIVE_OWNER_RVA, \
+      ISAAC_VITA_CRT_QSORT_LIVE_CALL_RVA, \
+      ISAAC_VITA_CRT_QSORT_LIVE_RETURN_RVA, \
+      ISAAC_VITA_CRT_QSORT_LIVE_PUSH_RVA, \
+      ISAAC_VITA_CRT_QSORT_LIVE_COMPARATOR_RVA, \
+      ISAAC_VITA_CRT_QSORT_LIVE_WIDTH) \
+    X(0x005bb410U, 0x005bc7e8U, 0x005bc7eeU, 0x005bc7dbU, \
+      0x005b7530U, 4U) \
+    X(0x005c84e0U, 0x005c8603U, 0x005c8609U, 0x005c85f8U, \
+      0x005c84b0U, 4U) \
+    X(0x005c9b60U, 0x005c9dfaU, 0x005c9e00U, 0x005c9defU, \
+      0x005c9aa0U, 4U) \
+    X(0x005d2d60U, 0x005d30d1U, 0x005d30d7U, 0x005d30c2U, \
+      0x005d2d40U, 4U) \
+    X(0x005d3140U, 0x005d3341U, 0x005d3347U, 0x005d3332U, \
+      0x005d2d40U, 4U)
+#define ISAAC_VITA_CRT_QSORT_DIRECT_CALL_COUNT    7U
+#define ISAAC_VITA_CRT_QSORT_REGISTER_LOAD_COUNT  0U
+#define ISAAC_VITA_CRT_QSORT_REGISTER_CALL_COUNT  0U
+#define ISAAC_VITA_CRT_QSORT_PHYSICAL_CALL_COUNT  7U
+#define ISAAC_VITA_CRT_QSORT_COMPARATOR_COUNT     6U
+#define ISAAC_VITA_CRT_QSORT_IMPORT_COUNT         1U
+#define ISAAC_VITA_CRT_QSORT_EVIDENCE_FNV64 \
+    UINT64_C(0xaa1c43247a4bce26)
+
+/* Measured save/data-root path.  platform.h owns the one native Vita root
+ * literal; getenv exposes that stable writable root to the x86 guest. */
+#define ISAAC_VITA_CRT_GETENV_NAME \
+    "api-ms-win-crt-environment-l1-1-0.dll!getenv"
+#define ISAAC_VITA_CRT_GETENV_IAT_RVA              0x006064e4U
+#define ISAAC_VITA_CRT_GETENV_USERPROFILE_CALL_RVA 0x0050aa0bU
+#define ISAAC_VITA_CRT_GETENV_USERPROFILE_RETURN_RVA 0x0050aa0dU
+#define ISAAC_VITA_CRT_GETENV_USERPROFILE_NAME_VA  0x9875a9a8U
+#define ISAAC_VITA_CRT_GETENV_USERPROFILE_NAME     "USERPROFILE"
+#define ISAAC_VITA_CRT_GETENV_USERPROFILE_ORDINAL  274U
+#define ISAAC_VITA_CRT_GETENV_HOMEDRIVE_CALL_RVA   0x0050ab42U
+#define ISAAC_VITA_CRT_GETENV_HOMEDRIVE_RETURN_RVA 0x0050ab44U
+#define ISAAC_VITA_CRT_GETENV_HOMEDRIVE_NAME_VA    0x9875a9b4U
+#define ISAAC_VITA_CRT_GETENV_HOMEDRIVE_NAME       "HOMEDRIVE"
+#define ISAAC_VITA_CRT_GETENV_HOMEPATH_CALL_RVA    0x0050ab4bU
+#define ISAAC_VITA_CRT_GETENV_HOMEPATH_RETURN_RVA  0x0050ab51U
+#define ISAAC_VITA_CRT_GETENV_HOMEPATH_NAME_VA     0x9875a9c0U
+#define ISAAC_VITA_CRT_GETENV_HOMEPATH_NAME        "HOMEPATH"
+#define ISAAC_VITA_CRT_GETENV_NAME_MAX             32U
+
+#define ISAAC_VITA_CRT_VSPRINTF_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vsprintf"
+#define ISAAC_VITA_CRT_VSPRINTF_IAT_RVA             0x00606614U
+#define ISAAC_VITA_CRT_VSPRINTF_IMPORT_CALL_RVA     0x00011f8eU
+#define ISAAC_VITA_CRT_VSPRINTF_IMPORT_RETURN_RVA   0x00011f94U
+#define ISAAC_VITA_CRT_VSPRINTF_FIRST_ORIGIN_CALL_RVA 0x0050aa1dU
+#define ISAAC_VITA_CRT_VSPRINTF_FIRST_ORIGIN_RETURN_RVA 0x0050aa22U
+#define ISAAC_VITA_CRT_VSPRINTF_FIRST_ORDINAL       275U
+#define ISAAC_VITA_CRT_VSPRINTF_LOG_PATH_CALL_RVA   0x0048bcb4U
+#define ISAAC_VITA_CRT_VSPRINTF_LOG_PATH_RETURN_RVA 0x0048bcb9U
+#define ISAAC_VITA_CRT_VSPRINTF_LOG_PATH_ORDINAL    304U
+#define ISAAC_VITA_CRT_VSPRINTF_TIMER_CALL_RVA      0x0055e454U
+#define ISAAC_VITA_CRT_VSPRINTF_TIMER_RETURN_RVA    0x0055e45aU
+#define ISAAC_VITA_CRT_VSPRINTF_TIMER_ORDINAL       317U
+#define ISAAC_VITA_CRT_VSPRINTF_OPTIONS_PATH        0x25U
+#define ISAAC_VITA_CRT_VSPRINTF_OPTIONS_TIMER       0x26U
+#define ISAAC_VITA_CRT_VSPRINTF_FIXED_CALL_COUNT    15U
+
+/* The frozen PE imports exactly one scanf-family entry.  The local sscanf
+ * adapter at 0x003f0ef0 expands the ordinary variadic call into this seven-
+ * dword UCRT ABI; its live Vita frontier was observed before the handler was
+ * installed, with 563 earlier import occurrences already counted. */
+#define ISAAC_VITA_CRT_VSSCANF_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vsscanf"
+#define ISAAC_VITA_CRT_VSSCANF_IAT_RVA             0x00606610U
+#define ISAAC_VITA_CRT_VSSCANF_IAT_VA              0x98606610U
+#define ISAAC_VITA_CRT_VSSCANF_ADAPTER_RVA         0x003f0ef0U
+#define ISAAC_VITA_CRT_VSSCANF_IMPORT_CALL_RVA     0x003f0f09U
+#define ISAAC_VITA_CRT_VSSCANF_IMPORT_RETURN_RVA   0x003f0f0fU
+#define ISAAC_VITA_CRT_VSSCANF_FIRST_BEFORE_COUNT  563U
+#define ISAAC_VITA_CRT_VSSCANF_FIRST_ORDINAL       564U
+#define ISAAC_VITA_CRT_VSSCANF_SHADER_CALL1_RVA    0x00524399U
+#define ISAAC_VITA_CRT_VSSCANF_SHADER_RETURN1_RVA  0x0052439eU
+#define ISAAC_VITA_CRT_VSSCANF_SHADER_CALL2_RVA    0x0052e40fU
+#define ISAAC_VITA_CRT_VSSCANF_SHADER_RETURN2_RVA  0x0052e414U
+#define ISAAC_VITA_CRT_VSSCANF_VERSION_CALL_RVA    0x00599198U
+#define ISAAC_VITA_CRT_VSSCANF_VERSION_RETURN_RVA  0x0059919dU
+#define ISAAC_VITA_CRT_VSSCANF_TRIPLE_CALL_RVA     0x0059aa43U
+#define ISAAC_VITA_CRT_VSSCANF_TRIPLE_RETURN_RVA   0x0059aa48U
+#define ISAAC_VITA_CRT_VSSCANF_SHADER_FORMAT_VA    0x9875b470U
+#define ISAAC_VITA_CRT_VSSCANF_VERSION_FORMAT_VA   0x987649e4U
+#define ISAAC_VITA_CRT_VSSCANF_TRIPLE_FORMAT_VA    0x98747dacU
+#define ISAAC_VITA_CRT_VSSCANF_STATIC_CALL_COUNT   4U
+#define ISAAC_VITA_CRT_VSSCANF_STATIC_FORMAT_COUNT 3U
+#define ISAAC_VITA_CRT_SCAN_IMPORT_COUNT            1U
+
+#define ISAAC_VITA_CRT_FOPEN_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!fopen"
+#define ISAAC_VITA_CRT_FOPEN_IAT_RVA                0x00606608U
+#define ISAAC_VITA_CRT_FOPEN_SAVEPATH_CALL_RVA      0x0050affeU
+#define ISAAC_VITA_CRT_FOPEN_SAVEPATH_RETURN_RVA    0x0050b004U
+#define ISAAC_VITA_CRT_FOPEN_SAVEPATH_ORDINAL       299U
+#define ISAAC_VITA_CRT_FOPEN_SAVEPATH_NAME_VA       0x9875aab0U
+#define ISAAC_VITA_CRT_FOPEN_SAVEPATH_NAME          "savedatapath.txt"
+#define ISAAC_VITA_CRT_FOPEN_WRITE_MODE_VA          0x9875aaacU
+#define ISAAC_VITA_CRT_FOPEN_WRITE_MODE             "w"
+#define ISAAC_VITA_CRT_FOPEN_KAGE_CALL_RVA          0x00596384U
+#define ISAAC_VITA_CRT_FOPEN_KAGE_RETURN_RVA        0x0059638aU
+#define ISAAC_VITA_CRT_FOPEN_KAGE_ORDINAL           331U
+#define ISAAC_VITA_CRT_FOPEN_KAGE_NAME_VA           0x9875d758U
+#define ISAAC_VITA_CRT_FOPEN_KAGE_NAME              "kage_mount_points.dat"
+#define ISAAC_VITA_CRT_FOPEN_READ_MODE_VA           0x9874e754U
+#define ISAAC_VITA_CRT_FOPEN_READ_MODE              "rb"
+#define ISAAC_VITA_CRT_FOPEN_BINARY_WRITE_MODE_VA   0x9876488cU
+#define ISAAC_VITA_CRT_FOPEN_BINARY_WRITE_MODE      "wb"
+#define ISAAC_VITA_CRT_FOPEN_TEXT_READ_MODE_VA      0x98747e04U
+#define ISAAC_VITA_CRT_FOPEN_TEXT_READ_MODE         "r"
+#define ISAAC_VITA_CRT_FILE_READ_BUFFER_SIZE        (16U * 1024U)
+#define ISAAC_VITA_CRT_FILE_TOKEN_COUNT             16U
+/* Pseudo _fileno values for asynchronous save images: one per token slot,
+ * far above any newlib descriptor, consumed only by the LockFileEx bridge. */
+#define ISAAC_VITA_CRT_ASYNC_WRITE_FD_BASE          0x00400000U
+#define ISAAC_VITA_CRT_STANDARD_STREAM_COUNT        3U
+/* ISAAC_VITA_CRT_SEEK_SHADOW: File::IsEOF (sub_0059c8d0, frameless
+ * `push esi; push edi`) returns into itself here after File::GetSize; the
+ * loop that called IsEOF is then at [EBP+16] of GetSize's frame. */
+#define ISAAC_VITA_CRT_SEEK_SHADOW_ISEOF_RETURN_RVA 0x0059c8e2U
+#define ISAAC_VITA_CRT_SEEK_SHADOW_NAME_CAPACITY    24U
+
+#define ISAAC_VITA_CRT_VFPRINTF_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vfprintf"
+#define ISAAC_VITA_CRT_VFPRINTF_IAT_RVA             0x006065fcU
+#define ISAAC_VITA_CRT_VFPRINTF_IMPORT_CALL_RVA     0x003f8767U
+#define ISAAC_VITA_CRT_VFPRINTF_IMPORT_RETURN_RVA   0x003f876dU
+#define ISAAC_VITA_CRT_VFPRINTF_SAVEPATH_FIRST_ORIGIN_CALL_RVA \
+                                                    0x0050b013U
+#define ISAAC_VITA_CRT_VFPRINTF_SAVEPATH_LAST_ORIGIN_CALL_RVA \
+                                                    0x0050b033U
+#define ISAAC_VITA_CRT_VFPRINTF_SAVEPATH_FIRST_ORDINAL 300U
+#define ISAAC_VITA_CRT_VFPRINTF_SAVEPATH_CALL_COUNT 3U
+
+#define ISAAC_VITA_CRT_FCLOSE_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!fclose"
+#define ISAAC_VITA_CRT_FCLOSE_IAT_RVA               0x0060661cU
+#define ISAAC_VITA_CRT_FCLOSE_CALL_RVA              0x0050b039U
+#define ISAAC_VITA_CRT_FCLOSE_RETURN_RVA            0x0050b03fU
+#define ISAAC_VITA_CRT_FCLOSE_ORDINAL               303U
+
+/* Complete missing half of the frozen PE's contiguous 16-slot stdio IAT.
+ * Direct-IAT and provable register-loaded sites are listed separately and
+ * deduplicated across overlapping translated roots.  This is 92 physical
+ * calls: 24 + 1 + 1 + 5 + 1 + 3 + 2 + 55.  The EDI load at 0x0040da1a
+ * deliberately feeds both 0x0040da27 and the post-CFG 0x0040da66 call. */
+#define ISAAC_VITA_CRT_FILENO_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!_fileno"
+#define ISAAC_VITA_CRT_FILENO_IAT_RVA               0x006065e0U
+#define ISAAC_VITA_CRT_FILENO_FIRST_CALL_RVA        0x0040dd88U
+#define ISAAC_VITA_CRT_FILENO_FIRST_RETURN_RVA      0x0040dd8eU
+#define ISAAC_VITA_CRT_FILENO_DIRECT_CALL_SITES(X) \
+    X(0x0040dd88U, 0x0040dd8eU) \
+    X(0x0040de14U, 0x0040de1aU) \
+    X(0x00481dcdU, 0x00481dd3U) \
+    X(0x00481e06U, 0x00481e0cU) \
+    X(0x0048488dU, 0x00484893U) \
+    X(0x004848c0U, 0x004848c6U) \
+    X(0x00486828U, 0x0048682eU) \
+    X(0x00486868U, 0x0048686eU) \
+    X(0x004b3a75U, 0x004b3a7bU) \
+    X(0x004b3ae3U, 0x004b3ae9U) \
+    X(0x004b3e0cU, 0x004b3e12U) \
+    X(0x004b3e7aU, 0x004b3e80U) \
+    X(0x004b4c8dU, 0x004b4c93U) \
+    X(0x004b4d19U, 0x004b4d1fU) \
+    X(0x004b4e2dU, 0x004b4e33U) \
+    X(0x004b4eb9U, 0x004b4ebfU)
+#define ISAAC_VITA_CRT_FILENO_REGISTER_LOAD_SITES(X) \
+    X(0x0040da1aU) \
+    X(0x0048476cU) \
+    X(0x00487584U) \
+    X(0x00487817U)
+#define ISAAC_VITA_CRT_FILENO_REGISTER_CALL_SITES(X) \
+    X(0x0040da27U, 0x0040da29U) \
+    X(0x0040da66U, 0x0040da68U) \
+    X(0x00484779U, 0x0048477bU) \
+    X(0x004847a8U, 0x004847aaU) \
+    X(0x00487591U, 0x00487593U) \
+    X(0x004875c8U, 0x004875caU) \
+    X(0x00487824U, 0x00487826U) \
+    X(0x00487860U, 0x00487862U)
+#define ISAAC_VITA_CRT_FILENO_DIRECT_CALL_COUNT     16U
+#define ISAAC_VITA_CRT_FILENO_REGISTER_CALL_COUNT   8U
+#define ISAAC_VITA_CRT_FILENO_CALL_COUNT            24U
+
+#define ISAAC_VITA_CRT_FREAD_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!fread"
+#define ISAAC_VITA_CRT_FREAD_IAT_RVA                0x006065e4U
+#define ISAAC_VITA_CRT_FREAD_ADAPTER_RVA            0x00596560U
+#define ISAAC_VITA_CRT_FREAD_CALL_RVA               0x0059657bU
+#define ISAAC_VITA_CRT_FREAD_RETURN_RVA             0x00596581U
+/* ArchivedFile::refill_buffer reaches fread only through the adapter above.
+ * EBP is still that adapter's frame, so [EBP+4] pins which of the four exact
+ * header/payload call edges owns the request. */
+#define ISAAC_VITA_CRT_ARCHIVE_TYPE1_HEADER_RETURN_RVA  0x0059c2ceU
+#define ISAAC_VITA_CRT_ARCHIVE_TYPE1_PAYLOAD_RETURN_RVA 0x0059c300U
+#define ISAAC_VITA_CRT_ARCHIVE_TYPE2_HEADER_RETURN_RVA  0x0059c33aU
+#define ISAAC_VITA_CRT_ARCHIVE_TYPE2_PAYLOAD_RETURN_RVA 0x0059c383U
+#define ISAAC_VITA_CRT_ARCHIVE_BLOCK_MAX_BYTES          0x00000800U
+#define ISAAC_VITA_CRT_FREAD_FIRST_ORIGIN_CALL_RVA  0x00563a3aU
+#define ISAAC_VITA_CRT_FREAD_FIRST_ORIGIN_RETURN_RVA 0x00563a3dU
+#define ISAAC_VITA_CRT_FREAD_FIRST_SIZE             1U
+#define ISAAC_VITA_CRT_FREAD_FIRST_COUNT            7U
+#define ISAAC_VITA_CRT_FREAD_PREDICTED_BEFORE_COUNT 2792U
+#define ISAAC_VITA_CRT_FREAD_PREDICTED_ORDINAL      2793U
+#define ISAAC_VITA_CRT_FREAD_PREDICTED_DYNAMIC_COUNT 79U
+#define ISAAC_VITA_CRT_FREAD_CALL_COUNT             1U
+
+#define ISAAC_VITA_CRT_FWRITE_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!fwrite"
+#define ISAAC_VITA_CRT_FWRITE_IAT_RVA               0x006065e8U
+#define ISAAC_VITA_CRT_FWRITE_ADAPTER_RVA           0x00596590U
+#define ISAAC_VITA_CRT_FWRITE_CALL_RVA              0x005965abU
+#define ISAAC_VITA_CRT_FWRITE_RETURN_RVA            0x005965b1U
+#define ISAAC_VITA_CRT_FWRITE_FIRST_ORIGIN_CALL_RVA 0x0055e4e3U
+#define ISAAC_VITA_CRT_FWRITE_FIRST_ORIGIN_RETURN_RVA 0x0055e4e6U
+#define ISAAC_VITA_CRT_FWRITE_FIRST_BEFORE_COUNT    2771U
+#define ISAAC_VITA_CRT_FWRITE_FIRST_ORDINAL         2772U
+#define ISAAC_VITA_CRT_FWRITE_CALL_COUNT            1U
+
+#define ISAAC_VITA_CRT_FSEEK_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!fseek"
+#define ISAAC_VITA_CRT_FSEEK_IAT_RVA                0x006065ecU
+#define ISAAC_VITA_CRT_FSEEK_FIRST_CALL_RVA         0x005964c6U
+#define ISAAC_VITA_CRT_FSEEK_FIRST_RETURN_RVA       0x005964c8U
+#define ISAAC_VITA_CRT_FSEEK_REGISTER_LOAD_SITES(X) \
+    X(0x005964beU)
+#define ISAAC_VITA_CRT_FSEEK_REGISTER_CALL_SITES(X) \
+    X(0x005964c6U, 0x005964c8U) \
+    X(0x005964dbU, 0x005964ddU)
+#define ISAAC_VITA_CRT_FSEEK_DIRECT_CALL_SITES(X) \
+    X(0x0059651dU, 0x00596523U) \
+    X(0x00596532U, 0x00596538U) \
+    X(0x00596547U, 0x0059654dU)
+#define ISAAC_VITA_CRT_FSEEK_CALL_COUNT             5U
+/* ArchivedFile's constructor calls File::seek(offset, SEEK_SET); the wrapper
+ * owns the direct import return and retains its parent return at [EBP+4]. */
+#define ISAAC_VITA_CRT_ARCHIVE_FSEEK_RETURN_RVA     0x0059654dU
+#define ISAAC_VITA_CRT_ARCHIVE_SEEK_PARENT_RETURN_RVA 0x0059c269U
+
+#define ISAAC_VITA_CRT_GET_OSFHANDLE_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!_get_osfhandle"
+#define ISAAC_VITA_CRT_GET_OSFHANDLE_IAT_RVA        0x006065f0U
+#define ISAAC_VITA_CRT_GET_OSFHANDLE_ADAPTER_RVA    0x005965d0U
+#define ISAAC_VITA_CRT_GET_OSFHANDLE_CALL_RVA       0x005965dbU
+#define ISAAC_VITA_CRT_GET_OSFHANDLE_RETURN_RVA     0x005965e1U
+#define ISAAC_VITA_CRT_GET_OSFHANDLE_CALL_COUNT     1U
+
+#define ISAAC_VITA_CRT_FTELL_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!ftell"
+#define ISAAC_VITA_CRT_FTELL_IAT_RVA                0x006065f4U
+#define ISAAC_VITA_CRT_FTELL_FIRST_CALL_RVA         0x005964b5U
+#define ISAAC_VITA_CRT_FTELL_FIRST_RETURN_RVA       0x005964b7U
+#define ISAAC_VITA_CRT_FTELL_REGISTER_LOAD_SITES(X) \
+    X(0x005964a6U)
+#define ISAAC_VITA_CRT_FTELL_REGISTER_CALL_SITES(X) \
+    X(0x005964b5U, 0x005964b7U) \
+    X(0x005964ceU, 0x005964d0U)
+#define ISAAC_VITA_CRT_FTELL_DIRECT_CALL_SITES(X) \
+    X(0x005964f3U, 0x005964f9U)
+#define ISAAC_VITA_CRT_FTELL_CALL_COUNT             3U
+
+#define ISAAC_VITA_CRT_FFLUSH_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!fflush"
+#define ISAAC_VITA_CRT_FFLUSH_IAT_RVA               0x00606600U
+#define ISAAC_VITA_CRT_FFLUSH_CALL_SITES(X) \
+    X(0x003fcaeaU, 0x003fcaf0U) \
+    X(0x005965c3U, 0x005965c9U)
+#define ISAAC_VITA_CRT_FFLUSH_FIRST_CALL_RVA        0x005965c3U
+#define ISAAC_VITA_CRT_FFLUSH_FIRST_RETURN_RVA      0x005965c9U
+#define ISAAC_VITA_CRT_FFLUSH_FIRST_ORIGIN_CALL_RVA 0x0055e4f7U
+#define ISAAC_VITA_CRT_FFLUSH_FIRST_ORIGIN_RETURN_RVA 0x0055e4faU
+#define ISAAC_VITA_CRT_FFLUSH_FIRST_BEFORE_COUNT    2772U
+#define ISAAC_VITA_CRT_FFLUSH_FIRST_ORDINAL         2773U
+#define ISAAC_VITA_CRT_FFLUSH_CALL_COUNT            2U
+
+#define ISAAC_VITA_CRT_ACRT_IOB_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!__acrt_iob_func"
+#define ISAAC_VITA_CRT_ACRT_IOB_IAT_RVA             0x00606604U
+#define ISAAC_VITA_CRT_ACRT_IOB_FIRST_CALL_RVA      0x003fcaccU
+#define ISAAC_VITA_CRT_ACRT_IOB_FIRST_RETURN_RVA    0x003fcad2U
+#define ISAAC_VITA_CRT_ACRT_IOB_DIRECT_CALL_SITES(X) \
+    X(0x003fcaccU, 0x003fcad2U) \
+    X(0x003fcae0U, 0x003fcae6U) \
+    X(0x005699c3U, 0x005699c9U) \
+    X(0x0059908eU, 0x00599094U) \
+    X(0x005990d9U, 0x005990dfU) \
+    X(0x0059934bU, 0x00599351U) \
+    X(0x00599579U, 0x0059957fU) \
+    X(0x0059d479U, 0x0059d47fU) \
+    X(0x005bff89U, 0x005bff8fU) \
+    X(0x005c3456U, 0x005c345cU) \
+    X(0x005c355bU, 0x005c3561U) \
+    X(0x005c3e4fU, 0x005c3e55U) \
+    X(0x005c410bU, 0x005c4111U) \
+    X(0x005c4227U, 0x005c422dU) \
+    X(0x005c43c3U, 0x005c43c9U) \
+    X(0x005c4478U, 0x005c447eU) \
+    X(0x005c44beU, 0x005c44c4U) \
+    X(0x005c45c9U, 0x005c45cfU) \
+    X(0x005c4721U, 0x005c4727U) \
+    X(0x005c4eaaU, 0x005c4eb0U) \
+    X(0x005c4f11U, 0x005c4f17U) \
+    X(0x005c4fe5U, 0x005c4febU) \
+    X(0x005c51b9U, 0x005c51bfU) \
+    X(0x005c540aU, 0x005c5410U) \
+    X(0x005c561dU, 0x005c5623U) \
+    X(0x005c57a8U, 0x005c57aeU) \
+    X(0x005c5918U, 0x005c591eU) \
+    X(0x005c5a73U, 0x005c5a79U) \
+    X(0x005c5c03U, 0x005c5c09U) \
+    X(0x005c5d0bU, 0x005c5d11U) \
+    X(0x005c5dfdU, 0x005c5e03U) \
+    X(0x005c6088U, 0x005c608eU) \
+    X(0x005c634fU, 0x005c6355U) \
+    X(0x005c7529U, 0x005c752fU) \
+    X(0x005c7560U, 0x005c7566U) \
+    X(0x005e335aU, 0x005e3360U) \
+    X(0x005e3369U, 0x005e336fU)
+#define ISAAC_VITA_CRT_ACRT_IOB_REGISTER_LOAD_SITES(X) \
+    X(0x00569906U) \
+    X(0x0056995cU) \
+    X(0x0059cf52U) \
+    X(0x0059d0a9U) \
+    X(0x005a7c9dU) \
+    X(0x005c4746U) \
+    X(0x005c4762U) \
+    X(0x005c4c4dU) \
+    X(0x005c4e07U) \
+    X(0x005e33ccU)
+#define ISAAC_VITA_CRT_ACRT_IOB_REGISTER_CALL_SITES(X) \
+    X(0x00569913U, 0x00569915U) \
+    X(0x00569979U, 0x0056997bU) \
+    X(0x005699b5U, 0x005699b7U) \
+    X(0x0059cf64U, 0x0059cf66U) \
+    X(0x0059cfb5U, 0x0059cfb7U) \
+    X(0x0059d0bbU, 0x0059d0bdU) \
+    X(0x0059d0e6U, 0x0059d0e8U) \
+    X(0x0059d11dU, 0x0059d11fU) \
+    X(0x0059d145U, 0x0059d147U) \
+    X(0x0059d19cU, 0x0059d19eU) \
+    X(0x005a8267U, 0x005a8269U) \
+    X(0x005c479eU, 0x005c47a0U) \
+    X(0x005c47e5U, 0x005c47e7U) \
+    X(0x005c4c89U, 0x005c4c8bU) \
+    X(0x005c4cd5U, 0x005c4cd7U) \
+    X(0x005c4e14U, 0x005c4e16U) \
+    X(0x005e33d4U, 0x005e33d6U) \
+    X(0x005e33dfU, 0x005e33e1U)
+#define ISAAC_VITA_CRT_ACRT_IOB_DIRECT_CALL_COUNT   37U
+#define ISAAC_VITA_CRT_ACRT_IOB_REGISTER_CALL_COUNT 18U
+#define ISAAC_VITA_CRT_ACRT_IOB_CALL_COUNT          55U
+
+#define ISAAC_VITA_CRT_FILE_IO_IMPORT_COUNT         8U
+#define ISAAC_VITA_CRT_FILE_IO_CALL_COUNT           92U
+#define ISAAC_VITA_CRT_STDIO_IMPORT_COUNT           16U
+
+/* Complete narrow UCRT import surface from the frozen PE.  The slots are one
+ * contiguous IAT family.  Existing live startup handlers (_strdup, strncpy,
+ * and strncpy_s) keep their measured call evidence below; the other slots
+ * use a direct frozen-PE caller except strncmp, whose first Vita call is the
+ * measured GetProcAddress/call-ebx path at 0x0057032a. */
+#define ISAAC_VITA_CRT_STRDUP_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!_strdup"
+#define ISAAC_VITA_CRT_STRDUP_IAT_RVA               0x00606624U
+#define ISAAC_VITA_CRT_STRDUP_CALL_RVA              0x005641f9U
+#define ISAAC_VITA_CRT_STRDUP_RETURN_RVA            0x005641ffU
+#define ISAAC_VITA_CRT_STRDUP_ORDINAL               338U
+
+#define ISAAC_VITA_CRT_STRPBRK_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!strpbrk"
+#define ISAAC_VITA_CRT_STRPBRK_IAT_RVA              0x00606628U
+#define ISAAC_VITA_CRT_STRPBRK_CALL_RVA             0x00567f0bU
+#define ISAAC_VITA_CRT_STRPBRK_RETURN_RVA           0x00567f11U
+
+#define ISAAC_VITA_CRT_ISPUNCT_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!ispunct"
+#define ISAAC_VITA_CRT_ISPUNCT_IAT_RVA              0x0060662cU
+#define ISAAC_VITA_CRT_ISPUNCT_CALL_RVA             0x0026aaf4U
+#define ISAAC_VITA_CRT_ISPUNCT_RETURN_RVA           0x0026aafaU
+
+#define ISAAC_VITA_CRT_TOLOWER_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!tolower"
+#define ISAAC_VITA_CRT_TOLOWER_IAT_RVA              0x00606630U
+#define ISAAC_VITA_CRT_TOLOWER_CALL_RVA             0x00265ae3U
+#define ISAAC_VITA_CRT_TOLOWER_RETURN_RVA           0x00265ae9U
+
+#define ISAAC_VITA_CRT_STRNICMP_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!_strnicmp"
+#define ISAAC_VITA_CRT_STRNICMP_IAT_RVA             0x00606634U
+#define ISAAC_VITA_CRT_STRNICMP_CALL_RVA            0x00259f18U
+#define ISAAC_VITA_CRT_STRNICMP_RETURN_RVA          0x00259f1eU
+
+#define ISAAC_VITA_CRT_STRNCPY_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!strncpy"
+#define ISAAC_VITA_CRT_STRNCPY_IAT_RVA              0x00606638U
+#define ISAAC_VITA_CRT_STRNCPY_CALL_RVA             0x0055e414U
+#define ISAAC_VITA_CRT_STRNCPY_RETURN_RVA           0x0055e41aU
+#define ISAAC_VITA_CRT_STRNCPY_ORDINAL              316U
+#define ISAAC_VITA_CRT_STRNCPY_LOG_DST_VA           0x988007e8U
+#define ISAAC_VITA_CRT_STRNCPY_LOG_PREFIX_VA        0x9875d20cU
+#define ISAAC_VITA_CRT_STRNCPY_LOG_PREFIX           "[INFO] - "
+#define ISAAC_VITA_CRT_STRNCPY_LOG_CAPACITY         0x2800U
+
+#define ISAAC_VITA_CRT_ISDIGIT_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!isdigit"
+#define ISAAC_VITA_CRT_ISDIGIT_IAT_RVA              0x0060663cU
+#define ISAAC_VITA_CRT_ISDIGIT_CALL_RVA             0x0053a926U
+#define ISAAC_VITA_CRT_ISDIGIT_RETURN_RVA           0x0053a92cU
+
+#define ISAAC_VITA_CRT_STRNCMP_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!strncmp"
+#define ISAAC_VITA_CRT_STRNCMP_IAT_RVA              0x00606640U
+#define ISAAC_VITA_CRT_STRNCMP_IAT_VA               0x98606640U
+#define ISAAC_VITA_CRT_STRNCMP_CALL_RVA             0x0057032aU
+#define ISAAC_VITA_CRT_STRNCMP_RETURN_RVA           0x0057032cU
+
+#define ISAAC_VITA_CRT_ISWSPACE_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!iswspace"
+#define ISAAC_VITA_CRT_ISWSPACE_IAT_RVA             0x00606644U
+#define ISAAC_VITA_CRT_ISWSPACE_CALL_RVA            0x00503f36U
+#define ISAAC_VITA_CRT_ISWSPACE_RETURN_RVA          0x00503f3cU
+
+#define ISAAC_VITA_CRT_STRNCPY_S_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!strncpy_s"
+#define ISAAC_VITA_CRT_STRNCPY_S_IAT_RVA            0x00606648U
+#define ISAAC_VITA_CRT_STRNCPY_S_CALL_RVA           0x0059878eU
+#define ISAAC_VITA_CRT_STRNCPY_S_RETURN_RVA         0x00598794U
+#define ISAAC_VITA_CRT_STRNCPY_S_LOG_PATH_ORDINAL   307U
+#define ISAAC_VITA_CRT_STRNCPY_S_FIRST_KAGE_ORDINAL 324U
+#define ISAAC_VITA_CRT_STRNCPY_S_LAST_KAGE_ORDINAL  330U
+#define ISAAC_VITA_CRT_STRNCPY_S_FIXED_CALL_COUNT   4U
+
+#define ISAAC_VITA_CRT_TOUPPER_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!toupper"
+#define ISAAC_VITA_CRT_TOUPPER_IAT_RVA              0x0060664cU
+#define ISAAC_VITA_CRT_TOUPPER_CALL_RVA             0x00388f3aU
+#define ISAAC_VITA_CRT_TOUPPER_RETURN_RVA           0x00388f40U
+
+#define ISAAC_VITA_CRT_STRCAT_S_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!strcat_s"
+#define ISAAC_VITA_CRT_STRCAT_S_IAT_RVA             0x00606650U
+#define ISAAC_VITA_CRT_STRCAT_S_CALL_RVA            0x00008cd9U
+#define ISAAC_VITA_CRT_STRCAT_S_RETURN_RVA          0x00008cdfU
+
+#define ISAAC_VITA_CRT_STRCPY_S_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!strcpy_s"
+#define ISAAC_VITA_CRT_STRCPY_S_IAT_RVA             0x00606654U
+#define ISAAC_VITA_CRT_STRCPY_S_CALL_RVA            0x0048bba9U
+#define ISAAC_VITA_CRT_STRCPY_S_RETURN_RVA          0x0048bbafU
+
+#define ISAAC_VITA_CRT_ISSPACE_NAME \
+    "api-ms-win-crt-string-l1-1-0.dll!isspace"
+#define ISAAC_VITA_CRT_ISSPACE_IAT_RVA              0x00606658U
+#define ISAAC_VITA_CRT_ISSPACE_CALL_RVA             0x0025e6b9U
+#define ISAAC_VITA_CRT_ISSPACE_RETURN_RVA           0x0025e6bfU
+
+#define ISAAC_VITA_CRT_STRING_IMPORT_COUNT          14U
+
+/* Complete frozen six-slot convert DLL.  atoi has both direct-IAT and
+ * register-mediated calls.  A register load of the IAT slot is a reference,
+ * not a call: freeze the sorted load and unique call RVAs separately, then
+ * freeze their duplicate-free physical-call union.  atof and the strto*
+ * imports have only direct calls in this PE. */
+#define ISAAC_VITA_CRT_STRTOULL_NAME \
+    "api-ms-win-crt-convert-l1-1-0.dll!strtoull"
+#define ISAAC_VITA_CRT_STRTOULL_IAT_RVA             0x006064c8U
+#define ISAAC_VITA_CRT_STRTOULL_CALL1_RVA           0x0025e6f1U
+#define ISAAC_VITA_CRT_STRTOULL_RETURN1_RVA         0x0025e6f7U
+#define ISAAC_VITA_CRT_STRTOULL_CALL2_RVA           0x00265770U
+#define ISAAC_VITA_CRT_STRTOULL_RETURN2_RVA         0x00265776U
+#define ISAAC_VITA_CRT_STRTOULL_DIRECT_CALL_COUNT   2U
+#define ISAAC_VITA_CRT_STRTOULL_CALL_FNV64 \
+    UINT64_C(0x0035ba6d7f48d3dc)
+
+#define ISAAC_VITA_CRT_MBSTOWCS_S_NAME \
+    "api-ms-win-crt-convert-l1-1-0.dll!mbstowcs_s"
+#define ISAAC_VITA_CRT_MBSTOWCS_S_IAT_RVA           0x006064ccU
+#define ISAAC_VITA_CRT_MBSTOWCS_S_CALL_RVA          0x00562f4cU
+#define ISAAC_VITA_CRT_MBSTOWCS_S_RETURN_RVA        0x00562f52U
+#define ISAAC_VITA_CRT_MBSTOWCS_S_ORDINAL           341U
+#define ISAAC_VITA_CRT_MBSTOWCS_S_SOURCE_VA         0x9875a9d4U
+#define ISAAC_VITA_CRT_MBSTOWCS_S_SOURCE            "./"
+#define ISAAC_VITA_CRT_MBSTOWCS_S_CAPACITY          0x104U
+#define ISAAC_VITA_CRT_MBSTOWCS_S_CONVERTED         3U
+
+#define ISAAC_VITA_CRT_WCSTOMBS_S_NAME \
+    "api-ms-win-crt-convert-l1-1-0.dll!wcstombs_s"
+#define ISAAC_VITA_CRT_WCSTOMBS_S_IAT_RVA           0x006064d0U
+#define ISAAC_VITA_CRT_WCSTOMBS_S_CALL_RVA          0x00563303U
+#define ISAAC_VITA_CRT_WCSTOMBS_S_RETURN_RVA        0x00563305U
+#define ISAAC_VITA_CRT_WCSTOMBS_S_ALT_CALL_RVA      0x0056332cU
+#define ISAAC_VITA_CRT_WCSTOMBS_S_ALT_RETURN_RVA    0x0056332fU
+#define ISAAC_VITA_CRT_WCSTOMBS_S_FIRST_ORDINAL     347U
+#define ISAAC_VITA_CRT_WCSTOMBS_S_MEASURED_CALL_COUNT 7U
+#define ISAAC_VITA_CRT_WCSTOMBS_S_CAPACITY          0x104U
+#define ISAAC_VITA_CRT_WCSTOMBS_S_SOURCE_UNITS_MAX  0x104U
+#define ISAAC_VITA_CRT_WCSTOMBS_S_STRUNCATE         80U
+
+#define ISAAC_VITA_CRT_STRTOL_NAME \
+    "api-ms-win-crt-convert-l1-1-0.dll!strtol"
+#define ISAAC_VITA_CRT_STRTOL_IAT_RVA               0x006064d4U
+#define ISAAC_VITA_CRT_STRTOL_CALL_RVA              0x005e39bcU
+#define ISAAC_VITA_CRT_STRTOL_RETURN_RVA            0x005e39c2U
+#define ISAAC_VITA_CRT_STRTOL_DIRECT_CALL_COUNT     1U
+#define ISAAC_VITA_CRT_STRTOL_CALL_FNV64 \
+    UINT64_C(0xde15b345976c94b8)
+
+#define ISAAC_VITA_CRT_ATOI_NAME \
+    "api-ms-win-crt-convert-l1-1-0.dll!atoi"
+#define ISAAC_VITA_CRT_ATOI_IAT_RVA                 0x006064d8U
+#define ISAAC_VITA_CRT_ATOI_FIRST_CALL_RVA          0x0000a057U
+#define ISAAC_VITA_CRT_ATOI_FIRST_RETURN_RVA        0x0000a05dU
+#define ISAAC_VITA_CRT_ATOI_DIRECT_CALL_COUNT       191U
+#define ISAAC_VITA_CRT_ATOI_DIRECT_CALL_FNV64 \
+    UINT64_C(0x12df3796e35d8810)
+#define ISAAC_VITA_CRT_ATOI_REGISTER_LOAD_COUNT     46U
+#define ISAAC_VITA_CRT_ATOI_REGISTER_LOAD_FNV64 \
+    UINT64_C(0x511eadab81df57e7)
+#define ISAAC_VITA_CRT_ATOI_REGISTER_CALL_COUNT     102U
+#define ISAAC_VITA_CRT_ATOI_REGISTER_CALL_FNV64 \
+    UINT64_C(0x1326d7c20835a7fd)
+#define ISAAC_VITA_CRT_ATOI_PHYSICAL_CALL_COUNT     293U
+#define ISAAC_VITA_CRT_ATOI_PHYSICAL_CALL_FNV64 \
+    UINT64_C(0x6781eec9a7526398)
+
+#define ISAAC_VITA_CRT_ATOF_NAME \
+    "api-ms-win-crt-convert-l1-1-0.dll!atof"
+#define ISAAC_VITA_CRT_ATOF_IAT_RVA                 0x006064dcU
+#define ISAAC_VITA_CRT_ATOF_FIRST_CALL_RVA          0x004b279dU
+#define ISAAC_VITA_CRT_ATOF_FIRST_RETURN_RVA        0x004b27a3U
+#define ISAAC_VITA_CRT_ATOF_DIRECT_CALL_COUNT       160U
+#define ISAAC_VITA_CRT_ATOF_CALL_FNV64 \
+    UINT64_C(0xdbaef5daea0a3908)
+
+#define ISAAC_VITA_CRT_CONVERT_TEXT_MAX             4095U
+#define ISAAC_VITA_CRT_CONVERT_IMPORT_COUNT         6U
+#define ISAAC_VITA_CRT_NUMERIC_CONVERT_IMPORT_COUNT 4U
+#define ISAAC_VITA_CRT_NUMERIC_CONVERT_CALL_COUNT   456U
+
+/* First secure path join after the recursive FindFile walk.  The IAT edge is
+ * inside the UCRT adapter; the origin calls the local variadic wrapper with
+ * exactly enough space for "Documents/My Games" plus its terminator. */
+#define ISAAC_VITA_CRT_VSPRINTF_S_NAME \
+    "api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vsprintf_s"
+#define ISAAC_VITA_CRT_VSPRINTF_S_IAT_RVA             0x00606618U
+#define ISAAC_VITA_CRT_VSPRINTF_S_IMPORT_CALL_RVA     0x00011fcaU
+#define ISAAC_VITA_CRT_VSPRINTF_S_IMPORT_RETURN_RVA   0x00011fd0U
+#define ISAAC_VITA_CRT_VSPRINTF_S_ADAPTER_RVA         0x00011fb0U
+#define ISAAC_VITA_CRT_VSPRINTF_S_WRAPPER_RVA         0x001ef060U
+#define ISAAC_VITA_CRT_VSPRINTF_S_WRAPPER_CALL_RVA    0x001ef072U
+#define ISAAC_VITA_CRT_VSPRINTF_S_WRAPPER_RETURN_RVA  0x001ef077U
+#define ISAAC_VITA_CRT_VSPRINTF_S_ORIGIN_CALL_RVA     0x005987ceU
+#define ISAAC_VITA_CRT_VSPRINTF_S_ORIGIN_RETURN_RVA   0x005987d3U
+#define ISAAC_VITA_CRT_VSPRINTF_S_FORMAT_VA            0x9876492cU
+#define ISAAC_VITA_CRT_VSPRINTF_S_FORMAT               "%s/%s"
+#define ISAAC_VITA_CRT_VSPRINTF_S_FIRST_LEFT           "Documents"
+#define ISAAC_VITA_CRT_VSPRINTF_S_FIRST_RIGHT          "My Games"
+#define ISAAC_VITA_CRT_VSPRINTF_S_FIRST_RESULT         "Documents/My Games"
+#define ISAAC_VITA_CRT_VSPRINTF_S_FIRST_CAPACITY       0x13U
+#define ISAAC_VITA_CRT_VSPRINTF_S_FIRST_ORDINAL        445U
+
+/* USERPROFILE success is the production path.  The fixed prefix owns 72
+ * dynamic calls: CRT 29, startup/path 12, heap 20, memory 3, sync 3, and
+ * COM/Steam/power/timer 5.  Every handler is counted before it can fault. */
+#define ISAAC_VITA_CRT_FIXED_FIRST_ORDINAL          274U
+#define ISAAC_VITA_CRT_FIXED_LAST_ORDINAL           345U
+#define ISAAC_VITA_CRT_FIXED_CALL_COUNT             72U
+#define ISAAC_VITA_CRT_FIXED_OWNED_CALL_COUNT       29U
+#define ISAAC_VITA_CRT_FIXED_STARTUP_CALL_COUNT     12U
+#define ISAAC_VITA_CRT_FIXED_HEAP_CALL_COUNT        20U
+#define ISAAC_VITA_CRT_FIXED_MEMORY_CALL_COUNT      3U
+#define ISAAC_VITA_CRT_FIXED_SYNC_CALL_COUNT        3U
+#define ISAAC_VITA_CRT_FIXED_OTHER_CALL_COUNT       5U
+#define ISAAC_VITA_SAVE_PATH_TO_COM_BOOT_CALL_COUNT 34U
+#define ISAAC_VITA_LOGGER_WALK_BOOT_CALL_COUNT      33U
+#define ISAAC_VITA_SAVE_AND_WALK_BOOT_CALL_COUNT    67U
+#define ISAAC_VITA_SAVE_WALK_INTERLUDE_CALL_COUNT   5U
+
+#define ISAAC_VITA_CRT_FIXED_NEXT_NAME \
+    "KERNEL32.dll!FindFirstFileW"
+#define ISAAC_VITA_CRT_FIXED_NEXT_IAT_RVA           0x006060ecU
+#define ISAAC_VITA_CRT_FIXED_NEXT_CALL_RVA          0x00563036U
+#define ISAAC_VITA_CRT_FIXED_NEXT_RETURN_RVA        0x0056303cU
+#define ISAAC_VITA_CRT_FIXED_NEXT_ATTEMPT_ORDINAL   346U
+
+#define ISAAC_VITA_CRT_NEXT_NAME \
+    "KERNEL32.dll!InitializeCriticalSectionAndSpinCount"
+#define ISAAC_VITA_CRT_NEXT_IAT_RVA     0x0060606cU
+#define ISAAC_VITA_CRT_NEXT_CALL_RVA    0x005eb16fU
+#define ISAAC_VITA_CRT_NEXT_RETURN_RVA  0x005eb175U
+
+#define ISAAC_VITA_CRT_IMPORT_COUNT 60U
+/* Initial `_initterm_e` plus its nine CRT imports before synchronization. */
+#define ISAAC_VITA_CRT_PRE_MEMORY_CALL_COUNT 10U
+/* Three `_crt_atexit` registrations execute in total: one in the initial CRT
+ * prefix, one after synchronization but before the first memset, and one
+ * after it.  `_initterm` then enters the table and is counted before its
+ * nested SetUnhandledExceptionFilter fault. */
+#define ISAAC_VITA_CRT_PRE_INITTERM_CALL_COUNT 12U
+#define ISAAC_VITA_CRT_BOOT_CALL_COUNT 13U
+#define ISAAC_VITA_CRT_ATEXIT_MAX   256U
+
+/* These values were deliberately observable in host_win32.c.  Keep one
+ * namespaced copy here so the Vita implementation does not silently discard
+ * a startup policy choice.  commode is directly guest-addressable. */
+typedef struct isaac_vita_crt_state {
+    uint32_t app_type;
+    uint32_t fmode;
+    uint32_t commode;
+    uint32_t argv_mode;
+    uint32_t fp_control;
+    int32_t  thread_locale;
+    uint32_t atexit_count;
+} isaac_vita_crt_state;
+
+extern isaac_vita_crt_state g_isaac_vita_crt;
+/* Stable guest-addressable errno cell.  The current Vita runtime has one
+ * runnable guest thread; move this into per-thread CRT state when that
+ * changes, matching UCRT's thread-local contract. */
+extern int32_t g_isaac_vita_crt_errno;
+extern uint32_t g_isaac_vita_crt_atexit[ISAAC_VITA_CRT_ATEXIT_MAX];
+
+/* Public only so the focused host oracle can execute the exact production
+ * handler without retaining every unrelated CRT handler through the dispatch
+ * table.  Normal runtime entry remains isaac_vita_crt_import(). */
+void isaac_vita_crt_qsort(CPU *__restrict c);
+
+/* Public for the same focused host-oracle reason as qsort above.  Production
+ * import dispatch still reaches this exact handler through `_strdup`. */
+void isaac_vita_crt_strdup(CPU *__restrict c);
+
+/* Ownership gate for `_get_osfhandle` consumers such as LockFileEx.  HANDLE
+ * is the identity-mapped newlib descriptor only while it still belongs to a
+ * live FILE token or stdin/stdout/stderr; no FILE pointer escapes. */
+int isaac_vita_crt_osfhandle_is_owned(uint32_t handle);
+
+/* Release the one idle packed-archive FILE before guest/process teardown.
+ * The function is a no-op when the source-scoped cache option is disabled. */
+void isaac_vita_crt_archive_cache_shutdown(void);
+
+/* Drain the asynchronous save writer and publish its summary receipt before
+ * guest/process teardown.  A no-op unless ISAAC_VITA_ASYNC_SAVE_WRITE is on. */
+void isaac_vita_crt_async_write_shutdown(void);
+
+/* Dump the bounded cache/open/seek/read tail without holding the FILE lock.
+ * Fatal imported-I/O and memory boundaries call this before guest_fault so a
+ * real-hardware crash leaves the cursor history in first-arm-fault.log. */
+void isaac_vita_crt_archive_diag_dump(void);
+
+/* The frozen logger flushes after every record.  The optional Vita policy
+ * defers only exact INFO flushes and leaves WARN/ERROR/ASSERT synchronous.
+ * This snapshot is deliberately scalar-only so cold diagnostics can read it
+ * without sharing the private FILE-token registry layout. */
+#define ISAAC_VITA_CRT_LOG_BATCH_ABI       1U
+#define ISAAC_VITA_CRT_LOG_BATCH_SIZE      8U
+typedef struct isaac_vita_crt_log_batch_snapshot {
+    uint32_t abi_version;
+    uint32_t enabled;
+    uint32_t info_seen;
+    uint32_t info_deferred;
+    uint32_t info_batch_flushes;
+    uint32_t warn_forwarded;
+    uint32_t error_forwarded;
+    uint32_t assert_forwarded;
+    uint32_t native_flush_calls;
+    uint32_t native_failures;
+    uint32_t chain_rejects;
+    uint32_t sticky_fail_open;
+    uint32_t max_deferred;
+    uint32_t pending_info;
+} isaac_vita_crt_log_batch_snapshot;
+
+/* Returns one when the policy was compiled in, zero for the byte-compatible
+ * native-flush path.  A non-NULL snapshot is always initialized. */
+int isaac_vita_crt_log_batch_get_snapshot(
+    isaac_vita_crt_log_batch_snapshot *snapshot);
+
+/* Flush every newlib stream while the guest FILE registry is still live.
+ * `exit` uses this after TLS/atexit callbacks; `_exit` deliberately does not.
+ * Returns zero on success and EOF on a native flush failure. */
+int isaac_vita_crt_flush_all(void);
+
+#if defined(ISAAC_VITA_IO_PROFILE)
+/* Startup-only logical stdio telemetry.  Physical sceIoRead/sceIoLseek
+ * timing lives in kage_vita_io_profile.c; this projection records how the
+ * frozen UCRT-facing layer amplifies that traffic and whether the one-entry
+ * packed-archive cache is actually hit. */
+#define ISAAC_VITA_CRT_IO_SHADOW_VARIANT_COUNT 4U
+#define ISAAC_VITA_CRT_IO_SHADOW_8K_INDEX      0U
+#define ISAAC_VITA_CRT_IO_SHADOW_16K_INDEX     1U
+#define ISAAC_VITA_CRT_IO_SHADOW_32K_INDEX     2U
+#define ISAAC_VITA_CRT_IO_SHADOW_64K_INDEX     3U
+#define ISAAC_VITA_CRT_IO_ARCHIVE_KEY_CAPACITY 64U
+
+typedef struct isaac_vita_crt_io_profile_snapshot {
+    uint32_t fopen_calls;
+    uint32_t fopen_failures;
+    uint32_t fopen_cache_hits;
+    uint32_t fclose_calls;
+    uint32_t fread_calls;
+    uint32_t fread_requested_bytes;
+    uint32_t fread_returned_bytes;
+    uint32_t fread_failures;
+    uint32_t fseek_calls;
+    uint32_t fseek_failures;
+    uint32_t live_files;
+    uint32_t shadow_cacheable_fopen_calls;
+    uint32_t shadow_cacheable_fclose_calls;
+    uint32_t shadow_setvbuf_failures;
+    uint32_t shadow_invalid_cache_hits;
+    uint32_t shadow_fread_calls;
+    uint32_t shadow_fread_requested_bytes;
+    uint32_t shadow_fread_returned_bytes;
+    uint32_t shadow_fseek_set_calls;
+    uint32_t shadow_fseek_cur_calls;
+    uint32_t shadow_fseek_end_calls;
+    uint32_t shadow_fseek_other_calls;
+    uint32_t shadow_fflush_calls;
+    uint32_t shadow_fflush_all_calls;
+    uint32_t shadow_unmodelled_seeks;
+    uint32_t shadow_unmodelled_fread_calls;
+    uint32_t shadow_unmodelled_fread_bytes;
+    uint32_t shadow_partial_fread_calls;
+    uint32_t shadow_partial_fread_requested_bytes;
+    uint32_t shadow_partial_fread_returned_bytes;
+    uint32_t shadow_unmodelled_fflush_calls;
+    uint32_t shadow_read_calls[ISAAC_VITA_CRT_IO_SHADOW_VARIANT_COUNT];
+    uint32_t shadow_read_requested_bytes[
+        ISAAC_VITA_CRT_IO_SHADOW_VARIANT_COUNT];
+    /* Newest entry from the already-bounded archive diagnostic ring.  Zero
+     * means the cache build has not recorded an archive operation yet. */
+    uint32_t archive_sequence;
+    uint32_t archive_kind;
+    uint32_t archive_flags;
+    int32_t archive_position_before;
+    int32_t archive_position_after;
+    char archive_key[ISAAC_VITA_CRT_IO_ARCHIVE_KEY_CAPACITY];
+} isaac_vita_crt_io_profile_snapshot;
+
+void isaac_vita_crt_io_profile_begin(void);
+/* Copy a live epoch without disabling any logical or physical counters. */
+int isaac_vita_crt_io_profile_get_snapshot(
+    isaac_vita_crt_io_profile_snapshot *snapshot);
+int isaac_vita_crt_io_profile_stop_and_snapshot(
+    isaac_vita_crt_io_profile_snapshot *snapshot);
+#endif
+
+/* ISAAC_VITA_CRT_SEEK_SHADOW only: two bounded "KAGE VITA CRT SEEK SHADOW"
+ * counter lines (why = loading-complete | periodic | shutdown).  Not defined
+ * when the option is compiled out; callers guard on the macro. */
+void isaac_vita_crt_seek_shadow_report(const char *why);
+
+/* Returns one only when NAME was handled.  Zero is a mutation-free handoff:
+ * the outer Vita import dispatcher remains responsible for the exact loud
+ * DLL!symbol fault. */
+int isaac_vita_crt_import(CPU *__restrict c, const char *name);
+
+/* Production dispatch increments CALL_COUNT immediately after the exact name
+ * match and before entering the handler.  This ordering is observable when a
+ * nested guest fault unwinds _initterm_e or _initterm before its native call
+ * can return. */
+int isaac_vita_crt_import_counted(CPU *__restrict c, const char *name,
+                                  unsigned *call_count);
+
+#endif

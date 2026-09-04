@@ -1,0 +1,115 @@
+# Never, under any circumstances. The source directory this was assembled from
+# holds console crypto keys and game binaries next to our own sources, and the
+# assembling script refuses them by name as well as by extension. Belt and
+# braces, because one bad `git add -A` is unrecoverable once it is in history.
+*.keys
+prod.keys
+title.keys
+*.tik
+*.cert
+
+# Game and console binaries. We ship code that reads them, never them.
+*.exe
+*.dll
+*.nro
+*.nrs
+*.nso
+*.nca
+*.nsp
+*.nsz
+*.apk
+*.ipa
+*.pkg
+*.elf
+*.velf
+*.rpl
+*.vpk
+*.self
+*.sfo
+*.suprx
+*.sprx
+*.skprx
+eboot.bin
+*.bin
+*.a
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.dmp
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.*
+*.dat
+
+# Extracted or decoded game content.
+*.pcx
+*.anm2
+*.stb
+*.wav
+*.ogg
+*.mp3
+*.flac
+*.aac
+*.m4a
+*.opus
+*.mp4
+*.webm
+*.ogv
+*.avi
+*.mkv
+*.mov
+*.png
+# Reviewed private-package presentation assets; each path and payload is pinned
+# by recomp/vita/test_livearea_package.py and tools/release_audit.py.
+!recomp/vita/assets/sce_sys/icon0.png
+!recomp/vita/assets/sce_sys/pic0.png
+!recomp/vita/assets/sce_sys/livearea/contents/bg0.png
+!recomp/vita/assets/sce_sys/livearea/contents/nicalis.png
+!recomp/vita/assets/sce_sys/livearea/contents/startup.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tga
+*.dds
+*.ico
+*.svg
+*.ttf
+*.otf
+romfs*/
+exefs*/
+resources/
+
+# Generated translation.
+guest_[0-9][0-9][0-9][0-9].c
+
+# User-owned Isaac data created beside local developer runs.
+/Documents/
+/mods/
+/savedatapath.txt
+
+# Build and run litter.
+build/
+/.host-build*/
+recomp/out/
+/backup-*/
+recomp/*.png
+recomp/*.pid
+/Screenshot_*.png
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.tmp
+.venv/
+.idea/
+.vscode/
+CMakeUserPresets.json
+
+# Local GitHub Release handoff. Notes/checksums remain tracked; binary stays out.
+/release/*.vpk
+/release/*.zip

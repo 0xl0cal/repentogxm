@@ -1,0 +1,12 @@
+diff --git a/Alc/ALc.c b/Alc/ALc.c
+index d785e477..323290a4 100644
+--- a/Alc/ALc.c
++++ b/Alc/ALc.c
+@@ -3833,1 +3833,6 @@ ALC_API ALCcontext* ALC_APIENTRY alcCreateContext(ALCdevice *device, const ALCi
+-    AllocateVoices(ALContext, 256, device->NumAuxSends);
++    /* The old fixed 256-voice reservation costs 8.13 MiB on Vita even when
++     * the device's configured source ceiling is much smaller.  Keep the
++     * upstream ceiling, but let the explicit project source configuration
++     * bound the initial mixer pool before any game audio is created. */
++    AllocateVoices(ALContext, mini(256, device->SourcesMax),
++                   device->NumAuxSends);

@@ -1,0 +1,76 @@
+#ifndef ISAAC_HOST_VITA_POST_COM_H
+#define ISAAC_HOST_VITA_POST_COM_H
+
+#include "guest.h"
+
+/* Exact successful-USERPROFILE boot sequence immediately after COM.  These
+ * four calls are target policy, not native Win32/Steam services. */
+#define ISAAC_VITA_POST_COM_STEAM_INIT_NAME \
+    "steam_api.dll!SteamAPI_Init"
+#define ISAAC_VITA_POST_COM_STEAM_INIT_IAT_RVA     0x006066d0U
+#define ISAAC_VITA_POST_COM_STEAM_INIT_CALL_RVA    0x00598c80U
+#define ISAAC_VITA_POST_COM_STEAM_INIT_RETURN_RVA  0x00598c86U
+#define ISAAC_VITA_POST_COM_STEAM_INIT_ORDINAL     309U
+
+#define ISAAC_VITA_POST_COM_EXECUTION_STATE_NAME \
+    "KERNEL32.dll!SetThreadExecutionState"
+#define ISAAC_VITA_POST_COM_EXECUTION_STATE_IAT_RVA     0x0060609cU
+#define ISAAC_VITA_POST_COM_EXECUTION_STATE_CALL_RVA    0x00598d27U
+#define ISAAC_VITA_POST_COM_EXECUTION_STATE_RETURN_RVA  0x00598d2dU
+#define ISAAC_VITA_POST_COM_EXECUTION_STATE_ORDINAL     310U
+#define ISAAC_VITA_POST_COM_EXECUTION_STATE_INITIAL     0x80000000U
+#define ISAAC_VITA_POST_COM_EXECUTION_STATE_REQUEST     0x80000002U
+
+#define ISAAC_VITA_POST_COM_GET_CAPS_NAME "WINMM.dll!timeGetDevCaps"
+#define ISAAC_VITA_POST_COM_GET_CAPS_IAT_RVA     0x006064b8U
+#define ISAAC_VITA_POST_COM_GET_CAPS_CALL_RVA    0x00598d34U
+#define ISAAC_VITA_POST_COM_GET_CAPS_RETURN_RVA  0x00598d3aU
+#define ISAAC_VITA_POST_COM_GET_CAPS_ORDINAL     311U
+#define ISAAC_VITA_POST_COM_CAPS_SIZE             8U
+#define ISAAC_VITA_POST_COM_PERIOD_MIN            1U
+#define ISAAC_VITA_POST_COM_PERIOD_MAX            1000U
+#define ISAAC_VITA_POST_COM_TIMERR_NOERROR         0U
+#define ISAAC_VITA_POST_COM_TIMERR_NOCANDO         97U
+
+#define ISAAC_VITA_POST_COM_BEGIN_PERIOD_NAME "WINMM.dll!timeBeginPeriod"
+#define ISAAC_VITA_POST_COM_BEGIN_PERIOD_IAT_RVA     0x006064bcU
+#define ISAAC_VITA_POST_COM_BEGIN_PERIOD_CALL_RVA    0x00598d40U
+#define ISAAC_VITA_POST_COM_BEGIN_PERIOD_RETURN_RVA  0x00598d46U
+#define ISAAC_VITA_POST_COM_BEGIN_PERIOD_ORDINAL     312U
+
+#define ISAAC_VITA_POST_COM_END_PERIOD_NAME "WINMM.dll!timeEndPeriod"
+#define ISAAC_VITA_POST_COM_END_PERIOD_IAT_RVA     0x006064b4U
+#define ISAAC_VITA_POST_COM_END_PERIOD_CALL_RVA    0x00598eeeU
+#define ISAAC_VITA_POST_COM_END_PERIOD_RETURN_RVA  0x00598ef4U
+
+/* Later startup seeding reads the same WinMM millisecond clock three times. */
+#define ISAAC_VITA_POST_COM_GET_TIME_NAME "WINMM.dll!timeGetTime"
+#define ISAAC_VITA_POST_COM_GET_TIME_IAT_RVA       0x006064c0U
+#define ISAAC_VITA_POST_COM_GET_TIME_FIRST_CALL_RVA   0x0050b810U
+#define ISAAC_VITA_POST_COM_GET_TIME_FIRST_RETURN_RVA 0x0050b812U
+#define ISAAC_VITA_POST_COM_GET_TIME_FIRST_ORDINAL    2776U
+#define ISAAC_VITA_POST_COM_GET_TIME_SECOND_CALL_RVA  0x0050b8eaU
+#define ISAAC_VITA_POST_COM_GET_TIME_SECOND_RETURN_RVA 0x0050b8ecU
+#define ISAAC_VITA_POST_COM_GET_TIME_THIRD_CALL_RVA   0x0050b927U
+#define ISAAC_VITA_POST_COM_GET_TIME_THIRD_RETURN_RVA 0x0050b929U
+
+#define ISAAC_VITA_POST_COM_NEXT_NAME \
+    "api-ms-win-crt-heap-l1-1-0.dll!malloc"
+#define ISAAC_VITA_POST_COM_NEXT_RETURN_RVA 0x005ead12U
+#define ISAAC_VITA_POST_COM_NEXT_SIZE       0x1cU
+#define ISAAC_VITA_POST_COM_NEXT_ORDINAL    313U
+
+#define ISAAC_VITA_POST_COM_IMPORT_COUNT    6U
+#define ISAAC_VITA_POST_COM_BOOT_CALL_COUNT 4U
+
+int isaac_vita_post_com_import(CPU *__restrict c, const char *name);
+int isaac_vita_post_com_import_counted(CPU *__restrict c, const char *name,
+                                       unsigned *call_count);
+
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+/* Cumulative guest timeGetTime import calls; the 120-loop profiler prints
+ * the window delta as ph120.c tgt.  Single guest thread, plain increment. */
+extern uint32_t g_isaac_vita_post_com_time_get_time_calls;
+#endif
+
+#endif

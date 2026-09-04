@@ -1,0 +1,5519 @@
+/* Typed vitaGL implementation of the generated guest GL boundary.
+ *
+ * Guest and host pointers are both 32-bit and identity-mapped in the Vita
+ * runtime.  Pointer-shaped parameters are converted only here, never exposed
+ * as untyped native proc addresses to translated x86 code. */
+#include "gl_vita_backend.h"
+
+#include <stdint.h>
+#include <string.h>
+
+#if defined(_MSC_VER)
+# include <intrin.h>
+#endif
+
+#include "gl_bridge.h"
+#include "kage_vita_canonical_quads.h"
+
+#if defined(ISAAC_VITA_COLOROFFSET_GPU_OPTIMIZATIONS)
+# include "gl_vita_coloroffset_source.h"
+#endif
+
+#if defined(ISAAC_GL_VITA_FIRST_FRAME_ORACLE)
+# include "gl_vita_first_frame_oracle_vitagl.h"
+#elif defined(ISAAC_GL_VITA_BACKEND_ORACLE)
+# include "gl_vita_backend_test_vitagl.h"
+# if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE) || \
+    defined(ISAAC_VITA_GL_TIME_PROFILE)
+uint64_t sceKernelGetProcessTimeWide(void);
+# endif
+#else
+# include <psp2/kernel/processmgr.h>
+# include <vitaGL.h>
+#endif
+
+#include "kage_vita_io_profile.h"
+#include "kage_vita_backend.h"
+#include "kage_vita_loading.h"
+#include "kage_vita_world_seam_diag.h"
+
+#define GL_VITA_RESOLVED_COUNT 62u
+#define GL_VITA_MISSING_COUNT  11u
+#define GL_VITA_RBO_CAPACITY   64u
+
+#define GL_VITA_RENDERBUFFER        0x00008d41u
+#define GL_VITA_RENDERBUFFER_WIDTH  0x00008d42u
+#define GL_VITA_RENDERBUFFER_HEIGHT 0x00008d43u
+
+#define GL_VITA_FRAMEBUFFER      0x00008d40u
+#define GL_VITA_READ_FRAMEBUFFER 0x00008ca8u
+#define GL_VITA_DRAW_FRAMEBUFFER 0x00008ca9u
+#define GL_VITA_VIEWPORT         0x00000ba2u
+#define GL_VITA_TEXTURE_2D       0x00000de1u
+#define GL_VITA_TEXTURE_BINDING_2D 0x00008069u
+#define GL_VITA_TEXTURE_MAG_FILTER 0x00002800u
+#define GL_VITA_TEXTURE_MIN_FILTER 0x00002801u
+#define GL_VITA_TEXTURE_WRAP_S     0x00002802u
+#define GL_VITA_TEXTURE_WRAP_T     0x00002803u
+#define GL_VITA_ALPHA            0x00001906u
+#define GL_VITA_RED              0x00001903u
+#define GL_VITA_RGB              0x00001907u
+#define GL_VITA_RGBA             0x00001908u
+#define GL_VITA_ABGR_EXT         0x00008000u
+#define GL_VITA_BLEND            0x00000be2u
+#define GL_VITA_TEXTURE0         0x000084c0u
+#define GL_VITA_TEXTURE_UNITS    16u
+#define GL_VITA_TEXTURE_CAPACITY 16384u
+#define GL_VITA_VERTEX_ATTRIBS   16u
+#define GL_VITA_ONE              1u
+#define GL_VITA_ONE_MINUS_SRC_ALPHA 0x00000303u
+
+#define GL_VITA_ZERO                  0x00000000u
+#define GL_VITA_SRC_COLOR             0x00000300u
+#define GL_VITA_ONE_MINUS_SRC_COLOR   0x00000301u
+#define GL_VITA_SRC_ALPHA             0x00000302u
+#define GL_VITA_DST_ALPHA             0x00000304u
+#define GL_VITA_ONE_MINUS_DST_ALPHA   0x00000305u
+#define GL_VITA_DST_COLOR             0x00000306u
+#define GL_VITA_ONE_MINUS_DST_COLOR   0x00000307u
+#define GL_VITA_SRC_ALPHA_SATURATE    0x00000308u
+
+#define GL_VITA_NEVER                 0x00000200u
+#define GL_VITA_LESS                  0x00000201u
+#define GL_VITA_EQUAL                 0x00000202u
+#define GL_VITA_LEQUAL                0x00000203u
+#define GL_VITA_GREATER               0x00000204u
+#define GL_VITA_NOTEQUAL              0x00000205u
+#define GL_VITA_GEQUAL                0x00000206u
+#define GL_VITA_ALWAYS                0x00000207u
+
+#define GL_VITA_BYTE                  0x00001400u
+#define GL_VITA_UNSIGNED_BYTE         0x00001401u
+#define GL_VITA_SHORT                 0x00001402u
+#define GL_VITA_UNSIGNED_SHORT        0x00001403u
+#define GL_VITA_FLOAT                 0x00001406u
+#define GL_VITA_HALF_FLOAT            0x0000140bu
+#define GL_VITA_HALF_FLOAT_OES        0x00008d61u
+
+#define GL_VITA_TOKEN_BIND_RENDERBUFFER   0x7e9bfd5cu
+#define GL_VITA_TOKEN_DELETE_RENDERBUFFERS 0x7efa9491u
+#define GL_VITA_TOKEN_GEN_RENDERBUFFERS    0x7e9316cdu
+#define GL_VITA_TOKEN_GET_RBO_PARAMETER    0x7e7972cau
+#define GL_VITA_TOKEN_RBO_STORAGE          0x7eca621du
+
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+/* The FXLayers fx_ray{,_2}.png assets are the only 256x512 images in the
+ * frozen 9,194-PNG corpus whose RGB channels are uniformly white.  Their
+ * alpha channel is therefore the complete sampled value: vitaGL's GL_ALPHA
+ * U8_R111 storage returns (1, 1, 1, A), exactly like their original RGBA8.
+ *
+ * Keep two CPU alpha shadows so an unexpected mutating/attachment edge can
+ * restore ordinary RGBA8 before it reaches native GL.  This remains a net
+ * roughly 511 KiB reduction for the two resident textures (768 KiB less
+ * texture storage, 256 KiB of bounded shadows and one 1 KiB restore row),
+ * without a raw heap allocation. */
+# define GL_VITA_FXRAY_WIDTH              256u
+# define GL_VITA_FXRAY_HEIGHT             512u
+# define GL_VITA_FXRAY_PIXELS             \
+    (GL_VITA_FXRAY_WIDTH * GL_VITA_FXRAY_HEIGHT)
+# define GL_VITA_FXRAY_RECORDS            2u
+# define GL_VITA_FXRAY_ATTACHMENT_RECORDS 64u
+#endif
+
+_Static_assert(GL_VITA_RESOLVED_COUNT + GL_VITA_MISSING_COUNT ==
+               GUEST_GL_SURFACE_COUNT,
+               "Vita GL table must be re-audited when the guest ABI changes");
+#if UINTPTR_MAX == UINT32_MAX
+_Static_assert(sizeof(IsaacVitaGlRenderTargetTelemetry) == 92u,
+               "vitaGL render-target telemetry ABI drifted");
+#endif
+_Static_assert(ISAAC_VITAGL_RT_EVENT_MAX_BODY < 384u,
+               "vitaGL render-target event exceeds isaac_vita_log body");
+
+typedef struct gl_vita_renderbuffer_record {
+    guest_gl_uint name;
+    guest_gl_enum internal_format;
+    guest_gl_sizei width;
+    guest_gl_sizei height;
+} gl_vita_renderbuffer_record;
+
+static int s_installed;
+static guest_gl_uint s_bound_renderbuffer;
+static gl_vita_renderbuffer_record s_renderbuffers[GL_VITA_RBO_CAPACITY];
+static const char *s_last_error;
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+enum gl_vita_texture_profile_name_bits {
+    GL_VITA_TEXTURE_PROFILE_LIVE = 1u,
+    GL_VITA_TEXTURE_PROFILE_DEFINED = 2u,
+    GL_VITA_TEXTURE_PROFILE_EVER = 4u
+};
+
+typedef struct gl_vita_texture_profile_state {
+    IsaacVitaTextureChurnProfile window;
+    uint8_t names[GL_VITA_TEXTURE_CAPACITY];
+    guest_gl_uint bound_2d[GL_VITA_TEXTURE_UNITS];
+    uint32_t active_unit;
+    uint32_t logical_live;
+    uint32_t window_peak_live;
+    uint32_t clock_pair_max_us;
+    uint32_t lifecycle_incomplete;
+} gl_vita_texture_profile_state;
+
+static gl_vita_texture_profile_state s_texture_profile;
+
+/* guest_gl_dispatch serializes all typed-wrapper mutations process-wide and
+ * faults nested/concurrent entry before reaching this owner.  The phase-loop
+ * snapshot inherits the existing main-thread ownership assumption; future
+ * worker-thread GL or snapshot use would require explicit synchronization. */
+static void gl_vita_texture_profile_bad(void)
+{
+    if (s_texture_profile.window.bad != UINT32_MAX)
+        ++s_texture_profile.window.bad;
+}
+
+static void gl_vita_texture_profile_poison_lifecycle(void)
+{
+    s_texture_profile.lifecycle_incomplete = 1u;
+    gl_vita_texture_profile_bad();
+}
+
+static void gl_vita_texture_profile_add(uint32_t *value, uint64_t amount)
+{
+    if (amount > UINT32_MAX - *value) {
+        *value = UINT32_MAX;
+        gl_vita_texture_profile_bad();
+    } else {
+        *value += (uint32_t)amount;
+    }
+}
+
+static uint32_t gl_vita_texture_profile_elapsed(
+    uint64_t started_at, uint64_t ended_at)
+{
+    uint64_t elapsed;
+
+    if (ended_at < started_at) {
+        gl_vita_texture_profile_bad();
+        return 0u;
+    }
+    elapsed = ended_at - started_at;
+    if (elapsed > UINT32_MAX) {
+        gl_vita_texture_profile_bad();
+        return UINT32_MAX;
+    }
+    return (uint32_t)elapsed;
+}
+
+static void gl_vita_texture_profile_reset_all(void)
+{
+    memset(&s_texture_profile, 0, sizeof s_texture_profile);
+}
+
+static void gl_vita_texture_profile_calibrate_clock(void)
+{
+    uint32_t sample;
+    uint32_t maximum = 0u;
+
+    /* One install-time calibration, outside every phase window.  Eight
+     * back-to-back pairs sample the same two calls charged to each observed
+     * wrapper interval without perturbing room-transition calls further. */
+    for (sample = 0u; sample < 8u; ++sample) {
+        uint64_t started_at = sceKernelGetProcessTimeWide();
+        uint64_t ended_at = sceKernelGetProcessTimeWide();
+
+        if (ended_at < started_at) {
+            maximum = UINT32_MAX;
+            break;
+        }
+        if (ended_at - started_at > maximum) {
+            maximum = ended_at - started_at > UINT32_MAX ? UINT32_MAX :
+                (uint32_t)(ended_at - started_at);
+        }
+    }
+    s_texture_profile.clock_pair_max_us = maximum;
+}
+
+static void gl_vita_texture_profile_reset_window(void)
+{
+    memset(&s_texture_profile.window, 0, sizeof s_texture_profile.window);
+    s_texture_profile.window_peak_live = s_texture_profile.logical_live;
+}
+
+void gl_vita_backend_texture_churn_profile_take_window(
+    IsaacVitaTextureChurnProfile *profile)
+{
+    uint64_t classified_images;
+    uint64_t expected_clock_calls;
+
+    if (!profile)
+        return;
+    classified_images =
+        (uint64_t)s_texture_profile.window.image_first +
+        s_texture_profile.window.image_redefine +
+        s_texture_profile.window.image_unknown +
+        s_texture_profile.window.image_other_level;
+    /* Gen/image own one interval; delete owns native and post intervals. */
+    expected_clock_calls =
+        2u * ((uint64_t)s_texture_profile.window.gen_calls +
+              classified_images) +
+        4u * (uint64_t)s_texture_profile.window.delete_calls;
+    if (s_texture_profile.window.bad == 0u &&
+            (expected_clock_calls > UINT32_MAX ||
+             s_texture_profile.window.clock_calls != expected_clock_calls))
+        gl_vita_texture_profile_bad();
+    /* A missed native allocation/deletion can poison every later first/live
+     * classification.  Keep subsequent quiet windows visibly incomplete. */
+    if (s_texture_profile.lifecycle_incomplete &&
+            s_texture_profile.window.bad == 0u)
+        gl_vita_texture_profile_bad();
+    s_texture_profile.window.logical_live = s_texture_profile.logical_live;
+    s_texture_profile.window.window_peak_live =
+        s_texture_profile.window_peak_live;
+    s_texture_profile.window.clock_pair_max_us =
+        s_texture_profile.clock_pair_max_us;
+    *profile = s_texture_profile.window;
+    gl_vita_texture_profile_reset_window();
+}
+
+static void gl_vita_texture_profile_note_active(guest_gl_enum texture)
+{
+    if (texture >= GL_VITA_TEXTURE0 &&
+            texture < GL_VITA_TEXTURE0 + GL_VITA_TEXTURE_UNITS) {
+        s_texture_profile.active_unit = texture - GL_VITA_TEXTURE0;
+    } else {
+        /* The frozen guest never emits this shape.  NO_DEBUG vitaGL omits
+         * enum checks, so fail the attribution model closed instead of
+         * following a potentially out-of-range native unit. */
+        gl_vita_texture_profile_bad();
+    }
+}
+
+static void gl_vita_texture_profile_note_bind(
+    guest_gl_enum target, guest_gl_uint texture)
+{
+    if (target != GL_VITA_TEXTURE_2D ||
+            texture >= GL_VITA_TEXTURE_CAPACITY) {
+        gl_vita_texture_profile_bad();
+        return;
+    }
+    s_texture_profile.bound_2d[s_texture_profile.active_unit] = texture;
+}
+
+static void gl_vita_texture_profile_note_gen(
+    guest_gl_sizei count, guest_gl_addr textures,
+    uint32_t value_before, int value_before_valid,
+    uint64_t started_at, uint64_t ended_at)
+{
+    IsaacVitaTextureChurnProfile *window = &s_texture_profile.window;
+    uint32_t name;
+    uint8_t state;
+
+    gl_vita_texture_profile_add(&window->gen_calls, 1u);
+    gl_vita_texture_profile_add(&window->clock_calls, 2u);
+    gl_vita_texture_profile_add(
+        &window->gen_observed_us,
+        gl_vita_texture_profile_elapsed(started_at, ended_at));
+
+    /* The frozen PE has exactly two glGenTextures sites and both request one
+     * name.  Reject every wider shape observationally rather than guessing
+     * which outputs were written on slot exhaustion. */
+    if (count != 1 || !value_before_valid || !textures ||
+            textures > UINT32_MAX - 3u) {
+        gl_vita_texture_profile_poison_lifecycle();
+        return;
+    }
+    name = ld32(textures);
+    if (name == 0u || name >= GL_VITA_TEXTURE_CAPACITY) {
+        gl_vita_texture_profile_poison_lifecycle();
+        return;
+    }
+    /* vitaGL's exhaustion path leaves the destination untouched.  An equal
+     * before/after value is ambiguous with a legitimate recycled same-name
+     * result, so accept neither interpretation and keep the model closed. */
+    if (name == value_before) {
+        gl_vita_texture_profile_add(&window->gen_ambiguous, 1u);
+        gl_vita_texture_profile_poison_lifecycle();
+        return;
+    }
+    state = s_texture_profile.names[name];
+    if (state & GL_VITA_TEXTURE_PROFILE_LIVE) {
+        /* A newly returned name cannot alias an already-live accepted name;
+         * preserve the earlier lifecycle rather than adopting the conflict. */
+        gl_vita_texture_profile_poison_lifecycle();
+        return;
+    }
+    gl_vita_texture_profile_add(&window->gen_names, 1u);
+    /* Pinned vitaGL 73dd57a scans slots 1..N once; for n=1 the returned name
+     * is exactly the number of texture_slots entries examined. */
+    gl_vita_texture_profile_add(&window->gen_scan_slots, name);
+    if (state & GL_VITA_TEXTURE_PROFILE_EVER)
+        gl_vita_texture_profile_add(&window->recycled_names, 1u);
+    s_texture_profile.names[name] =
+        GL_VITA_TEXTURE_PROFILE_LIVE | GL_VITA_TEXTURE_PROFILE_EVER;
+    ++s_texture_profile.logical_live;
+    if (s_texture_profile.logical_live > s_texture_profile.window_peak_live)
+        s_texture_profile.window_peak_live = s_texture_profile.logical_live;
+}
+
+static void gl_vita_texture_profile_note_delete(
+    guest_gl_sizei count, guest_gl_addr textures)
+{
+    IsaacVitaTextureChurnProfile *window = &s_texture_profile.window;
+    uint32_t name;
+    guest_gl_sizei index;
+    uint32_t unit;
+
+    if (count == 0)
+        return;
+    if (count < 0) {
+        gl_vita_texture_profile_bad();
+        return;
+    }
+    if (!textures || (uint32_t)count > GL_VITA_TEXTURE_CAPACITY ||
+            (uint64_t)textures + (uint64_t)(uint32_t)count * 4u >
+                UINT64_C(0x100000000)) {
+        gl_vita_texture_profile_poison_lifecycle();
+        return;
+    }
+    gl_vita_texture_profile_add(&window->delete_names, (uint32_t)count);
+    for (index = 0; index < count; ++index) {
+        name = ld32(textures + (uint32_t)index * 4u);
+        if (name == 0u)
+            continue;
+        if (name >= GL_VITA_TEXTURE_CAPACITY) {
+            gl_vita_texture_profile_bad();
+            continue;
+        }
+        if (s_texture_profile.names[name] & GL_VITA_TEXTURE_PROFILE_LIVE) {
+            s_texture_profile.names[name] =
+                (uint8_t)(s_texture_profile.names[name] &
+                          GL_VITA_TEXTURE_PROFILE_EVER);
+            if (s_texture_profile.logical_live != 0u)
+                --s_texture_profile.logical_live;
+            else
+                gl_vita_texture_profile_poison_lifecycle();
+        } else {
+            /* Legal GL no-op, but outside the observed generated-name set. */
+            gl_vita_texture_profile_bad();
+        }
+        for (unit = 0u; unit < GL_VITA_TEXTURE_UNITS; ++unit)
+            if (s_texture_profile.bound_2d[unit] == name)
+                s_texture_profile.bound_2d[unit] = 0u;
+    }
+}
+
+static void gl_vita_texture_profile_note_delete_timing(
+    uint64_t native_started_at, uint64_t native_ended_at,
+    uint64_t post_started_at, uint64_t post_ended_at)
+{
+    IsaacVitaTextureChurnProfile *window = &s_texture_profile.window;
+    uint32_t native_elapsed = gl_vita_texture_profile_elapsed(
+        native_started_at, native_ended_at);
+    uint32_t post_elapsed = gl_vita_texture_profile_elapsed(
+        post_started_at, post_ended_at);
+
+    gl_vita_texture_profile_add(&window->delete_calls, 1u);
+    gl_vita_texture_profile_add(&window->clock_calls, 4u);
+    gl_vita_texture_profile_add(
+        &window->delete_native_observed_us, native_elapsed);
+    gl_vita_texture_profile_add(
+        &window->delete_post_observed_us, post_elapsed);
+    if (native_elapsed > window->delete_native_max_observed_us)
+        window->delete_native_max_observed_us = native_elapsed;
+    if (post_elapsed > window->delete_post_max_observed_us)
+        window->delete_post_max_observed_us = post_elapsed;
+}
+
+static void gl_vita_texture_profile_note_image(
+    guest_gl_enum target, guest_gl_int level,
+    guest_gl_int internal_format,
+    guest_gl_sizei width, guest_gl_sizei height,
+    guest_gl_int border, guest_gl_enum format,
+    guest_gl_enum type, int native_dispatched,
+    uint64_t started_at, uint64_t ended_at)
+{
+    IsaacVitaTextureChurnProfile *window = &s_texture_profile.window;
+    uint32_t name = s_texture_profile.bound_2d[s_texture_profile.active_unit];
+    uint32_t elapsed = gl_vita_texture_profile_elapsed(started_at, ended_at);
+    uint32_t bytes_per_pixel = 0u;
+    uint64_t aligned_width;
+    int known_name = target == GL_VITA_TEXTURE_2D && name != 0u &&
+        name < GL_VITA_TEXTURE_CAPACITY &&
+        (s_texture_profile.names[name] & GL_VITA_TEXTURE_PROFILE_LIVE);
+    int linear = native_dispatched && target == GL_VITA_TEXTURE_2D &&
+        level == 0 && border == 0 && width > 0 && height > 0 &&
+        type == GL_VITA_UNSIGNED_BYTE &&
+        internal_format == (guest_gl_int)format &&
+        (format == GL_VITA_RED || format == GL_VITA_RGB ||
+         format == GL_VITA_RGBA);
+    int converted = native_dispatched && target == GL_VITA_TEXTURE_2D &&
+        level == 0 && border == 0 && width == 256 && height == 1 &&
+        internal_format == (guest_gl_int)GL_VITA_RGBA &&
+        format == GL_VITA_ABGR_EXT && type == GL_VITA_UNSIGNED_BYTE;
+    int bridge_compacted = !native_dispatched &&
+        target == GL_VITA_TEXTURE_2D && level == 0 && border == 0 &&
+        width == 256 && height == 512 &&
+        internal_format == (guest_gl_int)GL_VITA_RGBA &&
+        format == GL_VITA_RGBA && type == GL_VITA_UNSIGNED_BYTE;
+
+    gl_vita_texture_profile_add(&window->clock_calls, 2u);
+    gl_vita_texture_profile_add(&window->image_observed_us, elapsed);
+    if (elapsed > window->image_max_observed_us)
+        window->image_max_observed_us = elapsed;
+
+    /* The buckets below describe observed bridge-call history.  NO_DEBUG
+     * vitaGL exposes no mapped-allocation success receipt, so first/redefine
+     * and byte totals are not allocation-completion proofs. */
+    if (!known_name) {
+        gl_vita_texture_profile_add(&window->image_unknown, 1u);
+    } else if (level != 0) {
+        gl_vita_texture_profile_add(&window->image_other_level, 1u);
+    } else if (s_texture_profile.names[name] &
+               GL_VITA_TEXTURE_PROFILE_DEFINED) {
+        gl_vita_texture_profile_add(&window->image_redefine, 1u);
+    } else {
+        gl_vita_texture_profile_add(&window->image_first, 1u);
+        s_texture_profile.names[name] |= GL_VITA_TEXTURE_PROFILE_DEFINED;
+    }
+
+    if (linear) {
+        gl_vita_texture_profile_add(&window->path_linear, 1u);
+        bytes_per_pixel = format == GL_VITA_RED ? 1u :
+            (format == GL_VITA_RGB ? 3u : 4u);
+    } else if (converted || bridge_compacted) {
+        gl_vita_texture_profile_add(&window->path_converted, 1u);
+        bytes_per_pixel = bridge_compacted ? 1u : 4u;
+    } else {
+        gl_vita_texture_profile_add(&window->path_other, 1u);
+    }
+    if (bytes_per_pixel != 0u) {
+        aligned_width = ((uint64_t)(uint32_t)width + 7u) & ~UINT64_C(7);
+        gl_vita_texture_profile_add(
+            &window->known_pixels,
+            (uint64_t)(uint32_t)width * (uint32_t)height);
+        gl_vita_texture_profile_add(
+            &window->known_alloc_bytes,
+            aligned_width * (uint32_t)height * bytes_per_pixel);
+    }
+}
+#else
+# define gl_vita_texture_profile_reset_all() ((void)0)
+# define gl_vita_texture_profile_calibrate_clock() ((void)0)
+# define gl_vita_texture_profile_reset_window() ((void)0)
+# define gl_vita_texture_profile_note_active(texture) ((void)0)
+# define gl_vita_texture_profile_note_bind(target, texture) ((void)0)
+#endif
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+typedef struct gl_vita_fxray_record {
+    guest_gl_uint name;
+    guest_gl_uint alignment_padding;
+    uint8_t alpha[GL_VITA_FXRAY_PIXELS];
+} gl_vita_fxray_record;
+
+static _Alignas(8) gl_vita_fxray_record
+    s_fxray_records[GL_VITA_FXRAY_RECORDS];
+static guest_gl_uint
+    s_fxray_attachments[GL_VITA_FXRAY_ATTACHMENT_RECORDS];
+static uint8_t s_fxray_attachment_registry_saturated;
+static _Alignas(8) uint8_t
+    s_fxray_rgba_row[GL_VITA_FXRAY_WIDTH * 4u];
+static uint8_t s_fxray_upload_receipts;
+static uint8_t s_fxray_fallback_receipt;
+
+void isaac_vita_log(const char *format, ...);
+
+_Static_assert(sizeof s_fxray_rgba_row == 1024u,
+               "FXLayers ray restoration row drifted");
+_Static_assert(sizeof s_fxray_records[0].alpha == 131072u,
+               "FXLayers ray alpha shadow drifted");
+_Static_assert(sizeof(gl_vita_fxray_record) % 8u == 0u,
+               "FXLayers ray record stride lost 8-byte alignment");
+#endif
+#if defined(ISAAC_VITA_DISPLAY_RASTER_720) || \
+        defined(ISAAC_VITA_FBO_RASTER_SCALE)
+/* Either raster A/B makes the native viewport differ from the guest's
+ * logical 960x540 request, so the guest viewport is shadowed and replayed. */
+# define GL_VITA_LOGICAL_VIEWPORT 1
+#endif
+#if defined(GL_VITA_LOGICAL_VIEWPORT) || defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+/* Every offscreen-target policy needs the guest's draw-framebuffer binding. */
+# define GL_VITA_DRAW_FRAMEBUFFER_SHADOW 1
+#endif
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE) || defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+# define GL_VITA_FBO_TABLE 1
+#endif
+#if defined(GL_VITA_LOGICAL_VIEWPORT)
+typedef struct gl_vita_logical_viewport {
+    guest_gl_int x;
+    guest_gl_int y;
+    guest_gl_sizei width;
+    guest_gl_sizei height;
+} gl_vita_logical_viewport;
+
+static gl_vita_logical_viewport s_logical_viewport;
+#endif
+#if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+static guest_gl_uint s_draw_framebuffer;
+#endif
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+IsaacVitaGlPhaseProfileCounters g_isaac_vita_gl_phase_profile_counters;
+# define GL_VITA_PHASE_COUNT(field) \
+    (++g_isaac_vita_gl_phase_profile_counters.field)
+# define GL_VITA_PHASE_ADD(field, value) \
+    (g_isaac_vita_gl_phase_profile_counters.field += (uint32_t)(value))
+#else
+# define GL_VITA_PHASE_COUNT(field) ((void)0)
+# define GL_VITA_PHASE_ADD(field, value) ((void)0)
+#endif
+
+#if defined(ISAAC_VITA_GL_TIME_PROFILE)
+# if !defined(ISAAC_VITA_PHASE_PROFILE)
+#  error "ISAAC_VITA_GL_TIME_PROFILE requires ISAAC_VITA_PHASE_PROFILE"
+# endif
+/* The bracket encloses exactly one native vitaGL call and nothing of our
+ * own bookkeeping, so the bucket is what vitaGL plus GXM cost on the CPU
+ * (including any wait inside sceGxmBeginScene that a clear, a draw-target
+ * switch or a present forces).  Two 64-bit clock reads per wrapped call. */
+IsaacVitaGlTimeProfile g_isaac_vita_gl_time_profile;
+static inline uint64_t gl_vita_time_now(void)
+{
+    return sceKernelGetProcessTimeWide();
+}
+# define GL_VITA_TIME_BEGIN() \
+    uint64_t gl_vita_time_started_at = gl_vita_time_now()
+# define GL_VITA_TIME_END(bucket) \
+    isaac_vita_gl_time_add(&g_isaac_vita_gl_time_profile.bucket, \
+                           gl_vita_time_started_at, gl_vita_time_now())
+#else
+# define GL_VITA_TIME_BEGIN() ((void)0)
+# define GL_VITA_TIME_END(bucket) ((void)0)
+#endif
+
+/* Shim-side glGetAttribLocation/glGetUniformLocation memo
+ * (ISAAC_VITA_GL_LOCATION_CACHE, part of ISAAC_VITA_GL_SHIM_FASTDISPATCH).
+ *
+ * Pinned vitaGL 73dd57a answers both queries as a pure function of the
+ * program object's state: glGetAttribLocation reads p->vshader->prog and
+ * p->attr[]/attr_highest_idx (custom_shaders.c:4317), glGetUniformLocation
+ * reads p->vshader->prog, p->fshader->prog and the vert/frag uniform lists
+ * (custom_shaders.c:3502); neither call mutates anything or sets a GL error.
+ * Every guest-reachable mutator of that state is in the typed surface and
+ * bumps the single cache generation before it runs: glAttachShader (rebinds
+ * the shader pointers), glLinkProgram (rebuilds attr[] and the uniform
+ * lists), glDeleteProgram/glCreateProgram (slot reuse), glCompileShader/
+ * glShaderSource/glDeleteShader (replace the GXP an attached program reads).
+ * glBindAttribLocation is not in the registry, so the guest cannot reach it.
+ * A hit therefore returns exactly the value vitaGL returned for the same
+ * (program, name bytes) since the last mutation, including -1 for unknown
+ * names.  Keys copy the ASCII name bytes (never the pointer) from the same
+ * identity-mapped guest memory vitaGL reads.  Fail-open: program 0, a NULL,
+ * empty, non-printable or >63-byte name, and any table miss reach vitaGL. */
+#define GL_VITA_LOCATION_KIND_ATTRIB 1u
+#define GL_VITA_LOCATION_KIND_UNIFORM 2u
+#define GL_VITA_LOCATION_NAME_MAX 63u
+
+typedef struct gl_vita_location_cache_key {
+    uint32_t hash;
+    uint32_t slot;
+    guest_gl_uint program;
+    uint8_t kind;
+    uint8_t length;
+    uint8_t cacheable;
+    char name[GL_VITA_LOCATION_NAME_MAX + 1u];
+} gl_vita_location_cache_key;
+
+#if defined(ISAAC_VITA_GL_LOCATION_CACHE)
+#define GL_VITA_LOCATION_CACHE_CAPACITY 256u
+
+typedef struct gl_vita_location_cache_entry {
+    uint32_t generation;        /* 0 = never written */
+    uint32_t hash;
+    guest_gl_uint program;
+    guest_gl_int location;
+    uint8_t kind;
+    uint8_t length;
+    char name[GL_VITA_LOCATION_NAME_MAX + 1u];
+} gl_vita_location_cache_entry;
+
+_Static_assert((GL_VITA_LOCATION_CACHE_CAPACITY &
+                (GL_VITA_LOCATION_CACHE_CAPACITY - 1u)) == 0u,
+               "GL location cache capacity must be a power of two");
+
+static gl_vita_location_cache_entry
+    s_gl_location_cache[GL_VITA_LOCATION_CACHE_CAPACITY];
+static uint32_t s_gl_location_generation = 1u;
+
+static void gl_vita_location_cache_invalidate(void)
+{
+    /* One monotonic generation covers every program: mutations happen at
+     * load time, so a whole-table miss costs one extra native query per
+     * (program, name) and never a stale answer. */
+    if (++s_gl_location_generation == 0u) {
+        memset(s_gl_location_cache, 0, sizeof s_gl_location_cache);
+        s_gl_location_generation = 1u;
+    }
+}
+
+static void gl_vita_location_cache_reset(void)
+{
+    memset(s_gl_location_cache, 0, sizeof s_gl_location_cache);
+    s_gl_location_generation = 1u;
+}
+
+static int gl_vita_location_cache_lookup(
+    uint32_t kind, guest_gl_uint program, guest_gl_addr name,
+    gl_vita_location_cache_key *key, guest_gl_int *location)
+{
+    uint32_t hash = UINT32_C(2166136261) ^ (program * UINT32_C(0x9e3779b9));
+    uint32_t length = 0u;
+    const gl_vita_location_cache_entry *entry;
+
+    key->cacheable = 0u;
+    if (!program || !name)
+        return 0;
+    hash = (hash ^ kind) * UINT32_C(16777619);
+    for (;;) {
+        uint8_t byte = ld8(name + length);
+        if (!byte)
+            break;
+        if (byte < 0x20u || byte > 0x7eu ||
+                length == GL_VITA_LOCATION_NAME_MAX)
+            return 0;
+        key->name[length++] = (char)byte;
+        hash = (hash ^ byte) * UINT32_C(16777619);
+    }
+    if (!length)
+        return 0;
+    key->name[length] = '\0';
+    key->hash = hash;
+    key->slot = (hash ^ (hash >> 16)) &
+        (GL_VITA_LOCATION_CACHE_CAPACITY - 1u);
+    key->program = program;
+    key->kind = (uint8_t)kind;
+    key->length = (uint8_t)length;
+    key->cacheable = 1u;
+    entry = &s_gl_location_cache[key->slot];
+    if (entry->generation != s_gl_location_generation ||
+            entry->hash != hash || entry->program != program ||
+            entry->kind != (uint8_t)kind || entry->length != (uint8_t)length ||
+            memcmp(entry->name, key->name, length) != 0)
+        return 0;
+    *location = entry->location;
+    return 1;
+}
+
+static void gl_vita_location_cache_store(
+    const gl_vita_location_cache_key *key, guest_gl_int location)
+{
+    gl_vita_location_cache_entry *entry;
+
+    if (!key->cacheable)
+        return;
+    entry = &s_gl_location_cache[key->slot];
+    entry->generation = s_gl_location_generation;
+    entry->hash = key->hash;
+    entry->program = key->program;
+    entry->location = location;
+    entry->kind = key->kind;
+    entry->length = key->length;
+    memcpy(entry->name, key->name, (size_t)key->length + 1u);
+}
+#else
+static inline int gl_vita_location_cache_lookup(
+    uint32_t kind, guest_gl_uint program, guest_gl_addr name,
+    gl_vita_location_cache_key *key, guest_gl_int *location)
+{
+    (void)kind;
+    (void)program;
+    (void)name;
+    (void)location;
+    key->cacheable = 0u;
+    return 0;
+}
+
+static inline void gl_vita_location_cache_store(
+    const gl_vita_location_cache_key *key, guest_gl_int location)
+{
+    (void)key;
+    (void)location;
+}
+
+# define gl_vita_location_cache_invalidate() ((void)0)
+# define gl_vita_location_cache_reset() ((void)0)
+#endif
+
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+/* Exact limits and enum sets are copied from the pinned vitaGL f4b23b6
+ * sources (shared.h, textures.c, blending.c, tests.c and custom_shaders.c).
+ * The production NO_DEBUG build makes its native invalid paths especially
+ * important: unknown or invalid calls always pass through and poison only the
+ * shadow which that call could have changed. */
+typedef struct gl_vita_typed_attrib_pointer {
+    guest_gl_addr pointer;
+    guest_gl_enum type;
+    guest_gl_int size;
+    guest_gl_sizei stride;
+    guest_gl_boolean normalized;
+} gl_vita_typed_attrib_pointer;
+
+typedef struct gl_vita_typed_state {
+    guest_gl_uint texture_2d[GL_VITA_TEXTURE_UNITS];
+    gl_vita_typed_attrib_pointer attrib_pointer[GL_VITA_VERTEX_ATTRIBS];
+    guest_gl_enum blend[4];
+    guest_gl_enum depth;
+    guest_gl_int viewport_x;
+    guest_gl_int viewport_y;
+    guest_gl_sizei viewport_width;
+    guest_gl_sizei viewport_height;
+    uint16_t texture_known;
+    uint16_t attrib_enable_known;
+    uint16_t attrib_enabled;
+    uint16_t attrib_pointer_known;
+    uint8_t active_texture;
+    uint8_t active_texture_known;
+    uint8_t blend_known;
+    uint8_t depth_known;
+    uint8_t viewport_known;
+} gl_vita_typed_state;
+
+static gl_vita_typed_state s_gl_typed_state;
+
+static void gl_vita_typed_state_reset(void)
+{
+    memset(&s_gl_typed_state, 0, sizeof s_gl_typed_state);
+}
+
+static void gl_vita_typed_invalidate_viewport(void)
+{
+    s_gl_typed_state.viewport_known = 0u;
+}
+
+static int gl_vita_typed_valid_blend_factor(guest_gl_enum factor)
+{
+    switch (factor) {
+    case GL_VITA_ZERO:
+    case GL_VITA_ONE:
+    case GL_VITA_SRC_COLOR:
+    case GL_VITA_ONE_MINUS_SRC_COLOR:
+    case GL_VITA_SRC_ALPHA:
+    case GL_VITA_ONE_MINUS_SRC_ALPHA:
+    case GL_VITA_DST_ALPHA:
+    case GL_VITA_ONE_MINUS_DST_ALPHA:
+    case GL_VITA_DST_COLOR:
+    case GL_VITA_ONE_MINUS_DST_COLOR:
+    case GL_VITA_SRC_ALPHA_SATURATE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int gl_vita_typed_valid_depth_function(guest_gl_enum function)
+{
+    return function >= GL_VITA_NEVER && function <= GL_VITA_ALWAYS;
+}
+
+static int gl_vita_typed_valid_attrib_type(guest_gl_enum type)
+{
+    switch (type) {
+    case GL_VITA_HALF_FLOAT:
+    case GL_VITA_HALF_FLOAT_OES:
+    case GL_VITA_FLOAT:
+    case GL_VITA_SHORT:
+    case GL_VITA_UNSIGNED_SHORT:
+    case GL_VITA_BYTE:
+    case GL_VITA_UNSIGNED_BYTE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int gl_vita_typed_attrib_pointer_equal(
+    const gl_vita_typed_attrib_pointer *state,
+    guest_gl_int size, guest_gl_enum type, guest_gl_boolean normalized,
+    guest_gl_sizei stride, guest_gl_addr pointer)
+{
+    return state->pointer == pointer && state->type == type &&
+        state->size == size && state->normalized == normalized &&
+        state->stride == stride;
+}
+#else
+# define gl_vita_typed_state_reset() ((void)0)
+# define gl_vita_typed_invalidate_viewport() ((void)0)
+#endif
+
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+typedef struct gl_vita_fusion_profile_state {
+    guest_gl_uint textures[GL_VITA_TEXTURE_UNITS];
+    guest_gl_uint framebuffer;
+    guest_gl_uint program;
+    guest_gl_uint previous_texture;
+    guest_gl_uint previous_program;
+    guest_gl_enum blend_source_rgb;
+    guest_gl_enum blend_destination_rgb;
+    uint8_t active_texture;
+    uint8_t blend_enabled;
+    uint8_t previous_draw_valid;
+    uint8_t additive_run_active;
+} gl_vita_fusion_profile_state;
+
+static gl_vita_fusion_profile_state s_fusion_profile;
+
+static void gl_vita_fusion_profile_reset(void)
+{
+    memset(&s_fusion_profile, 0, sizeof s_fusion_profile);
+}
+
+void gl_vita_backend_phase_profile_window_boundary(void)
+{
+    s_fusion_profile.previous_draw_valid = 0u;
+    s_fusion_profile.additive_run_active = 0u;
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    gl_vita_texture_profile_reset_window();
+#endif
+}
+
+static void gl_vita_fusion_profile_draw(
+    guest_gl_sizei count, guest_gl_enum type)
+{
+    IsaacVitaGlPhaseProfileCounters *c =
+        &g_isaac_vita_gl_phase_profile_counters;
+    guest_gl_uint texture = s_fusion_profile.textures[0];
+    int additive = s_fusion_profile.blend_enabled &&
+        s_fusion_profile.blend_destination_rgb == GL_VITA_ONE;
+
+    /* This is the guest-requested GL stream, measured before any native
+     * redundancy suppression.  Same-atlas and additive draws/runs therefore
+     * describe the byte-preserving fusion ceiling, not a fused implementation. */
+    if (count > 0) {
+        uint32_t width = type == KAGE_VITA_GL_UNSIGNED_SHORT ? 2u :
+            type == 0x00001405u ? 4u : type == 0x00001401u ? 1u : 0u;
+        if (width && (uint32_t)count <= UINT32_MAX / width)
+            c->fusion_index_bytes += (uint32_t)count * width;
+    }
+    if (!s_fusion_profile.blend_enabled)
+        c->fusion_blend_other++;
+    else if (additive)
+        c->fusion_blend_additive++;
+    else if (s_fusion_profile.blend_destination_rgb ==
+            GL_VITA_ONE_MINUS_SRC_ALPHA)
+        c->fusion_blend_alpha++;
+    else
+        c->fusion_blend_other++;
+    if (s_fusion_profile.framebuffer)
+        c->fusion_fbo_offscreen++;
+    else
+        c->fusion_fbo_default++;
+    if (s_fusion_profile.previous_draw_valid) {
+        if (s_fusion_profile.previous_program == s_fusion_profile.program)
+            c->fusion_shader_same++;
+        else
+            c->fusion_shader_change++;
+        if (s_fusion_profile.previous_texture == texture)
+            c->fusion_atlas_same++;
+        else
+            c->fusion_atlas_change++;
+    }
+    if (additive) {
+        c->fusion_additive_draws++;
+        if (!s_fusion_profile.additive_run_active)
+            c->fusion_additive_runs++;
+        s_fusion_profile.additive_run_active = 1u;
+    } else {
+        s_fusion_profile.additive_run_active = 0u;
+    }
+    s_fusion_profile.previous_program = s_fusion_profile.program;
+    s_fusion_profile.previous_texture = texture;
+    s_fusion_profile.previous_draw_valid = 1u;
+}
+#else
+# define gl_vita_fusion_profile_reset() ((void)0)
+# define gl_vita_fusion_profile_draw(count, type) ((void)0)
+void gl_vita_backend_phase_profile_window_boundary(void)
+{
+}
+#endif
+
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+/* The frozen vitaGL has 1024 native program slots, but Isaac keeps only a
+ * handful live.  A bounded tracker deliberately fails open if that changes. */
+#define GL_VITA_REDUNDANCY_PROGRAM_CAPACITY 32u
+#define GL_VITA_REDUNDANCY_LOCATION_CAPACITY 256u
+#define GL_VITA_REDUNDANCY_UNIFORM_CAPACITY 128u
+#define GL_VITA_REDUNDANCY_PAYLOAD_CAPACITY 4u
+#define GL_VITA_LINK_STATUS 0x00008b82u
+#define GL_VITA_CURRENT_PROGRAM 0x00008b8du
+
+enum gl_vita_uniform_kind {
+    GL_VITA_UNIFORM_1FV = 1,
+    GL_VITA_UNIFORM_1I,
+    GL_VITA_UNIFORM_1IV,
+    GL_VITA_UNIFORM_2FV,
+    GL_VITA_UNIFORM_2IV,
+    GL_VITA_UNIFORM_3FV,
+    GL_VITA_UNIFORM_3IV,
+    GL_VITA_UNIFORM_4FV,
+    GL_VITA_UNIFORM_4IV,
+    GL_VITA_UNIFORM_MATRIX2FV,
+    GL_VITA_UNIFORM_MATRIX3FV,
+    GL_VITA_UNIFORM_MATRIX4FV
+};
+
+typedef struct gl_vita_program_record {
+    guest_gl_uint name;
+    uint32_t generation;
+    uint8_t live;
+    uint8_t linked;
+} gl_vita_program_record;
+
+typedef struct gl_vita_location_record {
+    guest_gl_uint program;
+    guest_gl_int location;
+    uint32_t generation;
+    uint8_t valid;
+} gl_vita_location_record;
+
+typedef struct gl_vita_uniform_record {
+    guest_gl_uint program;
+    guest_gl_int location;
+    uint32_t generation;
+    guest_gl_addr source;
+    uint8_t kind;
+    uint8_t transpose;
+    uint8_t size;
+    uint8_t valid;
+    uint8_t payload[GL_VITA_REDUNDANCY_PAYLOAD_CAPACITY];
+} gl_vita_uniform_record;
+
+static gl_vita_program_record
+    s_gl_programs[GL_VITA_REDUNDANCY_PROGRAM_CAPACITY];
+static gl_vita_location_record
+    s_gl_locations[GL_VITA_REDUNDANCY_LOCATION_CAPACITY];
+static gl_vita_uniform_record
+    s_gl_uniforms[GL_VITA_REDUNDANCY_UNIFORM_CAPACITY];
+static guest_gl_uint s_gl_current_program;
+static uint32_t s_gl_current_generation;
+static uint32_t s_gl_next_generation;
+static uint8_t s_gl_current_known;
+static uint8_t s_gl_generation_exhausted;
+
+_Static_assert((GL_VITA_REDUNDANCY_LOCATION_CAPACITY &
+                (GL_VITA_REDUNDANCY_LOCATION_CAPACITY - 1u)) == 0u,
+               "GL location cache capacity must be a power of two");
+_Static_assert((GL_VITA_REDUNDANCY_UNIFORM_CAPACITY &
+                (GL_VITA_REDUNDANCY_UNIFORM_CAPACITY - 1u)) == 0u,
+               "GL uniform cache capacity must be a power of two");
+
+static void gl_vita_redundancy_reset(void)
+{
+    memset(s_gl_programs, 0, sizeof s_gl_programs);
+    memset(s_gl_locations, 0, sizeof s_gl_locations);
+    memset(s_gl_uniforms, 0, sizeof s_gl_uniforms);
+    s_gl_current_program = 0u;
+    s_gl_current_generation = 0u;
+    s_gl_next_generation = 1u;
+    s_gl_current_known = 0u;
+    s_gl_generation_exhausted = 0u;
+}
+
+static uint32_t gl_vita_redundancy_generation(void)
+{
+    uint32_t result;
+
+    if (s_gl_generation_exhausted)
+        return 0u;
+    result = s_gl_next_generation++;
+    if (!s_gl_next_generation)
+        s_gl_generation_exhausted = 1u;
+    return result;
+}
+
+static gl_vita_program_record *gl_vita_program_find(guest_gl_uint program)
+{
+    uint32_t index;
+
+    for (index = 0u; index < GL_VITA_REDUNDANCY_PROGRAM_CAPACITY; ++index) {
+        gl_vita_program_record *record = &s_gl_programs[index];
+        if (record->live && record->name == program)
+            return record;
+    }
+    return NULL;
+}
+
+static void gl_vita_program_created(guest_gl_uint program)
+{
+    gl_vita_program_record *record = gl_vita_program_find(program);
+    uint32_t index;
+
+    if (!program || program == UINT32_MAX || s_gl_generation_exhausted)
+        return;
+    if (!record) {
+        for (index = 0u;
+                index < GL_VITA_REDUNDANCY_PROGRAM_CAPACITY; ++index) {
+            if (!s_gl_programs[index].live) {
+                record = &s_gl_programs[index];
+                break;
+            }
+        }
+    }
+    if (!record)
+        return;
+    record->name = program;
+    record->generation = gl_vita_redundancy_generation();
+    record->live = record->generation != 0u;
+    record->linked = 0u;
+    if (s_gl_current_known && s_gl_current_program == program)
+        s_gl_current_known = 0u;
+}
+
+static void gl_vita_program_mutated(guest_gl_uint program, int deleted)
+{
+    gl_vita_program_record *record = gl_vita_program_find(program);
+
+    if (record) {
+        record->linked = 0u;
+        record->generation = gl_vita_redundancy_generation();
+        if (deleted || !record->generation)
+            record->live = 0u;
+    }
+    if (s_gl_current_known && s_gl_current_program == program)
+        s_gl_current_known = 0u;
+}
+
+static void gl_vita_program_link_status(
+    guest_gl_uint program, guest_gl_enum name)
+{
+    gl_vita_program_record *record;
+    GLint value = 0;
+
+    if (name != GL_VITA_LINK_STATUS)
+        return;
+    record = gl_vita_program_find(program);
+    if (!record)
+        return;
+    /* Never read the guest output pointer: a native query can return after an
+     * invalid request without proving it wrote that address.  This second,
+     * internal exact-pname query writes only our known local word. */
+    glGetProgramiv((GLuint)program, (GLenum)GL_VITA_LINK_STATUS, &value);
+    record->linked = value == 1;
+}
+
+static uint32_t gl_vita_redundancy_hash(
+    guest_gl_uint program, uint32_t generation, guest_gl_int location)
+{
+    uint32_t value = (uint32_t)location;
+    value ^= program * UINT32_C(0x9e3779b9);
+    value ^= generation * UINT32_C(0x85ebca6b);
+    value ^= value >> 16;
+    return value;
+}
+
+static gl_vita_location_record *gl_vita_location_slot(
+    guest_gl_uint program, uint32_t generation, guest_gl_int location)
+{
+    uint32_t index = gl_vita_redundancy_hash(
+        program, generation, location) &
+        (GL_VITA_REDUNDANCY_LOCATION_CAPACITY - 1u);
+    return &s_gl_locations[index];
+}
+
+static gl_vita_uniform_record *gl_vita_uniform_slot(
+    guest_gl_uint program, uint32_t generation, guest_gl_int location)
+{
+    uint32_t index = gl_vita_redundancy_hash(
+        program, generation, location) &
+        (GL_VITA_REDUNDANCY_UNIFORM_CAPACITY - 1u);
+    return &s_gl_uniforms[index];
+}
+
+static void gl_vita_location_observed(
+    guest_gl_uint program, guest_gl_int location)
+{
+    gl_vita_program_record *record;
+    gl_vita_location_record *slot;
+
+    /* Pinned vitaGL encodes a uniform pointer in positive locations and uses
+     * both zero and -1 as no-op sentinels.  Neither sentinel is evidence of a
+     * mutable uniform which can safely be shadowed. */
+    if (location == 0 || location == -1)
+        return;
+    record = gl_vita_program_find(program);
+    if (!record || !record->linked)
+        return;
+    slot = gl_vita_location_slot(program, record->generation, location);
+    slot->program = program;
+    slot->location = location;
+    slot->generation = record->generation;
+    slot->valid = 1u;
+}
+
+static gl_vita_program_record *gl_vita_current_program_for_location(
+    guest_gl_int location)
+{
+    gl_vita_program_record *program;
+    gl_vita_location_record *slot;
+
+    if (!s_gl_current_known || !s_gl_current_program ||
+            location == 0 || location == -1)
+        return NULL;
+    program = gl_vita_program_find(s_gl_current_program);
+    if (!program || !program->linked ||
+            program->generation != s_gl_current_generation)
+        return NULL;
+    slot = gl_vita_location_slot(
+        program->name, program->generation, location);
+    if (!slot->valid || slot->program != program->name ||
+            slot->generation != program->generation ||
+            slot->location != location)
+        return NULL;
+    return program;
+}
+
+static void gl_vita_uniform_invalidate_program(
+    const gl_vita_program_record *program)
+{
+    uint32_t index;
+
+    if (!program)
+        return;
+    for (index = 0u; index < GL_VITA_REDUNDANCY_UNIFORM_CAPACITY; ++index) {
+        gl_vita_uniform_record *slot = &s_gl_uniforms[index];
+        if (slot->valid && slot->program == program->name &&
+                slot->generation == program->generation)
+            slot->valid = 0u;
+    }
+}
+
+static void gl_vita_uniform_invalidate_location(
+    const gl_vita_program_record *program, guest_gl_int location)
+{
+    gl_vita_uniform_record *slot;
+
+    if (!program)
+        return;
+    slot = gl_vita_uniform_slot(
+        program->name, program->generation, location);
+    if (slot->valid && slot->program == program->name &&
+            slot->generation == program->generation &&
+            slot->location == location)
+        slot->valid = 0u;
+}
+
+static int gl_vita_use_program_skip(guest_gl_uint program)
+{
+    gl_vita_program_record *record;
+
+    if (program == 0u) {
+        if (s_gl_current_known && s_gl_current_program == 0u) {
+            GL_VITA_PHASE_COUNT(use_program_suppressed);
+            return 1;
+        }
+        return 0;
+    }
+    record = gl_vita_program_find(program);
+    if (!record || !record->linked)
+        return 0;
+    if (s_gl_current_known && s_gl_current_program == program &&
+            s_gl_current_generation == record->generation) {
+        GL_VITA_PHASE_COUNT(use_program_suppressed);
+        return 1;
+    }
+    return 0;
+}
+
+static void gl_vita_use_program_forwarded(guest_gl_uint program)
+{
+    gl_vita_program_record *record;
+    GLint observed = -1;
+
+    record = program ? gl_vita_program_find(program) : NULL;
+    if (program && (!record || !record->linked)) {
+        s_gl_current_known = 0u;
+        return;
+    }
+    /* Link status proves the object eligible; the driver query proves this
+     * particular UseProgram returned with the requested program current.  A
+     * failed/invalid bind therefore remains on the native path forever. */
+    glGetIntegerv((GLenum)GL_VITA_CURRENT_PROGRAM, &observed);
+    if ((guest_gl_uint)observed != program) {
+        s_gl_current_known = 0u;
+        return;
+    }
+    s_gl_current_program = program;
+    s_gl_current_generation = record ? record->generation : 0u;
+    s_gl_current_known = 1u;
+}
+
+static int gl_vita_uniform_skip(
+    enum gl_vita_uniform_kind kind, guest_gl_int location,
+    guest_gl_sizei count, guest_gl_boolean transpose,
+    guest_gl_addr source, const void *inline_value, uint32_t size)
+{
+    gl_vita_program_record *program =
+        gl_vita_current_program_for_location(location);
+    gl_vita_uniform_record *slot;
+    const void *payload;
+
+    if (!program) {
+        /* An unknown non-sentinel location/current program may alias state which
+         * was previously cached.  Fail open and forget every shadow. */
+        if (location != 0 && location != -1)
+            memset(s_gl_uniforms, 0, sizeof s_gl_uniforms);
+        return 0;
+    }
+    /* Pointer-form uniforms remain exact native calls.  Native return is not
+     * proof that the source span was read (sentinel/type paths may return
+     * early), and probing a Vita memblock before every comparison would erase
+     * the intended hot-path win.  They also invalidate a same-location scalar
+     * shadow before being forwarded. */
+    if (source) {
+        if (count == 1)
+            gl_vita_uniform_invalidate_location(program, location);
+        else
+            gl_vita_uniform_invalidate_program(program);
+        return 0;
+    }
+    if (count != 1 || !size ||
+            size > GL_VITA_REDUNDANCY_PAYLOAD_CAPACITY ||
+            (!source && !inline_value)) {
+        /* count>1 can overlap locations obtained for array elements. */
+        gl_vita_uniform_invalidate_program(program);
+        return 0;
+    }
+    slot = gl_vita_uniform_slot(
+        program->name, program->generation, location);
+    if (!slot->valid || slot->program != program->name ||
+            slot->generation != program->generation ||
+            slot->location != location || slot->kind != (uint8_t)kind ||
+            slot->transpose != (uint8_t)transpose || slot->size != size ||
+            slot->source != source) {
+        slot->valid = 0u;
+        return 0;
+    }
+    payload = inline_value;
+    if (memcmp(slot->payload, payload, size) != 0) {
+        slot->valid = 0u;
+        return 0;
+    }
+    GL_VITA_PHASE_COUNT(uniform_suppressed);
+    return 1;
+}
+
+static void gl_vita_uniform_forwarded(
+    enum gl_vita_uniform_kind kind, guest_gl_int location,
+    guest_gl_sizei count, guest_gl_boolean transpose,
+    guest_gl_addr source, const void *inline_value, uint32_t size)
+{
+    gl_vita_program_record *program =
+        gl_vita_current_program_for_location(location);
+    gl_vita_uniform_record *slot;
+    const void *payload;
+
+    if (!program || source || count != 1 || !size ||
+            size > GL_VITA_REDUNDANCY_PAYLOAD_CAPACITY ||
+            !inline_value)
+        return;
+    payload = inline_value;
+    slot = gl_vita_uniform_slot(
+        program->name, program->generation, location);
+    slot->program = program->name;
+    slot->location = location;
+    slot->generation = program->generation;
+    slot->source = source;
+    slot->kind = (uint8_t)kind;
+    slot->transpose = (uint8_t)transpose;
+    slot->size = (uint8_t)size;
+    memcpy(slot->payload, payload, size);
+    slot->valid = 1u;
+}
+#endif
+static const char s_partial[] =
+    "Vita GL backend: 62/73 typed symbols installed; 11 remain loud";
+static const char *const s_missing_symbols[] = {
+    "glClampColorARB",
+    "glUniform1uiv",
+    "glUniform2uiv",
+    "glUniform3uiv",
+    "glUniform4uiv",
+    "glUniformMatrix2x3fv",
+    "glUniformMatrix2x4fv",
+    "glUniformMatrix3x2fv",
+    "glUniformMatrix3x4fv",
+    "glUniformMatrix4x2fv",
+    "glUniformMatrix4x3fv"
+};
+
+#if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
+#ifndef ISAAC_VITA_FIRST_FRAME_BUILD_ID
+# error ISAAC_VITA_FIRST_FRAME_BUILD_ID must identify the diagnostic binary
+#endif
+
+#define GL_VITA_FF_FRAMEBUFFER         0x00008d40u
+#define GL_VITA_FF_READ_FRAMEBUFFER    0x00008ca8u
+#define GL_VITA_FF_DRAW_FRAMEBUFFER    0x00008ca9u
+#define GL_VITA_FF_FRAMEBUFFER_BINDING 0x00008ca6u
+#define GL_VITA_FF_READ_FRAMEBUFFER_BINDING 0x00008caau
+#define GL_VITA_FF_COLOR_ATTACHMENT0   0x00008ce0u
+#define GL_VITA_FF_VIEWPORT            0x00000ba2u
+#define GL_VITA_FF_SCISSOR_TEST        0x00000c11u
+#define GL_VITA_FF_COLOR_CLEAR_VALUE   0x00000c22u
+#define GL_VITA_FF_COLOR_WRITEMASK     0x00000c23u
+#define GL_VITA_FF_COLOR_BUFFER_BIT    0x00004000u
+#define GL_VITA_FF_FRAMEBUFFER_COMPLETE 0x00008cd5u
+#define GL_VITA_FF_NEAREST             0x00002600u
+#define GL_VITA_FF_RGBA                0x00001908u
+#define GL_VITA_FF_UNSIGNED_BYTE       0x00001401u
+#define GL_VITA_FF_NO_ERROR            0u
+#define GL_VITA_FF_DISPLAY_WIDTH       960
+#define GL_VITA_FF_DISPLAY_HEIGHT      544
+#define GL_VITA_FF_VIEWPORT_Y          2
+#define GL_VITA_FF_LOGICAL_WIDTH       960
+#define GL_VITA_FF_LOGICAL_HEIGHT      540
+#define GL_VITA_FF_READBACK_WIDTH      1
+#define GL_VITA_FF_READBACK_HEIGHT     1
+#define GL_VITA_FF_QUEUE_CAPACITY      16u
+#define GL_VITA_FF_QUEUE_STOP_PRESENT  8u
+#define GL_VITA_FF_DISPLAY_BUFFER_COUNT 3u
+
+_Static_assert(sizeof(ISAAC_VITA_FIRST_FRAME_BUILD_ID) - 1u <= 96u,
+               "first-frame build stamp exceeds durable-log bound");
+#if !defined(ISAAC_VITA_DIRECT_DEFAULT)
+_Static_assert(ISAAC_VITA_FIRST_FRAME_CLEAR_END_PRESENT <
+               ISAAC_VITA_FIRST_FRAME_BLIT_END_PRESENT,
+               "first-frame diagnostic phases overlap");
+_Static_assert(ISAAC_VITA_FIRST_FRAME_BLIT_END_PRESENT <
+               ISAAC_VITA_FIRST_FRAME_BYPASS_END_PRESENT,
+               "first-frame postprocess phase is empty");
+#endif
+_Static_assert((GL_VITA_FF_QUEUE_CAPACITY &
+                (GL_VITA_FF_QUEUE_CAPACITY - 1u)) == 0u,
+               "display-queue ring capacity must be a power of two");
+_Static_assert(GL_VITA_FF_READBACK_WIDTH == 1 &&
+               GL_VITA_FF_READBACK_HEIGHT == 1,
+               "guarded readback payload holds exactly one RGBA pixel");
+_Static_assert(sizeof(IsaacVitaGlDisplayQueueProbe) == 96u,
+               "vitaGL display-lineage probe ABI drifted");
+
+#if defined(ISAAC_GL_VITA_FIRST_FRAME_ORACLE)
+void isaac_gl_vita_first_frame_oracle_log(const char *format, ...);
+# define GL_VITA_FF_LOG isaac_gl_vita_first_frame_oracle_log
+#else
+void isaac_vita_log(const char *format, ...);
+# define GL_VITA_FF_LOG isaac_vita_log
+#endif
+
+static IsaacVitaFirstFrameSnapshot s_first_frame;
+#if !defined(ISAAC_VITA_DIRECT_DEFAULT)
+static uint32_t s_first_frame_result_log_mask;
+#endif
+static unsigned s_first_frame_config_logged;
+#if !defined(ISAAC_VITA_DIRECT_DEFAULT)
+static unsigned s_first_frame_final_logged;
+#endif
+
+typedef struct gl_vita_first_frame_queue_slot {
+    volatile uint32_t published_sequence;
+    uint32_t generation;
+    uint32_t guest_present;
+    IsaacVitaGlDisplayQueueProbe event;
+} gl_vita_first_frame_queue_slot;
+
+typedef struct gl_vita_first_frame_queue_map {
+    uint32_t sequence;
+    uint32_t guest_present;
+} gl_vita_first_frame_queue_map;
+
+static gl_vita_first_frame_queue_slot
+    s_first_frame_queue_add[GL_VITA_FF_QUEUE_CAPACITY];
+static gl_vita_first_frame_queue_slot
+    s_first_frame_queue_callback[GL_VITA_FF_QUEUE_CAPACITY];
+static gl_vita_first_frame_queue_map
+    s_first_frame_queue_map[GL_VITA_FF_QUEUE_CAPACITY];
+static volatile uint32_t s_first_frame_queue_active;
+static volatile uint32_t s_first_frame_queue_generation;
+static volatile uint32_t s_first_frame_queue_present_tag;
+static uint32_t s_first_frame_queue_log_mask;
+static uint32_t s_first_frame_queue_dedicated_mask;
+static unsigned s_first_frame_queue_final_logged;
+
+#if defined(ISAAC_VITA_KNOWN_COLOR_PROBE)
+typedef struct gl_vita_known_color_clear_state {
+    uint32_t attempted;
+    uint32_t present_index;
+    uint32_t saved_read_framebuffer;
+    uint32_t saved_draw_framebuffer;
+    int32_t saved_viewport[4];
+    uint32_t saved_color_mask;
+    uint32_t saved_scissor;
+    uint32_t pre_error;
+    uint32_t post_error;
+} gl_vita_known_color_clear_state;
+
+static gl_vita_known_color_clear_state s_known_color_clear;
+static IsaacVitaGlKnownColorProbe s_known_color_transfer;
+static volatile uint32_t s_known_color_transfer_valid;
+static unsigned s_known_color_logged;
+#endif
+
+static uint32_t gl_vita_first_frame_atomic_load(
+    const volatile uint32_t *value)
+{
+#if defined(_MSC_VER)
+    return (uint32_t)_InterlockedCompareExchange(
+        (volatile long *)value, 0, 0);
+#else
+    return __atomic_load_n(value, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static void gl_vita_first_frame_atomic_store(
+    volatile uint32_t *destination, uint32_t value)
+{
+#if defined(_MSC_VER)
+    (void)_InterlockedExchange(
+        (volatile long *)destination, (long)value);
+#else
+    __atomic_store_n(destination, value, __ATOMIC_RELEASE);
+#endif
+}
+
+static int gl_vita_first_frame_atomic_compare_exchange(
+    volatile uint32_t *destination, uint32_t expected, uint32_t desired)
+{
+#if defined(_MSC_VER)
+    return (uint32_t)_InterlockedCompareExchange(
+        (volatile long *)destination, (long)desired,
+        (long)expected) == expected;
+#else
+    return __atomic_compare_exchange_n(
+        destination, &expected, desired, 0,
+        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static void gl_vita_first_frame_increment(uint32_t *value)
+{
+    if (*value != UINT32_MAX)
+        ++*value;
+}
+
+static void gl_vita_first_frame_reset(void)
+{
+    uint32_t generation;
+
+    /* A callback which already passed the active test may still publish.
+     * Retire its generation before resetting owner-only state; fixed static
+     * slots deliberately remain allocated and are never memset. */
+    gl_vita_first_frame_atomic_store(&s_first_frame_queue_active, 0u);
+    gl_vita_first_frame_atomic_store(
+        &s_first_frame_queue_present_tag, 0u);
+    generation = gl_vita_first_frame_atomic_load(
+        &s_first_frame_queue_generation) + 1u;
+    if (!generation)
+        generation = 1u;
+    gl_vita_first_frame_atomic_store(
+        &s_first_frame_queue_generation, generation);
+    memset(&s_first_frame, 0, sizeof s_first_frame);
+    memset(s_first_frame_queue_map, 0, sizeof s_first_frame_queue_map);
+#if !defined(ISAAC_VITA_DIRECT_DEFAULT)
+    s_first_frame_result_log_mask = 0u;
+#endif
+    s_first_frame_config_logged = 0u;
+#if !defined(ISAAC_VITA_DIRECT_DEFAULT)
+    s_first_frame_final_logged = 0u;
+#endif
+    s_first_frame_queue_log_mask = 0u;
+    s_first_frame_queue_dedicated_mask = 0u;
+    s_first_frame_queue_final_logged = 0u;
+#if defined(ISAAC_VITA_KNOWN_COLOR_PROBE)
+    gl_vita_first_frame_atomic_store(&s_known_color_transfer_valid, 0u);
+    memset(&s_known_color_clear, 0, sizeof s_known_color_clear);
+    memset(&s_known_color_transfer, 0, sizeof s_known_color_transfer);
+    s_known_color_logged = 0u;
+#endif
+}
+
+static void gl_vita_first_frame_log_summary(
+    const char *phase, uint32_t present_index)
+{
+    GL_VITA_FF_LOG(
+        "KAGE VITA FIRST FRAME: bid40=%.40s phase=%s present=%u "
+        "gfbo=%u mfbo=%u att_arg=%u att_calls=%u "
+        "bind=%u/%u clear=%u/%u "
+        "draw=%u/%u last_draw=%u control=%u blit=%u/%u skip=%u/%u end=ff",
+        ISAAC_VITA_FIRST_FRAME_BUILD_ID, phase, (unsigned)present_index,
+        (unsigned)s_first_frame.current_guest_fbo,
+        (unsigned)s_first_frame.manager_fbo,
+        (unsigned)s_first_frame.manager_color_attach_arg,
+        (unsigned)s_first_frame.manager_color_attach_calls,
+        (unsigned)s_first_frame.bind_zero,
+        (unsigned)s_first_frame.bind_nonzero,
+        (unsigned)s_first_frame.clear_default,
+        (unsigned)s_first_frame.clear_offscreen,
+        (unsigned)s_first_frame.draw_default,
+        (unsigned)s_first_frame.draw_offscreen,
+        (unsigned)s_first_frame.last_draw_fbo,
+        (unsigned)s_first_frame.control_clears,
+        (unsigned)s_first_frame.blit_successes,
+        (unsigned)s_first_frame.blit_attempts,
+        (unsigned)s_first_frame.blit_no_manager,
+        (unsigned)s_first_frame.blit_incomplete);
+}
+
+#if defined(ISAAC_GL_VITA_FIRST_FRAME_ORACLE)
+void isaac_gl_vita_first_frame_oracle_log_worst_summary(void)
+{
+    IsaacVitaFirstFrameSnapshot saved = s_first_frame;
+
+    memset(&s_first_frame, 0xff, sizeof s_first_frame);
+    gl_vita_first_frame_log_summary(
+#if defined(ISAAC_VITA_DIRECT_DEFAULT)
+        "true-direct-default-passive", UINT32_MAX);
+#else
+        "postprocess-bypass-complete", UINT32_MAX);
+#endif
+    s_first_frame = saved;
+}
+#endif
+
+void gl_vita_backend_first_frame_set_manager_framebuffer(
+    uint32_t framebuffer)
+{
+    if (framebuffer != s_first_frame.manager_fbo) {
+        s_first_frame.manager_color_attach_arg = 0u;
+        s_first_frame.manager_color_attach_calls = 0u;
+    }
+    s_first_frame.manager_fbo = framebuffer;
+    if (framebuffer && !s_first_frame_config_logged) {
+        s_first_frame_config_logged = 1u;
+#if defined(ISAAC_VITA_DIRECT_DEFAULT)
+        GL_VITA_FF_LOG(
+            "KAGE VITA FIRST FRAME: bid40=%.40s phase=config manager_fbo=%u "
+            "mode=true-direct-default probes=passive",
+            ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)framebuffer);
+#else
+        GL_VITA_FF_LOG(
+            "KAGE VITA FIRST FRAME: bid40=%.40s phase=config manager_fbo=%u "
+            "clear=[0,%u) blit=[%u,%u) bypass=[%u,%u)",
+            ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)framebuffer,
+            (unsigned)ISAAC_VITA_FIRST_FRAME_CLEAR_END_PRESENT,
+            (unsigned)ISAAC_VITA_FIRST_FRAME_CLEAR_END_PRESENT,
+            (unsigned)ISAAC_VITA_FIRST_FRAME_BLIT_END_PRESENT,
+            (unsigned)ISAAC_VITA_FIRST_FRAME_BLIT_END_PRESENT,
+            (unsigned)ISAAC_VITA_FIRST_FRAME_BYPASS_END_PRESENT);
+#endif
+    }
+}
+
+void gl_vita_backend_first_frame_snapshot(
+    IsaacVitaFirstFrameSnapshot *snapshot)
+{
+    if (snapshot)
+        *snapshot = s_first_frame;
+}
+
+/* vitaGL calls this strong endpoint from both the owner and display-queue
+ * threads.  It must remain a bounded copy only: no GL, logging, allocation,
+ * or waiting is legal here.  Each stage has one producer and its own fixed
+ * slots; the owner-thread poller below consumes published snapshots. */
+void isaac_vitagl_display_queue_probe(
+    const IsaacVitaGlDisplayQueueProbe *event)
+{
+    gl_vita_first_frame_queue_slot *slot;
+    uint32_t generation;
+    uint32_t guest_present = UINT32_MAX;
+
+    if (!event)
+        return;
+    /* Read generation first: if shutdown races this callback, the event is
+     * either rejected by active==0 or published with the retired generation. */
+    generation = gl_vita_first_frame_atomic_load(
+        &s_first_frame_queue_generation);
+    if (!gl_vita_first_frame_atomic_load(
+            &s_first_frame_queue_active))
+        return;
+    if (event->size != sizeof *event || event->sequence == 0u)
+        return;
+    if (event->stage == ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_ADD_RESULT) {
+        uint32_t tag = gl_vita_first_frame_atomic_load(
+            &s_first_frame_queue_present_tag);
+
+        /* Loading/splash swaps never run inside the explicit game tag. */
+        if (!tag)
+            return;
+        guest_present = tag - 1u;
+        slot = &s_first_frame_queue_add[
+            event->sequence & (GL_VITA_FF_QUEUE_CAPACITY - 1u)];
+    } else if (event->stage ==
+            ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_DISPLAY_CALLBACK) {
+        slot = &s_first_frame_queue_callback[
+            event->sequence & (GL_VITA_FF_QUEUE_CAPACITY - 1u)];
+    } else {
+        return;
+    }
+
+    gl_vita_first_frame_atomic_store(&slot->published_sequence, 0u);
+    slot->generation = generation;
+    slot->guest_present = guest_present;
+    slot->event = *event;
+    if (gl_vita_first_frame_atomic_load(&s_first_frame_queue_active) &&
+            gl_vita_first_frame_atomic_load(
+                &s_first_frame_queue_generation) == generation) {
+        gl_vita_first_frame_atomic_store(
+            &slot->published_sequence, event->sequence);
+    }
+}
+
+static int gl_vita_first_frame_boundary_index(uint32_t present)
+{
+    switch (present) {
+#if defined(ISAAC_VITA_DIRECT_DEFAULT)
+    case 0u: return 0;
+    case 1u: return 1;
+    case 119u: return 2;
+    case 239u: return 3;
+    case 240u: return 4;
+    case 359u: return 5;
+    case 360u: return 6;
+#else
+    case 119u: return 0;
+    case 239u: return 1;
+    case 240u: return 2;
+    case 359u: return 3;
+    case 360u: return 4;
+#endif
+    default: return -1;
+    }
+}
+
+/* These are deliberately not first-frame readback boundaries.  The old
+ * p0/p1 observations invoke glFinish/glReadPixels and create extra GXM
+ * scenes.  p2..p4 are three consecutive unmodified game presents and cover
+ * every member of the three-buffer rotation. */
+static int gl_vita_display_lineage_boundary_index(uint32_t present)
+{
+    switch (present) {
+    case 2u: return 0;
+    case 3u: return 1;
+    case 4u: return 2;
+    default: return -1;
+    }
+}
+
+static int gl_vita_first_frame_queue_lookup(
+    uint32_t sequence, uint32_t *guest_present)
+{
+    gl_vita_first_frame_queue_map *entry =
+        &s_first_frame_queue_map[
+            sequence & (GL_VITA_FF_QUEUE_CAPACITY - 1u)];
+
+    if (entry->sequence != sequence)
+        return 0;
+    *guest_present = entry->guest_present;
+    return 1;
+}
+
+static void gl_vita_first_frame_queue_event(
+    const IsaacVitaGlDisplayQueueProbe *event, uint32_t tagged_present)
+{
+    uint32_t present;
+    uint32_t bit;
+    int boundary;
+
+    if (event->stage == ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_ADD_RESULT) {
+        gl_vita_first_frame_queue_map *entry =
+            &s_first_frame_queue_map[
+                event->sequence & (GL_VITA_FF_QUEUE_CAPACITY - 1u)];
+
+        if (tagged_present == UINT32_MAX)
+            return;
+        entry->guest_present = tagged_present;
+        entry->sequence = event->sequence;
+        present = tagged_present;
+    } else if (!gl_vita_first_frame_queue_lookup(
+            event->sequence, &present)) {
+        return;
+    }
+    boundary = gl_vita_display_lineage_boundary_index(present);
+    if (boundary < 0)
+        return;
+    bit = 1u << ((unsigned)boundary * 2u +
+        (event->stage == ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_DISPLAY_CALLBACK));
+    if (s_first_frame_queue_log_mask & bit)
+        return;
+    s_first_frame_queue_log_mask |= bit;
+
+    if (event->stage == ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_ADD_RESULT) {
+        const int chain_ok =
+            event->detail.add.begin_count == 1u &&
+            event->detail.add.end_count == 1u &&
+            event->detail.add.begin_context ==
+                event->detail.add.end_context &&
+            event->detail.add.begin_fragment_sync ==
+                event->detail.add.new_sync &&
+            event->detail.add.begin_color_data == event->address &&
+            event->detail.add.mismatch_mask == 0u;
+        const int dedicated_ok =
+            event->back_index < GL_VITA_FF_DISPLAY_BUFFER_COUNT &&
+            event->detail.add.back_memblock_uid >= 0 &&
+            event->detail.add.back_get_base_result == 0 &&
+            event->detail.add.back_map_result == 0 &&
+            event->detail.add.back_dedicated == 1u;
+
+        if (dedicated_ok)
+            s_first_frame_queue_dedicated_mask |=
+                1u << event->back_index;
+
+        GL_VITA_FF_LOG(
+            "KAGE VITA FIRST FRAME: bid40=%.40s phase=queue-add "
+            "p=%08x seq=%08x rc=%08x front=%08x back=%08x "
+            "addr=%08x old=%08x new=%08x mem=%08x/%08x/%08x "
+            "ded=%u end=ff",
+            ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)present,
+            (unsigned)event->sequence,
+            (unsigned)event->detail.add.result,
+            (unsigned)event->front_index, (unsigned)event->back_index,
+            (unsigned)event->address,
+            (unsigned)event->detail.add.old_sync,
+            (unsigned)event->detail.add.new_sync,
+            (unsigned)event->detail.add.back_memblock_uid,
+            (unsigned)event->detail.add.back_get_base_result,
+            (unsigned)event->detail.add.back_map_result,
+            (unsigned)event->detail.add.back_dedicated);
+        GL_VITA_FF_LOG(
+            "KAGE VITA FIRST FRAME: bid40=%.40s phase=queue-scene "
+            "p=%08x seq=%08x begin=%08x/%08x/%08x/%08x/%08x/"
+            "%08x/%08x end=%08x/%08x/%08x mismatch=%08x chain=%u "
+            "end=ff",
+            ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)present,
+            (unsigned)event->sequence,
+            (unsigned)event->detail.add.begin_count,
+            (unsigned)event->detail.add.begin_context,
+            (unsigned)event->detail.add.begin_render_target,
+            (unsigned)event->detail.add.begin_fragment_sync,
+            (unsigned)event->detail.add.begin_color_surface,
+            (unsigned)event->detail.add.begin_color_data,
+            (unsigned)event->detail.add.begin_result,
+            (unsigned)event->detail.add.end_count,
+            (unsigned)event->detail.add.end_context,
+            (unsigned)event->detail.add.end_result,
+            (unsigned)event->detail.add.mismatch_mask,
+            (unsigned)chain_ok);
+    } else {
+        const int chain_ok =
+            event->detail.display.size == 24u &&
+            event->detail.display.base == event->address &&
+            event->detail.display.pitch == 960u &&
+            event->detail.display.pixel_format == 0u &&
+            event->detail.display.width == 960u &&
+            event->detail.display.height == 544u &&
+            event->detail.display.sync == 1u;
+
+        GL_VITA_FF_LOG(
+            "KAGE VITA FIRST FRAME: bid40=%.40s phase=queue-display "
+            "p=%08x seq=%08x front=%08x back=%08x addr=%08x "
+            "fb=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x chain=%u "
+            "samples=%08x hash=%08x rgba=%08x,%08x,%08x,%08x,"
+            "%08x,%08x,%08x,%08x end=ff",
+            ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)present,
+            (unsigned)event->sequence, (unsigned)event->front_index,
+            (unsigned)event->back_index, (unsigned)event->address,
+            (unsigned)event->detail.display.size,
+            (unsigned)event->detail.display.base,
+            (unsigned)event->detail.display.pitch,
+            (unsigned)event->detail.display.pixel_format,
+            (unsigned)event->detail.display.width,
+            (unsigned)event->detail.display.height,
+            (unsigned)event->detail.display.sync,
+            (unsigned)event->detail.display.result,
+            (unsigned)chain_ok,
+            (unsigned)event->detail.display.sample_count,
+            (unsigned)event->detail.display.sparse_hash,
+            (unsigned)event->detail.display.rgba[0],
+            (unsigned)event->detail.display.rgba[1],
+            (unsigned)event->detail.display.rgba[2],
+            (unsigned)event->detail.display.rgba[3],
+            (unsigned)event->detail.display.rgba[4],
+            (unsigned)event->detail.display.rgba[5],
+            (unsigned)event->detail.display.rgba[6],
+            (unsigned)event->detail.display.rgba[7]);
+    }
+}
+
+static void gl_vita_first_frame_queue_poll_slots(
+    gl_vita_first_frame_queue_slot *slots)
+{
+    unsigned index;
+    uint32_t generation = gl_vita_first_frame_atomic_load(
+        &s_first_frame_queue_generation);
+
+    for (index = 0u; index < GL_VITA_FF_QUEUE_CAPACITY; ++index) {
+        gl_vita_first_frame_queue_slot *slot = &slots[index];
+        IsaacVitaGlDisplayQueueProbe event;
+        uint32_t slot_generation;
+        uint32_t guest_present;
+        uint32_t published = gl_vita_first_frame_atomic_load(
+            &slot->published_sequence);
+
+        if (!published)
+            continue;
+        slot_generation = slot->generation;
+        guest_present = slot->guest_present;
+        event = slot->event;
+        if (gl_vita_first_frame_atomic_load(
+                &slot->published_sequence) != published)
+            continue;
+        if (slot_generation == generation &&
+                event.sequence == published &&
+                gl_vita_first_frame_atomic_compare_exchange(
+                    &slot->published_sequence, published, 0u))
+            gl_vita_first_frame_queue_event(&event, guest_present);
+    }
+}
+
+static void gl_vita_first_frame_queue_poll(uint32_t present_index)
+{
+    if (present_index == 0u) {
+        gl_vita_first_frame_atomic_store(
+            &s_first_frame_queue_active, 1u);
+        return;
+    }
+    if (!gl_vita_first_frame_atomic_load(&s_first_frame_queue_active))
+        return;
+
+    /* ADD publishes the exact guest-present mapping before callback lookup. */
+    gl_vita_first_frame_queue_poll_slots(s_first_frame_queue_add);
+    gl_vita_first_frame_queue_poll_slots(s_first_frame_queue_callback);
+    if (present_index >= GL_VITA_FF_QUEUE_STOP_PRESENT &&
+            !s_first_frame_queue_final_logged) {
+        const uint32_t expected_dedicated_mask =
+            (1u << GL_VITA_FF_DISPLAY_BUFFER_COUNT) - 1u;
+        const unsigned dedicated_count =
+            (unsigned)((s_first_frame_queue_dedicated_mask & 1u) != 0u) +
+            (unsigned)((s_first_frame_queue_dedicated_mask & 2u) != 0u) +
+            (unsigned)((s_first_frame_queue_dedicated_mask & 4u) != 0u);
+
+        gl_vita_first_frame_atomic_store(
+            &s_first_frame_queue_active, 0u);
+        s_first_frame_queue_final_logged = 1u;
+        GL_VITA_FF_LOG(
+            "KAGE VITA FIRST FRAME: bid40=%.40s "
+            "phase=queue-probe-complete present=%u seen=0x%02x "
+            "expected=0x3f dedicated=%u/3 dedmask=0x%02x "
+            "dedgate=%u",
+            ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)present_index,
+            (unsigned)s_first_frame_queue_log_mask, dedicated_count,
+            (unsigned)s_first_frame_queue_dedicated_mask,
+            (unsigned)(s_first_frame_queue_dedicated_mask ==
+                expected_dedicated_mask));
+    }
+}
+
+void gl_vita_backend_first_frame_queue_begin(uint32_t present_index)
+{
+    /* tag==0 is reserved for every loading/splash/non-game swap. */
+    gl_vita_first_frame_atomic_store(
+        &s_first_frame_queue_present_tag, present_index + 1u);
+}
+
+#if defined(ISAAC_VITA_KNOWN_COLOR_PROBE)
+uint32_t isaac_vita_vitagl_known_color_present_index(void)
+{
+    uint32_t tag = gl_vita_first_frame_atomic_load(
+        &s_first_frame_queue_present_tag);
+
+    return tag ? tag - 1u : UINT32_MAX;
+}
+
+/* Synchronous owner-thread endpoint called only after QueueAddEntry returns.
+ * It remains a single fixed-size copy: diagnostics are emitted by queue_end. */
+void isaac_vita_vitagl_known_color_probe(
+    const IsaacVitaGlKnownColorProbe *event)
+{
+    if (!event || event->size != sizeof *event ||
+            event->present_index != ISAAC_VITAGL_KNOWN_COLOR_PRESENT_INDEX ||
+            isaac_vita_vitagl_known_color_present_index() !=
+                event->present_index ||
+            gl_vita_first_frame_atomic_load(
+                &s_known_color_transfer_valid)) {
+        return;
+    }
+    s_known_color_transfer = *event;
+    gl_vita_first_frame_atomic_store(&s_known_color_transfer_valid, 1u);
+}
+
+static void gl_vita_known_color_log_after_swap(uint32_t present_index)
+{
+    IsaacVitaGlKnownColorProbe transfer;
+    uint32_t transfer_valid;
+
+    if (present_index != ISAAC_VITAGL_KNOWN_COLOR_PRESENT_INDEX ||
+            s_known_color_logged) {
+        return;
+    }
+    s_known_color_logged = 1u;
+    GL_VITA_FF_LOG(
+        "KAGE VITA FIRST FRAME: bid40=%.40s phase=known-color-clear "
+        "p=%08x rgba=ff00ff00 attempted=%u saved=%08x/%08x "
+        "vp=%d,%d,%d,%d mask=%x scissor=%u error=%08x/%08x end=ff",
+        ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)present_index,
+        (unsigned)s_known_color_clear.attempted,
+        (unsigned)s_known_color_clear.saved_read_framebuffer,
+        (unsigned)s_known_color_clear.saved_draw_framebuffer,
+        (int)s_known_color_clear.saved_viewport[0],
+        (int)s_known_color_clear.saved_viewport[1],
+        (int)s_known_color_clear.saved_viewport[2],
+        (int)s_known_color_clear.saved_viewport[3],
+        (unsigned)s_known_color_clear.saved_color_mask,
+        (unsigned)s_known_color_clear.saved_scissor,
+        (unsigned)s_known_color_clear.pre_error,
+        (unsigned)s_known_color_clear.post_error);
+
+    transfer_valid = gl_vita_first_frame_atomic_load(
+        &s_known_color_transfer_valid);
+    if (transfer_valid)
+        transfer = s_known_color_transfer;
+    else
+        memset(&transfer, 0, sizeof transfer);
+    GL_VITA_FF_LOG(
+        "KAGE VITA FIRST FRAME: bid40=%.40s phase=known-color-transfer "
+        "captured=%u p=%08x seq=%08x front=%08x back=%08x "
+        "addr=%08x ded=%u color=%08x fmt=%08x rect=%u,%u,%u,%u "
+        "stride=%u sync=%08x/%08x gate=%08x finish=%u fill=%08x "
+        "transfer_finish=%u/%08x queue=%08x end=ff",
+        ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)transfer_valid,
+        (unsigned)transfer.present_index, (unsigned)transfer.sequence,
+        (unsigned)transfer.front_index, (unsigned)transfer.back_index,
+        (unsigned)transfer.address, (unsigned)transfer.dedicated,
+        (unsigned)transfer.color, (unsigned)transfer.format,
+        (unsigned)transfer.x, (unsigned)transfer.y,
+        (unsigned)transfer.width, (unsigned)transfer.height,
+        (unsigned)transfer.stride_bytes, (unsigned)transfer.sync_object,
+        (unsigned)transfer.sync_flags, (unsigned)transfer.gate_mask,
+        (unsigned)transfer.context_finish_called,
+        (unsigned)transfer.fill_result,
+        (unsigned)transfer.transfer_finish_called,
+        (unsigned)transfer.transfer_finish_result,
+        (unsigned)transfer.queue_result);
+}
+#endif
+
+void gl_vita_backend_first_frame_queue_end(void)
+{
+#if defined(ISAAC_VITA_KNOWN_COLOR_PROBE)
+    uint32_t tag = gl_vita_first_frame_atomic_load(
+        &s_first_frame_queue_present_tag);
+#endif
+
+    gl_vita_first_frame_atomic_store(
+        &s_first_frame_queue_present_tag, 0u);
+#if defined(ISAAC_VITA_KNOWN_COLOR_PROBE)
+    if (tag)
+        gl_vita_known_color_log_after_swap(tag - 1u);
+#endif
+}
+
+static uint32_t gl_vita_first_frame_hash(
+    const uint32_t *pixels, size_t count)
+{
+    uint32_t hash = 2166136261u;
+    size_t index;
+
+    for (index = 0u; index < count; ++index) {
+        uint32_t value = pixels[index];
+        unsigned byte;
+
+        for (byte = 0u; byte < 4u; ++byte) {
+            hash ^= value & 0xffu;
+            hash *= 16777619u;
+            value >>= 8u;
+        }
+    }
+    return hash;
+}
+
+static void gl_vita_first_frame_readback_surface(
+    uint32_t present_index, const char *surface, GLuint framebuffer,
+    GLint x, GLint y, int available,
+    GLenum sync_pre_error, GLenum sync_error)
+{
+    struct {
+        uint32_t before[2];
+        uint32_t pixel;
+        uint32_t after[2];
+    } guarded;
+    GLint saved_read = 0;
+    GLint saved_draw = 0;
+    GLenum status = available
+        ? (GLenum)GL_VITA_FF_FRAMEBUFFER_COMPLETE : 0u;
+    GLenum read_error = 0u;
+    GLenum restore_error;
+    uint32_t hash = 0u;
+    unsigned canary_ok;
+    int attempted = available;
+
+    /* Native diagnostic FBO binds can replay vitaGL's physical viewport. */
+    gl_vita_typed_invalidate_viewport();
+    guarded.before[0] = 0x13579bdfu;
+    guarded.before[1] = 0x2468ace0u;
+    guarded.pixel = 0u;
+    guarded.after[0] = 0x0badc0deu;
+    guarded.after[1] = 0xc001d00du;
+    glGetIntegerv(
+        (GLenum)GL_VITA_FF_READ_FRAMEBUFFER_BINDING, &saved_read);
+    glGetIntegerv((GLenum)GL_VITA_FF_FRAMEBUFFER_BINDING, &saved_draw);
+    if (attempted && framebuffer) {
+        status = glCheckNamedFramebufferStatus(
+            framebuffer, (GLenum)GL_VITA_FF_FRAMEBUFFER);
+        if (status != (GLenum)GL_VITA_FF_FRAMEBUFFER_COMPLETE)
+            attempted = 0;
+    }
+    if (attempted) {
+        glBindFramebuffer(
+            (GLenum)GL_VITA_FF_READ_FRAMEBUFFER, framebuffer);
+        glReadPixels(
+            x, y, GL_VITA_FF_READBACK_WIDTH,
+            GL_VITA_FF_READBACK_HEIGHT,
+            (GLenum)GL_VITA_FF_RGBA,
+            (GLenum)GL_VITA_FF_UNSIGNED_BYTE, &guarded.pixel);
+        read_error = glGetError();
+        hash = gl_vita_first_frame_hash(
+            &guarded.pixel, 1u);
+    }
+    glBindFramebuffer(
+        (GLenum)GL_VITA_FF_READ_FRAMEBUFFER, (GLuint)saved_read);
+    glBindFramebuffer(
+        (GLenum)GL_VITA_FF_DRAW_FRAMEBUFFER, (GLuint)saved_draw);
+    restore_error = glGetError();
+    canary_ok = guarded.before[0] == 0x13579bdfu &&
+        guarded.before[1] == 0x2468ace0u &&
+        guarded.after[0] == 0x0badc0deu &&
+        guarded.after[1] == 0xc001d00du;
+
+    GL_VITA_FF_LOG(
+        "KAGE VITA FIRST FRAME: bid40=%.40s phase=readback "
+        "present=%u surface=%s fbo=%u attach_arg=%u att_calls=%u "
+        "available=%u status=0x%08x attempted=%u sync=0x%08x/0x%08x "
+        "read=0x%08x restore=0x%08x canary=%u hash=0x%08x "
+        "nonblack=%u rgba=%08x end=ff",
+        ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)present_index,
+        surface, (unsigned)framebuffer,
+        (unsigned)s_first_frame.manager_color_attach_arg,
+        (unsigned)s_first_frame.manager_color_attach_calls,
+        (unsigned)available, (unsigned)status, (unsigned)attempted,
+        (unsigned)sync_pre_error, (unsigned)sync_error,
+        (unsigned)read_error, (unsigned)restore_error, canary_ok,
+        (unsigned)hash,
+        (unsigned)((guarded.pixel & 0x00ffffffu) != 0u),
+        (unsigned)guarded.pixel);
+}
+
+static void gl_vita_first_frame_readback(uint32_t present_index)
+{
+    GLenum pre_error;
+    GLenum sync_error;
+
+    if (gl_vita_first_frame_boundary_index(present_index) < 0)
+        return;
+    pre_error = glGetError();
+    glFinish();
+    sync_error = glGetError();
+#if !defined(ISAAC_VITA_DIRECT_DEFAULT)
+    gl_vita_first_frame_readback_surface(
+        present_index, "manager", (GLuint)s_first_frame.manager_fbo,
+        GL_VITA_FF_LOGICAL_WIDTH / 2,
+        GL_VITA_FF_LOGICAL_HEIGHT / 2,
+        s_first_frame.manager_fbo != 0u,
+        pre_error, sync_error);
+#endif
+    gl_vita_first_frame_readback_surface(
+        present_index, "default", 0u,
+        /* vitaGL flips default-FBO readback Y, so GL row 272 is physical
+         * scanout row 271 sampled by the queue callback. */
+        GL_VITA_FF_DISPLAY_WIDTH / 2,
+        GL_VITA_FF_DISPLAY_HEIGHT / 2,
+        1,
+        pre_error, sync_error);
+}
+
+#if defined(ISAAC_VITA_KNOWN_COLOR_PROBE)
+static void gl_vita_known_color_clear(uint32_t present_index)
+{
+    gl_vita_known_color_clear_state state;
+    GLint saved_read = 0;
+    GLint saved_draw = 0;
+    GLint viewport[4] = { 0, 0, GL_VITA_FF_DISPLAY_WIDTH,
+                          GL_VITA_FF_DISPLAY_HEIGHT };
+    GLboolean color_mask[4] = { 1u, 1u, 1u, 1u };
+    GLfloat clear_color[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    GLboolean scissor_enabled;
+
+    gl_vita_typed_invalidate_viewport();
+    memset(&state, 0, sizeof state);
+    state.present_index = present_index;
+    state.pre_error = (uint32_t)glGetError();
+    scissor_enabled = glIsEnabled((GLenum)GL_VITA_FF_SCISSOR_TEST);
+    state.saved_scissor = (uint32_t)(scissor_enabled != 0u);
+    glGetIntegerv(
+        (GLenum)GL_VITA_FF_READ_FRAMEBUFFER_BINDING, &saved_read);
+    glGetIntegerv((GLenum)GL_VITA_FF_FRAMEBUFFER_BINDING, &saved_draw);
+    state.saved_read_framebuffer = (uint32_t)saved_read;
+    state.saved_draw_framebuffer = (uint32_t)saved_draw;
+    if (scissor_enabled || saved_draw != 0) {
+        state.post_error = (uint32_t)glGetError();
+        s_known_color_clear = state;
+        return;
+    }
+
+    state.attempted = 1u;
+    glGetIntegerv((GLenum)GL_VITA_FF_VIEWPORT, viewport);
+    glGetBooleanv((GLenum)GL_VITA_FF_COLOR_WRITEMASK, color_mask);
+    glGetFloatv((GLenum)GL_VITA_FF_COLOR_CLEAR_VALUE, clear_color);
+
+    memcpy(state.saved_viewport, viewport, sizeof viewport);
+    state.saved_color_mask =
+        ((uint32_t)(color_mask[0] != 0u) << 0u) |
+        ((uint32_t)(color_mask[1] != 0u) << 1u) |
+        ((uint32_t)(color_mask[2] != 0u) << 2u) |
+        ((uint32_t)(color_mask[3] != 0u) << 3u);
+
+    glViewport(0, 0, GL_VITA_FF_DISPLAY_WIDTH, GL_VITA_FF_DISPLAY_HEIGHT);
+    glColorMask(1u, 1u, 1u, 1u);
+    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    glClear((GLbitfield)GL_VITA_FF_COLOR_BUFFER_BIT);
+
+    glClearColor(clear_color[0], clear_color[1],
+                 clear_color[2], clear_color[3]);
+    glColorMask(color_mask[0], color_mask[1],
+                color_mask[2], color_mask[3]);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    state.post_error = (uint32_t)glGetError();
+    s_known_color_clear = state;
+    gl_vita_first_frame_increment(&s_first_frame.control_clears);
+}
+#endif
+
+#if !defined(ISAAC_VITA_DIRECT_DEFAULT)
+static void gl_vita_first_frame_control_clear(uint32_t present_index)
+{
+    GLint framebuffer = 0;
+    GLint viewport[4] = { 0, 0, GL_VITA_FF_DISPLAY_WIDTH,
+                          GL_VITA_FF_DISPLAY_HEIGHT };
+    GLboolean color_mask[4] = { 1u, 1u, 1u, 1u };
+    GLfloat clear_color[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    GLboolean scissor_enabled;
+    GLenum pre_error;
+    GLenum post_error;
+
+    gl_vita_typed_invalidate_viewport();
+    pre_error = glGetError();
+    glGetIntegerv((GLenum)GL_VITA_FF_FRAMEBUFFER_BINDING, &framebuffer);
+    glGetIntegerv((GLenum)GL_VITA_FF_VIEWPORT, viewport);
+    glGetBooleanv((GLenum)GL_VITA_FF_COLOR_WRITEMASK, color_mask);
+    glGetFloatv((GLenum)GL_VITA_FF_COLOR_CLEAR_VALUE, clear_color);
+    scissor_enabled = glIsEnabled((GLenum)GL_VITA_FF_SCISSOR_TEST);
+
+    glBindFramebuffer((GLenum)GL_VITA_FF_FRAMEBUFFER, 0u);
+    glViewport(0, 0, GL_VITA_FF_DISPLAY_WIDTH, GL_VITA_FF_DISPLAY_HEIGHT);
+    if (scissor_enabled)
+        glDisable((GLenum)GL_VITA_FF_SCISSOR_TEST);
+    glColorMask(1u, 1u, 1u, 1u);
+    glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+    glClear((GLbitfield)GL_VITA_FF_COLOR_BUFFER_BIT);
+    glClearColor(clear_color[0], clear_color[1],
+                 clear_color[2], clear_color[3]);
+    glColorMask(color_mask[0], color_mask[1],
+                color_mask[2], color_mask[3]);
+    if (scissor_enabled)
+        glEnable((GLenum)GL_VITA_FF_SCISSOR_TEST);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    glBindFramebuffer(
+        (GLenum)GL_VITA_FF_FRAMEBUFFER, (GLuint)framebuffer);
+    post_error = glGetError();
+    gl_vita_first_frame_increment(&s_first_frame.control_clears);
+
+    if (present_index == 0u) {
+        GL_VITA_FF_LOG(
+            "KAGE VITA FIRST FRAME: bid40=%.40s phase=control-clear "
+            "range=[0,%u) result=gpu-clear-fbo0 saved_fbo=%u "
+            "pre_error=0x%08x post_error=0x%08x",
+            ISAAC_VITA_FIRST_FRAME_BUILD_ID,
+            (unsigned)ISAAC_VITA_FIRST_FRAME_CLEAR_END_PRESENT,
+            (unsigned)framebuffer, (unsigned)pre_error,
+            (unsigned)post_error);
+    }
+}
+
+static void gl_vita_first_frame_blit(uint32_t present_index)
+{
+    uint32_t fbo = s_first_frame.manager_fbo;
+    GLenum status;
+    GLenum pre_error;
+    GLenum post_error;
+    GLboolean scissor_enabled;
+    uint32_t result_bit;
+    const char *result;
+
+    if (!fbo) {
+        gl_vita_first_frame_increment(&s_first_frame.blit_no_manager);
+        result_bit = 1u;
+        result = "skip-zero-manager";
+        status = 0u;
+        pre_error = 0u;
+        post_error = 0u;
+    } else {
+        status = glCheckNamedFramebufferStatus(
+            (GLuint)fbo, (GLenum)GL_VITA_FF_FRAMEBUFFER);
+        if (status != (GLenum)GL_VITA_FF_FRAMEBUFFER_COMPLETE) {
+            gl_vita_first_frame_increment(&s_first_frame.blit_incomplete);
+            result_bit = 2u;
+            result = "skip-incomplete";
+            pre_error = 0u;
+            post_error = 0u;
+        } else {
+            pre_error = glGetError();
+            scissor_enabled = glIsEnabled(
+                (GLenum)GL_VITA_FF_SCISSOR_TEST);
+            if (scissor_enabled)
+                glDisable((GLenum)GL_VITA_FF_SCISSOR_TEST);
+            gl_vita_first_frame_increment(&s_first_frame.blit_attempts);
+            glBlitNamedFramebuffer(
+                (GLuint)fbo, 0u,
+                0, 0, GL_VITA_FF_LOGICAL_WIDTH,
+                GL_VITA_FF_LOGICAL_HEIGHT,
+                0, GL_VITA_FF_VIEWPORT_Y, GL_VITA_FF_DISPLAY_WIDTH,
+                GL_VITA_FF_VIEWPORT_Y + GL_VITA_FF_LOGICAL_HEIGHT,
+                (GLbitfield)GL_VITA_FF_COLOR_BUFFER_BIT,
+                (GLenum)GL_VITA_FF_NEAREST);
+            post_error = glGetError();
+            if (scissor_enabled)
+                glEnable((GLenum)GL_VITA_FF_SCISSOR_TEST);
+            if (post_error == (GLenum)GL_VITA_FF_NO_ERROR) {
+                gl_vita_first_frame_increment(
+                    &s_first_frame.blit_successes);
+                result_bit = 4u;
+                result = "blit-ok";
+            } else {
+                result_bit = 8u;
+                result = "blit-error";
+            }
+        }
+    }
+
+    if (!(s_first_frame_result_log_mask & result_bit)) {
+        s_first_frame_result_log_mask |= result_bit;
+        GL_VITA_FF_LOG(
+            "KAGE VITA FIRST FRAME: bid40=%.40s phase=explicit-blit "
+            "present=%u result=%s manager_fbo=%u status=0x%08x "
+            "pre_error=0x%08x post_error=0x%08x src=0,0,960,540 "
+            "dst=0,2,960,542",
+            ISAAC_VITA_FIRST_FRAME_BUILD_ID, (unsigned)present_index,
+            result, (unsigned)fbo, (unsigned)status,
+            (unsigned)pre_error, (unsigned)post_error);
+    }
+}
+#endif
+
+void gl_vita_backend_first_frame_before_present(uint32_t present_index)
+{
+    gl_vita_first_frame_queue_poll(present_index);
+#if defined(ISAAC_VITA_KNOWN_COLOR_PROBE)
+    if (present_index == ISAAC_VITAGL_KNOWN_COLOR_PRESENT_INDEX)
+        gl_vita_known_color_clear(present_index);
+#endif
+#if defined(ISAAC_VITA_DIRECT_DEFAULT)
+    if (present_index <= 1u)
+        gl_vita_first_frame_log_summary(
+            "true-direct-default-passive", present_index);
+    gl_vita_first_frame_readback(present_index);
+#else
+    if (present_index < ISAAC_VITA_FIRST_FRAME_CLEAR_END_PRESENT) {
+        gl_vita_first_frame_control_clear(present_index);
+        gl_vita_first_frame_readback(present_index);
+        return;
+    }
+    if (present_index < ISAAC_VITA_FIRST_FRAME_BLIT_END_PRESENT) {
+        if (present_index == ISAAC_VITA_FIRST_FRAME_CLEAR_END_PRESENT)
+            gl_vita_first_frame_log_summary("control-clear-complete",
+                                            present_index);
+        gl_vita_first_frame_blit(present_index);
+        if (present_index + 1u ==
+                ISAAC_VITA_FIRST_FRAME_BLIT_END_PRESENT) {
+            gl_vita_first_frame_log_summary("explicit-blit-complete",
+                                            present_index + 1u);
+            s_first_frame_final_logged = 1u;
+        }
+        gl_vita_first_frame_readback(present_index);
+        return;
+    }
+    if (!s_first_frame_final_logged) {
+        gl_vita_first_frame_log_summary("explicit-blit-complete",
+                                        present_index);
+        s_first_frame_final_logged = 1u;
+    }
+    gl_vita_first_frame_readback(present_index);
+#endif
+}
+
+#undef GL_VITA_FF_LOG
+#endif
+
+#if !defined(ISAAC_GL_VITA_BACKEND_ORACLE)
+void isaac_vita_log(const char *format, ...);
+
+static IsaacVitaGlDisplaySurfaceStatus s_display_surface_status;
+static volatile uint32_t s_display_surface_status_valid;
+
+void isaac_vita_vitagl_display_surface_status(
+    const IsaacVitaGlDisplaySurfaceStatus *status)
+{
+    if (!status || status->size != sizeof(*status)) {
+        memset(&s_display_surface_status, 0,
+               sizeof(s_display_surface_status));
+        __sync_synchronize();
+        s_display_surface_status_valid = 2u;
+        isaac_vita_log(
+            "KAGE VITA DISPLAY SURFACE: profile=dedicated-scanout-v1 "
+            "status=invalid ptr=0x%08x size=%u expected=%u",
+            (unsigned)(uintptr_t)status,
+            status ? (unsigned)status->size : 0u,
+            (unsigned)sizeof(*status));
+        return;
+    }
+
+    s_display_surface_status = *status;
+    __sync_synchronize();
+    s_display_surface_status_valid = 1u;
+    isaac_vita_log(
+        "KAGE VITA DISPLAY SURFACE: profile=dedicated-scanout-v1 "
+        "size=%u count=%u dedicated=%u system=%u fail=%u/%u "
+        "b0=%08x/%08x/%08x/%u/%08x/%08x "
+        "b1=%08x/%08x/%08x/%u/%08x/%08x "
+        "b2=%08x/%08x/%08x/%u/%08x/%08x",
+        (unsigned)status->display_size, (unsigned)status->buffer_count,
+        (unsigned)status->dedicated_count,
+        (unsigned)status->system_app_mode,
+        (unsigned)status->failure_stage,
+        (unsigned)status->failure_index,
+        (unsigned)status->alloc_result[0],
+        (unsigned)status->get_base_result[0],
+        (unsigned)status->map_result[0],
+        (unsigned)status->dedicated[0],
+        (unsigned)status->color_init_result[0],
+        (unsigned)status->sync_create_result[0],
+        (unsigned)status->alloc_result[1],
+        (unsigned)status->get_base_result[1],
+        (unsigned)status->map_result[1],
+        (unsigned)status->dedicated[1],
+        (unsigned)status->color_init_result[1],
+        (unsigned)status->sync_create_result[1],
+        (unsigned)status->alloc_result[2],
+        (unsigned)status->get_base_result[2],
+        (unsigned)status->map_result[2],
+        (unsigned)status->dedicated[2],
+        (unsigned)status->color_init_result[2],
+        (unsigned)status->sync_create_result[2]);
+}
+
+int gl_vita_backend_get_display_surface_status(
+    IsaacVitaGlDisplaySurfaceStatus *status)
+{
+    uint32_t valid = s_display_surface_status_valid;
+
+    if (valid != 1u || !status)
+        return 0;
+    __sync_synchronize();
+    *status = s_display_surface_status;
+    return 1;
+}
+
+void isaac_vita_vitagl_display_surface_lifecycle_failure(
+    const char *site, int32_t result)
+{
+    isaac_vita_log(
+        "KAGE VITA DISPLAY SURFACE LIFECYCLE FAILURE: "
+        "profile=dedicated-scanout-v1 site=%s result=0x%08x "
+        "action=fail-closed",
+        site ? site : "unknown", (unsigned)result);
+}
+
+/* Strong project-side endpoints for the weak vitaGL overlay hooks.  Every
+ * current non-splash reserve/scene-reset path runs under typed guest GL
+ * dispatch and becomes one exact guest fault.  If a future native path calls
+ * one outside an active guest CPU, it still durable-logs and flushes the
+ * profile before guest_gl_backend_fault fail-closes via host abort. */
+void isaac_vita_vitagl_reserve_failure(
+    const char *site, int32_t result, const void *buffer,
+    uint32_t vertex_ring_bytes, uint32_t fragment_ring_bytes)
+{
+    isaac_vita_log(
+        "KAGE VITA GXM RESERVE FAILURE: profile=gxm-io-v1 "
+        "site=%s result=0x%08x "
+        "buffer=0x%08x vertex_ring=%u fragment_ring=%u",
+        site ? site : "unknown", (unsigned)result,
+        (unsigned)(uintptr_t)buffer, (unsigned)vertex_ring_bytes,
+        (unsigned)fragment_ring_bytes);
+    kage_vita_io_profile_report("gxm-reserve");
+    guest_gl_backend_fault(
+        (uint32_t)result, "vitaGL default uniform reserve failed");
+}
+
+void isaac_vita_vitagl_scene_failure(
+    const char *site, int32_t result, const void *target, uint32_t frame)
+{
+    isaac_vita_log(
+        "KAGE VITA GXM SCENE FAILURE: profile=gxm-io-v1 "
+        "site=%s result=0x%08x target=0x%08x frame=%u",
+        site ? site : "unknown", (unsigned)result,
+        (unsigned)(uintptr_t)target, (unsigned)frame);
+    kage_vita_io_profile_report("scene-begin");
+    guest_gl_backend_fault(
+        (uint32_t)result, "vitaGL scene begin failed");
+}
+#endif
+
+#if defined(ISAAC_GL_VITA_BACKEND_ORACLE)
+void isaac_gl_vita_oracle_rt_log(const char *format, ...);
+void isaac_gl_vita_oracle_rt_profile_report(const char *reason);
+void isaac_gl_vita_oracle_rt_fault(uint32_t result, const char *message);
+# define ISAAC_VITAGL_RT_LOG isaac_gl_vita_oracle_rt_log
+# define ISAAC_VITAGL_RT_REPORT isaac_gl_vita_oracle_rt_profile_report
+# define ISAAC_VITAGL_RT_FAULT isaac_gl_vita_oracle_rt_fault
+#else
+# define ISAAC_VITAGL_RT_LOG isaac_vita_log
+# define ISAAC_VITAGL_RT_REPORT kage_vita_io_profile_report
+# define ISAAC_VITAGL_RT_FAULT guest_gl_backend_fault
+#endif
+
+void isaac_vita_vitagl_render_target_event(
+    const IsaacVitaGlRenderTargetTelemetry *event)
+{
+    uint32_t fault_result;
+
+    if (!event) {
+        ISAAC_VITAGL_RT_LOG(
+            "KAGE VITA GXM RT FAILURE: profile=gxm-io-v1 "
+            "site=render-target:null-event");
+        ISAAC_VITAGL_RT_REPORT("render-target-acquire");
+        ISAAC_VITAGL_RT_FAULT(
+            0x805b0004u, "vitaGL render-target telemetry was null");
+        return;
+    }
+
+#if defined(ISAAC_VITA_IO_PROFILE)
+    /* The overlay reports consumption of the early reserve, and every
+     * transactional failure/recovery, at the actual scene-reset FBO boundary.
+     * Sample the first 1024x1024 event there without changing its recipe. */
+    if (event->width == 1024u && event->height == 1024u && event->site &&
+            !strncmp(event->site, "scene_reset:framebuffer:", 24u)) {
+        kage_vita_backend_memory_snapshot_at_first_fbo(
+            event->first_result, event->first_target);
+    }
+#endif
+
+    ISAAC_VITAGL_RT_LOG(
+        "KAGE VITA GXM RT %s: profile=gxm-io-v1 site=%.42s "
+        "f=0x%08x/0x%08x r=0x%08x/0x%08x fin=0x%08x fc=%u del=0x%08x "
+        "t=%u full=%u dup=%u inv=%u p=%u,%u,%u,%u "
+        "drain=%u live=%u refs=%u "
+        "wh=%ux%u frame=%u",
+        event->recovered ? "RECOVERED" : "FAILURE",
+        event->site ? event->site : "unknown",
+        (unsigned)event->first_result,
+        (unsigned)(uintptr_t)event->first_target,
+        (unsigned)event->retry_result,
+        (unsigned)(uintptr_t)event->retry_target,
+        (unsigned)event->finish_result,
+        (unsigned)event->finish_called,
+        (unsigned)event->destroy_result,
+        (unsigned)event->retry_attempted, (unsigned)event->pool_full,
+        (unsigned)event->pending_duplicate,
+        (unsigned)event->invariant_failure,
+        (unsigned)event->pending[0], (unsigned)event->pending[1],
+        (unsigned)event->pending[2], (unsigned)event->pending[3],
+        (unsigned)event->drained_targets, (unsigned)event->live_targets,
+        (unsigned)event->reference_sum, (unsigned)event->width,
+        (unsigned)event->height, (unsigned)event->frame);
+    if (event->recovered)
+        return;
+
+    ISAAC_VITAGL_RT_REPORT("render-target-acquire");
+    if (event->pool_full) {
+        fault_result = 0x805b0027u;
+    } else if (event->invariant_failure || event->pending_duplicate) {
+        fault_result = 0x805b0004u;
+    } else if (event->retry_attempted) {
+        fault_result = (uint32_t)event->retry_result;
+    } else {
+        fault_result = (uint32_t)event->first_result;
+    }
+    if (!fault_result)
+        fault_result = event->finish_result ?
+            (uint32_t)event->finish_result :
+            (event->destroy_result ? (uint32_t)event->destroy_result :
+             0x805b0004u);
+    ISAAC_VITAGL_RT_FAULT(
+        fault_result, "vitaGL render-target acquire failed");
+}
+
+#undef ISAAC_VITAGL_RT_LOG
+#undef ISAAC_VITAGL_RT_REPORT
+#undef ISAAC_VITAGL_RT_FAULT
+
+_Static_assert(sizeof s_missing_symbols / sizeof s_missing_symbols[0] ==
+               GL_VITA_MISSING_COUNT,
+               "Vita GL missing-symbol inventory/count drifted");
+
+static void gl_vita_rbo_reset(void)
+{
+    memset(s_renderbuffers, 0, sizeof s_renderbuffers);
+    s_bound_renderbuffer = 0u;
+}
+
+static gl_vita_renderbuffer_record *gl_vita_rbo_find(guest_gl_uint name)
+{
+    size_t index;
+
+    if (!name)
+        return NULL;
+    for (index = 0u; index < GL_VITA_RBO_CAPACITY; ++index) {
+        if (s_renderbuffers[index].name == name)
+            return &s_renderbuffers[index];
+    }
+    return NULL;
+}
+
+static gl_vita_renderbuffer_record *gl_vita_rbo_add(guest_gl_uint name)
+{
+    gl_vita_renderbuffer_record *record;
+    size_t index;
+
+    record = gl_vita_rbo_find(name);
+    if (record) {
+        record->internal_format = 0u;
+        record->width = 0;
+        record->height = 0;
+        return record;
+    }
+    for (index = 0u; index < GL_VITA_RBO_CAPACITY; ++index) {
+        if (!s_renderbuffers[index].name) {
+            s_renderbuffers[index].name = name;
+            s_renderbuffers[index].internal_format = 0u;
+            s_renderbuffers[index].width = 0;
+            s_renderbuffers[index].height = 0;
+            return &s_renderbuffers[index];
+        }
+    }
+    s_last_error = "Vita GL renderbuffer registry exhausted";
+    return NULL;
+}
+
+static size_t gl_vita_rbo_free_count(void)
+{
+    size_t free_count = 0u;
+    size_t index;
+
+    for (index = 0u; index < GL_VITA_RBO_CAPACITY; ++index) {
+        if (!s_renderbuffers[index].name)
+            ++free_count;
+    }
+    return free_count;
+}
+
+static void gl_vita_rbo_remove(guest_gl_uint name)
+{
+    gl_vita_renderbuffer_record *record = gl_vita_rbo_find(name);
+
+    if (record)
+        memset(record, 0, sizeof *record);
+    if (s_bound_renderbuffer == name)
+        s_bound_renderbuffer = 0u;
+}
+
+int gl_vita_backend_register_renderbuffer(
+    uint32_t renderbuffer, uint32_t internal_format,
+    int32_t width, int32_t height)
+{
+    gl_vita_renderbuffer_record *record;
+
+    if (!s_installed) {
+        s_last_error = "Vita GL renderbuffer registration before install";
+        return 0;
+    }
+    if (!renderbuffer || width < 0 || height < 0) {
+        s_last_error = "Vita GL invalid native renderbuffer registration";
+        return 0;
+    }
+    record = gl_vita_rbo_add((guest_gl_uint)renderbuffer);
+    if (!record)
+        return 0;
+    record->internal_format = (guest_gl_enum)internal_format;
+    record->width = (guest_gl_sizei)width;
+    record->height = (guest_gl_sizei)height;
+    s_bound_renderbuffer = (guest_gl_uint)renderbuffer;
+    return 1;
+}
+
+void gl_vita_backend_unregister_renderbuffer(uint32_t renderbuffer)
+{
+    gl_vita_rbo_remove((guest_gl_uint)renderbuffer);
+}
+
+static GUEST_NORETURN void gl_vita_rbo_fault(
+    uint32_t token, const char *message)
+{
+    s_last_error = message;
+    guest_gl_backend_fault(token, message);
+}
+
+#if defined(GL_VITA_FBO_TABLE)
+/* Offscreen render-target table.
+ *
+ * Measured rationale (Bundle35, 720x408 display raster, real gameplay; ph120.c
+ * gl(c,f) against ph120.f fbo(d,o), 1494 windows): every present with
+ * offscreen draws (1001 gameplay/pause windows, exactly four such draws per
+ * present) binds five framebuffers and issues five glClear calls, i.e. two
+ * offscreen passes around the display pass, each pass being bind(mgr) ->
+ * attach(surface) -> glClear -> draws -> glClear(GL_DEPTH_BUFFER_BIT) ->
+ * bind(0) (the A02 title-screen trace shows the same shape).  Presents with no
+ * offscreen draws (480 menu windows) issue one clear and one bind.  KAGE owns
+ * a single manager framebuffer ('KAGE VITA READY: ... fbo=<one name>') and
+ * swaps its COLOR_ATTACHMENT0 per pass.  In the pinned vitaGL 73dd57a
+ * glBindFramebuffer only stores a pointer; the GXM scene switch
+ * (sceGxmEndScene/BeginScene = full tile store and reload of a 960x540 RGBA8
+ * surface) is deferred to the next glClear or draw (gxm.c:572 scene_reset,
+ * misc.c:640 glClear), and the stock-reference build has no
+ * STORE_DEPTH_STENCIL, so FBO depth/stencil is neither loaded nor stored
+ * across scenes (gxm.c init_depth_stencil_buffer): every scene starts at the
+ * GXM background depth 1.0 / stencil 0 and a depth clear is only observable
+ * by later draws of the same scene.
+ *
+ * Both policies are exact at the pixel level or an explicit user mode:
+ *  - FBO_CLEAR_ELISION: the colour part of a guest glClear on an offscreen
+ *    target is a no-op when the attached texture is known to hold exactly the
+ *    current clear colour; that knowledge is keyed by texture (vitaGL's
+ *    colour surface is the texture's own storage, shared.h
+ *    _glFramebufferTexture2D, so it survives re-attachment and scene
+ *    switches) and is forgotten by any draw through the texture, any texture
+ *    upload or deletion.  The depth/stencil part is never dropped on its own:
+ *    it is owed and replayed as a native glClear right before the first draw
+ *    on that target (same scene, same values as the stock quad), folded into
+ *    the next native clear of the target, or dropped only where stock vitaGL
+ *    ends that scene anyway (clear or draw on another framebuffer, present,
+ *    framebuffer deletion).  Rare calls whose scene effect is not modelled
+ *    (attachment change, glReadPixels, texture upload/deletion, scissor
+ *    enable) issue the owed clear first.  The guest GL surface
+ *    (gl_surface_generated.h) has no glScissor, glColorMask, glDepthMask,
+ *    glStencilMask, glClearStencil, glDisable, glFinish, glFlush or
+ *    glDrawArrays; vitaGL's clear quad is drawn with an unblended patched
+ *    fragment program (vgl.c:276), disables the fragment program for
+ *    depth/stencil-only clears, and covers the whole surface unless
+ *    GL_SCISSOR_TEST is enabled.  A guest glEnable(GL_SCISSOR_TEST) therefore
+ *    permanently poisons the policy.  Expected effect on the measured frame:
+ *    the trailing depth-only clear of each non-empty pass is dropped (gl(c)
+ *    5 -> 3 per present); a pass that draws nothing into a still-clean
+ *    surface costs no scene and no quad at all.
+ *  - FBO_RASTER_SCALE: colour targets of at least 512x512 logical pixels that
+ *    are defined without pixel data (Isaac's 960x540 surfaces) are allocated
+ *    at NUM/DEN and the viewport is scaled with floor semantics while such a
+ *    target is the draw framebuffer.  Composites sample through normalized
+ *    texture coordinates so only the raster of that layer changes. */
+# define GL_VITA_FBO_COLOR_ATTACHMENT0     0x00008ce0u
+# define GL_VITA_FBO_READ_FRAMEBUFFER      0x00008ca8u
+# define GL_VITA_FBO_COLOR_BUFFER_BIT      0x00004000u
+# define GL_VITA_FBO_DEPTH_BUFFER_BIT      0x00000100u
+# define GL_VITA_FBO_STENCIL_BUFFER_BIT    0x00000400u
+# define GL_VITA_FBO_SCISSOR_TEST          0x00000c11u
+# define GL_VITA_FBO_RECORDS               16u
+
+typedef struct gl_vita_fbo_record {
+    guest_gl_uint name;             /* 0 = free slot */
+    guest_gl_uint color_texture;    /* level-0 2D colour attachment, 0 = unknown */
+    guest_gl_uint depth_renderbuffer;
+    uint8_t scaled;                 /* colour texture lives at NUM/DEN */
+} gl_vita_fbo_record;
+
+static gl_vita_fbo_record s_fbo_records[GL_VITA_FBO_RECORDS];
+
+static gl_vita_fbo_record *gl_vita_fbo_find(guest_gl_uint name)
+{
+    uint32_t index;
+
+    if (!name)
+        return NULL;
+    for (index = 0u; index < GL_VITA_FBO_RECORDS; ++index)
+        if (s_fbo_records[index].name == name)
+            return &s_fbo_records[index];
+    return NULL;
+}
+
+static gl_vita_fbo_record *gl_vita_fbo_acquire(guest_gl_uint name)
+{
+    gl_vita_fbo_record *record = gl_vita_fbo_find(name);
+    uint32_t index;
+
+    if (record || !name)
+        return record;
+    for (index = 0u; index < GL_VITA_FBO_RECORDS; ++index) {
+        if (!s_fbo_records[index].name) {
+            record = &s_fbo_records[index];
+            memset(record, 0, sizeof *record);
+            record->name = name;
+            return record;
+        }
+    }
+    /* Table full: the name simply has no record and keeps stock behaviour. */
+    return NULL;
+}
+
+static void gl_vita_fbo_forget(guest_gl_uint name)
+{
+    gl_vita_fbo_record *record = gl_vita_fbo_find(name);
+
+    if (record)
+        memset(record, 0, sizeof *record);
+}
+
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+/* Colour knowledge keyed by texture name: the texture is known to hold
+ * exactly |bits| in every pixel.  A texture attached to several framebuffers
+ * shares one note, so writes through any of them forget it. */
+typedef struct gl_vita_fbo_color_note {
+    guest_gl_uint texture;          /* 0 = free slot */
+    uint32_t bits[4];               /* exact float bits of the held colour */
+} gl_vita_fbo_color_note;
+
+static gl_vita_fbo_color_note s_fbo_color_notes[GL_VITA_FBO_RECORDS];
+static uint32_t s_fbo_clear_color_bits[4];
+static uint64_t s_fbo_clear_depth_bits;
+static uint8_t s_fbo_elision_poisoned;
+/* Owed depth/stencil clear: the framebuffer that owes it (0 = none), the
+ * buffer bits, and the clamped clear depth it has to be issued with. */
+static guest_gl_uint s_fbo_owed_framebuffer;
+static guest_gl_bitfield s_fbo_owed_mask;
+static uint64_t s_fbo_owed_depth_bits;
+
+static gl_vita_fbo_color_note *gl_vita_fbo_color_find(guest_gl_uint texture)
+{
+    uint32_t index;
+
+    if (!texture)
+        return NULL;
+    for (index = 0u; index < GL_VITA_FBO_RECORDS; ++index)
+        if (s_fbo_color_notes[index].texture == texture)
+            return &s_fbo_color_notes[index];
+    return NULL;
+}
+
+static void gl_vita_fbo_color_forget(guest_gl_uint texture)
+{
+    gl_vita_fbo_color_note *note = gl_vita_fbo_color_find(texture);
+
+    if (note)
+        memset(note, 0, sizeof *note);
+}
+
+static void gl_vita_fbo_color_forget_all(void)
+{
+    memset(s_fbo_color_notes, 0, sizeof s_fbo_color_notes);
+}
+
+/* The texture now holds the current clear colour everywhere.  A full table
+ * simply leaves the texture unknown (stock behaviour). */
+static void gl_vita_fbo_color_remember(guest_gl_uint texture)
+{
+    gl_vita_fbo_color_note *note = gl_vita_fbo_color_find(texture);
+    uint32_t index;
+
+    if (!texture)
+        return;
+    for (index = 0u; !note && index < GL_VITA_FBO_RECORDS; ++index)
+        if (!s_fbo_color_notes[index].texture)
+            note = &s_fbo_color_notes[index];
+    if (!note)
+        return;
+    note->texture = texture;
+    memcpy(note->bits, s_fbo_clear_color_bits, sizeof note->bits);
+}
+#endif
+
+/* Guest names arrive in a guest array; read it only when the bounds are sane,
+ * exactly like vita_glDeleteFramebuffers does. */
+static int gl_vita_fbo_guest_array_valid(
+    guest_gl_sizei count, guest_gl_addr names)
+{
+    return count > 0 && names &&
+        (uint32_t)count <= (UINT32_MAX - names) / 4u;
+}
+#endif
+
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+# if !defined(ISAAC_VITA_FBO_RASTER_SCALE_NUM) || \
+        !defined(ISAAC_VITA_FBO_RASTER_SCALE_DEN)
+#  error "ISAAC_VITA_FBO_RASTER_SCALE needs _NUM and _DEN definitions"
+# endif
+_Static_assert(ISAAC_VITA_FBO_RASTER_SCALE_NUM >= 1 &&
+               ISAAC_VITA_FBO_RASTER_SCALE_DEN >= 2 &&
+               ISAAC_VITA_FBO_RASTER_SCALE_NUM <
+                   ISAAC_VITA_FBO_RASTER_SCALE_DEN &&
+               ISAAC_VITA_FBO_RASTER_SCALE_DEN <= 16,
+               "FBO raster scale must be a proper fraction NUM/DEN, DEN <= 16");
+/* Isaac's world surfaces are 480x270; only its screen-sized 960x540 surfaces
+ * (colour modifier / render / HQX surfaces) reach this edge. */
+# define GL_VITA_FBO_RASTER_MIN_EDGE   512
+# define GL_VITA_SCALED_TEXTURES       32u
+
+typedef struct gl_vita_scaled_texture {
+    guest_gl_uint name;             /* 0 = free slot */
+    guest_gl_int internal_format;
+    guest_gl_sizei logical_width;
+    guest_gl_sizei logical_height;
+    guest_gl_enum format;
+    guest_gl_enum type;
+} gl_vita_scaled_texture;
+
+static gl_vita_scaled_texture s_scaled_textures[GL_VITA_SCALED_TEXTURES];
+void isaac_vita_log(const char *format, ...);
+/* Guest texture-unit shadow: which 2D texture name glTexImage2D addresses. */
+static uint32_t s_fbo_active_unit;
+static guest_gl_uint s_fbo_bound_2d[GL_VITA_TEXTURE_UNITS];
+static uint8_t s_fbo_raster_readback_logged;
+static uint8_t s_fbo_raster_respecify_logged;
+
+/* Scale an integer edge by NUM/DEN with mathematical floor semantics (same
+ * contract as gl_vita_scale_edge_3_4).  |edge| stays below 2^33 and DEN <= 16,
+ * so the product cannot overflow int64_t. */
+static int64_t gl_vita_fbo_scale_edge(int64_t edge)
+{
+    int64_t numerator = edge * ISAAC_VITA_FBO_RASTER_SCALE_NUM;
+    int64_t scaled = numerator / ISAAC_VITA_FBO_RASTER_SCALE_DEN;
+
+    if (numerator % ISAAC_VITA_FBO_RASTER_SCALE_DEN < 0)
+        --scaled;
+    return scaled;
+}
+
+static guest_gl_sizei gl_vita_fbo_scale_extent(guest_gl_sizei extent)
+{
+    int64_t scaled = gl_vita_fbo_scale_edge((int64_t)extent);
+
+    return scaled < 1 ? 1 : (guest_gl_sizei)scaled;
+}
+
+static gl_vita_scaled_texture *gl_vita_scaled_find(guest_gl_uint name)
+{
+    uint32_t index;
+
+    if (!name)
+        return NULL;
+    for (index = 0u; index < GL_VITA_SCALED_TEXTURES; ++index)
+        if (s_scaled_textures[index].name == name)
+            return &s_scaled_textures[index];
+    return NULL;
+}
+
+static gl_vita_scaled_texture *gl_vita_scaled_acquire(guest_gl_uint name)
+{
+    gl_vita_scaled_texture *record = gl_vita_scaled_find(name);
+    uint32_t index;
+
+    if (record || !name)
+        return record;
+    for (index = 0u; index < GL_VITA_SCALED_TEXTURES; ++index) {
+        if (!s_scaled_textures[index].name) {
+            record = &s_scaled_textures[index];
+            memset(record, 0, sizeof *record);
+            record->name = name;
+            return record;
+        }
+    }
+    return NULL;
+}
+
+static guest_gl_uint gl_vita_fbo_bound_texture(void)
+{
+    return s_fbo_active_unit < GL_VITA_TEXTURE_UNITS ?
+        s_fbo_bound_2d[s_fbo_active_unit] : 0u;
+}
+
+static int gl_vita_fbo_draw_is_scaled(void)
+{
+    const gl_vita_fbo_record *record = gl_vita_fbo_find(s_draw_framebuffer);
+
+    return record && record->scaled;
+}
+
+/* A texture qualifies for the reduced raster only when it is a plain level-0
+ * 2D image of at least MIN_EDGE x MIN_EDGE defined without pixel data, which
+ * is how KAGE creates render-target surfaces. */
+static int gl_vita_fbo_raster_qualifies(
+    guest_gl_enum target, guest_gl_int level,
+    guest_gl_sizei width, guest_gl_sizei height,
+    guest_gl_int border, guest_gl_addr pixels)
+{
+    return target == GL_VITA_TEXTURE_2D && level == 0 && border == 0 &&
+        pixels == 0u &&
+        width >= GL_VITA_FBO_RASTER_MIN_EDGE &&
+        height >= GL_VITA_FBO_RASTER_MIN_EDGE;
+}
+
+static void gl_vita_apply_logical_viewport(void);
+
+/* Propagate a texture's scaled/unscaled state to the framebuffers that
+ * attach it, replaying the viewport if the draw target changed raster. */
+static void gl_vita_fbo_texture_raster_changed(
+    guest_gl_uint texture, uint8_t scaled)
+{
+    uint32_t index;
+    int draw_changed = 0;
+
+    if (!texture)
+        return;
+    for (index = 0u; index < GL_VITA_FBO_RECORDS; ++index) {
+        gl_vita_fbo_record *record = &s_fbo_records[index];
+
+        if (record->color_texture == texture && record->scaled != scaled) {
+            record->scaled = scaled;
+            if (record->name == s_draw_framebuffer)
+                draw_changed = 1;
+        }
+    }
+    if (draw_changed)
+        gl_vita_apply_logical_viewport();
+}
+
+/* Give a scaled texture its full logical allocation back before the guest
+ * writes pixels into it.  vitaGL zero-fills a NULL-defined image
+ * (gpu_alloc_texture), so re-specifying one that was never rendered into is
+ * lossless; one that already holds rendered layers loses them (the stock
+ * upload would have kept them around the sub-rectangle).  The frozen PE is
+ * not known to sub-image its 960x540 surfaces; count and log the first
+ * occurrence so a device run can prove it. */
+static void gl_vita_scaled_forget(guest_gl_uint name, int respecify)
+{
+    gl_vita_scaled_texture *record = gl_vita_scaled_find(name);
+
+    if (!record)
+        return;
+    if (respecify) {
+        GL_VITA_PHASE_COUNT(fbo_raster_respecified);
+        if (!s_fbo_raster_respecify_logged) {
+            s_fbo_raster_respecify_logged = 1u;
+            isaac_vita_log(
+                "[kage-vita] fbo-raster: glTexSubImage2D into scaled "
+                "texture %u re-specified at %dx%d",
+                (unsigned)name, (int)record->logical_width,
+                (int)record->logical_height);
+        }
+        glTexImage2D(
+            (GLenum)GL_VITA_TEXTURE_2D, 0, (GLint)record->internal_format,
+            (GLsizei)record->logical_width, (GLsizei)record->logical_height,
+            0, (GLenum)record->format, (GLenum)record->type, NULL);
+    }
+    memset(record, 0, sizeof *record);
+    gl_vita_fbo_texture_raster_changed(name, 0u);
+}
+
+static void gl_vita_fbo_raster_reset(void)
+{
+    memset(s_scaled_textures, 0, sizeof s_scaled_textures);
+    memset(s_fbo_bound_2d, 0, sizeof s_fbo_bound_2d);
+    s_fbo_active_unit = 0u;
+    s_fbo_raster_readback_logged = 0u;
+    s_fbo_raster_respecify_logged = 0u;
+}
+#endif
+
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+static void gl_vita_fbo_elision_reset(void)
+{
+    /* GL defaults: clear colour (0,0,0,0), clear depth 1.0. */
+    double depth = 1.0;
+
+    memset(s_fbo_clear_color_bits, 0, sizeof s_fbo_clear_color_bits);
+    memcpy(&s_fbo_clear_depth_bits, &depth, sizeof depth);
+    s_fbo_elision_poisoned = 0u;
+    s_fbo_owed_framebuffer = 0u;
+    s_fbo_owed_mask = 0u;
+    s_fbo_owed_depth_bits = 0u;
+    gl_vita_fbo_color_forget_all();
+}
+
+/* One native glClear of |mask| whose depth part lands at exactly
+ * |depth_bits| even when the guest has since changed its clear depth (an
+ * owed depth was captured under the earlier glClearDepth). */
+static void gl_vita_fbo_native_clear(
+    guest_gl_bitfield mask, uint64_t depth_bits)
+{
+    int retarget = (mask & GL_VITA_FBO_DEPTH_BUFFER_BIT) != 0u &&
+        depth_bits != s_fbo_clear_depth_bits;
+    double depth;
+
+    if (retarget) {
+        memcpy(&depth, &depth_bits, sizeof depth);
+        glClearDepth((GLdouble)depth);
+    }
+    GL_VITA_PHASE_COUNT(clear);
+    GL_VITA_TIME_BEGIN();
+    glClear((GLbitfield)mask);
+    GL_VITA_TIME_END(clear);
+    if (retarget) {
+        memcpy(&depth, &s_fbo_clear_depth_bits, sizeof depth);
+        glClearDepth((GLdouble)depth);
+    }
+}
+
+/* Forget the owed clear.  Exact only where stock vitaGL ends the owing
+ * framebuffer's GXM scene (clear or draw on another framebuffer, present,
+ * deletion of the framebuffer): the next scene starts at the background
+ * depth/stencil no matter what the stock clear quad had written. */
+static void gl_vita_fbo_owed_drop(void)
+{
+    s_fbo_owed_mask = 0u;
+    s_fbo_owed_framebuffer = 0u;
+}
+
+/* Issue the owed clear now.  Exact at any point before a scene-ending event,
+ * because stock vitaGL kept that scene open with no other depth/stencil
+ * write in between; the caller places it BEFORE the native call whose scene
+ * effect it does not model (vitaGL sets dirty_framebuffer on an attachment
+ * change, shared.h:1384, so the quad must precede it).  A framebuffer bound
+ * away from without any clear or draw still owes: rebind natively for the
+ * quad, which vitaGL treats as a pointer store. */
+static void gl_vita_fbo_owed_materialize(void)
+{
+    int rebind;
+
+    if (!s_fbo_owed_mask)
+        return;
+    rebind = s_fbo_owed_framebuffer != s_draw_framebuffer;
+    if (rebind) {
+        glBindFramebuffer(
+            (GLenum)GL_VITA_DRAW_FRAMEBUFFER, (GLuint)s_fbo_owed_framebuffer);
+    }
+    gl_vita_fbo_native_clear(s_fbo_owed_mask, s_fbo_owed_depth_bits);
+    if (rebind) {
+        glBindFramebuffer(
+            (GLenum)GL_VITA_DRAW_FRAMEBUFFER, (GLuint)s_draw_framebuffer);
+    }
+    GL_VITA_PHASE_COUNT(clear_replayed);
+    gl_vita_fbo_owed_drop();
+}
+
+/* A clear or draw on |framebuffer| makes stock vitaGL's scene_reset end the
+ * scene of any other framebuffer, taking its depth/stencil with it. */
+static void gl_vita_fbo_owed_enter(guest_gl_uint framebuffer)
+{
+    if (s_fbo_owed_mask && s_fbo_owed_framebuffer != framebuffer)
+        gl_vita_fbo_owed_drop();
+}
+
+/* Guest glClear: nonzero when the request is fully absorbed, i.e. its colour
+ * part cannot change a pixel (attached texture known to hold the clear
+ * colour) and its depth/stencil part is now owed.  The default framebuffer
+ * and unknown, poisoned or invalid requests take the native path. */
+static int gl_vita_fbo_clear_defer(guest_gl_bitfield mask)
+{
+    const gl_vita_fbo_record *record;
+
+    gl_vita_fbo_owed_enter(s_draw_framebuffer);
+    if (s_fbo_elision_poisoned || s_draw_framebuffer == 0u)
+        return 0;
+    record = gl_vita_fbo_find(s_draw_framebuffer);
+    if (!record)
+        return 0;
+    if (mask & ~(GL_VITA_FBO_COLOR_BUFFER_BIT |
+                 GL_VITA_FBO_DEPTH_BUFFER_BIT |
+                 GL_VITA_FBO_STENCIL_BUFFER_BIT))
+        return 0;
+    if (mask & GL_VITA_FBO_COLOR_BUFFER_BIT) {
+        const gl_vita_fbo_color_note *note =
+            gl_vita_fbo_color_find(record->color_texture);
+
+        if (!note || memcmp(note->bits, s_fbo_clear_color_bits,
+                            sizeof note->bits) != 0)
+            return 0;
+    }
+    if (mask & GL_VITA_FBO_DEPTH_BUFFER_BIT)
+        s_fbo_owed_depth_bits = s_fbo_clear_depth_bits;
+    s_fbo_owed_mask |= mask & (GL_VITA_FBO_DEPTH_BUFFER_BIT |
+                               GL_VITA_FBO_STENCIL_BUFFER_BIT);
+    if (s_fbo_owed_mask)
+        s_fbo_owed_framebuffer = s_draw_framebuffer;
+    return 1;
+}
+
+/* Native path of a guest glClear: fold the owed bits of this very target
+ * into the same quad (bits the guest requests again are superseded by its
+ * current values) and record what the colour part left behind. */
+static void gl_vita_fbo_clear_native(guest_gl_bitfield mask)
+{
+    gl_vita_fbo_record *record;
+    guest_gl_bitfield merged = mask;
+    uint64_t depth_bits = s_fbo_clear_depth_bits;
+
+    if (mask & ~(GL_VITA_FBO_COLOR_BUFFER_BIT |
+                 GL_VITA_FBO_DEPTH_BUFFER_BIT |
+                 GL_VITA_FBO_STENCIL_BUFFER_BIT)) {
+        /* vitaGL rejects the request with GL_INVALID_VALUE and clears
+         * nothing; settle the owed quad separately, then forward as is. */
+        gl_vita_fbo_owed_materialize();
+        GL_VITA_PHASE_COUNT(clear);
+        GL_VITA_TIME_BEGIN();
+        glClear((GLbitfield)mask);
+        GL_VITA_TIME_END(clear);
+        return;
+    }
+    if (s_fbo_owed_mask && s_fbo_owed_framebuffer == s_draw_framebuffer) {
+        guest_gl_bitfield owed = s_fbo_owed_mask & ~mask;
+
+        merged |= owed;
+        if (owed & GL_VITA_FBO_DEPTH_BUFFER_BIT)
+            depth_bits = s_fbo_owed_depth_bits;
+        gl_vita_fbo_owed_drop();
+    }
+    gl_vita_fbo_native_clear(merged, depth_bits);
+    if (!(mask & GL_VITA_FBO_COLOR_BUFFER_BIT) || s_draw_framebuffer == 0u)
+        return;
+    record = gl_vita_fbo_find(s_draw_framebuffer);
+    if (!record || !record->color_texture)
+        return;
+    if (s_fbo_elision_poisoned)
+        gl_vita_fbo_color_forget(record->color_texture);
+    else
+        gl_vita_fbo_color_remember(record->color_texture);
+}
+
+/* Before the native draw: replay what this target owes (same scene as the
+ * draw, exactly what the stock quad would have left), then forget the colour
+ * of the texture being drawn into.  An untracked attachment (renderbuffer,
+ * non-2D or non-level-0 texture) could alias any note: forget them all. */
+static void gl_vita_fbo_note_draw(void)
+{
+    const gl_vita_fbo_record *record;
+
+    gl_vita_fbo_owed_enter(s_draw_framebuffer);
+    gl_vita_fbo_owed_materialize();
+    if (s_draw_framebuffer == 0u)
+        return;
+    record = gl_vita_fbo_find(s_draw_framebuffer);
+    if (record && record->color_texture)
+        gl_vita_fbo_color_forget(record->color_texture);
+    else
+        gl_vita_fbo_color_forget_all();
+}
+
+/* vglSwapBuffers ends the current scene and forces a fresh one at the next
+ * clear or draw (gxm.c:930 needs_scene_reset): an owed depth/stencil clear
+ * can no longer reach any draw. */
+void gl_vita_backend_fbo_present(void)
+{
+    gl_vita_fbo_owed_drop();
+}
+#endif
+
+#if defined(GL_VITA_FBO_TABLE)
+/* Attachment edges.  Colour knowledge lives with the texture, so an
+ * attachment change only retargets the record; the owed clear was settled
+ * before the native call (vita_glFramebufferTexture2D).  vitaGL rejects
+ * attachments other than COLOR_ATTACHMENT0 for textures and any colour
+ * renderbuffer (framebuffers.c), so those leave the record untouched or fail
+ * closed to an untracked colour attachment. */
+static void gl_vita_fbo_note_texture_attachment(
+    guest_gl_enum target, guest_gl_enum attachment,
+    guest_gl_enum texture_target, guest_gl_uint texture, guest_gl_int level)
+{
+    gl_vita_fbo_record *record;
+    guest_gl_uint tracked;
+
+    if (target != GL_VITA_FRAMEBUFFER && target != GL_VITA_DRAW_FRAMEBUFFER)
+        return;
+    record = gl_vita_fbo_find(s_draw_framebuffer);
+    if (!record || attachment != GL_VITA_FBO_COLOR_ATTACHMENT0)
+        return;
+    tracked = (texture_target == GL_VITA_TEXTURE_2D && level == 0) ?
+        texture : 0u;
+    record->color_texture = tracked;
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    {
+        uint8_t scaled = tracked && gl_vita_scaled_find(tracked) ? 1u : 0u;
+
+        if (record->scaled != scaled) {
+            record->scaled = scaled;
+            gl_vita_apply_logical_viewport();
+        }
+    }
+#endif
+}
+
+static void gl_vita_fbo_note_renderbuffer_attachment(
+    guest_gl_enum target, guest_gl_enum attachment,
+    guest_gl_uint renderbuffer)
+{
+    gl_vita_fbo_record *record;
+
+    if (target != GL_VITA_FRAMEBUFFER && target != GL_VITA_DRAW_FRAMEBUFFER)
+        return;
+    record = gl_vita_fbo_find(s_draw_framebuffer);
+    if (!record)
+        return;
+    if (attachment == GL_VITA_FBO_COLOR_ATTACHMENT0) {
+        record->color_texture = 0u;
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+        if (record->scaled) {
+            record->scaled = 0u;
+            gl_vita_apply_logical_viewport();
+        }
+#endif
+        return;
+    }
+    record->depth_renderbuffer = renderbuffer;
+}
+
+/* Names handed out by glGenFramebuffers may recycle a deleted record slot. */
+static void gl_vita_fbo_forget_guest_names(
+    guest_gl_sizei count, guest_gl_addr names)
+{
+    guest_gl_sizei index;
+
+    if (!gl_vita_fbo_guest_array_valid(count, names))
+        return;
+    for (index = 0; index < count; ++index)
+        gl_vita_fbo_forget(ld32(names + (uint32_t)index * 4u));
+}
+
+static void gl_vita_fbo_shadow_reset(void)
+{
+    memset(s_fbo_records, 0, sizeof s_fbo_records);
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    gl_vita_fbo_raster_reset();
+#endif
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    gl_vita_fbo_elision_reset();
+#endif
+}
+#endif
+
+#if defined(ISAAC_VITA_DISPLAY_RASTER_720)
+/* Raster geometry: the build passes HEIGHT/NUM/DEN (720x408 at 3/4 or 480x272
+ * at 1/2); the bare legacy gate (host oracles) means 720x408.  The default
+ * framebuffer's viewport is the logical 960x540 scaled by NUM/DEN and centred
+ * vertically, so its Y origin gains (HEIGHT - 540*NUM/DEN)/2 rows: one row at
+ * 720x408 and at 480x272. */
+# if !defined(ISAAC_VITA_DISPLAY_RASTER_WIDTH)
+#  define ISAAC_VITA_DISPLAY_RASTER_WIDTH  720
+#  define ISAAC_VITA_DISPLAY_RASTER_HEIGHT 408
+#  define ISAAC_VITA_DISPLAY_RASTER_NUM    3
+#  define ISAAC_VITA_DISPLAY_RASTER_DEN    4
+# endif
+# define GL_VITA_DISPLAY_RASTER_VIEWPORT_Y \
+    ((ISAAC_VITA_DISPLAY_RASTER_HEIGHT - \
+      540 * ISAAC_VITA_DISPLAY_RASTER_NUM / ISAAC_VITA_DISPLAY_RASTER_DEN) / 2)
+
+/* Scale an integer edge by NUM/DEN with mathematical floor semantics.  C's
+ * signed division truncates toward zero, so adjust the negative remainder
+ * explicitly.  Callers promote the sum of two 32-bit guest values before this
+ * function; multiplying that bounded sum by a small NUM cannot overflow
+ * int64_t. */
+static int64_t gl_vita_scale_edge(int64_t edge)
+{
+    int64_t numerator = edge * ISAAC_VITA_DISPLAY_RASTER_NUM;
+    int64_t scaled = numerator / ISAAC_VITA_DISPLAY_RASTER_DEN;
+
+    if (numerator % ISAAC_VITA_DISPLAY_RASTER_DEN < 0)
+        --scaled;
+    return scaled;
+}
+#endif
+
+#if defined(GL_VITA_LOGICAL_VIEWPORT)
+static void gl_vita_apply_logical_viewport(void)
+{
+    /* This is a native replay rather than a guest request.  Leave the guest
+     * shadow unknown until its next exact glViewport call. */
+    gl_vita_typed_invalidate_viewport();
+    if (s_draw_framebuffer == 0u) {
+#if defined(ISAAC_VITA_DISPLAY_RASTER_720)
+        int64_t left = gl_vita_scale_edge(s_logical_viewport.x);
+        int64_t bottom = gl_vita_scale_edge(s_logical_viewport.y);
+        int64_t right = gl_vita_scale_edge(
+            (int64_t)s_logical_viewport.x + s_logical_viewport.width);
+        int64_t top = gl_vita_scale_edge(
+            (int64_t)s_logical_viewport.y + s_logical_viewport.height);
+
+        /* Scaling a single 32-bit origin and the difference between two edges
+         * remains inside signed 32-bit range.  Add the raster's vertical
+         * centre offset only to the default framebuffer's Y origin. */
+        glViewport(
+            (GLint)left, (GLint)(bottom + GL_VITA_DISPLAY_RASTER_VIEWPORT_Y),
+            (GLsizei)(right - left), (GLsizei)(top - bottom));
+        return;
+#endif
+    }
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    else if (gl_vita_fbo_draw_is_scaled()) {
+        /* The draw target itself lives at NUM/DEN: scale both edges with the
+         * same floor so adjacent guest viewports still tile without gaps. */
+        int64_t left = gl_vita_fbo_scale_edge(s_logical_viewport.x);
+        int64_t bottom = gl_vita_fbo_scale_edge(s_logical_viewport.y);
+        int64_t right = gl_vita_fbo_scale_edge(
+            (int64_t)s_logical_viewport.x + s_logical_viewport.width);
+        int64_t top = gl_vita_fbo_scale_edge(
+            (int64_t)s_logical_viewport.y + s_logical_viewport.height);
+
+        GL_VITA_PHASE_COUNT(fbo_raster_viewports);
+        glViewport(
+            (GLint)left, (GLint)bottom,
+            (GLsizei)(right - left), (GLsizei)(top - bottom));
+        return;
+    }
+#endif
+    glViewport(
+        (GLint)s_logical_viewport.x, (GLint)s_logical_viewport.y,
+        (GLsizei)s_logical_viewport.width,
+        (GLsizei)s_logical_viewport.height);
+}
+
+static void gl_vita_display_raster_reset(void)
+{
+    s_logical_viewport.x = 0;
+    s_logical_viewport.y = 0;
+    s_logical_viewport.width = 960;
+    s_logical_viewport.height = 540;
+}
+#endif
+
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+static gl_vita_fxray_record *gl_vita_fxray_find(guest_gl_uint name)
+{
+    uint32_t index;
+
+    if (!name)
+        return NULL;
+    for (index = 0u; index < GL_VITA_FXRAY_RECORDS; ++index)
+        if (s_fxray_records[index].name == name)
+            return &s_fxray_records[index];
+    return NULL;
+}
+
+static gl_vita_fxray_record *gl_vita_fxray_empty_record(void)
+{
+    uint32_t index;
+
+    for (index = 0u; index < GL_VITA_FXRAY_RECORDS; ++index)
+        if (!s_fxray_records[index].name)
+            return &s_fxray_records[index];
+    return NULL;
+}
+
+static int gl_vita_fxray_has_live_record(void)
+{
+    uint32_t index;
+
+    for (index = 0u; index < GL_VITA_FXRAY_RECORDS; ++index)
+        if (s_fxray_records[index].name)
+            return 1;
+    return 0;
+}
+
+static void gl_vita_fxray_log_fallback(
+    guest_gl_uint name, const char *reason)
+{
+    if (s_fxray_fallback_receipt)
+        return;
+    s_fxray_fallback_receipt = 1u;
+    isaac_vita_log(
+        "KAGE VITA FXRAY ALPHA: phase=fallback reason=%s name=%u "
+        "fail_closed=1 end=fxray",
+        reason, (unsigned)name);
+}
+
+static guest_gl_uint gl_vita_fxray_bound_texture(void)
+{
+    GLint binding = 0;
+
+    glGetIntegerv(GL_VITA_TEXTURE_BINDING_2D, &binding);
+    return binding > 0 ? (guest_gl_uint)(GLuint)binding : 0u;
+}
+
+static int gl_vita_fxray_parameter_is_sample_invariant(guest_gl_enum name)
+{
+    switch (name) {
+    case GL_VITA_TEXTURE_MAG_FILTER:
+    case GL_VITA_TEXTURE_MIN_FILTER:
+    case GL_VITA_TEXTURE_WRAP_S:
+    case GL_VITA_TEXTURE_WRAP_T:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int gl_vita_fxray_attachment_seen(guest_gl_uint name)
+{
+    uint32_t index;
+
+    if (s_fxray_attachment_registry_saturated)
+        return 1;
+    for (index = 0u; index < GL_VITA_FXRAY_ATTACHMENT_RECORDS; ++index)
+        if (s_fxray_attachments[index] == name)
+            return 1;
+    return 0;
+}
+
+static int gl_vita_fxray_extract_alpha(
+    gl_vita_fxray_record *record, guest_gl_addr pixels)
+{
+    const uint8_t *rgba = (const uint8_t *)(uintptr_t)pixels;
+    uint32_t index;
+
+    if (!record || !pixels)
+        return 0;
+    for (index = 0u; index < GL_VITA_FXRAY_PIXELS; ++index) {
+        uint32_t offset = index * 4u;
+
+        if (rgba[offset] != 255u || rgba[offset + 1u] != 255u ||
+                rgba[offset + 2u] != 255u)
+            return 0;
+    }
+    /* Validate the complete source before populating the empty shadow.  A
+     * near-match therefore remains an exact native RGBA upload. */
+    for (index = 0u; index < GL_VITA_FXRAY_PIXELS; ++index) {
+        uint32_t offset = index * 4u;
+
+        record->alpha[index] = rgba[offset + 3u];
+    }
+    return 1;
+}
+
+static void gl_vita_fxray_forget(guest_gl_uint name)
+{
+    gl_vita_fxray_record *record = gl_vita_fxray_find(name);
+
+    if (record)
+        record->name = 0u;
+}
+
+/* Restore one optimized object without requiring a 512 KiB temporary.  A
+ * single 1 KiB row is synchronously consumed by vitaGL 512 times.  This is a
+ * deliberately cold fail-safe: the measured ray path never mutates or
+ * attaches either image after upload. */
+static void gl_vita_fxray_deopt(
+    gl_vita_fxray_record *record, const char *reason)
+{
+    GLint previous = 0;
+    uint32_t y;
+
+    if (!record || !record->name)
+        return;
+    gl_vita_fxray_log_fallback(record->name, reason);
+    glGetIntegerv(GL_VITA_TEXTURE_BINDING_2D, &previous);
+    if ((guest_gl_uint)(GLuint)previous != record->name)
+        glBindTexture(GL_VITA_TEXTURE_2D, (GLuint)record->name);
+    glTexImage2D(
+        GL_VITA_TEXTURE_2D, 0, GL_VITA_RGBA,
+        (GLsizei)GL_VITA_FXRAY_WIDTH, (GLsizei)GL_VITA_FXRAY_HEIGHT,
+        0, GL_VITA_RGBA, GL_VITA_UNSIGNED_BYTE, NULL);
+    for (y = 0u; y < GL_VITA_FXRAY_HEIGHT; ++y) {
+        uint32_t x;
+
+        for (x = 0u; x < GL_VITA_FXRAY_WIDTH; ++x) {
+            uint32_t rgba_offset = x * 4u;
+
+            s_fxray_rgba_row[rgba_offset] = 255u;
+            s_fxray_rgba_row[rgba_offset + 1u] = 255u;
+            s_fxray_rgba_row[rgba_offset + 2u] = 255u;
+            s_fxray_rgba_row[rgba_offset + 3u] =
+                record->alpha[y * GL_VITA_FXRAY_WIDTH + x];
+        }
+        glTexSubImage2D(
+            GL_VITA_TEXTURE_2D, 0, 0, (GLint)y,
+            (GLsizei)GL_VITA_FXRAY_WIDTH, 1,
+            GL_VITA_RGBA, GL_VITA_UNSIGNED_BYTE, s_fxray_rgba_row);
+    }
+    if ((guest_gl_uint)(GLuint)previous != record->name)
+        glBindTexture(GL_VITA_TEXTURE_2D, (GLuint)previous);
+    record->name = 0u;
+}
+
+static void gl_vita_fxray_deopt_all(const char *reason)
+{
+    uint32_t index;
+
+    for (index = 0u; index < GL_VITA_FXRAY_RECORDS; ++index)
+        gl_vita_fxray_deopt(&s_fxray_records[index], reason);
+}
+
+static void gl_vita_fxray_note_attachment(guest_gl_uint name)
+{
+    uint32_t index;
+    gl_vita_fxray_record *record;
+
+    if (!name)
+        return;
+    record = gl_vita_fxray_find(name);
+    if (record)
+        gl_vita_fxray_deopt(record, "framebuffer-attachment");
+    if (gl_vita_fxray_attachment_seen(name))
+        return;
+    for (index = 0u; index < GL_VITA_FXRAY_ATTACHMENT_RECORDS; ++index) {
+        if (!s_fxray_attachments[index]) {
+            s_fxray_attachments[index] = name;
+            return;
+        }
+    }
+    /* Losing an attachment name could later misclassify a reused texture.
+     * Fail closed for the rest of this backend lifetime. */
+    gl_vita_fxray_deopt_all("attachment-registry-full");
+    gl_vita_fxray_log_fallback(0u, "attachment-registry-full");
+    s_fxray_attachment_registry_saturated = 1u;
+}
+
+static void gl_vita_fxray_forget_deleted(
+    guest_gl_sizei count, guest_gl_addr textures)
+{
+    guest_gl_sizei index;
+
+    if (count <= 0)
+        return;
+    if (!textures || (uint32_t)count > GL_VITA_TEXTURE_CAPACITY ||
+            textures > UINT32_MAX - (uint32_t)count * 4u) {
+        /* The native call still owns validation.  Make every live optimized
+         * object ordinary RGBA first if its deletion array is not bounded. */
+        gl_vita_fxray_deopt_all("unbounded-delete-array");
+        gl_vita_fxray_log_fallback(0u, "unbounded-delete-array");
+        s_fxray_attachment_registry_saturated = 1u;
+        return;
+    }
+    for (index = 0; index < count; ++index) {
+        guest_gl_uint deleted =
+            ld32(textures + (uint32_t)index * 4u);
+        uint32_t attachment;
+
+        gl_vita_fxray_forget(deleted);
+        for (attachment = 0u;
+             attachment < GL_VITA_FXRAY_ATTACHMENT_RECORDS;
+             ++attachment) {
+            if (s_fxray_attachments[attachment] == deleted)
+                s_fxray_attachments[attachment] = 0u;
+        }
+    }
+}
+
+static int gl_vita_fxray_try_upload(
+    guest_gl_enum target, guest_gl_int level,
+    guest_gl_int internal_format,
+    guest_gl_sizei width, guest_gl_sizei height,
+    guest_gl_int border, guest_gl_enum format,
+    guest_gl_enum type, guest_gl_addr pixels)
+{
+    guest_gl_uint binding;
+    gl_vita_fxray_record *record;
+
+    if (s_fxray_attachment_registry_saturated ||
+            target != GL_VITA_TEXTURE_2D || level != 0 ||
+            internal_format != GL_VITA_RGBA ||
+            width != (guest_gl_sizei)GL_VITA_FXRAY_WIDTH ||
+            height != (guest_gl_sizei)GL_VITA_FXRAY_HEIGHT || border != 0 ||
+            format != GL_VITA_RGBA || type != GL_VITA_UNSIGNED_BYTE ||
+            !pixels)
+        return 0;
+    binding = gl_vita_fxray_bound_texture();
+    if (!binding || gl_vita_fxray_attachment_seen(binding))
+        return 0;
+    /* Initial immutable uploads are the measured seam.  A second definition
+     * of the same object takes the restoration path below instead of risking
+     * replacement-failure ambiguity for a live alpha shadow. */
+    if (gl_vita_fxray_find(binding))
+        return 0;
+    record = gl_vita_fxray_empty_record();
+    if (!record || !gl_vita_fxray_extract_alpha(record, pixels))
+        return 0;
+
+    {
+        GL_VITA_TIME_BEGIN();
+        glTexImage2D(
+            GL_VITA_TEXTURE_2D, 0, GL_VITA_ALPHA,
+            (GLsizei)GL_VITA_FXRAY_WIDTH, (GLsizei)GL_VITA_FXRAY_HEIGHT,
+            0, GL_VITA_ALPHA, GL_VITA_UNSIGNED_BYTE, record->alpha);
+        GL_VITA_TIME_END(tex_upload);
+    }
+    record->name = binding;
+    if (s_fxray_upload_receipts < GL_VITA_FXRAY_RECORDS) {
+        uint32_t slot = (uint32_t)(record - s_fxray_records);
+
+        ++s_fxray_upload_receipts;
+        isaac_vita_log(
+            "KAGE VITA FXRAY ALPHA: phase=upload hit=%u slot=%u name=%u "
+            "size=256x512 storage=U8_R111 end=fxray",
+            (unsigned)s_fxray_upload_receipts, (unsigned)slot,
+            (unsigned)binding);
+    }
+    return 1;
+}
+
+static void gl_vita_fxray_reset(void)
+{
+    memset(s_fxray_records, 0, sizeof s_fxray_records);
+    memset(s_fxray_attachments, 0, sizeof s_fxray_attachments);
+    s_fxray_attachment_registry_saturated = 0u;
+    /* Receipt counters are deliberately process-lifetime bounded. */
+}
+#endif
+
+static void vita_glActiveTexture(guest_gl_enum texture)
+{
+    kage_vita_world_seam_diag_note_active_texture(texture);
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    /* vitaGL rejects out-of-range units without changing state; mirror that
+     * by marking the unit unknown so no texture qualifies through it. */
+    s_fbo_active_unit = (texture >= GL_VITA_TEXTURE0 &&
+        texture < GL_VITA_TEXTURE0 + GL_VITA_TEXTURE_UNITS) ?
+        texture - GL_VITA_TEXTURE0 : GL_VITA_TEXTURE_UNITS;
+#endif
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    gl_vita_texture_profile_note_active(texture);
+#endif
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    if (texture >= GL_VITA_TEXTURE0 &&
+            texture < GL_VITA_TEXTURE0 + GL_VITA_TEXTURE_UNITS)
+        s_fusion_profile.active_texture =
+            (uint8_t)(texture - GL_VITA_TEXTURE0);
+#endif
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (texture < GL_VITA_TEXTURE0 ||
+            texture >= GL_VITA_TEXTURE0 + GL_VITA_TEXTURE_UNITS) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_invalid);
+        GL_VITA_TIME_BEGIN();
+        glActiveTexture((GLenum)texture);
+        GL_VITA_TIME_END(state);
+        s_gl_typed_state.active_texture_known = 0u;
+        s_gl_typed_state.texture_known = 0u;
+        return;
+    }
+    if (s_gl_typed_state.active_texture_known &&
+            s_gl_typed_state.active_texture ==
+                (uint8_t)(texture - GL_VITA_TEXTURE0)) {
+        GL_VITA_PHASE_COUNT(typed_state_hit_active_texture);
+        return;
+    }
+#endif
+    GL_VITA_TIME_BEGIN();
+    glActiveTexture((GLenum)texture);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    s_gl_typed_state.active_texture =
+        (uint8_t)(texture - GL_VITA_TEXTURE0);
+    s_gl_typed_state.active_texture_known = 1u;
+    GL_VITA_PHASE_COUNT(typed_state_miss);
+#endif
+}
+
+static void vita_glAlphaFunc(guest_gl_enum function, guest_gl_float reference)
+{
+    glAlphaFunc((GLenum)function, (GLfloat)reference);
+}
+
+static void vita_glAttachShader(
+    guest_gl_uint program, guest_gl_uint shader)
+{
+    /* Pinned vitaGL rebinds p->vshader/p->fshader here, which is what its
+     * glGetAttribLocation/glGetUniformLocation read: every cached location
+     * of this generation is stale. */
+    gl_vita_location_cache_invalidate();
+    glAttachShader((GLuint)program, (GLuint)shader);
+}
+
+static void vita_glBindFramebuffer(
+    guest_gl_enum target, guest_gl_uint framebuffer)
+{
+    kage_vita_world_seam_diag_note_bind_framebuffer(target, framebuffer);
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    if (target == GL_VITA_FRAMEBUFFER || target == GL_VITA_DRAW_FRAMEBUFFER)
+        s_fusion_profile.framebuffer = framebuffer;
+#endif
+#if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+    guest_gl_uint previous_draw = s_draw_framebuffer;
+    int changes_draw = target == GL_VITA_FRAMEBUFFER ||
+        target == GL_VITA_DRAW_FRAMEBUFFER;
+#endif
+#if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
+    if (target == GL_VITA_FF_FRAMEBUFFER ||
+            target == GL_VITA_FF_DRAW_FRAMEBUFFER)
+        s_first_frame.current_guest_fbo = framebuffer;
+    gl_vita_first_frame_increment(
+        framebuffer ? &s_first_frame.bind_nonzero :
+                      &s_first_frame.bind_zero);
+#endif
+    GL_VITA_PHASE_COUNT(bind_framebuffer);
+    GL_VITA_TIME_BEGIN();
+    glBindFramebuffer((GLenum)target, (GLuint)framebuffer);
+    GL_VITA_TIME_END(bind_fb);
+#if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+    if (changes_draw) {
+        s_draw_framebuffer = framebuffer;
+# if defined(GL_VITA_FBO_TABLE)
+        (void)gl_vita_fbo_acquire(framebuffer);
+# endif
+# if defined(GL_VITA_LOGICAL_VIEWPORT)
+        if (framebuffer != previous_draw)
+            gl_vita_apply_logical_viewport();
+# else
+        (void)previous_draw;
+# endif
+    }
+#endif
+    gl_vita_typed_invalidate_viewport();
+}
+
+static void vita_glBindTexture(guest_gl_enum target, guest_gl_uint texture)
+{
+    kage_vita_world_seam_diag_note_bind_texture(target, texture);
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    gl_vita_texture_profile_note_bind(target, texture);
+#endif
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    if (target == GL_VITA_TEXTURE_2D &&
+            s_fusion_profile.active_texture < GL_VITA_TEXTURE_UNITS)
+        s_fusion_profile.textures[s_fusion_profile.active_texture] = texture;
+#endif
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (target != GL_VITA_TEXTURE_2D) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_unknown);
+    } else if (texture >= GL_VITA_TEXTURE_CAPACITY) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_invalid);
+        if (s_gl_typed_state.active_texture_known) {
+            s_gl_typed_state.texture_known &= (uint16_t)~(
+                UINT16_C(1) << s_gl_typed_state.active_texture);
+        } else {
+            s_gl_typed_state.texture_known = 0u;
+        }
+    } else if (!s_gl_typed_state.active_texture_known) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_unknown);
+        s_gl_typed_state.texture_known = 0u;
+    } else {
+        uint16_t bit = (uint16_t)(
+            UINT16_C(1) << s_gl_typed_state.active_texture);
+        if ((s_gl_typed_state.texture_known & bit) &&
+                s_gl_typed_state.texture_2d[
+                    s_gl_typed_state.active_texture] == texture) {
+            GL_VITA_PHASE_COUNT(typed_state_hit_bind_texture);
+            return;
+        }
+    }
+#endif
+    GL_VITA_PHASE_COUNT(bind_texture);
+    GL_VITA_TIME_BEGIN();
+    glBindTexture((GLenum)target, (GLuint)texture);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    if (target == GL_VITA_TEXTURE_2D &&
+            s_fbo_active_unit < GL_VITA_TEXTURE_UNITS)
+        s_fbo_bound_2d[s_fbo_active_unit] = texture;
+#endif
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (target == GL_VITA_TEXTURE_2D &&
+            texture < GL_VITA_TEXTURE_CAPACITY &&
+            s_gl_typed_state.active_texture_known) {
+        uint16_t bit = (uint16_t)(
+            UINT16_C(1) << s_gl_typed_state.active_texture);
+        s_gl_typed_state.texture_2d[
+            s_gl_typed_state.active_texture] = texture;
+        s_gl_typed_state.texture_known |= bit;
+        GL_VITA_PHASE_COUNT(typed_state_miss);
+    }
+#endif
+}
+
+static void vita_glBlendFuncSeparate(
+    guest_gl_enum source_rgb, guest_gl_enum destination_rgb,
+    guest_gl_enum source_alpha, guest_gl_enum destination_alpha)
+{
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    int valid = gl_vita_typed_valid_blend_factor(source_rgb) &&
+        gl_vita_typed_valid_blend_factor(destination_rgb) &&
+        gl_vita_typed_valid_blend_factor(source_alpha) &&
+        gl_vita_typed_valid_blend_factor(destination_alpha);
+
+    if (!valid) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_invalid);
+        s_gl_typed_state.blend_known = 0u;
+    } else if (s_gl_typed_state.blend_known &&
+            s_gl_typed_state.blend[0] == source_rgb &&
+            s_gl_typed_state.blend[1] == destination_rgb &&
+            s_gl_typed_state.blend[2] == source_alpha &&
+            s_gl_typed_state.blend[3] == destination_alpha) {
+        GL_VITA_PHASE_COUNT(typed_state_hit_blend);
+        return;
+    }
+#endif
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    s_fusion_profile.blend_source_rgb = source_rgb;
+    s_fusion_profile.blend_destination_rgb = destination_rgb;
+#endif
+    GL_VITA_PHASE_COUNT(state);
+    GL_VITA_TIME_BEGIN();
+    glBlendFuncSeparate(
+        (GLenum)source_rgb, (GLenum)destination_rgb,
+        (GLenum)source_alpha, (GLenum)destination_alpha);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (valid) {
+        s_gl_typed_state.blend[0] = source_rgb;
+        s_gl_typed_state.blend[1] = destination_rgb;
+        s_gl_typed_state.blend[2] = source_alpha;
+        s_gl_typed_state.blend[3] = destination_alpha;
+        s_gl_typed_state.blend_known = 1u;
+        GL_VITA_PHASE_COUNT(typed_state_miss);
+    }
+#endif
+}
+
+static guest_gl_enum vita_glCheckFramebufferStatus(guest_gl_enum target)
+{
+    return (guest_gl_enum)glCheckFramebufferStatus((GLenum)target);
+}
+
+static void vita_glClear(guest_gl_bitfield mask)
+{
+    kage_vita_world_seam_diag_note_clear(mask);
+#if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
+    gl_vita_first_frame_increment(
+        s_first_frame.current_guest_fbo ?
+            &s_first_frame.clear_offscreen :
+            &s_first_frame.clear_default);
+#endif
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    if (gl_vita_fbo_clear_defer(mask)) {
+        /* No colour pixel can change and the depth/stencil part is owed to
+         * the first draw; not touching vitaGL here also leaves its deferred
+         * GXM scene switch unissued. */
+        GL_VITA_PHASE_COUNT(clear_suppressed);
+        return;
+    }
+    gl_vita_fbo_clear_native(mask);
+#else
+    GL_VITA_PHASE_COUNT(clear);
+    GL_VITA_TIME_BEGIN();
+    glClear((GLbitfield)mask);
+    GL_VITA_TIME_END(clear);
+#endif
+}
+
+static void vita_glClearColor(
+    guest_gl_float red, guest_gl_float green,
+    guest_gl_float blue, guest_gl_float alpha)
+{
+    kage_vita_world_seam_diag_note_clear_color(red, green, blue, alpha);
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    {
+        GLfloat native[4];
+
+        native[0] = (GLfloat)red;
+        native[1] = (GLfloat)green;
+        native[2] = (GLfloat)blue;
+        native[3] = (GLfloat)alpha;
+        memcpy(s_fbo_clear_color_bits, native, sizeof native);
+    }
+#endif
+    GL_VITA_TIME_BEGIN();
+    glClearColor((GLfloat)red, (GLfloat)green,
+                 (GLfloat)blue, (GLfloat)alpha);
+    GL_VITA_TIME_END(state);
+}
+
+static void vita_glClearDepth(guest_gl_double depth)
+{
+    /* Desktop OpenGL defines this argument as clampd.  vitaGL 73dd57a
+     * stores it verbatim, so Isaac's deliberate -1000.0 clear depth would
+     * turn into an out-of-clip clear quad instead of the required 0.0. */
+    GLdouble clamped_depth = (GLdouble)depth;
+
+    if (clamped_depth < 0.0)
+        clamped_depth = 0.0;
+    else if (clamped_depth > 1.0)
+        clamped_depth = 1.0;
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    memcpy(&s_fbo_clear_depth_bits, &clamped_depth, sizeof clamped_depth);
+#endif
+    GL_VITA_TIME_BEGIN();
+    glClearDepth(clamped_depth);
+    GL_VITA_TIME_END(state);
+}
+
+static void vita_glCompileShader(guest_gl_uint shader)
+{
+    /* A recompiled shader replaces the GXP an attached program's location
+     * queries read through p->vshader->prog. */
+    gl_vita_location_cache_invalidate();
+    glCompileShader((GLuint)shader);
+}
+
+static guest_gl_uint vita_glCreateProgram(void)
+{
+    guest_gl_uint program;
+
+    /* Program names are recycled from the lowest free vitaGL slot. */
+    gl_vita_location_cache_invalidate();
+    program = (guest_gl_uint)glCreateProgram();
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_program_created(program);
+#endif
+    return program;
+}
+
+static guest_gl_uint vita_glCreateShader(guest_gl_enum type)
+{
+    return (guest_gl_uint)glCreateShader((GLenum)type);
+}
+
+static void vita_glCullFace(guest_gl_enum mode)
+{
+    GL_VITA_PHASE_COUNT(state);
+    GL_VITA_TIME_BEGIN();
+    glCullFace((GLenum)mode);
+    GL_VITA_TIME_END(state);
+}
+
+static void vita_glDeleteFramebuffers(
+    guest_gl_sizei count, guest_gl_addr framebuffers)
+{
+#if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW) || \
+        defined(ISAAC_VITA_PHASE_PROFILE)
+# if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+    int deletes_draw = 0;
+# endif
+# if defined(ISAAC_VITA_PHASE_PROFILE)
+    int deletes_profile = 0;
+# endif
+
+    if (count > 0 && framebuffers &&
+            (uint32_t)count <= (UINT32_MAX - framebuffers) / 4u) {
+        guest_gl_sizei index;
+
+        for (index = 0; index < count; ++index) {
+            guest_gl_uint deleted =
+                ld32(framebuffers + (uint32_t)index * 4u);
+# if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+            if (deleted ==
+                    s_draw_framebuffer) {
+                deletes_draw = s_draw_framebuffer != 0u;
+            }
+# endif
+# if defined(GL_VITA_FBO_TABLE)
+            gl_vita_fbo_forget(deleted);
+# endif
+# if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+            if (deleted && deleted == s_fbo_owed_framebuffer)
+                gl_vita_fbo_owed_drop();
+# endif
+# if defined(ISAAC_VITA_PHASE_PROFILE)
+            if (deleted == s_fusion_profile.framebuffer)
+                deletes_profile = s_fusion_profile.framebuffer != 0u;
+# endif
+        }
+    }
+#endif
+    glDeleteFramebuffers(
+        (GLsizei)count, (const GLuint *)(uintptr_t)framebuffers);
+#if defined(ISAAC_VITA_WORLD_SEAM_DIAG)
+    if (count > 0 && framebuffers &&
+            (uint32_t)count <= (UINT32_MAX - framebuffers) / 4u) {
+        guest_gl_sizei index;
+        for (index = 0; index < count; ++index) {
+            kage_vita_world_seam_diag_note_delete_framebuffer(
+                ld32(framebuffers + (uint32_t)index * 4u));
+        }
+    }
+#endif
+#if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+    if (deletes_draw) {
+        s_draw_framebuffer = 0u;
+# if defined(GL_VITA_LOGICAL_VIEWPORT)
+        gl_vita_apply_logical_viewport();
+# endif
+    }
+#endif
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    if (deletes_profile)
+        s_fusion_profile.framebuffer = 0u;
+#endif
+    gl_vita_typed_invalidate_viewport();
+}
+
+static void vita_glDeleteProgram(guest_gl_uint program)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_program_mutated(program, 1);
+#endif
+    gl_vita_location_cache_invalidate();
+    glDeleteProgram((GLuint)program);
+}
+
+static void vita_glGenFramebuffers(
+    guest_gl_sizei count, guest_gl_addr framebuffers)
+{
+    glGenFramebuffers((GLsizei)count, (GLuint *)(uintptr_t)framebuffers);
+#if defined(GL_VITA_FBO_TABLE)
+    gl_vita_fbo_forget_guest_names(count, framebuffers);
+#endif
+}
+
+static void vita_glBindRenderbuffer(
+    guest_gl_enum target, guest_gl_uint renderbuffer)
+{
+    if (target != GL_VITA_RENDERBUFFER)
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_BIND_RENDERBUFFER,
+            "Vita GL glBindRenderbuffer received an invalid target");
+    if (renderbuffer && !gl_vita_rbo_find(renderbuffer))
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_BIND_RENDERBUFFER,
+            "Vita GL glBindRenderbuffer received an unknown renderbuffer");
+    glBindRenderbuffer((GLenum)target, (GLuint)renderbuffer);
+    s_bound_renderbuffer = renderbuffer;
+}
+
+static void vita_glDeleteRenderbuffers(
+    guest_gl_sizei count, guest_gl_addr renderbuffers)
+{
+    guest_gl_sizei index;
+
+    if (count < 0 || (uint32_t)count > GL_VITA_RBO_CAPACITY ||
+            (count > 0 && (!renderbuffers ||
+             renderbuffers > UINT32_MAX - (uint32_t)count * 4u)))
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_DELETE_RENDERBUFFERS,
+            "Vita GL glDeleteRenderbuffers received an invalid array");
+    glDeleteRenderbuffers(
+        (GLsizei)count, (const GLuint *)(uintptr_t)renderbuffers);
+    for (index = 0; index < count; ++index)
+        gl_vita_rbo_remove(ld32(renderbuffers + (uint32_t)index * 4u));
+}
+
+static void vita_glDeleteShader(guest_gl_uint shader)
+{
+    gl_vita_location_cache_invalidate();
+    glDeleteShader((GLuint)shader);
+}
+
+static void vita_glDeleteTextures(
+    guest_gl_sizei count, guest_gl_addr textures)
+{
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    uint64_t native_started_at;
+    uint64_t native_ended_at;
+    uint64_t post_started_at;
+#endif
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+    gl_vita_fxray_forget_deleted(count, textures);
+#endif
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    /* Do not inspect the guest array for this cache.  vitaGL turns every
+     * deleted bound name into zero, so forgetting all 16 bindings is exact,
+     * bounded, and hostile-pointer safe at this layer. */
+    s_gl_typed_state.texture_known = 0u;
+#endif
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    if (count > 0 && textures &&
+            (uint32_t)count <= (UINT32_MAX - textures) / 4u) {
+        guest_gl_sizei index;
+
+        for (index = 0; index < count; ++index) {
+            guest_gl_uint deleted = ld32(textures + (uint32_t)index * 4u);
+            uint32_t unit;
+
+            for (unit = 0u; unit < GL_VITA_TEXTURE_UNITS; ++unit)
+                if (s_fusion_profile.textures[unit] == deleted)
+                    s_fusion_profile.textures[unit] = 0u;
+        }
+    }
+#endif
+#if defined(GL_VITA_FBO_TABLE)
+    /* Deleting any texture may free an attached colour surface: settle the
+     * owed clear in the current scene first, then forget every colour note.
+     * Scaled records (replaying the viewport if the draw target changes
+     * raster) and the unit shadow drop the names. */
+# if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    gl_vita_fbo_owed_materialize();
+    gl_vita_fbo_color_forget_all();
+# endif
+    if (gl_vita_fbo_guest_array_valid(count, textures)) {
+        guest_gl_sizei index;
+
+        for (index = 0; index < count; ++index) {
+            guest_gl_uint deleted = ld32(textures + (uint32_t)index * 4u);
+            uint32_t slot;
+
+# if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+            gl_vita_scaled_forget(deleted, 0);
+            for (slot = 0u; slot < GL_VITA_TEXTURE_UNITS; ++slot)
+                if (s_fbo_bound_2d[slot] == deleted)
+                    s_fbo_bound_2d[slot] = 0u;
+# endif
+            for (slot = 0u; slot < GL_VITA_FBO_RECORDS; ++slot)
+                if (deleted && s_fbo_records[slot].color_texture == deleted)
+                    s_fbo_records[slot].color_texture = 0u;
+        }
+    }
+#endif
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    /* Keep the native interval independent of the pre-call FXRay/state work. */
+    native_started_at = sceKernelGetProcessTimeWide();
+#endif
+    glDeleteTextures((GLsizei)count,
+                     (const GLuint *)(uintptr_t)textures);
+#if defined(ISAAC_VITA_WORLD_SEAM_DIAG)
+    if (count > 0 && textures &&
+            (uint32_t)count <= (UINT32_MAX - textures) / 4u) {
+        guest_gl_sizei index;
+        for (index = 0; index < count; ++index) {
+            kage_vita_world_seam_diag_note_delete_texture(
+                ld32(textures + (uint32_t)index * 4u));
+        }
+    }
+#endif
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    native_ended_at = sceKernelGetProcessTimeWide();
+    post_started_at = sceKernelGetProcessTimeWide();
+    gl_vita_texture_profile_note_delete(count, textures);
+    gl_vita_texture_profile_note_delete_timing(
+        native_started_at, native_ended_at,
+        post_started_at, sceKernelGetProcessTimeWide());
+#endif
+}
+
+static void vita_glDepthFunc(guest_gl_enum function)
+{
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    int valid = gl_vita_typed_valid_depth_function(function);
+
+    if (!valid) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_invalid);
+        s_gl_typed_state.depth_known = 0u;
+    } else if (s_gl_typed_state.depth_known &&
+            s_gl_typed_state.depth == function) {
+        GL_VITA_PHASE_COUNT(typed_state_hit_depth);
+        return;
+    }
+#endif
+    GL_VITA_PHASE_COUNT(state);
+    GL_VITA_TIME_BEGIN();
+    glDepthFunc((GLenum)function);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (valid) {
+        s_gl_typed_state.depth = function;
+        s_gl_typed_state.depth_known = 1u;
+        GL_VITA_PHASE_COUNT(typed_state_miss);
+    }
+#endif
+}
+
+static void vita_glDisableVertexAttribArray(guest_gl_uint index)
+{
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (index >= GL_VITA_VERTEX_ATTRIBS) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_invalid);
+        s_gl_typed_state.attrib_enable_known = 0u;
+    } else {
+        uint16_t bit = (uint16_t)(UINT16_C(1) << index);
+        if ((s_gl_typed_state.attrib_enable_known & bit) &&
+                !(s_gl_typed_state.attrib_enabled & bit)) {
+            GL_VITA_PHASE_COUNT(typed_state_hit_attrib_toggle);
+            return;
+        }
+    }
+#endif
+    GL_VITA_PHASE_COUNT(attrib_toggle);
+    GL_VITA_TIME_BEGIN();
+    glDisableVertexAttribArray((GLuint)index);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (index < GL_VITA_VERTEX_ATTRIBS) {
+        uint16_t bit = (uint16_t)(UINT16_C(1) << index);
+        s_gl_typed_state.attrib_enabled &= (uint16_t)~bit;
+        s_gl_typed_state.attrib_enable_known |= bit;
+        GL_VITA_PHASE_COUNT(typed_state_miss);
+    }
+#endif
+}
+
+static void vita_glDrawElements(
+    guest_gl_enum mode, guest_gl_sizei count,
+    guest_gl_enum type, guest_gl_addr indices)
+{
+    kage_vita_world_seam_diag_note_draw();
+#if defined(ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY)
+    KageVitaCanonicalQuadResult canonical =
+        kage_vita_canonical_quad_classify(
+            guest_gl_backend_return_rva(), mode, count, type, indices);
+#endif
+#if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
+    gl_vita_first_frame_increment(
+        s_first_frame.current_guest_fbo ?
+            &s_first_frame.draw_offscreen :
+            &s_first_frame.draw_default);
+    s_first_frame.last_draw_fbo = s_first_frame.current_guest_fbo;
+#endif
+    GL_VITA_PHASE_COUNT(draw_elements);
+    gl_vita_fusion_profile_draw(count, type);
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    gl_vita_fbo_note_draw();
+#endif
+#if defined(ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY)
+    switch (canonical) {
+    case KAGE_VITA_CANONICAL_QUAD_OK: {
+        int drawn;
+
+        GL_VITA_TIME_BEGIN();
+        drawn = vglIsaacDrawCanonicalQuads((GLsizei)count);
+        GL_VITA_TIME_END(draw);
+        if (drawn) {
+            GL_VITA_PHASE_COUNT(canonical_quad_hits);
+            GL_VITA_PHASE_ADD(
+                canonical_quad_index_bytes_saved, (uint32_t)count * 2u);
+            return;
+        }
+        GL_VITA_PHASE_COUNT(canonical_quad_driver_fallback);
+        break;
+    }
+    case KAGE_VITA_CANONICAL_QUAD_REJECT_CALLSITE:
+        GL_VITA_PHASE_COUNT(canonical_quad_reject_callsite);
+        break;
+    case KAGE_VITA_CANONICAL_QUAD_REJECT_SHAPE:
+        GL_VITA_PHASE_COUNT(canonical_quad_reject_shape);
+        break;
+    case KAGE_VITA_CANONICAL_QUAD_REJECT_BOUNDS:
+        GL_VITA_PHASE_COUNT(canonical_quad_reject_bounds);
+        break;
+    case KAGE_VITA_CANONICAL_QUAD_REJECT_POINTER:
+        GL_VITA_PHASE_COUNT(canonical_quad_reject_pointer);
+        break;
+    }
+#endif
+    GL_VITA_TIME_BEGIN();
+    glDrawElements((GLenum)mode, (GLsizei)count, (GLenum)type,
+                   (const void *)(uintptr_t)indices);
+    GL_VITA_TIME_END(draw);
+}
+
+static void vita_glEnable(guest_gl_enum capability)
+{
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    if (capability == GL_VITA_BLEND)
+        s_fusion_profile.blend_enabled = 1u;
+#endif
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    /* The guest surface has no glScissor/glDisable, so a scissor enable would
+     * clip every later clear to an unknown box: fail closed for good. */
+    if (capability == GL_VITA_FBO_SCISSOR_TEST && !s_fbo_elision_poisoned) {
+        gl_vita_fbo_owed_materialize();
+        s_fbo_elision_poisoned = 1u;
+        gl_vita_fbo_color_forget_all();
+        GL_VITA_PHASE_COUNT(fbo_elision_poison);
+    }
+#endif
+    GL_VITA_TIME_BEGIN();
+    glEnable((GLenum)capability);
+    GL_VITA_TIME_END(state);
+}
+
+static void vita_glEnableVertexAttribArray(guest_gl_uint index)
+{
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (index >= GL_VITA_VERTEX_ATTRIBS) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_invalid);
+        s_gl_typed_state.attrib_enable_known = 0u;
+    } else {
+        uint16_t bit = (uint16_t)(UINT16_C(1) << index);
+        if ((s_gl_typed_state.attrib_enable_known & bit) &&
+                (s_gl_typed_state.attrib_enabled & bit)) {
+            GL_VITA_PHASE_COUNT(typed_state_hit_attrib_toggle);
+            return;
+        }
+    }
+#endif
+    GL_VITA_PHASE_COUNT(attrib_toggle);
+    GL_VITA_TIME_BEGIN();
+    glEnableVertexAttribArray((GLuint)index);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (index < GL_VITA_VERTEX_ATTRIBS) {
+        uint16_t bit = (uint16_t)(UINT16_C(1) << index);
+        s_gl_typed_state.attrib_enabled |= bit;
+        s_gl_typed_state.attrib_enable_known |= bit;
+        GL_VITA_PHASE_COUNT(typed_state_miss);
+    }
+#endif
+}
+
+static void vita_glGenRenderbuffers(
+    guest_gl_sizei count, guest_gl_addr renderbuffers)
+{
+    guest_gl_sizei index;
+
+    if (count < 0 || (size_t)count > gl_vita_rbo_free_count() ||
+            (count > 0 && (!renderbuffers ||
+             renderbuffers > UINT32_MAX - (uint32_t)count * 4u)))
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_GEN_RENDERBUFFERS,
+            "Vita GL glGenRenderbuffers received an invalid output array");
+    glGenRenderbuffers((GLsizei)count, (GLuint *)(uintptr_t)renderbuffers);
+    for (index = 0; index < count; ++index) {
+        guest_gl_uint name = ld32(
+            renderbuffers + (uint32_t)index * 4u);
+        guest_gl_sizei prior;
+        int duplicate = 0;
+
+        for (prior = 0; prior < index; ++prior) {
+            if (ld32(renderbuffers + (uint32_t)prior * 4u) == name) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (!name || duplicate || gl_vita_rbo_find(name)) {
+            glDeleteRenderbuffers(
+                (GLsizei)count,
+                (const GLuint *)(uintptr_t)renderbuffers);
+            gl_vita_rbo_fault(
+                GL_VITA_TOKEN_GEN_RENDERBUFFERS,
+                "Vita GL glGenRenderbuffers returned an invalid name");
+        }
+    }
+    for (index = 0; index < count; ++index) {
+        guest_gl_uint name = ld32(
+            renderbuffers + (uint32_t)index * 4u);
+        if (!gl_vita_rbo_add(name)) {
+            guest_gl_sizei prior;
+
+            for (prior = 0; prior < index; ++prior) {
+                gl_vita_rbo_remove(ld32(
+                    renderbuffers + (uint32_t)prior * 4u));
+            }
+            glDeleteRenderbuffers(
+                (GLsizei)count,
+                (const GLuint *)(uintptr_t)renderbuffers);
+            gl_vita_rbo_fault(
+                GL_VITA_TOKEN_GEN_RENDERBUFFERS,
+                "Vita GL renderbuffer registry exhausted");
+        }
+    }
+}
+
+static void vita_glFramebufferTexture2D(
+    guest_gl_enum target, guest_gl_enum attachment,
+    guest_gl_enum texture_target, guest_gl_uint texture,
+    guest_gl_int level)
+{
+    kage_vita_world_seam_diag_note_framebuffer_texture(
+        target, attachment, texture_target, texture, level);
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+    /* An alpha-only mask is sampling-equivalent but is not promised to be a
+     * color-renderable vitaGL target.  Restore it before any attachment edge,
+     * and permanently exclude names seen on this API. */
+    gl_vita_fxray_note_attachment(texture);
+#endif
+#if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
+    if ((target == GL_VITA_FF_FRAMEBUFFER ||
+            target == GL_VITA_FF_DRAW_FRAMEBUFFER) &&
+            attachment == GL_VITA_FF_COLOR_ATTACHMENT0 &&
+            s_first_frame.current_guest_fbo != 0u &&
+            s_first_frame.current_guest_fbo == s_first_frame.manager_fbo) {
+        s_first_frame.manager_color_attach_arg = texture;
+        gl_vita_first_frame_increment(
+            &s_first_frame.manager_color_attach_calls);
+    }
+#endif
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    /* vitaGL flags the in-use framebuffer dirty on a colour attachment
+     * change (shared.h:1384) so the next clear or draw opens a new scene:
+     * anything still owed must land in the current one first. */
+    gl_vita_fbo_owed_materialize();
+#endif
+    GL_VITA_TIME_BEGIN();
+    glFramebufferTexture2D(
+        (GLenum)target, (GLenum)attachment, (GLenum)texture_target,
+        (GLuint)texture, (GLint)level);
+    GL_VITA_TIME_END(bind_fb);
+#if defined(GL_VITA_FBO_TABLE)
+    gl_vita_fbo_note_texture_attachment(
+        target, attachment, texture_target, texture, level);
+#endif
+}
+
+static void vita_glGenTextures(
+    guest_gl_sizei count, guest_gl_addr textures)
+{
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    int value_before_valid = count == 1 && textures &&
+        textures <= UINT32_MAX - 3u;
+    uint32_t value_before = value_before_valid ? ld32(textures) : 0u;
+    uint64_t started_at = sceKernelGetProcessTimeWide();
+#endif
+    glGenTextures((GLsizei)count, (GLuint *)(uintptr_t)textures);
+#if defined(ISAAC_VITA_WORLD_SEAM_DIAG)
+    if (count > 0 && textures &&
+            (uint32_t)count <= (UINT32_MAX - textures) / 4u) {
+        guest_gl_sizei index;
+        for (index = 0; index < count; ++index) {
+            kage_vita_world_seam_diag_note_gen_texture(
+                ld32(textures + (uint32_t)index * 4u));
+        }
+    }
+#endif
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    gl_vita_texture_profile_note_gen(
+        count, textures, value_before, value_before_valid,
+        started_at, sceKernelGetProcessTimeWide());
+#endif
+}
+
+static guest_gl_int vita_glGetAttribLocation(
+    guest_gl_uint program, guest_gl_addr name)
+{
+    guest_gl_int location;
+    gl_vita_location_cache_key key;
+
+    GL_VITA_PHASE_COUNT(attrib_location);
+    if (gl_vita_location_cache_lookup(
+            GL_VITA_LOCATION_KIND_ATTRIB, program, name, &key, &location)) {
+        GL_VITA_PHASE_COUNT(location_cache_hit);
+#if defined(ISAAC_VITA_GL_LOCATION_CACHE_VERIFY)
+        /* Device A/B variant: every hit also asks vitaGL and counts a
+         * disagreement into ph120.a loc(...,m); the cached answer is still
+         * what the guest receives so both variants render identically. */
+        if (location != (guest_gl_int)glGetAttribLocation(
+                (GLuint)program, (const GLchar *)(uintptr_t)name))
+            GL_VITA_PHASE_COUNT(location_cache_mismatch);
+#endif
+        return location;
+    }
+    {
+        GL_VITA_TIME_BEGIN();
+        location = (guest_gl_int)glGetAttribLocation(
+            (GLuint)program, (const GLchar *)(uintptr_t)name);
+        GL_VITA_TIME_END(state);
+    }
+    gl_vita_location_cache_store(&key, location);
+    return location;
+}
+
+static void vita_glGetIntegerv(guest_gl_enum name, guest_gl_addr value)
+{
+#if defined(GL_VITA_LOGICAL_VIEWPORT)
+    if (name == GL_VITA_VIEWPORT) {
+        st32(value + 0u, (uint32_t)s_logical_viewport.x);
+        st32(value + 4u, (uint32_t)s_logical_viewport.y);
+        st32(value + 8u, (uint32_t)s_logical_viewport.width);
+        st32(value + 12u, (uint32_t)s_logical_viewport.height);
+        return;
+    }
+#endif
+    glGetIntegerv((GLenum)name, (GLint *)(uintptr_t)value);
+}
+
+static void vita_glGetProgramInfoLog(
+    guest_gl_uint program, guest_gl_sizei buffer_size,
+    guest_gl_addr length, guest_gl_addr info_log)
+{
+    glGetProgramInfoLog(
+        (GLuint)program, (GLsizei)buffer_size,
+        (GLsizei *)(uintptr_t)length, (GLchar *)(uintptr_t)info_log);
+}
+
+static void vita_glGetProgramiv(
+    guest_gl_uint program, guest_gl_enum name, guest_gl_addr parameters)
+{
+    glGetProgramiv((GLuint)program, (GLenum)name,
+                   (GLint *)(uintptr_t)parameters);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_program_link_status(program, name);
+#endif
+}
+
+static void vita_glGetRenderbufferParameteriv(
+    guest_gl_enum target, guest_gl_enum name, guest_gl_addr parameters)
+{
+    gl_vita_renderbuffer_record *record;
+    guest_gl_int value;
+
+    if (target != GL_VITA_RENDERBUFFER)
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_GET_RBO_PARAMETER,
+            "Vita GL glGetRenderbufferParameteriv received an invalid target");
+    if (name != GL_VITA_RENDERBUFFER_WIDTH &&
+            name != GL_VITA_RENDERBUFFER_HEIGHT)
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_GET_RBO_PARAMETER,
+            "Vita GL glGetRenderbufferParameteriv received an unsupported pname");
+    if (!parameters)
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_GET_RBO_PARAMETER,
+            "Vita GL glGetRenderbufferParameteriv received a null output");
+    if (!s_bound_renderbuffer)
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_GET_RBO_PARAMETER,
+            "Vita GL glGetRenderbufferParameteriv has no bound renderbuffer");
+    record = gl_vita_rbo_find(s_bound_renderbuffer);
+    if (!record)
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_GET_RBO_PARAMETER,
+            "Vita GL glGetRenderbufferParameteriv found an unknown bound renderbuffer");
+    value = name == GL_VITA_RENDERBUFFER_WIDTH
+        ? record->width : record->height;
+    st32(parameters, (uint32_t)value);
+}
+
+static void vita_glGetShaderInfoLog(
+    guest_gl_uint shader, guest_gl_sizei buffer_size,
+    guest_gl_addr length, guest_gl_addr info_log)
+{
+    glGetShaderInfoLog(
+        (GLuint)shader, (GLsizei)buffer_size,
+        (GLsizei *)(uintptr_t)length, (GLchar *)(uintptr_t)info_log);
+}
+
+static void vita_glGetShaderiv(
+    guest_gl_uint shader, guest_gl_enum name, guest_gl_addr parameters)
+{
+    glGetShaderiv((GLuint)shader, (GLenum)name,
+                  (GLint *)(uintptr_t)parameters);
+}
+
+static guest_gl_addr vita_glGetString(guest_gl_enum name)
+{
+    return (guest_gl_addr)(uintptr_t)glGetString((GLenum)name);
+}
+
+static guest_gl_addr vita_glGetStringi(
+    guest_gl_enum name, guest_gl_uint index)
+{
+    return (guest_gl_addr)(uintptr_t)
+        glGetStringi((GLenum)name, (GLuint)index);
+}
+
+static guest_gl_int vita_glGetUniformLocation(
+    guest_gl_uint program, guest_gl_addr name)
+{
+    guest_gl_int location;
+    gl_vita_location_cache_key key;
+
+    GL_VITA_PHASE_COUNT(uniform_location);
+    if (gl_vita_location_cache_lookup(
+            GL_VITA_LOCATION_KIND_UNIFORM, program, name, &key,
+            &location)) {
+        GL_VITA_PHASE_COUNT(location_cache_hit);
+#if defined(ISAAC_VITA_GL_LOCATION_CACHE_VERIFY)
+        if (location != (guest_gl_int)glGetUniformLocation(
+                (GLuint)program, (const GLchar *)(uintptr_t)name))
+            GL_VITA_PHASE_COUNT(location_cache_mismatch);
+#endif
+    } else {
+        {
+            GL_VITA_TIME_BEGIN();
+            location = (guest_gl_int)glGetUniformLocation(
+                (GLuint)program, (const GLchar *)(uintptr_t)name);
+            GL_VITA_TIME_END(state);
+        }
+        gl_vita_location_cache_store(&key, location);
+    }
+    /* Observed on hits too: the redundancy cache's direct-mapped location
+     * slot evolves exactly as it did when every request reached vitaGL. */
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_location_observed(program, location);
+#endif
+    return location;
+}
+
+static void vita_glLinkProgram(guest_gl_uint program)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_program_mutated(program, 0);
+#endif
+    gl_vita_location_cache_invalidate();
+#if !defined(ISAAC_GL_VITA_BACKEND_ORACLE) && \
+    !defined(ISAAC_GL_VITA_FIRST_FRAME_ORACLE)
+    /* This is the context-owning thread and runs immediately before a
+     * potentially long native compile or persistent-cache lookup. */
+    kage_vita_loading_note_shader();
+#endif
+    glLinkProgram((GLuint)program);
+}
+
+#if defined(ISAAC_VITA_VITAGL_SHADER_CACHE)
+void gl_vita_backend_shader_cache_report(void)
+{
+    static int reported;
+    vglIsaacShaderCacheStats stats;
+
+    /* This is a cold-start milestone, not a per-shader logger.  The native
+     * Vita logger opens the diagnostic file for each record, so report the
+     * complete startup aggregate exactly once at the first game present. */
+    if (reported)
+        return;
+    reported = 1;
+    memset(&stats, 0, sizeof stats);
+    vglGetIsaacShaderCacheStats(&stats);
+    isaac_vita_log(
+        "KAGE VITA SHADER CACHE: serial=%llu attempts=%llu hits=%llu "
+        "misses=%llu corrupt=%llu native=%llu register_fail=%llu "
+        "write=%llu/%llu",
+        (unsigned long long)stats.serial,
+        (unsigned long long)stats.attempts,
+        (unsigned long long)stats.hits,
+        (unsigned long long)stats.misses,
+        (unsigned long long)stats.corrupt,
+        (unsigned long long)stats.native_compiles,
+        (unsigned long long)stats.register_failures,
+        (unsigned long long)stats.write_ok,
+        (unsigned long long)stats.write_failures);
+    isaac_vita_log(
+        "KAGE VITA SHADER CACHE IO: read=%lluB write=%lluB "
+        "read=%lluus hash=%lluus register=%lluus compile=%lluus "
+        "write=%lluus read_fail=%llu alloc_fail=%llu oversize=%llu",
+        (unsigned long long)stats.bytes_read,
+        (unsigned long long)stats.bytes_written,
+        (unsigned long long)stats.read_us,
+        (unsigned long long)stats.hash_us,
+        (unsigned long long)stats.register_us,
+        (unsigned long long)stats.compile_us,
+        (unsigned long long)stats.write_us,
+        (unsigned long long)stats.read_failures,
+        (unsigned long long)stats.alloc_failures,
+        (unsigned long long)stats.oversize);
+    isaac_vita_log(
+        "KAGE VITA SHADER CACHE PUBLISH: attempts=%llu block_list=%llu "
+        "ready=%llu block_records=%llu shape=%llu semantics=%llu "
+        "matrices=%llu blocks=%llu incomplete=%llu alloc=%llu",
+        (unsigned long long)stats.publish_attempts,
+        (unsigned long long)stats.publish_with_block_list,
+        (unsigned long long)stats.publish_ready,
+        (unsigned long long)stats.publish_block_records,
+        (unsigned long long)stats.publish_reject_shape,
+        (unsigned long long)stats.publish_reject_semantics,
+        (unsigned long long)stats.publish_reject_matrices,
+        (unsigned long long)stats.publish_reject_blocks,
+        (unsigned long long)stats.publish_reject_incomplete,
+        (unsigned long long)stats.publish_reject_alloc);
+}
+#endif
+
+static void vita_glReadPixels(
+    guest_gl_int x, guest_gl_int y,
+    guest_gl_sizei width, guest_gl_sizei height,
+    guest_gl_enum format, guest_gl_enum type,
+    guest_gl_addr pixels)
+{
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    /* vitaGL may end and finish the in-use scene here (framebuffers.c:674);
+     * the owed quad belongs to that scene. */
+    gl_vita_fbo_owed_materialize();
+#endif
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    /* Pixel-exact readback of a scaled target is not modelled; the frozen PE
+     * only reads the default framebuffer.  Log the first occurrence. */
+    if (gl_vita_fbo_draw_is_scaled() && !s_fbo_raster_readback_logged) {
+        s_fbo_raster_readback_logged = 1u;
+        isaac_vita_log(
+            "[kage-vita] fbo-raster: glReadPixels on scaled target %u",
+            (unsigned)s_draw_framebuffer);
+    }
+#endif
+    glReadPixels((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height,
+                 (GLenum)format, (GLenum)type,
+                 (void *)(uintptr_t)pixels);
+}
+
+static void vita_glRenderbufferStorage(
+    guest_gl_enum target, guest_gl_enum format,
+    guest_gl_sizei width, guest_gl_sizei height)
+{
+    gl_vita_renderbuffer_record *record;
+
+    if (target != GL_VITA_RENDERBUFFER || width < 0 || height < 0)
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_RBO_STORAGE,
+            "Vita GL glRenderbufferStorage received invalid dimensions or target");
+    if (!s_bound_renderbuffer ||
+            !(record = gl_vita_rbo_find(s_bound_renderbuffer)))
+        gl_vita_rbo_fault(
+            GL_VITA_TOKEN_RBO_STORAGE,
+            "Vita GL glRenderbufferStorage has no tracked bound renderbuffer");
+    glRenderbufferStorage(
+        (GLenum)target, (GLenum)format, (GLsizei)width, (GLsizei)height);
+    record->internal_format = format;
+    record->width = width;
+    record->height = height;
+}
+
+static void vita_glFramebufferRenderbuffer(
+    guest_gl_enum target, guest_gl_enum attachment,
+    guest_gl_enum renderbuffer_target, guest_gl_uint renderbuffer)
+{
+    glFramebufferRenderbuffer(
+        (GLenum)target, (GLenum)attachment,
+        (GLenum)renderbuffer_target, (GLuint)renderbuffer);
+#if defined(GL_VITA_FBO_TABLE)
+    gl_vita_fbo_note_renderbuffer_attachment(target, attachment, renderbuffer);
+#endif
+}
+
+static void vita_glShaderSource(
+    guest_gl_uint shader, guest_gl_sizei count,
+    guest_gl_addr strings, guest_gl_addr lengths)
+{
+    gl_vita_location_cache_invalidate();
+#if defined(ISAAC_VITA_COLOROFFSET_GPU_OPTIMIZATIONS)
+    IsaacColorOffsetSourceSignature signature =
+        isaac_coloroffset_production_signature();
+    IsaacColorOffsetSourceMatch match;
+    GLint shader_type = 0;
+    int selected;
+
+    glGetShaderiv((GLuint)shader, GL_SHADER_TYPE, &shader_type);
+    selected = isaac_coloroffset_match_source(
+        (uint32_t)shader_type, (int32_t)count,
+        (const char *const *)(uintptr_t)strings,
+        (const int32_t *)(uintptr_t)lengths, &signature, &match);
+    /* Source selection is observational.  Keep the original count, lengths,
+     * partition and bytes on the only glShaderSource call. */
+    glShaderSource(
+        (GLuint)shader, (GLsizei)count,
+        (const GLchar *const *)(uintptr_t)strings,
+        (const GLint *)(uintptr_t)lengths);
+    if (selected) {
+        /* vitaGL recomputes both signatures from its owned concatenation
+         * before it records the exact stock shader generation. */
+        vglIsaacMarkColorOffsetShader(
+            (GLuint)shader, match.source_fnv1a,
+            match.source_first512_fnv1a, match.source_size);
+    }
+#else
+    glShaderSource(
+        (GLuint)shader, (GLsizei)count,
+        (const GLchar *const *)(uintptr_t)strings,
+        (const GLint *)(uintptr_t)lengths);
+#endif
+}
+
+static void vita_glTexImage2D(
+    guest_gl_enum target, guest_gl_int level,
+    guest_gl_int internal_format,
+    guest_gl_sizei width, guest_gl_sizei height,
+    guest_gl_int border, guest_gl_enum format,
+    guest_gl_enum type, guest_gl_addr pixels)
+{
+    kage_vita_world_seam_diag_note_tex_image(
+        target, level, width, height);
+    guest_gl_sizei native_width = width;
+    guest_gl_sizei native_height = height;
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    int raster_scaled = 0;
+#endif
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+    int fxray_uploaded = 0;
+#endif
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    uint64_t started_at = sceKernelGetProcessTimeWide();
+#endif
+#if defined(ISAAC_VITA_IO_PROFILE)
+    kage_vita_io_profile_texture_begin(
+        0U, width, height);
+#endif
+    GL_VITA_PHASE_COUNT(tex_image);
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    /* Any image definition may replace an attached colour surface: the owed
+     * quad must precede it (stock order), and no colour stays known. */
+    gl_vita_fbo_owed_materialize();
+    gl_vita_fbo_color_forget_all();
+#endif
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    {
+        guest_gl_uint bound = gl_vita_fbo_bound_texture();
+
+        if (target == GL_VITA_TEXTURE_2D && level == 0 && bound) {
+            gl_vita_scaled_texture *scaled = gl_vita_scaled_find(bound);
+
+            if (gl_vita_fbo_raster_qualifies(
+                    target, level, width, height, border, pixels)) {
+                if (!scaled)
+                    scaled = gl_vita_scaled_acquire(bound);
+                if (scaled) {
+                    scaled->internal_format = internal_format;
+                    scaled->logical_width = width;
+                    scaled->logical_height = height;
+                    scaled->format = format;
+                    scaled->type = type;
+                    native_width = gl_vita_fbo_scale_extent(width);
+                    native_height = gl_vita_fbo_scale_extent(height);
+                    raster_scaled = 1;
+                }
+            } else if (scaled) {
+                /* Redefined with data or below the edge: plain texture. */
+                gl_vita_scaled_forget(bound, 0);
+            }
+        }
+    }
+#endif
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+    fxray_uploaded = gl_vita_fxray_try_upload(
+        target, level, internal_format, width, height, border,
+        format, type, pixels);
+    if (!fxray_uploaded && target == GL_VITA_TEXTURE_2D &&
+            gl_vita_fxray_has_live_record()) {
+        gl_vita_fxray_record *record =
+            gl_vita_fxray_find(gl_vita_fxray_bound_texture());
+
+        /* Any other image definition might alter a mip or replace level zero.
+         * Make the old object ordinary RGBA first, so even a rejected native
+         * call leaves exactly the original sampled contents. */
+        if (record)
+            gl_vita_fxray_deopt(record, "tex-image");
+    }
+    if (!fxray_uploaded)
+#endif
+    {
+        GL_VITA_TIME_BEGIN();
+        glTexImage2D(
+            (GLenum)target, (GLint)level, (GLint)internal_format,
+            (GLsizei)native_width, (GLsizei)native_height, (GLint)border,
+            (GLenum)format, (GLenum)type, (const void *)(uintptr_t)pixels);
+        GL_VITA_TIME_END(tex_upload);
+    }
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    if (raster_scaled) {
+        GL_VITA_PHASE_COUNT(fbo_raster_textures);
+        gl_vita_fbo_texture_raster_changed(gl_vita_fbo_bound_texture(), 1u);
+    }
+#endif
+#if defined(ISAAC_VITA_IO_PROFILE)
+    kage_vita_io_profile_texture_end();
+#endif
+#if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
+    gl_vita_texture_profile_note_image(
+        target, level, internal_format, width, height, border, format, type,
+# if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+        !fxray_uploaded,
+# else
+        1,
+# endif
+        started_at, sceKernelGetProcessTimeWide());
+#endif
+}
+
+static void vita_glTexParameteri(
+    guest_gl_enum target, guest_gl_enum name, guest_gl_int parameter)
+{
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+    /* The frozen KAGE uploader sets only filter/wrap state.  Those operations
+     * sample the same texels in either representation.  Fail back to RGBA for
+     * every other pname, including any future texture-swizzle exposure. */
+    if (target == GL_VITA_TEXTURE_2D &&
+            !gl_vita_fxray_parameter_is_sample_invariant(name) &&
+            gl_vita_fxray_has_live_record()) {
+        gl_vita_fxray_record *record =
+            gl_vita_fxray_find(gl_vita_fxray_bound_texture());
+
+        if (record)
+            gl_vita_fxray_deopt(record, "tex-parameter");
+    }
+#endif
+    GL_VITA_TIME_BEGIN();
+    glTexParameteri((GLenum)target, (GLenum)name, (GLint)parameter);
+    GL_VITA_TIME_END(state);
+}
+
+static void vita_glTexSubImage2D(
+    guest_gl_enum target, guest_gl_int level,
+    guest_gl_int x_offset, guest_gl_int y_offset,
+    guest_gl_sizei width, guest_gl_sizei height,
+    guest_gl_enum format, guest_gl_enum type,
+    guest_gl_addr pixels)
+{
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+    if (target == GL_VITA_TEXTURE_2D && gl_vita_fxray_has_live_record()) {
+        gl_vita_fxray_record *record =
+            gl_vita_fxray_find(gl_vita_fxray_bound_texture());
+
+        if (record)
+            gl_vita_fxray_deopt(record, "tex-sub-image");
+    }
+#endif
+#if defined(ISAAC_VITA_IO_PROFILE)
+    kage_vita_io_profile_texture_begin(
+        1U, width, height);
+#endif
+    GL_VITA_PHASE_COUNT(tex_sub_image);
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    gl_vita_fbo_owed_materialize();
+    gl_vita_fbo_color_forget_all();
+#endif
+#if defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    /* The guest writes pixels: this is not a pure render target after all.
+     * Restore the full logical allocation first so the upload lands 1:1. */
+    if (target == GL_VITA_TEXTURE_2D)
+        gl_vita_scaled_forget(gl_vita_fbo_bound_texture(), 1);
+#endif
+    GL_VITA_TIME_BEGIN();
+    glTexSubImage2D(
+        (GLenum)target, (GLint)level, (GLint)x_offset, (GLint)y_offset,
+        (GLsizei)width, (GLsizei)height, (GLenum)format, (GLenum)type,
+        (const void *)(uintptr_t)pixels);
+    GL_VITA_TIME_END(tex_upload);
+#if defined(ISAAC_VITA_IO_PROFILE)
+    kage_vita_io_profile_texture_end();
+#endif
+}
+
+static void vita_glUniform1fv(
+    guest_gl_int location, guest_gl_sizei count, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_1FV, location, count, 0u, value, NULL,
+            sizeof(guest_gl_float)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform1fv((GLint)location, (GLsizei)count,
+                 (const GLfloat *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_1FV, location, count, 0u, value, NULL,
+        sizeof(guest_gl_float));
+#endif
+}
+
+static void vita_glUniform1i(guest_gl_int location, guest_gl_int value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_1I, location, 1, 0u, 0u, &value,
+            sizeof value))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform1i((GLint)location, (GLint)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_1I, location, 1, 0u, 0u, &value,
+        sizeof value);
+#endif
+}
+
+static void vita_glUniform1iv(
+    guest_gl_int location, guest_gl_sizei count, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_1IV, location, count, 0u, value, NULL,
+            sizeof(guest_gl_int)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform1iv((GLint)location, (GLsizei)count,
+                 (const GLint *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_1IV, location, count, 0u, value, NULL,
+        sizeof(guest_gl_int));
+#endif
+}
+
+static void vita_glUniform2fv(
+    guest_gl_int location, guest_gl_sizei count, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_2FV, location, count, 0u, value, NULL,
+            2u * sizeof(guest_gl_float)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform2fv((GLint)location, (GLsizei)count,
+                 (const GLfloat *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_2FV, location, count, 0u, value, NULL,
+        2u * sizeof(guest_gl_float));
+#endif
+}
+
+static void vita_glUniform2iv(
+    guest_gl_int location, guest_gl_sizei count, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_2IV, location, count, 0u, value, NULL,
+            2u * sizeof(guest_gl_int)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform2iv((GLint)location, (GLsizei)count,
+                 (const GLint *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_2IV, location, count, 0u, value, NULL,
+        2u * sizeof(guest_gl_int));
+#endif
+}
+
+static void vita_glUniform3fv(
+    guest_gl_int location, guest_gl_sizei count, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_3FV, location, count, 0u, value, NULL,
+            3u * sizeof(guest_gl_float)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform3fv((GLint)location, (GLsizei)count,
+                 (const GLfloat *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_3FV, location, count, 0u, value, NULL,
+        3u * sizeof(guest_gl_float));
+#endif
+}
+
+static void vita_glUniform3iv(
+    guest_gl_int location, guest_gl_sizei count, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_3IV, location, count, 0u, value, NULL,
+            3u * sizeof(guest_gl_int)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform3iv((GLint)location, (GLsizei)count,
+                 (const GLint *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_3IV, location, count, 0u, value, NULL,
+        3u * sizeof(guest_gl_int));
+#endif
+}
+
+static void vita_glUniform4fv(
+    guest_gl_int location, guest_gl_sizei count, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_4FV, location, count, 0u, value, NULL,
+            4u * sizeof(guest_gl_float)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform4fv((GLint)location, (GLsizei)count,
+                 (const GLfloat *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_4FV, location, count, 0u, value, NULL,
+        4u * sizeof(guest_gl_float));
+#endif
+}
+
+static void vita_glUniform4iv(
+    guest_gl_int location, guest_gl_sizei count, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_4IV, location, count, 0u, value, NULL,
+            4u * sizeof(guest_gl_int)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniform4iv((GLint)location, (GLsizei)count,
+                 (const GLint *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_4IV, location, count, 0u, value, NULL,
+        4u * sizeof(guest_gl_int));
+#endif
+}
+
+static void vita_glUniformMatrix2fv(
+    guest_gl_int location, guest_gl_sizei count,
+    guest_gl_boolean transpose, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_MATRIX2FV, location, count, transpose,
+            value, NULL, 4u * sizeof(guest_gl_float)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniformMatrix2fv(
+        (GLint)location, (GLsizei)count, (GLboolean)transpose,
+        (const GLfloat *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_MATRIX2FV, location, count, transpose,
+        value, NULL, 4u * sizeof(guest_gl_float));
+#endif
+}
+
+static void vita_glUniformMatrix3fv(
+    guest_gl_int location, guest_gl_sizei count,
+    guest_gl_boolean transpose, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_MATRIX3FV, location, count, transpose,
+            value, NULL, 9u * sizeof(guest_gl_float)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniformMatrix3fv(
+        (GLint)location, (GLsizei)count, (GLboolean)transpose,
+        (const GLfloat *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_MATRIX3FV, location, count, transpose,
+        value, NULL, 9u * sizeof(guest_gl_float));
+#endif
+}
+
+static void vita_glUniformMatrix4fv(
+    guest_gl_int location, guest_gl_sizei count,
+    guest_gl_boolean transpose, guest_gl_addr value)
+{
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_uniform_skip(
+            GL_VITA_UNIFORM_MATRIX4FV, location, count, transpose,
+            value, NULL, 16u * sizeof(guest_gl_float)))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(uniform);
+    GL_VITA_TIME_BEGIN();
+    glUniformMatrix4fv(
+        (GLint)location, (GLsizei)count, (GLboolean)transpose,
+        (const GLfloat *)(uintptr_t)value);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_uniform_forwarded(
+        GL_VITA_UNIFORM_MATRIX4FV, location, count, transpose,
+        value, NULL, 16u * sizeof(guest_gl_float));
+#endif
+}
+
+static void vita_glUseProgram(guest_gl_uint program)
+{
+    kage_vita_world_seam_diag_note_use_program(program);
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    s_fusion_profile.program = program;
+#endif
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    if (gl_vita_use_program_skip(program))
+        return;
+#endif
+    GL_VITA_PHASE_COUNT(use_program);
+    GL_VITA_TIME_BEGIN();
+    glUseProgram((GLuint)program);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_use_program_forwarded(program);
+#endif
+}
+
+static void vita_glVertexAttribPointer(
+    guest_gl_uint index, guest_gl_int size, guest_gl_enum type,
+    guest_gl_boolean normalized, guest_gl_sizei stride,
+    guest_gl_addr pointer)
+{
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    int valid = index < GL_VITA_VERTEX_ATTRIBS &&
+        size >= 1 && size <= 4 && stride >= 0 &&
+        gl_vita_typed_valid_attrib_type(type);
+
+    if (!valid) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_invalid);
+        s_gl_typed_state.attrib_pointer_known = 0u;
+    } else {
+        uint16_t bit = (uint16_t)(UINT16_C(1) << index);
+        if ((s_gl_typed_state.attrib_pointer_known & bit) &&
+                gl_vita_typed_attrib_pointer_equal(
+                    &s_gl_typed_state.attrib_pointer[index],
+                    size, type, normalized, stride, pointer)) {
+            GL_VITA_PHASE_COUNT(typed_state_hit_attrib_pointer);
+            return;
+        }
+    }
+#endif
+    GL_VITA_PHASE_COUNT(attrib_pointer);
+    GL_VITA_TIME_BEGIN();
+    glVertexAttribPointer(
+        (GLuint)index, (GLint)size, (GLenum)type,
+        (GLboolean)normalized, (GLsizei)stride,
+        (const void *)(uintptr_t)pointer);
+    GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (valid) {
+        gl_vita_typed_attrib_pointer *state =
+            &s_gl_typed_state.attrib_pointer[index];
+        state->pointer = pointer;
+        state->type = type;
+        state->size = size;
+        state->normalized = normalized;
+        state->stride = stride;
+        s_gl_typed_state.attrib_pointer_known |=
+            (uint16_t)(UINT16_C(1) << index);
+        GL_VITA_PHASE_COUNT(typed_state_miss);
+    }
+#endif
+}
+
+static void vita_glViewport(
+    guest_gl_int x, guest_gl_int y,
+    guest_gl_sizei width, guest_gl_sizei height)
+{
+    kage_vita_world_seam_diag_note_viewport(x, y, width, height);
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    int valid = width >= 0 && height >= 0;
+
+    if (!valid) {
+        GL_VITA_PHASE_COUNT(typed_state_reject_invalid);
+        gl_vita_typed_invalidate_viewport();
+    } else if (s_gl_typed_state.viewport_known &&
+            s_gl_typed_state.viewport_x == x &&
+            s_gl_typed_state.viewport_y == y &&
+            s_gl_typed_state.viewport_width == width &&
+            s_gl_typed_state.viewport_height == height) {
+        GL_VITA_PHASE_COUNT(typed_state_hit_viewport);
+        return;
+    }
+#endif
+    GL_VITA_PHASE_COUNT(state);
+#if defined(GL_VITA_LOGICAL_VIEWPORT)
+    /* OpenGL rejects negative dimensions without changing viewport state.
+     * Preserve both the exact invalid native call and the saved logical state. */
+    if (width < 0 || height < 0) {
+        GL_VITA_TIME_BEGIN();
+        glViewport((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height);
+        GL_VITA_TIME_END(state);
+        return;
+    }
+    s_logical_viewport.x = x;
+    s_logical_viewport.y = y;
+    s_logical_viewport.width = width;
+    s_logical_viewport.height = height;
+    {
+        /* The scale arithmetic inside is a handful of integer ops. */
+        GL_VITA_TIME_BEGIN();
+        gl_vita_apply_logical_viewport();
+        GL_VITA_TIME_END(state);
+    }
+#else
+    {
+        GL_VITA_TIME_BEGIN();
+        glViewport((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height);
+        GL_VITA_TIME_END(state);
+    }
+#endif
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (valid) {
+        s_gl_typed_state.viewport_x = x;
+        s_gl_typed_state.viewport_y = y;
+        s_gl_typed_state.viewport_width = width;
+        s_gl_typed_state.viewport_height = height;
+        s_gl_typed_state.viewport_known = 1u;
+        GL_VITA_PHASE_COUNT(typed_state_miss);
+    }
+#endif
+}
+
+#if defined(ISAAC_GL_VITA_FIRST_FRAME_ORACLE)
+# include "gl_vita_first_frame_oracle_vitagl_undef.h"
+#elif defined(ISAAC_GL_VITA_BACKEND_ORACLE)
+# include "gl_vita_backend_test_vitagl_undef.h"
+#endif
+
+int gl_vita_backend_install(void)
+{
+    guest_gl_backend backend;
+
+    if (!kage_vita_backend_ready())
+        return 0;
+    gl_vita_texture_profile_reset_all();
+    gl_vita_texture_profile_calibrate_clock();
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+    /* A repeated install may retain objects from the preceding backend
+     * lifetime.  Never discard the only alpha shadows before restoring them. */
+    gl_vita_fxray_deopt_all("backend-install");
+    gl_vita_fxray_reset();
+#endif
+    gl_vita_fusion_profile_reset();
+    kage_vita_world_seam_diag_reset();
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_redundancy_reset();
+#endif
+    gl_vita_location_cache_reset();
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    gl_vita_typed_state_reset();
+#endif
+#if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
+    gl_vita_first_frame_reset();
+#endif
+#if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+    s_draw_framebuffer = 0u;
+#endif
+#if defined(GL_VITA_FBO_TABLE)
+    gl_vita_fbo_shadow_reset();
+#endif
+#if defined(GL_VITA_LOGICAL_VIEWPORT)
+    gl_vita_display_raster_reset();
+    gl_vita_apply_logical_viewport();
+#endif
+    gl_vita_rbo_reset();
+    s_last_error = s_partial;
+    memset(&backend, 0, sizeof backend);
+    backend.glActiveTexture = vita_glActiveTexture;
+    backend.glAlphaFunc = vita_glAlphaFunc;
+    backend.glAttachShader = vita_glAttachShader;
+    backend.glBindFramebuffer = vita_glBindFramebuffer;
+    backend.glBindRenderbuffer = vita_glBindRenderbuffer;
+    backend.glBindTexture = vita_glBindTexture;
+    backend.glBlendFuncSeparate = vita_glBlendFuncSeparate;
+    backend.glCheckFramebufferStatus = vita_glCheckFramebufferStatus;
+    /* glClampColorARB is absent from vitaGL. */
+    backend.glClear = vita_glClear;
+    backend.glClearColor = vita_glClearColor;
+    backend.glClearDepth = vita_glClearDepth;
+    backend.glCompileShader = vita_glCompileShader;
+    backend.glCreateProgram = vita_glCreateProgram;
+    backend.glCreateShader = vita_glCreateShader;
+    backend.glCullFace = vita_glCullFace;
+    backend.glDeleteFramebuffers = vita_glDeleteFramebuffers;
+    backend.glDeleteProgram = vita_glDeleteProgram;
+    backend.glDeleteRenderbuffers = vita_glDeleteRenderbuffers;
+    backend.glDeleteShader = vita_glDeleteShader;
+    backend.glDeleteTextures = vita_glDeleteTextures;
+    backend.glDepthFunc = vita_glDepthFunc;
+    backend.glDisableVertexAttribArray = vita_glDisableVertexAttribArray;
+    backend.glDrawElements = vita_glDrawElements;
+    backend.glEnable = vita_glEnable;
+    backend.glEnableVertexAttribArray = vita_glEnableVertexAttribArray;
+    backend.glFramebufferRenderbuffer = vita_glFramebufferRenderbuffer;
+    backend.glFramebufferTexture2D = vita_glFramebufferTexture2D;
+    backend.glGenFramebuffers = vita_glGenFramebuffers;
+    backend.glGenRenderbuffers = vita_glGenRenderbuffers;
+    backend.glGenTextures = vita_glGenTextures;
+    backend.glGetAttribLocation = vita_glGetAttribLocation;
+    backend.glGetIntegerv = vita_glGetIntegerv;
+    backend.glGetProgramInfoLog = vita_glGetProgramInfoLog;
+    backend.glGetProgramiv = vita_glGetProgramiv;
+    /* vitaGL lacks this query, so answer it from the bounded lifecycle above. */
+    backend.glGetRenderbufferParameteriv =
+        vita_glGetRenderbufferParameteriv;
+    backend.glGetShaderInfoLog = vita_glGetShaderInfoLog;
+    backend.glGetShaderiv = vita_glGetShaderiv;
+    backend.glGetString = vita_glGetString;
+    backend.glGetStringi = vita_glGetStringi;
+    backend.glGetUniformLocation = vita_glGetUniformLocation;
+    backend.glLinkProgram = vita_glLinkProgram;
+    backend.glReadPixels = vita_glReadPixels;
+    backend.glRenderbufferStorage = vita_glRenderbufferStorage;
+    backend.glShaderSource = vita_glShaderSource;
+    backend.glTexImage2D = vita_glTexImage2D;
+    backend.glTexParameteri = vita_glTexParameteri;
+    backend.glTexSubImage2D = vita_glTexSubImage2D;
+    backend.glUniform1fv = vita_glUniform1fv;
+    backend.glUniform1i = vita_glUniform1i;
+    backend.glUniform1iv = vita_glUniform1iv;
+    /* vitaGL has no unsigned-vector uniform entry points. */
+    backend.glUniform2fv = vita_glUniform2fv;
+    backend.glUniform2iv = vita_glUniform2iv;
+    backend.glUniform3fv = vita_glUniform3fv;
+    backend.glUniform3iv = vita_glUniform3iv;
+    backend.glUniform4fv = vita_glUniform4fv;
+    backend.glUniform4iv = vita_glUniform4iv;
+    backend.glUniformMatrix2fv = vita_glUniformMatrix2fv;
+    /* vitaGL has no non-square matrix uniform entry points. */
+    backend.glUniformMatrix3fv = vita_glUniformMatrix3fv;
+    backend.glUniformMatrix4fv = vita_glUniformMatrix4fv;
+    backend.glUseProgram = vita_glUseProgram;
+    backend.glVertexAttribPointer = vita_glVertexAttribPointer;
+    backend.glViewport = vita_glViewport;
+    guest_gl_install_backend(&backend);
+    s_installed = 1;
+    return 1;
+}
+
+void gl_vita_backend_uninstall(void)
+{
+#if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+    gl_vita_fxray_deopt_all("backend-uninstall");
+    gl_vita_fxray_reset();
+#endif
+    guest_gl_install_backend(NULL);
+    gl_vita_fusion_profile_reset();
+#if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
+    gl_vita_redundancy_reset();
+#endif
+    gl_vita_location_cache_reset();
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    gl_vita_typed_state_reset();
+#endif
+#if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
+    gl_vita_first_frame_reset();
+#endif
+#if defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+    s_draw_framebuffer = 0u;
+#endif
+#if defined(GL_VITA_FBO_TABLE)
+    gl_vita_fbo_shadow_reset();
+#endif
+#if defined(GL_VITA_LOGICAL_VIEWPORT)
+    gl_vita_display_raster_reset();
+#endif
+    gl_vita_rbo_reset();
+    gl_vita_texture_profile_reset_all();
+    s_installed = 0;
+    s_last_error = s_partial;
+}
+
+int gl_vita_backend_installed(void) { return s_installed; }
+size_t gl_vita_backend_resolved_count(void)
+{
+    return s_installed ? GL_VITA_RESOLVED_COUNT : 0u;
+}
+size_t gl_vita_backend_missing_count(void)
+{
+    return s_installed ? GL_VITA_MISSING_COUNT
+                       : GUEST_GL_SURFACE_COUNT;
+}
+const char *gl_vita_backend_missing_symbol(size_t index)
+{
+    return index < GL_VITA_MISSING_COUNT
+        ? s_missing_symbols[index] : NULL;
+}
+const char *gl_vita_backend_last_error(void)
+{
+    return s_last_error ? s_last_error : s_partial;
+}

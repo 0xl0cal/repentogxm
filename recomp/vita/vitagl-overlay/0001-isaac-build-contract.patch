@@ -1,0 +1,2121 @@
+diff --git a/Makefile b/Makefile
+index 1c8ba22..ab9366b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -11,7 +11,14 @@ CC      = $(PREFIX)-gcc
+ CXX     = $(PREFIX)-g++
+ AR      = $(PREFIX)-gcc-ar
++VGL_GIT_HASH ?= $(shell git rev-parse --short HEAD 2>/dev/null)
++EXTRA_CFLAGS ?=
++ISAAC_DISPLAY_QUEUE_PROBE ?= 0
+ CFLAGS  = -g -Wl,-q -O3 -ffast-math -mtune=cortex-a9 -mfpu=neon -Wno-incompatible-pointer-types -Wno-stringop-overflow -mfp16-format=ieee \
+-	-DVGL_GIT_HASH='"$(shell git rev-parse --short HEAD)"' -Isource
++	-DVGL_GIT_HASH='"$(VGL_GIT_HASH)"' -Isource
++CFLAGS += $(EXTRA_CFLAGS)
++ifeq ($(ISAAC_DISPLAY_QUEUE_PROBE),1)
++CFLAGS += -DHAVE_ISAAC_DISPLAY_QUEUE_PROBE
++endif
+ ASFLAGS = $(CFLAGS)
+ 
+ ifeq ($(SOFTFP_ABI),1)
+@@ -275,7 +278,7 @@ CXXFLAGS  = $(CFLAGS) -fexceptions -std=gnu++11 -Wno-write-strings
+ all: $(TARGET).a
+ 
+ $(TARGET).a: $(OBJS)
+-	$(AR) -rc $@ $^
++	$(AR) -rcD $@ $^
+ 	
+ %.smpc:
+ 	@make -C $(@:.smpc=) clean
+diff --git a/source/gxm.c b/source/gxm.c
+index f310099..0e75aca 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -23,6 +23,41 @@
+ 
+ #include "shared.h"
+ 
++/*
++ * Project-local build contract for the Isaac Vita port.  Keep these checks in
++ * the compiled translation unit: a typo in the Make invocation must fail the
++ * build instead of silently restoring vitaGL's asynchronous GC or per-FBO
++ * render-target churn.
++ */
++#ifndef HAVE_SOFTFP_ABI
++#error "Isaac vitaGL overlay requires the softfp ABI"
++#endif
++#ifndef HAVE_SINGLE_THREADED_GC
++#error "Isaac vitaGL overlay requires main-thread garbage collection"
++#endif
++#ifndef HAVE_SHARED_RENDERTARGETS
++#error "Isaac vitaGL overlay requires shared render targets"
++#endif
++#ifdef RECYCLE_RENDERTARGETS
++#error "Isaac vitaGL overlay pins SHARED_RENDERTARGETS=1, not recycling mode 2"
++#endif
++#ifndef SKIP_SPLASHSCREEN
++#error "Isaac vitaGL overlay must not create the splash-screen GXM context"
++#endif
++#ifndef SKIP_ERROR_HANDLING
++#error "Isaac vitaGL overlay must retain the measured NO_DEBUG build profile"
++#endif
++
++/* Stable archive-level evidence consumed by vitagl-overlay/test.sh. */
++const uint32_t isaac_vitagl_single_threaded_gc_enabled
++	__attribute__((used)) = 1;
++const uint32_t isaac_vitagl_shared_render_targets_mode
++	__attribute__((used)) = 1;
++const uint32_t isaac_vitagl_softfp_abi_enabled
++	__attribute__((used)) = 1;
++const uint32_t isaac_vitagl_splashscreen_disabled
++	__attribute__((used)) = 1;
++
+ #define MAX_SCENES_PER_FRAME 8 // Maximum amount of scenes per frame allowed by sceGxm per render target
+ 
+ // FIXME: Since we use our own default uniform buffers circular pool, fragment and vertex buffer rings can likely be reduced in size
+@@ -46,6 +81,12 @@ SceGxmRenderTarget *gxm_render_target; // Display render target
+ SceGxmColorSurface gxm_color_surfaces[DISPLAY_MAX_BUFFER_COUNT]; // Display color surfaces
+ uint8_t gxm_display_buffer_count = 3; // Display buffers count
+ void *gxm_color_surfaces_addr[DISPLAY_MAX_BUFFER_COUNT]; // Display color surfaces memblock starting addresses
++static SceUID gxm_color_surface_memblocks[DISPLAY_MAX_BUFFER_COUNT];
++static int32_t isaac_color_surface_alloc_results[DISPLAY_MAX_BUFFER_COUNT];
++static int32_t isaac_color_surface_get_base_results[DISPLAY_MAX_BUFFER_COUNT];
++static int32_t isaac_color_surface_map_results[DISPLAY_MAX_BUFFER_COUNT];
++static uint32_t isaac_color_surface_dedicated[DISPLAY_MAX_BUFFER_COUNT];
++#define ISAAC_DISPLAY_MEMBLOCK_NOT_CALLED ((int32_t)0x80000000u)
+ SceGxmSyncObject *gxm_sync_objects[DISPLAY_MAX_BUFFER_COUNT]; // Display sync objects
+ unsigned int gxm_front_buffer_index = 0; // Display front buffer id
+ unsigned int gxm_back_buffer_index; // Display back buffer id
+@@ -68,6 +112,75 @@ static uint32_t gxm_fragment_buf_size = SCE_GXM_DEFAULT_FRAGMENT_RING_BUFFER_SI
+ static uint32_t gxm_usse_buf_size = SCE_GXM_DEFAULT_FRAGMENT_USSE_RING_BUFFER_SIZE; // Fragment ring buffer size for sceGxm
+ 
++/* The library default remains self-contained, while the Isaac executable
++ * provides a strong endpoint which flushes its startup profile and faults at
++ * the active guest GL boundary. */
++__attribute__((weak)) void isaac_vita_vitagl_reserve_failure(
++	const char *site, int32_t result, const void *buffer,
++	uint32_t vertex_ring_bytes, uint32_t fragment_ring_bytes) {
++	sceClibPrintf(
++		"[vitaGL] default-uniform reserve failed site=%s result=0x%08x "
++		"buffer=0x%08x vertex_ring=%u fragment_ring=%u\n",
++		site ? site : "unknown", (unsigned)result,
++		(unsigned)(uintptr_t)buffer, (unsigned)vertex_ring_bytes,
++		(unsigned)fragment_ring_bytes);
++}
++
++void isaac_vitagl_report_uniform_reserve_failure(
++	const char *site, int32_t result, const void *buffer) {
++	isaac_vita_vitagl_reserve_failure(
++		site, result, buffer, gxm_vertex_buf_size,
++		gxm_fragment_buf_size);
++}
++
++__attribute__((weak)) void isaac_vita_vitagl_scene_failure(
++	const char *site, int32_t result, const void *target,
++	uint32_t frame) {
++	sceClibPrintf(
++		"[vitaGL] scene begin failed site=%s result=0x%08x "
++		"target=0x%08x frame=%u\n",
++		site ? site : "unknown", (unsigned)result,
++		(unsigned)(uintptr_t)target, (unsigned)frame);
++}
++
++void isaac_vitagl_report_scene_failure(
++	const char *site, int32_t result, const void *target) {
++	isaac_vita_vitagl_scene_failure(
++		site, result, target, vgl_framecount);
++}
++
++__attribute__((weak)) void isaac_vita_vitagl_render_target_event(
++	const IsaacVitaGlRenderTargetTelemetry *event) {
++	sceClibPrintf(
++		"[vitaGL] render-target acquire site=%.42s first=0x%08x/0x%08x "
++		"retry=0x%08x/0x%08x finish=0x%08x finish_called=%u destroy=0x%08x "
++		"retried=%u pool_full=%u dup=%u inv=%u p=%u,%u,%u,%u drained=%u live=%u "
++		"refsum=%u w=%u h=%u frame=%u recovered=%u\n",
++		event->site ? event->site : "unknown",
++		(unsigned)event->first_result,
++		(unsigned)(uintptr_t)event->first_target,
++		(unsigned)event->retry_result,
++		(unsigned)(uintptr_t)event->retry_target,
++		(unsigned)event->finish_result,
++		(unsigned)event->finish_called,
++		(unsigned)event->destroy_result,
++		(unsigned)event->retry_attempted, (unsigned)event->pool_full,
++		(unsigned)event->pending_duplicate,
++		(unsigned)event->invariant_failure,
++		(unsigned)event->pending[0], (unsigned)event->pending[1],
++		(unsigned)event->pending[2], (unsigned)event->pending[3],
++		(unsigned)event->drained_targets, (unsigned)event->live_targets,
++		(unsigned)event->reference_sum, (unsigned)event->width,
++		(unsigned)event->height, (unsigned)event->frame,
++		(unsigned)event->recovered);
++}
++
++void isaac_vitagl_report_render_target_event(
++	IsaacVitaGlRenderTargetTelemetry *event) {
++	event->frame = vgl_framecount;
++	isaac_vita_vitagl_render_target_event(event);
++}
++
+ // Shader Patcher memory configuration
+ static unsigned int shader_patcher_buffer_size = 1024 * 1024;
+ static unsigned int shader_patcher_vertex_usse_size = 1024 * 1024;
+ static unsigned int shader_patcher_fragment_usse_size = 1024 * 1024;
+@@ -163,64 +267,256 @@ static inline __attribute__((always_inline)) int setup_render_target(SceGxmRend
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ #define MAX_RENDER_TARGETS_NUM 47 // Maximum amount of dedicated render targets usable for fbos
+ #define MAX_SHARED_RT_SIZE 256 // Maximum  width value in pixels for shared rendertargets usage
+ render_target rt_list[MAX_RENDER_TARGETS_NUM];
++_Static_assert(FRAME_PURGE_FREQ == 4,
++	"Isaac render-target telemetry requires four GC buckets");
++_Static_assert(sizeof(IsaacVitaGlRenderTargetTelemetry) == 92,
++	"Isaac render-target telemetry ABI drifted");
+ 
+-render_target *get_free_render_target(int w, int h) {
++static void isaac_vitagl_count_render_target_state(
++	IsaacVitaGlRenderTargetTelemetry *event) {
++	event->live_targets = 0;
++	event->reference_sum = 0;
++	for (int i = 0; i < MAX_RENDER_TARGETS_NUM; i++) {
++		if (rt_list[i].rt)
++			event->live_targets++;
++		if (rt_list[i].ref_count > 0)
++			event->reference_sum += (uint32_t)rt_list[i].ref_count;
++	}
++}
++
++static uint32_t isaac_vitagl_count_pending_render_targets(
++	IsaacVitaGlRenderTargetTelemetry *event) {
++	uint32_t total = 0;
++
++	for (int bucket = 0; bucket < FRAME_PURGE_FREQ; bucket++) {
++		event->pending[bucket] = 0;
++		for (int i = 0; i < FRAME_PURGE_RENDERTARGETS_LIST_SIZE; i++) {
++			if (frame_rt_purge_list[bucket][i]) {
++				event->pending[bucket]++;
++				total++;
++			}
++		}
++	}
++	return total;
++}
++
++static GLboolean isaac_vitagl_has_duplicate_pending_render_target(void) {
++	for (int bucket = 0; bucket < FRAME_PURGE_FREQ; bucket++) {
++		for (int i = 0; i < FRAME_PURGE_RENDERTARGETS_LIST_SIZE; i++) {
++			SceGxmRenderTarget *target =
++				frame_rt_purge_list[bucket][i];
++			if (!target)
++				continue;
++			for (int next_bucket = bucket;
++			     next_bucket < FRAME_PURGE_FREQ; next_bucket++) {
++				int first = next_bucket == bucket ? i + 1 : 0;
++				for (int j = first;
++				     j < FRAME_PURGE_RENDERTARGETS_LIST_SIZE; j++) {
++					if (frame_rt_purge_list[next_bucket][j] == target)
++						return GL_TRUE;
++				}
++			}
++		}
++	}
++	return GL_FALSE;
++}
++
++/* Recovery is called only after scene_reset ended the prior scene.  Finishing
++ * the context makes every already-retired raw handle safe to destroy.  Failed
++ * destroys are compacted at the front of each bucket so the normal collector
++ * retains its dense-list invariant. */
++static void isaac_vitagl_drain_pending_render_targets(
++	IsaacVitaGlRenderTargetTelemetry *event) {
++	uint32_t current_bucket_count = 0;
++
++	/* sceGxmFinish is a void synchronization barrier in VitaSDK. */
++	event->finish_called = 1;
++	sceGxmFinish(gxm_context);
++
++	for (int bucket = 0; bucket < FRAME_PURGE_FREQ; bucket++) {
++		uint32_t write_idx = 0;
++		for (int read_idx = 0;
++			 read_idx < FRAME_PURGE_RENDERTARGETS_LIST_SIZE;
++			 read_idx++) {
++			SceGxmRenderTarget *target =
++				frame_rt_purge_list[bucket][read_idx];
++			if (!target)
++				continue;
++			int result = sceGxmDestroyRenderTarget(target);
++			if (result) {
++				if (!event->destroy_result)
++					event->destroy_result = result;
++				frame_rt_purge_list[bucket][write_idx++] = target;
++			} else {
++				event->drained_targets++;
++			}
++		}
++		for (uint32_t i = write_idx;
++		     i < FRAME_PURGE_RENDERTARGETS_LIST_SIZE; i++)
++			frame_rt_purge_list[bucket][i] = NULL;
++		if (bucket == frame_purge_idx)
++			current_bucket_count = write_idx;
++	}
++	frame_rt_purge_idx = (int)current_bucket_count;
++}
++
++static render_target *isaac_vitagl_publish_render_target(
++	render_target *slot, SceGxmRenderTarget *target,
++	int w, int h, int max_refs) {
++	slot->rt = target;
++	slot->w = w;
++	slot->h = h;
++	slot->max_refs = max_refs;
++	slot->ref_count = 1;
++	return slot;
++}
++
++render_target *get_free_render_target(
++	int w, int h, IsaacVitaGlRenderTargetTelemetry *event) {
++	vgl_memset(event, 0, sizeof(*event));
++	event->site = "scene_reset:framebuffer:create";
++	event->width = (uint32_t)w;
++	event->height = (uint32_t)h;
++
+-	int i;
+-	for (i = 0; i < MAX_RENDER_TARGETS_NUM; i++) {
+-		if (rt_list[i].rt != NULL) {
+-			if (w == rt_list[i].w && h == rt_list[i].h && rt_list[i].ref_count < rt_list[i].max_refs) {
+-				rt_list[i].ref_count++;
+-				return &rt_list[i];
+-			}
+-		} else {
+-			rt_list[i].max_refs = w > MAX_SHARED_RT_SIZE ? 1 : MAX_SCENES_PER_FRAME;
+-			int r = setup_render_target(&rt_list[i].rt, w, h, rt_list[i].max_refs);
++	int compatible = -1;
++	int i;
++	for (i = 0; i < MAX_RENDER_TARGETS_NUM; i++) {
++		if (rt_list[i].rt != NULL) {
++			if (rt_list[i].ref_count <= 0 || rt_list[i].max_refs <= 0 ||
++			    rt_list[i].ref_count > rt_list[i].max_refs) {
++				event->site =
++					"scene_reset:framebuffer:pool-invariant";
++				event->invariant_failure = 1;
++				return NULL;
++			}
++			if (compatible < 0 && w == rt_list[i].w &&
++			    h == rt_list[i].h &&
++			    rt_list[i].ref_count < rt_list[i].max_refs)
++				compatible = i;
++		} else if (rt_list[i].ref_count != 0 || rt_list[i].max_refs != 0 ||
++		           rt_list[i].w != 0 || rt_list[i].h != 0) {
++			event->site = "scene_reset:framebuffer:pool-invariant";
++			event->invariant_failure = 1;
++			return NULL;
++		}
++	}
++	if (compatible >= 0) {
++		rt_list[compatible].ref_count++;
++		return &rt_list[compatible];
++	}
++
++	/* Only after a complete reuse pass may a canonical empty slot create a
++	 * new driver object.  This prevents an early hole from hiding a later
++	 * compatible shared target. */
++	for (i = 0; i < MAX_RENDER_TARGETS_NUM; i++) {
++		if (rt_list[i].rt == NULL) {
++			int max_refs =
++				w > MAX_SHARED_RT_SIZE ? 1 : MAX_SCENES_PER_FRAME;
++			SceGxmRenderTarget *target = NULL;
++			event->first_result =
++				setup_render_target(&target, w, h, MAX_SCENES_PER_FRAME);
++			event->first_target = target;
+ #ifdef LOG_ERRORS
+-			if (r)
+-				vgl_log("%s:%d Failed to create a shared rendertarget of size %dx%d (%s).\n", __FILE__, __LINE__, w, h, get_gxm_error_literal(r));
++			if (event->first_result)
++				vgl_log("%s:%d Failed to create a shared rendertarget of size %dx%d (%s).\n", __FILE__, __LINE__, w, h, get_gxm_error_literal(event->first_result));
+ #endif
+-			rt_list[i].w = w;
+-			rt_list[i].h = h;
+-			rt_list[i].ref_count = 1;
+-			return &rt_list[i];
++			if (!event->first_result && target)
++				return isaac_vitagl_publish_render_target(
++					&rt_list[i], target, w, h, max_refs);
++
++			/* Do not turn arbitrary driver/OOM/value failures into a
++			 * destructive retry.  Only handle pressure can be caused by
++			 * the deferred mode-1 retirement queue. */
++			if (event->first_result !=
++			    (int32_t)SCE_GXM_ERROR_OUT_OF_RENDER_TARGETS)
++				return NULL;
++
++			uint32_t pending_total =
++				isaac_vitagl_count_pending_render_targets(event);
++			if (!pending_total) {
++				event->site =
++					"scene_reset:framebuffer:no-pending-targets";
++				return NULL;
++			}
++			if (isaac_vitagl_has_duplicate_pending_render_target()) {
++				event->site =
++					"scene_reset:framebuffer:duplicate-pending";
++				event->pending_duplicate = 1;
++				return NULL;
++			}
++			event->site = "scene_reset:framebuffer:drain";
++			isaac_vitagl_drain_pending_render_targets(event);
++			if (event->destroy_result)
++				return NULL;
++
++			target = NULL;
++			event->retry_attempted = 1;
++			event->retry_result =
++				setup_render_target(&target, w, h, MAX_SCENES_PER_FRAME);
++			event->retry_target = target;
++			if (!event->retry_result && target) {
++				event->recovered = 1;
++				return isaac_vitagl_publish_render_target(
++					&rt_list[i], target, w, h, max_refs);
++			}
++			event->site = "scene_reset:framebuffer:retry";
++			return NULL;
+ 		}
+ 	}
+ #ifdef RECYCLE_RENDERTARGETS
+ 	vgl_log("%s:%d Out of rendertargets handles: Recycling an old rendertarget.\n", __FILE__, __LINE__);
+ 	uint32_t oldest_framecount = 0xFFFFFFFF;
+ 	render_target *r = NULL;
+ 	for (i = 0; i < MAX_RENDER_TARGETS_NUM; i++) {
+ 		if (rt_list[i].last_frame < oldest_framecount) {
+ 			oldest_framecount = rt_list[i].last_frame;
+ 			r = &rt_list[i];
+ 		}
+ 	}
+ 	sceGxmFinish(gxm_context);
+ 	sceGxmDestroyRenderTarget(r->rt);
+ 	r->max_refs = w > MAX_SHARED_RT_SIZE ? 1 : MAX_SCENES_PER_FRAME;
+ 	int res = setup_render_target(&r->rt, w, h, r->max_refs);
+ #ifdef LOG_ERRORS
+ 	if (res)
+ 		vgl_log("%s:%d Failed to create a shared rendertarget of size %dx%d (%s).\n", __FILE__, __LINE__, w, h, get_gxm_error_literal(res));
+ #endif
+ 	r->w = w;
+ 	r->h = h;
+ 	r->ref_count = 1;
+ 	return r;
+ #else
++	event->site = "scene_reset:framebuffer:pool-full";
++	event->pool_full = 1;
+ #ifdef LOG_ERRORS
+ 	vgl_log("%s:%d Failed to create a shared rendertarget of size %dx%d (Out of rendertargets handles).\n", __FILE__, __LINE__, w, h);
+ #endif
+ 	return NULL;
+ #endif
+ }
+ 
+ void __mark_rt_as_dirty(render_target *rt) {
++	if (!rt || !rt->rt || rt->ref_count <= 0) {
++		IsaacVitaGlRenderTargetTelemetry event;
++		vgl_memset(&event, 0, sizeof(event));
++		event.site = "mark_rt_as_dirty:invariant";
++		event.first_target = rt ? rt->rt : NULL;
++		event.width = rt ? (uint32_t)rt->w : 0;
++		event.height = rt ? (uint32_t)rt->h : 0;
++		event.invariant_failure = 1;
++		isaac_vitagl_count_render_target_state(&event);
++		isaac_vitagl_report_render_target_event(&event);
++		return;
++	}
+ 	rt->ref_count--;
+ 	if (!rt->ref_count) {
+-		_mark_rt_as_dirty(rt->rt);
++		SceGxmRenderTarget *target = rt->rt;
+ 		rt->rt = NULL;
++		rt->w = 0;
++		rt->h = 0;
++		rt->max_refs = 0;
++		_mark_rt_as_dirty(target);
+ 	}
+ }
+ #endif
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -24,6 +24,41 @@ extern "C" {
+ #endif
+ 
+ #include <vitashark.h>
++
++/* Project-local failure/recovery boundary for mode-1 shared render targets.
++ * Both raw create outputs and every destructive recovery result are retained
++ * so a recovered run does not erase the hardware cause. */
++#ifndef ISAAC_VITAGL_RT_TELEMETRY_DEFINED
++#define ISAAC_VITAGL_RT_TELEMETRY_DEFINED 1
++typedef struct IsaacVitaGlRenderTargetTelemetry {
++	const char *site;
++	int32_t first_result;
++	int32_t retry_result;
++	int32_t finish_result;
++	uint32_t finish_called;
++	int32_t destroy_result;
++	const void *first_target;
++	const void *retry_target;
++	uint32_t retry_attempted;
++	uint32_t pool_full;
++	uint32_t pending_duplicate;
++	uint32_t invariant_failure;
++	uint32_t pending[4];
++	uint32_t drained_targets;
++	uint32_t live_targets;
++	uint32_t reference_sum;
++	uint32_t width;
++	uint32_t height;
++	uint32_t frame;
++	uint32_t recovered;
++} IsaacVitaGlRenderTargetTelemetry;
++#endif
++#ifndef ISAAC_VITAGL_RT_EVENT_MAX_BODY
++#define ISAAC_VITAGL_RT_EVENT_MAX_BODY 381u
++#endif
++
++void isaac_vita_vitagl_render_target_event(
++	const IsaacVitaGlRenderTargetTelemetry *event);
+ 
+ #ifndef HAVE_GL_HEADERS
+ // clang-format off
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -26,6 +26,13 @@
+ #include <vitasdk.h>
+ #include "vitaGL.h"
+ 
++void isaac_vitagl_report_uniform_reserve_failure(
++	const char *site, int32_t result, const void *buffer);
++void isaac_vitagl_report_scene_failure(
++	const char *site, int32_t result, const void *target);
++void isaac_vitagl_report_render_target_event(
++	IsaacVitaGlRenderTargetTelemetry *event);
++
+ // Internal constants
+ #define TEXTURES_NUM 16384 // Available textures
+ #define TEXTURE_IMAGE_UNITS_NUM 16 // Available texture image units
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -832,10 +832,20 @@ static inline __attribute__((always_inline)) void scene_end(void) {
+ 	// Ends current gxm scene
+ 	query_fence.value++;
+-	sceGxmEndScene(gxm_context, NULL, &query_fence);
++	int32_t result = sceGxmEndScene(gxm_context, NULL, &query_fence);
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++	if (is_rendering_display)
++		isaac_vitagl_note_display_end(gxm_context, result);
++#endif
+ 	if (system_app_mode && vsync_interval)
+ 		sceDisplayWaitVblankStartMulti(vsync_interval);
+ }
+ 
++static inline void isaac_vitagl_rearm_scene_after_failure(void) {
++	needs_end_scene = GL_FALSE;
++	needs_scene_reset = GL_TRUE;
++	dirty_framebuffer = GL_TRUE;
++}
++
+ void scene_reset(void) {
+ 	if (in_use_framebuffer != active_write_fb || needs_scene_reset || dirty_framebuffer || dirty_query) {
+ 		dirty_framebuffer = GL_FALSE;
+@@ -891,6 +897,20 @@ void scene_reset(void) {
+ 				vgl_log("%s:%d Scene reset failed due to sceGxmBeginScene erroring (%s) on display.\n", __FILE__, __LINE__, get_gxm_error_literal(r));
+ 			}
+ #endif
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++			isaac_vitagl_note_display_begin(
++				gxm_context, gxm_render_target,
++				gxm_sync_objects[gxm_back_buffer_index],
++				&gxm_color_surfaces[gxm_back_buffer_index],
++				sceGxmColorSurfaceGetData(
++					&gxm_color_surfaces[gxm_back_buffer_index]), r);
++#endif
++			if (r) {
++				isaac_vitagl_rearm_scene_after_failure();
++				isaac_vitagl_report_scene_failure(
++					"scene_reset:display", r, gxm_render_target);
++				return;
++			}
+ 		} else {
+ 			// Double check that colorsurface and target texture are synced
+ 			if (sceGxmColorSurfaceGetData(&active_write_fb->colorbuffer) != active_write_fb->tex->data) {
+@@ -909,8 +921,20 @@ void scene_reset(void) {
+ 			// If a rendertarget is not bound to the in use framebuffer, we get one for it
+ 			if (!active_write_fb->target) {
+ #ifdef HAVE_SHARED_RENDERTARGETS
+-				active_write_fb->target = (SceGxmRenderTarget *)get_free_render_target(active_write_fb->width, active_write_fb->height);
++				IsaacVitaGlRenderTargetTelemetry event;
++				render_target *acquired = get_free_render_target(
++					active_write_fb->width, active_write_fb->height,
++					&event);
++				active_write_fb->target = (SceGxmRenderTarget *)acquired;
++				isaac_vitagl_count_render_target_state(&event);
++				if (!acquired || !acquired->rt) {
++					isaac_vitagl_rearm_scene_after_failure();
++					isaac_vitagl_report_render_target_event(&event);
++					return;
++				}
++				if (event.recovered)
++					isaac_vitagl_report_render_target_event(&event);
+ #else
+ 				int r = setup_render_target(&active_write_fb->target, active_write_fb->width, active_write_fb->height, 1);
+ #ifdef LOG_ERRORS
+ 				if (r) {
+@@ -928,14 +952,26 @@ void scene_reset(void) {
+ 			}
+ #endif
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ 			render_target *fbo_rt = (render_target *)active_write_fb->target;
++			if (!fbo_rt || !fbo_rt->rt) {
++				IsaacVitaGlRenderTargetTelemetry event;
++				vgl_memset(&event, 0, sizeof(event));
++				event.site = "scene_reset:framebuffer:stale-target";
++				event.first_target = fbo_rt ? fbo_rt->rt : NULL;
++				event.width = (uint32_t)active_write_fb->width;
++				event.height = (uint32_t)active_write_fb->height;
++				isaac_vitagl_count_render_target_state(&event);
++				isaac_vitagl_rearm_scene_after_failure();
++				isaac_vitagl_report_render_target_event(&event);
++				return;
++			}
+ #ifdef RECYCLE_RENDERTARGETS
+ 			fbo_rt->last_frame = vgl_framecount;
+ #endif
+ 			int r = sceGxmBeginScene(gxm_context, 0, fbo_rt->rt,
+ #else
+ 			int r = sceGxmBeginScene(gxm_context, 0, active_write_fb->target,
+ #endif
+ 					NULL, NULL, NULL,
+ 					&active_write_fb->colorbuffer,
+ 					active_write_fb->depthbuffer_ptr);
+@@ -943,6 +979,17 @@ void scene_reset(void) {
+ 			if (r)
+ 				vgl_log("%s:%d Scene reset failed due to sceGxmBeginScene erroring (%s) on framebuffer 0x%08X.\n", __FILE__, __LINE__, get_gxm_error_literal(r), active_write_fb);
+ #endif
++			if (r) {
++				isaac_vitagl_rearm_scene_after_failure();
++				isaac_vitagl_report_scene_failure(
++					"scene_reset:framebuffer", r,
++#ifdef HAVE_SHARED_RENDERTARGETS
++					fbo_rt->rt);
++#else
++					active_write_fb->target);
++#endif
++				return;
++			}
+ 		}
+ 
+ 		// Setting back current viewport if enabled cause sceGxm will reset it at sceGxmEndScene call
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -273,9 +273,11 @@ void glDeleteFramebuffers(GLsizei n, const GLuint *ids) {
+ 			}
+ 			if (fb->target) {
+ 				mark_rt_as_dirty(fb->target);
++				fb->target = NULL;
+ 			}
+ #ifndef DEPTH_STENCIL_HACK
+ 			if (fb->depthbuffer_ptr) {
+ 				mark_as_dirty(fb->depthbuffer_ptr->depthData);
++				fb->depthbuffer_ptr = NULL;
+ 			}
+ #endif
+diff --git a/source/tests.c b/source/tests.c
+--- a/source/tests.c
++++ b/source/tests.c
+@@ -293,8 +293,14 @@ void update_scissor_test(void) {
+ 		// Calculating scissor test region vertices
+ 		vector4f_convert_to_local_space(scissor_test_vertices, region.x, region.y, region.w, region.h);
+ 
+-		void *vertex_buffer;
+-		sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer);
++		void *vertex_buffer = NULL;
++		int reserve_result = sceGxmReserveVertexDefaultUniformBuffer(
++			gxm_context, &vertex_buffer);
++		if (reserve_result < 0 || !vertex_buffer) {
++			isaac_vitagl_report_uniform_reserve_failure(
++				"update_scissor_test:mask", reserve_result, vertex_buffer);
++			return;
++		}
+ 		sceGxmSetUniformDataF(vertex_buffer, clear_position, 0, 4, &clear_vertices->x);
+ 		sceGxmSetUniformDataF(vertex_buffer, clear_depth, 0, 1, &scissor_depth);
+ 
+@@ -331,5 +337,11 @@ void update_scissor_test(void) {
+-	void *vertex_buffer;
+-	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer);
++	void *vertex_buffer = NULL;
++	int reserve_result = sceGxmReserveVertexDefaultUniformBuffer(
++		gxm_context, &vertex_buffer);
++	if (reserve_result < 0 || !vertex_buffer) {
++		isaac_vitagl_report_uniform_reserve_failure(
++			"update_scissor_test:restore", reserve_result, vertex_buffer);
++		return;
++	}
+ 	sceGxmSetUniformDataF(vertex_buffer, clear_position, 0, 4, scissor_test_state ? &scissor_test_vertices->x : &clear_vertices->x);
+ 	sceGxmSetUniformDataF(vertex_buffer, clear_depth, 0, 1, &scissor_depth);
+ 
+diff --git a/source/misc.c b/source/misc.c
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -654,3 +654,4 @@ void glClear(GLbitfield mask) {
+-	void *fbuffer, *vbuffer;
++	void *fbuffer = NULL, *vbuffer = NULL;
++	int reserve_result;
+ 
+ 	orig_depth_test = depth_test_state;
+@@ -670,11 +671,23 @@ void glClear(GLbitfield mask) {
+ 	sceGxmSetVertexProgram(gxm_context, clear_vertex_program_patched);
+ 	sceGxmSetFragmentProgram(gxm_context, is_fbo_float ? clear_fragment_program_float_patched : clear_fragment_program_patched);
+ 
+-	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vbuffer);
++	reserve_result = sceGxmReserveVertexDefaultUniformBuffer(
++		gxm_context, &vbuffer);
++	if (reserve_result < 0 || !vbuffer) {
++		isaac_vitagl_report_uniform_reserve_failure(
++			"glClear:vertex", reserve_result, vbuffer);
++		return;
++	}
+ 	sceGxmSetUniformDataF(vbuffer, clear_position, 0, 4, &clear_vertices->x);
+ 	sceGxmSetUniformDataF(vbuffer, clear_depth, 0, 1, &clear_depth_value);
+ 
+-	sceGxmReserveFragmentDefaultUniformBuffer(gxm_context, &fbuffer);
++	reserve_result = sceGxmReserveFragmentDefaultUniformBuffer(
++		gxm_context, &fbuffer);
++	if (reserve_result < 0 || !fbuffer) {
++		isaac_vitagl_report_uniform_reserve_failure(
++			"glClear:fragment", reserve_result, fbuffer);
++		return;
++	}
+ 	sceGxmSetUniformDataF(fbuffer, clear_color, 0, 4, &clear_rgba_val.r);
+ 
+ 	// Disable fragment program if not clearing color buffer. Depth and stencil clears are unaffected.
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -267,12 +267,48 @@ static inline __attribute__((always_inline)) int setup_render_target(SceGxmRende
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ #define MAX_RENDER_TARGETS_NUM 47 // Maximum amount of dedicated render targets usable for fbos
+ #define MAX_SHARED_RT_SIZE 256 // Maximum  width value in pixels for shared rendertargets usage
++#define ISAAC_RESERVED_RT_WIDTH 1024
++#define ISAAC_RESERVED_RT_HEIGHT 1024
++#define ISAAC_RESERVED_RT_SCENES 8
+ render_target rt_list[MAX_RENDER_TARGETS_NUM];
++static SceGxmRenderTarget *isaac_reserved_render_target;
++static GLboolean isaac_reserved_render_target_attempted = GL_FALSE;
+ _Static_assert(FRAME_PURGE_FREQ == 4,
+ 	"Isaac render-target telemetry requires four GC buckets");
+ _Static_assert(sizeof(IsaacVitaGlRenderTargetTelemetry) == 92,
+ 	"Isaac render-target telemetry ABI drifted");
+ 
++/* Reserve the one fatal-without-fallback GXM allocation before game loading
++ * consumes and fragments LPDDR.  If creation fails, leave the pointer null so
++ * the normal late transactional path remains authoritative.  An unconsumed
++ * target deliberately stays process-owned, like the display target: vitaGL
++ * has no teardown API and KAGE exits through sceKernelExitProcess. */
++static void isaac_vitagl_reserve_render_target_once(void) {
++	IsaacVitaGlRenderTargetTelemetry event;
++	SceGxmRenderTarget *target = NULL;
++
++	if (isaac_reserved_render_target_attempted ||
++	    msaa_mode != SCE_GXM_MULTISAMPLE_NONE)
++		return;
++	isaac_reserved_render_target_attempted = GL_TRUE;
++	vgl_memset(&event, 0, sizeof(event));
++	event.site = "init:reserved-rt:late-fallback";
++	event.width = ISAAC_RESERVED_RT_WIDTH;
++	event.height = ISAAC_RESERVED_RT_HEIGHT;
++	event.first_result = setup_render_target(&target,
++		ISAAC_RESERVED_RT_WIDTH, ISAAC_RESERVED_RT_HEIGHT,
++		ISAAC_RESERVED_RT_SCENES);
++	event.first_target = target;
++	if (!event.first_result && target) {
++		isaac_reserved_render_target = target;
++		event.site = "init:reserved-rt:ready";
++	}
++	/* This event is diagnostic, never a startup-profile terminal condition.
++	 * A failed early attempt is recovered by retaining the normal late path. */
++	event.recovered = 1;
++	isaac_vitagl_report_render_target_event(&event);
++}
++
+ static void isaac_vitagl_count_render_target_state(
+ 	IsaacVitaGlRenderTargetTelemetry *event) {
+ 	event->live_targets = 0;
+@@ -414,6 +450,21 @@ render_target *get_free_render_target(
+ 			int max_refs =
+ 				w > MAX_SHARED_RT_SIZE ? 1 : MAX_SCENES_PER_FRAME;
+ 			SceGxmRenderTarget *target = NULL;
++			if (isaac_reserved_render_target &&
++			    w == ISAAC_RESERVED_RT_WIDTH &&
++			    h == ISAAC_RESERVED_RT_HEIGHT &&
++			    ISAAC_RESERVED_RT_SCENES == MAX_SCENES_PER_FRAME &&
++			    msaa_mode == SCE_GXM_MULTISAMPLE_NONE) {
++				target = isaac_reserved_render_target;
++				isaac_vitagl_publish_render_target(
++					&rt_list[i], target, w, h, max_refs);
++				isaac_reserved_render_target = NULL;
++				event->site =
++					"scene_reset:framebuffer:reserved";
++				event->first_target = target;
++				event->recovered = 1;
++				return &rt_list[i];
++			}
+ 			event->first_result =
+ 				setup_render_target(&target, w, h, MAX_SCENES_PER_FRAME);
+ 			event->first_target = target;
+@@ -731,6 +782,9 @@ void init_gxm_context(SceGxmContext **ctx, uint8_t ctx_slot) {
+ void create_display_render_target(void) {
+ 	// Creating render target for the display
+ 	setup_render_target(&gxm_render_target, DISPLAY_WIDTH, DISPLAY_HEIGHT, gxm_display_rt_size);
++#ifdef HAVE_SHARED_RENDERTARGETS
++	isaac_vitagl_reserve_render_target_once();
++#endif
+ }
+ 
+ void init_display_color_surfaces(GLboolean is_swap) {
+@@ -737,23 +830,93 @@ void init_display_color_surfaces(GLboolean is_swap) {
++	uint32_t display_size = VGL_ALIGN(
++		4 * DISPLAY_STRIDE * DISPLAY_HEIGHT, 1 * 1024 * 1024);
++	GLboolean dedicated_ok = system_app_mode ? GL_FALSE : GL_TRUE;
++
++	for (int i = 0; i < gxm_display_buffer_count; i++) {
++		gxm_color_surfaces_addr[i] = NULL;
++		gxm_color_surface_memblocks[i] = -1;
++		isaac_color_surface_alloc_results[i] =
++			ISAAC_DISPLAY_MEMBLOCK_NOT_CALLED;
++		isaac_color_surface_get_base_results[i] =
++			ISAAC_DISPLAY_MEMBLOCK_NOT_CALLED;
++		isaac_color_surface_map_results[i] =
++			ISAAC_DISPLAY_MEMBLOCK_NOT_CALLED;
++		isaac_color_surface_dedicated[i] = 0;
++	}
++
+ 	// Getting access to the shared framebuffer on system app mode
+ 	while (system_app_mode) {
+ 		shared_fb = sceSharedFbOpen(1);
+ 		vgl_memset(&shared_fb_info, 0, sizeof(SceSharedFbInfo));
+ 		sceSharedFbGetInfo(shared_fb, &shared_fb_info);
+ 		if (shared_fb_info.index == 1)
+ 			sceSharedFbClose(shared_fb);
+ 		else {
+ 			sceGxmMapMemory(shared_fb_info.fb_base, shared_fb_info.fb_size, SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
+ 			gxm_color_surfaces_addr[0] = shared_fb_info.fb_base;
+ 			gxm_color_surfaces_addr[1] = shared_fb_info.fb_base2;
+ 			break;
+ 		}
+ 	}
+ 
++	/* One transaction: hardware A/B evidence is valid only when all display
++	 * surfaces are dedicated CDRAM blocks.  A partial failure rolls every
++	 * successful slot back before the explicit all-pool fallback. */
++	if (!system_app_mode) {
++		for (int i = 0; i < gxm_display_buffer_count; i++) {
++			SceUID uid = sceKernelAllocMemBlock(
++				"vitaGL_display_fb",
++				SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
++				display_size, NULL);
++			isaac_color_surface_alloc_results[i] = uid;
++			if (uid < 0) {
++				dedicated_ok = GL_FALSE;
++				break;
++			}
++			gxm_color_surface_memblocks[i] = uid;
++			isaac_color_surface_get_base_results[i] =
++				sceKernelGetMemBlockBase(
++					uid, &gxm_color_surfaces_addr[i]);
++			if (isaac_color_surface_get_base_results[i] ||
++			    !gxm_color_surfaces_addr[i]) {
++				dedicated_ok = GL_FALSE;
++				break;
++			}
++			isaac_color_surface_map_results[i] = sceGxmMapMemory(
++				gxm_color_surfaces_addr[i], display_size,
++				SCE_GXM_MEMORY_ATTRIB_READ |
++				SCE_GXM_MEMORY_ATTRIB_WRITE);
++			if (isaac_color_surface_map_results[i]) {
++				dedicated_ok = GL_FALSE;
++				break;
++			}
++		}
++		if (!dedicated_ok) {
++			for (int i = 0; i < gxm_display_buffer_count; i++) {
++				if (gxm_color_surface_memblocks[i] >= 0) {
++					if (!isaac_color_surface_map_results[i] &&
++					    gxm_color_surfaces_addr[i])
++						sceGxmUnmapMemory(
++							gxm_color_surfaces_addr[i]);
++					sceKernelFreeMemBlock(
++						gxm_color_surface_memblocks[i]);
++				}
++				gxm_color_surface_memblocks[i] = -1;
++				gxm_color_surfaces_addr[i] = NULL;
++			}
++		} else {
++			for (int i = 0; i < gxm_display_buffer_count; i++)
++				isaac_color_surface_dedicated[i] = 1;
++		}
++	}
++
+ 	for (int i = 0; i < gxm_display_buffer_count; i++) {
+ 		// Allocating color surface memblock
+ 		if (!system_app_mode) {
+-			gxm_color_surfaces_addr[i] = gpu_alloc_mapped_aligned_for_gpu(4096, VGL_ALIGN(4 * DISPLAY_STRIDE * DISPLAY_HEIGHT, 1 * 1024 * 1024));
++			if (!dedicated_ok)
++				gxm_color_surfaces_addr[i] =
++					gpu_alloc_mapped_aligned_for_gpu(
++						4096, display_size);
+ 			vgl_memset(gxm_color_surfaces_addr[i], 0, 4 * DISPLAY_STRIDE * DISPLAY_HEIGHT);
+ 		}
+ 
+ 		// Initializing allocated color surface
+@@ -775,7 +923,23 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 		if (!is_swap)
+ 			sceGxmSyncObjectCreate(&gxm_sync_objects[i]);
+ 	}
+ }
+ 
++static void isaac_vitagl_release_display_color_surface(int index) {
++	void *address = gxm_color_surfaces_addr[index];
++	SceUID uid = gxm_color_surface_memblocks[index];
++
++	if (uid >= 0) {
++		if (address)
++			sceGxmUnmapMemory(address);
++		sceKernelFreeMemBlock(uid);
++	} else if (address) {
++		vgl_free(address);
++	}
++	gxm_color_surface_memblocks[index] = -1;
++	gxm_color_surfaces_addr[index] = NULL;
++	isaac_color_surface_dedicated[index] = 0;
++}
++
+ void init_depth_stencil_buffer(uint32_t w, uint32_t h, SceGxmDepthStencilSurface *surface, GLboolean has_stencil) {
+ 	// Calculating sizes for depth and stencil surfaces
+@@ -932,10 +1097,11 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 	// Perform resolution change if there's one pending
+ 	if (NEW_DISPLAY_WIDTH) {
++		sceGxmDisplayQueueFinish();
+ 		sceGxmFinish(gxm_context);
+ 		sceGxmDestroyRenderTarget(gxm_render_target);
+ 		if (!system_app_mode) {
+ 			for (int i = 0; i < gxm_display_buffer_count; i++) {
+-				vgl_free(gxm_color_surfaces_addr[i]);
++				isaac_vitagl_release_display_color_surface(i);
+ 			}
+ 		}
+ 		DISPLAY_WIDTH = NEW_DISPLAY_WIDTH;
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -57,4 +57,73 @@ void isaac_vita_vitagl_render_target_event(
+ 	const IsaacVitaGlRenderTargetTelemetry *event);
+ 
++#ifndef ISAAC_VITAGL_DISPLAY_QUEUE_PROBE_DEFINED
++#define ISAAC_VITAGL_DISPLAY_QUEUE_PROBE_DEFINED 1
++/* Fixed-size project telemetry for the exact display-queue boundary.  The
++ * ADD_RESULT event is emitted by the owner thread; DISPLAY_CALLBACK is
++ * emitted by GXM's queue thread after GPU synchronization. */
++#define ISAAC_VITAGL_DISPLAY_QUEUE_SAMPLE_COUNT 8u
++#define ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_ADD_RESULT 1u
++#define ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_DISPLAY_CALLBACK 2u
++#define ISAAC_VITAGL_DISPLAY_LINEAGE_BEGIN_MISMATCH 0x00000001u
++#define ISAAC_VITAGL_DISPLAY_LINEAGE_END_MISMATCH   0x00000002u
++
++typedef struct IsaacVitaGlDisplayQueueProbe {
++	uint32_t size;
++	uint32_t stage;
++	uint32_t sequence;
++	uint32_t front_index;
++	uint32_t back_index;
++	uint32_t address;
++	union {
++		struct {
++			int32_t result;
++			uint32_t old_sync;
++			uint32_t new_sync;
++			uint32_t begin_context;
++			uint32_t begin_render_target;
++			uint32_t begin_fragment_sync;
++			uint32_t begin_color_surface;
++			uint32_t begin_color_data;
++			int32_t begin_result;
++			uint32_t begin_count;
++			uint32_t end_context;
++			int32_t end_result;
++			uint32_t end_count;
++			uint32_t mismatch_mask;
++			int32_t back_memblock_uid;
++			int32_t back_get_base_result;
++			int32_t back_map_result;
++			uint32_t back_dedicated;
++		} add;
++		struct {
++			int32_t result;
++			uint32_t size;
++			uint32_t base;
++			uint32_t pitch;
++			uint32_t pixel_format;
++			uint32_t width;
++			uint32_t height;
++			uint32_t sync;
++			uint32_t sample_count;
++			uint32_t sparse_hash;
++			uint32_t rgba[ISAAC_VITAGL_DISPLAY_QUEUE_SAMPLE_COUNT];
++		} display;
++	} detail;
++} IsaacVitaGlDisplayQueueProbe;
++#if defined(__cplusplus)
++static_assert(sizeof(IsaacVitaGlDisplayQueueProbe) == 96u,
++	"Isaac display-lineage telemetry ABI drifted");
++#else
++_Static_assert(sizeof(IsaacVitaGlDisplayQueueProbe) == 96u,
++	"Isaac display-lineage telemetry ABI drifted");
++#endif
++
++/* rgba[] contains raw A8B8G8R8 words at the eight fixed positions documented
++ * by the overlay source.  The event is stack-owned and valid only for the
++ * duration of this call; a strong hook may only make a bounded copy. */
++void isaac_vitagl_display_queue_probe(
++	const IsaacVitaGlDisplayQueueProbe *event);
++#endif
++
+ #ifndef HAVE_GL_HEADERS
+ // clang-format off
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -136,4 +136,11 @@ extern void *fragment_usse_ring_buffer_addr[GXM_CONTEXTS_NUM]; // fragment USSE
+ 
+ // sceDisplay callback data struct
+-struct display_queue_callback_data { void *addr; };
++struct display_queue_callback_data {
++	void *addr;
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++	uint32_t isaac_sequence;
++	uint32_t isaac_front_index;
++	uint32_t isaac_back_index;
++#endif
++};
+ 
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -144,6 +144,18 @@ void isaac_vitagl_report_render_target_event(
+ 	isaac_vita_vitagl_render_target_event(event);
+ }
+ 
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++_Static_assert(sizeof(IsaacVitaGlDisplayQueueProbe) == 96,
++	"Isaac display-lineage telemetry ABI drifted");
++
++/* The archive stays self-contained.  The diagnostic executable supplies a
++ * strong bounded-copy collector; this callback-thread default must stay inert. */
++__attribute__((weak)) void isaac_vitagl_display_queue_probe(
++	const IsaacVitaGlDisplayQueueProbe *event) {
++	(void)event;
++}
++#endif
++
+ // Shader Patcher memory configuration
+ static unsigned int shader_patcher_buffer_size = 1024 * 1024;
+ static unsigned int shader_patcher_vertex_usse_size = 1024 * 1024;
+@@ -172,5 +184,22 @@ unsigned int gxm_front_buffer_index = 0; // Display front buffer id
+ unsigned int gxm_back_buffer_index; // Display back buffer id
+ static void (*vgl_display_cb)(void *framebuf) = NULL; // Additional custom callback used inside display queue callback
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++static uint32_t isaac_display_queue_sequence;
++typedef struct IsaacVitaGlPendingDisplayLineage {
++	uint32_t begin_context;
++	uint32_t begin_render_target;
++	uint32_t begin_fragment_sync;
++	uint32_t begin_color_surface;
++	uint32_t begin_color_data;
++	int32_t begin_result;
++	uint32_t begin_count;
++	uint32_t end_context;
++	int32_t end_result;
++	uint32_t end_count;
++	uint32_t mismatch_mask;
++} IsaacVitaGlPendingDisplayLineage;
++static IsaacVitaGlPendingDisplayLineage isaac_pending_display_lineage;
++#endif
+ 
+ static void *gxm_shader_patcher_buffer_addr; // Shader PAtcher buffer memblock starting address
+ static void *gxm_shader_patcher_vertex_usse_addr; // Shader Patcher vertex USSE memblock starting address
+@@ -583,6 +598,177 @@ static void shader_patcher_host_free_cb(void *user_data, void *mem) {
+ 	vgl_free(mem);
+ }
+ 
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++static inline __attribute__((always_inline)) uint32_t
++isaac_vitagl_next_display_queue_sequence(void) {
++	uint32_t sequence = ++isaac_display_queue_sequence;
++	/* Zero is reserved for splash/foreign callback data. */
++	if (!sequence)
++		sequence = ++isaac_display_queue_sequence;
++	return sequence;
++}
++
++static inline __attribute__((always_inline)) void
++isaac_vitagl_note_display_begin(
++	SceGxmContext *context, const SceGxmRenderTarget *render_target,
++	SceGxmSyncObject *fragment_sync,
++	const SceGxmColorSurface *color_surface, void *color_data,
++	int32_t result) {
++	IsaacVitaGlPendingDisplayLineage *lineage =
++		&isaac_pending_display_lineage;
++	uint32_t context_value = (uint32_t)(uintptr_t)context;
++	uint32_t target_value = (uint32_t)(uintptr_t)render_target;
++	uint32_t sync_value = (uint32_t)(uintptr_t)fragment_sync;
++	uint32_t surface_value = (uint32_t)(uintptr_t)color_surface;
++	uint32_t data_value = (uint32_t)(uintptr_t)color_data;
++
++	if (!lineage->begin_count) {
++		lineage->begin_context = context_value;
++		lineage->begin_render_target = target_value;
++		lineage->begin_fragment_sync = sync_value;
++		lineage->begin_color_surface = surface_value;
++		lineage->begin_color_data = data_value;
++		lineage->begin_result = result;
++	} else if (lineage->begin_context != context_value ||
++		lineage->begin_render_target != target_value ||
++		lineage->begin_fragment_sync != sync_value ||
++		lineage->begin_color_surface != surface_value ||
++		lineage->begin_color_data != data_value ||
++		lineage->begin_result != result) {
++		lineage->mismatch_mask |=
++			ISAAC_VITAGL_DISPLAY_LINEAGE_BEGIN_MISMATCH;
++	}
++	if (lineage->begin_count != UINT32_MAX)
++		lineage->begin_count++;
++}
++
++static inline __attribute__((always_inline)) void
++isaac_vitagl_note_display_end(SceGxmContext *context, int32_t result) {
++	IsaacVitaGlPendingDisplayLineage *lineage =
++		&isaac_pending_display_lineage;
++	uint32_t context_value = (uint32_t)(uintptr_t)context;
++
++	if (!lineage->end_count) {
++		lineage->end_context = context_value;
++		lineage->end_result = result;
++	} else if (lineage->end_context != context_value ||
++		lineage->end_result != result) {
++		lineage->mismatch_mask |=
++			ISAAC_VITAGL_DISPLAY_LINEAGE_END_MISMATCH;
++	}
++	if (lineage->end_count != UINT32_MAX)
++		lineage->end_count++;
++}
++
++static inline __attribute__((always_inline)) void
++isaac_vitagl_init_display_queue_probe(
++	IsaacVitaGlDisplayQueueProbe *event,
++	const struct display_queue_callback_data *cb_data,
++	uint32_t stage) {
++	uint32_t index;
++	volatile uint32_t *detail = (volatile uint32_t *)&event->detail;
++
++	event->size = sizeof(*event);
++	event->stage = stage;
++	event->sequence = cb_data->isaac_sequence;
++	event->front_index = cb_data->isaac_front_index;
++	event->back_index = cb_data->isaac_back_index;
++	event->address = (uint32_t)(uintptr_t)cb_data->addr;
++	for (index = 0; index < sizeof(event->detail) / sizeof(uint32_t);
++	     ++index)
++		detail[index] = 0;
++}
++
++static void isaac_vitagl_probe_display_queue_add(
++	const struct display_queue_callback_data *cb_data,
++	SceGxmSyncObject *old_sync, SceGxmSyncObject *new_sync,
++	int32_t result) {
++	IsaacVitaGlDisplayQueueProbe event;
++	isaac_vitagl_init_display_queue_probe(&event, cb_data,
++		ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_ADD_RESULT);
++	event.detail.add.result = result;
++	event.detail.add.old_sync = (uint32_t)(uintptr_t)old_sync;
++	event.detail.add.new_sync = (uint32_t)(uintptr_t)new_sync;
++	event.detail.add.begin_context =
++		isaac_pending_display_lineage.begin_context;
++	event.detail.add.begin_render_target =
++		isaac_pending_display_lineage.begin_render_target;
++	event.detail.add.begin_fragment_sync =
++		isaac_pending_display_lineage.begin_fragment_sync;
++	event.detail.add.begin_color_surface =
++		isaac_pending_display_lineage.begin_color_surface;
++	event.detail.add.begin_color_data =
++		isaac_pending_display_lineage.begin_color_data;
++	event.detail.add.begin_result =
++		isaac_pending_display_lineage.begin_result;
++	event.detail.add.begin_count =
++		isaac_pending_display_lineage.begin_count;
++	event.detail.add.end_context =
++		isaac_pending_display_lineage.end_context;
++	event.detail.add.end_result =
++		isaac_pending_display_lineage.end_result;
++	event.detail.add.end_count = isaac_pending_display_lineage.end_count;
++	event.detail.add.mismatch_mask =
++		isaac_pending_display_lineage.mismatch_mask;
++	if (cb_data->isaac_back_index < DISPLAY_MAX_BUFFER_COUNT) {
++		uint32_t back = cb_data->isaac_back_index;
++		event.detail.add.back_memblock_uid =
++			isaac_color_surface_alloc_results[back];
++		event.detail.add.back_get_base_result =
++			isaac_color_surface_get_base_results[back];
++		event.detail.add.back_map_result =
++			isaac_color_surface_map_results[back];
++		event.detail.add.back_dedicated =
++			isaac_color_surface_dedicated[back];
++	}
++	isaac_vitagl_display_queue_probe(&event);
++	isaac_pending_display_lineage =
++		(IsaacVitaGlPendingDisplayLineage){ 0 };
++}
++
++static inline __attribute__((always_inline)) void
++isaac_vitagl_prepare_display_queue_callback(
++	const struct display_queue_callback_data *cb_data,
++	const SceDisplayFrameBuf *framebuffer, SceDisplaySetBufSync sync,
++	IsaacVitaGlDisplayQueueProbe *event) {
++	/* Fixed physical pixels: four corners, centre, loading accent/panel/bar.
++	 * A smaller/different surface reports no samples instead of reading past it. */
++	static const uint16_t sample_xy
++		[ISAAC_VITAGL_DISPLAY_QUEUE_SAMPLE_COUNT][2] = {
++		{   0,   0 }, { 959,   0 }, {   0, 543 }, { 959, 543 },
++		{ 480, 271 }, {   4,   4 }, { 100, 100 }, { 480, 365 }
++	};
++	const uint32_t *pixels = (const uint32_t *)cb_data->addr;
++	uint32_t hash = 2166136261u;
++	uint32_t index;
++
++	isaac_vitagl_init_display_queue_probe(event, cb_data,
++		ISAAC_VITAGL_DISPLAY_QUEUE_STAGE_DISPLAY_CALLBACK);
++	if (pixels && DISPLAY_WIDTH >= 960 && DISPLAY_HEIGHT >= 544 &&
++	    DISPLAY_STRIDE >= 960) {
++		for (index = 0;
++		     index < ISAAC_VITAGL_DISPLAY_QUEUE_SAMPLE_COUNT; ++index) {
++			uint32_t x = sample_xy[index][0];
++			uint32_t y = sample_xy[index][1];
++			uint32_t sample = pixels[y * DISPLAY_STRIDE + x];
++			event->detail.display.rgba[index] = sample;
++			hash ^= sample;
++			hash *= 16777619u;
++		}
++		event->detail.display.sample_count =
++			ISAAC_VITAGL_DISPLAY_QUEUE_SAMPLE_COUNT;
++		event->detail.display.sparse_hash = hash;
++	}
++	event->detail.display.size = framebuffer->size;
++	event->detail.display.base = (uint32_t)(uintptr_t)framebuffer->base;
++	event->detail.display.pitch = framebuffer->pitch;
++	event->detail.display.pixel_format = framebuffer->pixelformat;
++	event->detail.display.width = framebuffer->width;
++	event->detail.display.height = framebuffer->height;
++	event->detail.display.sync = (uint32_t)sync;
++}
++#endif
++
+ // sceDisplay callback
+ static void display_queue_callback(const void *callbackData) {
+ 	// Populating sceDisplay framebuffer parameters
+@@ -605,7 +605,35 @@ static void display_queue_callback(const void *callbackData) {
+ 		vgl_display_cb(cb_data->addr);
+ 
+ 	// Setting sceDisplay framebuffer
+-	sceDisplaySetFrameBuf(&display_fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++	IsaacVitaGlDisplayQueueProbe display_event;
++	uint32_t *pixels = (uint32_t *)cb_data->addr;
++	uint32_t marker_x;
++	uint32_t marker_y;
++	if (cb_data->isaac_sequence)
++		isaac_vitagl_prepare_display_queue_callback(
++			cb_data, &display_fb, SCE_DISPLAY_SETBUF_NEXTFRAME,
++			&display_event);
++	/* Sampled telemetry above remains pure GPU output.  This tiny CPU-only
++	 * checker is deliberately outside all eight sample coordinates; a p600
++	 * system screenshot can therefore separate scanout from GPU color writes. */
++	if (pixels && DISPLAY_WIDTH >= 32 && DISPLAY_HEIGHT >= 32 &&
++	    DISPLAY_STRIDE >= 32) {
++		for (marker_y = 16; marker_y < 32; marker_y++)
++			for (marker_x = 16; marker_x < 32; marker_x++)
++				pixels[marker_y * DISPLAY_STRIDE + marker_x] =
++					(((marker_x >> 2) ^ (marker_y >> 2)) & 1)
++						? 0xffff00ff : 0xff00ff00;
++	}
++	int32_t display_result = sceDisplaySetFrameBuf(
++		&display_fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
++	if (cb_data->isaac_sequence) {
++		display_event.detail.display.result = display_result;
++		isaac_vitagl_display_queue_probe(&display_event);
++	}
++#else
++	sceDisplaySetFrameBuf(&display_fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
++#endif
+ 
+ 	// Performing VSync if enabled
+ 	if (vsync_interval)
+@@ -1310,11 +1409,32 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ #endif
+ #endif
+-		struct display_queue_callback_data queue_cb_data;
++		struct display_queue_callback_data queue_cb_data = { 0 };
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++		int32_t queue_result;
++#endif
+ 		queue_cb_data.addr = gxm_color_surfaces_addr[gxm_back_buffer_index];
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++		queue_cb_data.isaac_sequence =
++			isaac_vitagl_next_display_queue_sequence();
++		queue_cb_data.isaac_front_index = gxm_front_buffer_index;
++		queue_cb_data.isaac_back_index = gxm_back_buffer_index;
++#endif
+ #ifdef HAVE_PROFILING
+ 		tick = sceKernelGetProcessTimeLow();
+ #endif
+-		sceGxmDisplayQueueAddEntry(gxm_sync_objects[gxm_front_buffer_index], gxm_sync_objects[gxm_back_buffer_index], &queue_cb_data);
++#ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
++		queue_result = sceGxmDisplayQueueAddEntry(
++			gxm_sync_objects[gxm_front_buffer_index],
++			gxm_sync_objects[gxm_back_buffer_index], &queue_cb_data);
++		isaac_vitagl_probe_display_queue_add(
++			&queue_cb_data,
++			gxm_sync_objects[gxm_front_buffer_index],
++			gxm_sync_objects[gxm_back_buffer_index], queue_result);
++#else
++		sceGxmDisplayQueueAddEntry(
++			gxm_sync_objects[gxm_front_buffer_index],
++			gxm_sync_objects[gxm_back_buffer_index], &queue_cb_data);
++#endif
+ #ifdef HAVE_PROFILING
+ 		gpu_stall_cnt += sceKernelGetProcessTimeLow() - tick;
+ #endif
+diff --git a/source/splashscreen.c b/source/splashscreen.c
+--- a/source/splashscreen.c
++++ b/source/splashscreen.c
+@@ -6463,7 +6463,7 @@ int invoke_splashscreen(unsigned int args, void *arg) {
+ 		}
+ 		
+ 		// Sending new frame to display queue
+-		struct display_queue_callback_data queue_cb_data;
++		struct display_queue_callback_data queue_cb_data = { 0 };
+ 		queue_cb_data.addr = gxm_color_surfaces_addr[gxm_back_buffer_index];
+ 		sceGxmDisplayQueueAddEntry(gxm_sync_objects[gxm_front_buffer_index], gxm_sync_objects[gxm_back_buffer_index], &queue_cb_data);
+ 		gxm_front_buffer_index = gxm_back_buffer_index;
+
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -815,7 +815,6 @@ static void display_queue_callback(const void *callbackData) {
+ 	// Populating sceDisplay framebuffer parameters
+ 	SceDisplayFrameBuf display_fb;
+ 	const struct display_queue_callback_data *cb_data = callbackData;
+-	vgl_memset(&display_fb, 0, sizeof(SceDisplayFrameBuf));
+ 	display_fb.size = sizeof(SceDisplayFrameBuf);
+ 	display_fb.base = cb_data->addr;
+ 	display_fb.pitch = DISPLAY_STRIDE;
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -136,6 +136,27 @@ void isaac_vitagl_report_render_target_event(
+ 	isaac_vita_vitagl_render_target_event(event);
+ }
+ 
++__attribute__((weak)) void isaac_vita_vitagl_display_surface_status(
++	const IsaacVitaGlDisplaySurfaceStatus *status) {
++	sceClibPrintf(
++		"[vitaGL] display surfaces size=%u count=%u dedicated=%u "
++		"system=%u fail=%u/%u\n",
++		(unsigned)status->display_size, (unsigned)status->buffer_count,
++		(unsigned)status->dedicated_count,
++		(unsigned)status->system_app_mode,
++		(unsigned)status->failure_stage,
++		(unsigned)status->failure_index);
++}
++
++__attribute__((weak)) void
++isaac_vita_vitagl_display_surface_lifecycle_failure(
++	const char *site, int32_t result) {
++	sceClibPrintf(
++		"[vitaGL] display surface lifecycle failure site=%s "
++		"result=0x%08x; retaining old scanout\n",
++		site ? site : "unknown", (unsigned)result);
++}
++
+ #ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
+ _Static_assert(sizeof(IsaacVitaGlDisplayQueueProbe) == 96,
+ 	"Isaac display-lineage telemetry ABI drifted");
+@@ -168,6 +189,8 @@ static int32_t isaac_color_surface_alloc_results[DISPLAY_MAX_BUFFER_COUNT];
+ static int32_t isaac_color_surface_get_base_results[DISPLAY_MAX_BUFFER_COUNT];
+ static int32_t isaac_color_surface_map_results[DISPLAY_MAX_BUFFER_COUNT];
+ static uint32_t isaac_color_surface_dedicated[DISPLAY_MAX_BUFFER_COUNT];
++static int32_t isaac_color_surface_init_results[DISPLAY_MAX_BUFFER_COUNT];
++static int32_t isaac_color_surface_sync_results[DISPLAY_MAX_BUFFER_COUNT];
+ #define ISAAC_DISPLAY_MEMBLOCK_NOT_CALLED ((int32_t)0x80000000u)
+ SceGxmSyncObject *gxm_sync_objects[DISPLAY_MAX_BUFFER_COUNT]; // Display sync objects
+ unsigned int gxm_front_buffer_index = 0; // Display front buffer id
+@@ -1025,6 +1048,9 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 	uint32_t display_size = VGL_ALIGN(
+ 		4 * DISPLAY_STRIDE * DISPLAY_HEIGHT, 1 * 1024 * 1024);
+ 	GLboolean dedicated_ok = system_app_mode ? GL_FALSE : GL_TRUE;
++	uint32_t failure_stage = ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_NONE;
++	uint32_t failure_index = UINT32_MAX;
++	uint32_t dedicated_count = 0;
+ 
+ 	for (int i = 0; i < gxm_display_buffer_count; i++) {
+ 		gxm_color_surfaces_addr[i] = NULL;
+@@ -1036,6 +1062,10 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 		isaac_color_surface_map_results[i] =
+ 			ISAAC_DISPLAY_MEMBLOCK_NOT_CALLED;
+ 		isaac_color_surface_dedicated[i] = 0;
++		isaac_color_surface_init_results[i] =
++			ISAAC_DISPLAY_MEMBLOCK_NOT_CALLED;
++		isaac_color_surface_sync_results[i] =
++			ISAAC_DISPLAY_MEMBLOCK_NOT_CALLED;
+ 	}
+ 
+ 	// Getting access to the shared framebuffer on system app mode
+@@ -1055,7 +1085,10 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 
+ 	/* One transaction: hardware A/B evidence is valid only when all display
+ 	 * surfaces are dedicated CDRAM blocks.  A partial failure rolls every
+-	 * successful slot back before the explicit all-pool fallback. */
++	 * successful slot back before the explicit all-pool fallback.  Provenance:
++	 * birbparty/vitaGL f92c10450fdc861a59c015352dd2855465ed6399 reports
++	 * physical SetFrameBuf=0x80290002 for pool suballocations.  It allocates a
++	 * dedicated, 1 MiB-rounded memblock; opt=NULL does not prove base alignment. */
+ 	if (!system_app_mode) {
+ 		for (int i = 0; i < gxm_display_buffer_count; i++) {
+ 			SceUID uid = sceKernelAllocMemBlock(
+@@ -1065,6 +1098,9 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 			isaac_color_surface_alloc_results[i] = uid;
+ 			if (uid < 0) {
+ 				dedicated_ok = GL_FALSE;
++				failure_stage =
++					ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_ALLOC;
++				failure_index = (uint32_t)i;
+ 				break;
+ 			}
+ 			gxm_color_surface_memblocks[i] = uid;
+@@ -1074,6 +1110,9 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 			if (isaac_color_surface_get_base_results[i] ||
+ 			    !gxm_color_surfaces_addr[i]) {
+ 				dedicated_ok = GL_FALSE;
++				failure_stage =
++					ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_GET_BASE;
++				failure_index = (uint32_t)i;
+ 				break;
+ 			}
+ 			isaac_color_surface_map_results[i] = sceGxmMapMemory(
+@@ -1082,6 +1121,9 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 				SCE_GXM_MEMORY_ATTRIB_WRITE);
+ 			if (isaac_color_surface_map_results[i]) {
+ 				dedicated_ok = GL_FALSE;
++				failure_stage =
++					ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_MAP;
++				failure_index = (uint32_t)i;
+ 				break;
+ 			}
+ 		}
+@@ -1099,8 +1141,10 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 				gxm_color_surfaces_addr[i] = NULL;
+ 			}
+ 		} else {
+-			for (int i = 0; i < gxm_display_buffer_count; i++)
++			for (int i = 0; i < gxm_display_buffer_count; i++) {
+ 				isaac_color_surface_dedicated[i] = 1;
++				dedicated_count++;
++			}
+ 		}
+ 	}
+ 
+@@ -1115,7 +1159,8 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 		}
+ 
+ 		// Initializing allocated color surface
+-		sceGxmColorSurfaceInit(&gxm_color_surfaces[i],
++		isaac_color_surface_init_results[i] =
++			sceGxmColorSurfaceInit(&gxm_color_surfaces[i],
+ 			SCE_GXM_COLOR_FORMAT_A8B8G8R8,
+ 			SCE_GXM_COLOR_SURFACE_LINEAR,
+ 			msaa_mode == SCE_GXM_MULTISAMPLE_NONE ? SCE_GXM_COLOR_SURFACE_SCALE_NONE : SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE,
+@@ -1124,11 +1169,51 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 			DISPLAY_HEIGHT,
+ 			DISPLAY_STRIDE,
+ 			gxm_color_surfaces_addr[i]);
++		if (isaac_color_surface_init_results[i] &&
++		    failure_stage == ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_NONE) {
++			failure_stage =
++				ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_COLOR_INIT;
++			failure_index = (uint32_t)i;
++		}
+ 
+ 		// Creating a display sync object for the allocated color surface
+-		if (!is_swap)
+-			sceGxmSyncObjectCreate(&gxm_sync_objects[i]);
++		if (!is_swap) {
++			isaac_color_surface_sync_results[i] =
++				sceGxmSyncObjectCreate(&gxm_sync_objects[i]);
++			if (isaac_color_surface_sync_results[i] &&
++			    failure_stage ==
++				    ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_NONE) {
++				failure_stage =
++					ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_SYNC_CREATE;
++				failure_index = (uint32_t)i;
++			}
++		} else {
++			/* Resolution changes retain the original sync objects. */
++			isaac_color_surface_sync_results[i] = 0;
++		}
++	}
++
++	IsaacVitaGlDisplaySurfaceStatus status;
++	vgl_memset(&status, 0, sizeof(status));
++	status.size = sizeof(status);
++	status.display_size = display_size;
++	status.buffer_count = gxm_display_buffer_count;
++	status.dedicated_count = dedicated_count;
++	status.system_app_mode = system_app_mode;
++	status.failure_stage = failure_stage;
++	status.failure_index = failure_index;
++	for (int i = 0; i < gxm_display_buffer_count; i++) {
++		status.alloc_result[i] = isaac_color_surface_alloc_results[i];
++		status.get_base_result[i] =
++			isaac_color_surface_get_base_results[i];
++		status.map_result[i] = isaac_color_surface_map_results[i];
++		status.dedicated[i] = isaac_color_surface_dedicated[i];
++		status.color_init_result[i] =
++			isaac_color_surface_init_results[i];
++		status.sync_create_result[i] =
++			isaac_color_surface_sync_results[i];
+ 	}
++	isaac_vita_vitagl_display_surface_status(&status);
+ }
+ 
+ static void isaac_vitagl_release_display_color_surface(int index) {
+@@ -1681,8 +1766,32 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 	
+ 	// Perform resolution change if there's one pending
+ 	if (NEW_DISPLAY_WIDTH) {
+-		sceGxmDisplayQueueFinish();
++		int32_t queue_finish_result = sceGxmDisplayQueueFinish();
++		if (queue_finish_result) {
++			isaac_vita_vitagl_display_surface_lifecycle_failure(
++				"resize:queue-finish", queue_finish_result);
++			NEW_DISPLAY_WIDTH = 0;
++			NEW_DISPLAY_HEIGHT = 0;
++			return;
++		}
+ 		sceGxmFinish(gxm_context);
++		int32_t detach_result = sceDisplaySetFrameBuf(
++			NULL, SCE_DISPLAY_SETBUF_NEXTFRAME);
++		if (detach_result) {
++			isaac_vita_vitagl_display_surface_lifecycle_failure(
++				"resize:detach-scanout", detach_result);
++			NEW_DISPLAY_WIDTH = 0;
++			NEW_DISPLAY_HEIGHT = 0;
++			return;
++		}
++		int32_t wait_result = sceDisplayWaitSetFrameBuf();
++		if (wait_result) {
++			isaac_vita_vitagl_display_surface_lifecycle_failure(
++				"resize:wait-detach", wait_result);
++			NEW_DISPLAY_WIDTH = 0;
++			NEW_DISPLAY_HEIGHT = 0;
++			return;
++		}
+ 		sceGxmDestroyRenderTarget(gxm_render_target);
+ 		if (!system_app_mode) {
+ 			for (int i = 0; i < gxm_display_buffer_count; i++) {
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -25,6 +25,44 @@ extern "C" {
+ 
+ #include <vitashark.h>
+ 
++#ifndef ISAAC_VITAGL_DISPLAY_SURFACE_STATUS_DEFINED
++#define ISAAC_VITAGL_DISPLAY_SURFACE_STATUS_DEFINED 1
++#define ISAAC_VITAGL_DISPLAY_SURFACE_COUNT 3u
++#define ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_NONE        0u
++#define ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_ALLOC       1u
++#define ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_GET_BASE    2u
++#define ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_MAP         3u
++#define ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_COLOR_INIT  4u
++#define ISAAC_VITAGL_DISPLAY_SURFACE_STAGE_SYNC_CREATE 5u
++typedef struct IsaacVitaGlDisplaySurfaceStatus {
++	uint32_t size;
++	uint32_t display_size;
++	uint32_t buffer_count;
++	uint32_t dedicated_count;
++	uint32_t system_app_mode;
++	uint32_t failure_stage;
++	uint32_t failure_index;
++	int32_t alloc_result[ISAAC_VITAGL_DISPLAY_SURFACE_COUNT];
++	int32_t get_base_result[ISAAC_VITAGL_DISPLAY_SURFACE_COUNT];
++	int32_t map_result[ISAAC_VITAGL_DISPLAY_SURFACE_COUNT];
++	uint32_t dedicated[ISAAC_VITAGL_DISPLAY_SURFACE_COUNT];
++	int32_t color_init_result[ISAAC_VITAGL_DISPLAY_SURFACE_COUNT];
++	int32_t sync_create_result[ISAAC_VITAGL_DISPLAY_SURFACE_COUNT];
++} IsaacVitaGlDisplaySurfaceStatus;
++#if defined(__cplusplus)
++static_assert(sizeof(IsaacVitaGlDisplaySurfaceStatus) == 100u,
++	"vitaGL display-surface status ABI drifted");
++#else
++_Static_assert(sizeof(IsaacVitaGlDisplaySurfaceStatus) == 100u,
++	"vitaGL display-surface status ABI drifted");
++#endif
++#endif
++
++void isaac_vita_vitagl_display_surface_status(
++	const IsaacVitaGlDisplaySurfaceStatus *status);
++void isaac_vita_vitagl_display_surface_lifecycle_failure(
++	const char *site, int32_t result);
++
+ /* Project-local failure/recovery boundary for mode-1 shared render targets.
+  * Both raw create outputs and every destructive recovery result are retained
+  * so a recovered run does not erase the hardware cause. */
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -1202,7 +1202,10 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 	status.system_app_mode = system_app_mode;
+ 	status.failure_stage = failure_stage;
+ 	status.failure_index = failure_index;
+-	for (int i = 0; i < gxm_display_buffer_count; i++) {
++	uint32_t status_copy_count = gxm_display_buffer_count;
++	if (status_copy_count > ISAAC_VITAGL_DISPLAY_SURFACE_COUNT)
++		status_copy_count = ISAAC_VITAGL_DISPLAY_SURFACE_COUNT;
++	for (uint32_t i = 0; i < status_copy_count; i++) {
+ 		status.alloc_result[i] = isaac_color_surface_alloc_results[i];
+ 		status.get_base_result[i] =
+ 			isaac_color_surface_get_base_results[i];
+@@ -1221,12 +1224,25 @@ static void isaac_vitagl_release_display_color_surface(int index) {
+ 	SceUID uid = gxm_color_surface_memblocks[index];
+ 
+ 	if (uid >= 0) {
+-		if (address)
+-			sceGxmUnmapMemory(address);
+-		sceKernelFreeMemBlock(uid);
++		if (address) {
++			int32_t unmap_result = sceGxmUnmapMemory(address);
++			if (unmap_result) {
++				isaac_vita_vitagl_display_surface_lifecycle_failure(
++					"resize:unmap-scanout", unmap_result);
++				goto retire;
++			}
++		}
++		int32_t free_result = sceKernelFreeMemBlock(uid);
++		if (free_result) {
++			isaac_vita_vitagl_display_surface_lifecycle_failure(
++				"resize:free-scanout", free_result);
++		}
+ 	} else if (address) {
+ 		vgl_free(address);
+ 	}
++retire:
++	/* Detach already succeeded.  A failed unmap/free is intentionally leaked,
++	 * but the retired pointer must never re-enter rendering. */
+ 	gxm_color_surface_memblocks[index] = -1;
+ 	gxm_color_surfaces_addr[index] = NULL;
+ 	isaac_color_surface_dedicated[index] = 0;
+@@ -1792,7 +1808,15 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 			NEW_DISPLAY_HEIGHT = 0;
+ 			return;
+ 		}
+-		sceGxmDestroyRenderTarget(gxm_render_target);
++		int32_t destroy_result =
++			sceGxmDestroyRenderTarget(gxm_render_target);
++		if (destroy_result) {
++			isaac_vita_vitagl_display_surface_lifecycle_failure(
++				"resize:destroy-target", destroy_result);
++			NEW_DISPLAY_WIDTH = 0;
++			NEW_DISPLAY_HEIGHT = 0;
++			return;
++		}
+ 		if (!system_app_mode) {
+ 			for (int i = 0; i < gxm_display_buffer_count; i++) {
+ 				isaac_vitagl_release_display_color_surface(i);
+
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -151,7 +151,7 @@ __attribute__((weak)) void
+ isaac_vita_vitagl_display_surface_lifecycle_failure(
+ 	const char *site, int32_t result) {
+ 	sceClibPrintf(
+ 		"[vitaGL] display surface lifecycle failure site=%s "
+-		"result=0x%08x; retaining old scanout\n",
++		"result=0x%08x action=fail-closed\n",
+ 		site ? site : "unknown", (unsigned)result);
+ }
+@@ -1114,14 +1114,29 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ 		if (!dedicated_ok) {
+ 			for (int i = 0; i < gxm_display_buffer_count; i++) {
+ 				if (gxm_color_surface_memblocks[i] >= 0) {
+-					if (!isaac_color_surface_map_results[i] &&
+-					    gxm_color_surfaces_addr[i])
+-						sceGxmUnmapMemory(
+-							gxm_color_surfaces_addr[i]);
+-					sceKernelFreeMemBlock(
+-						gxm_color_surface_memblocks[i]);
++					GLboolean may_free = GL_TRUE;
++					if (!isaac_color_surface_map_results[i] &&
++					    gxm_color_surfaces_addr[i]) {
++						int32_t unmap_result = sceGxmUnmapMemory(
++							gxm_color_surfaces_addr[i]);
++						if (unmap_result) {
++							isaac_vita_vitagl_display_surface_lifecycle_failure(
++								"init-rollback:unmap-scanout", unmap_result);
++							may_free = GL_FALSE;
++						}
++					}
++					if (may_free) {
++						int32_t free_result = sceKernelFreeMemBlock(
++							gxm_color_surface_memblocks[i]);
++						if (free_result)
++							isaac_vita_vitagl_display_surface_lifecycle_failure(
++								"init-rollback:free-scanout", free_result);
++					}
+ 				}
++				/* Cleanup failures intentionally leak the driver object.  Retire
++				 * local ownership so pool fallback cannot reuse or free it. */
+ 				gxm_color_surface_memblocks[i] = -1;
+ 				gxm_color_surfaces_addr[i] = NULL;
++				isaac_color_surface_dedicated[i] = 0;
+ 			}
+ 		} else {
+diff --git a/Makefile b/Makefile
+index 7d4e928..b341554 100644
+--- a/Makefile
++++ b/Makefile
+@@ -15,12 +15,16 @@ AR      = $(PREFIX)-gcc-ar
+ VGL_GIT_HASH ?= $(shell git rev-parse --short HEAD 2>/dev/null)
+ EXTRA_CFLAGS ?=
+ ISAAC_DISPLAY_QUEUE_PROBE ?= 0
++ISAAC_KNOWN_COLOR_PROBE ?= 0
+ CFLAGS  = -g -Wl,-q -O3 -ffast-math -mtune=cortex-a9 -mfpu=neon -Wno-incompatible-pointer-types -Wno-stringop-overflow -mfp16-format=ieee \
+ 	-DVGL_GIT_HASH='"$(VGL_GIT_HASH)"' -Isource
+ CFLAGS += $(EXTRA_CFLAGS)
+ ifeq ($(ISAAC_DISPLAY_QUEUE_PROBE),1)
+ CFLAGS += -DHAVE_ISAAC_DISPLAY_QUEUE_PROBE
+ endif
++ifeq ($(ISAAC_KNOWN_COLOR_PROBE),1)
++CFLAGS += -DHAVE_ISAAC_KNOWN_COLOR_PROBE
++endif
+ ASFLAGS = $(CFLAGS)
+ 
+ ifeq ($(SOFTFP_ABI),1)
+diff --git a/source/gxm.c b/source/gxm.c
+index 29e60da..2b8f46f 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -47,6 +47,9 @@
+ #ifndef SKIP_ERROR_HANDLING
+ #error "Isaac vitaGL overlay must retain the measured NO_DEBUG build profile"
+ #endif
++#if defined(HAVE_ISAAC_KNOWN_COLOR_PROBE) && !defined(HAVE_ISAAC_DISPLAY_QUEUE_PROBE)
++#error "Isaac known-color probe requires display-queue lineage telemetry"
++#endif
+ 
+ /* Stable archive-level evidence consumed by vitagl-overlay/test.sh. */
+ const uint32_t isaac_vitagl_single_threaded_gc_enabled
+@@ -169,6 +172,21 @@ __attribute__((weak)) void isaac_vitagl_display_queue_probe(
+ }
+ #endif
+ 
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++_Static_assert(sizeof(IsaacVitaGlKnownColorProbe) == 88,
++	"Isaac known-color telemetry ABI drifted");
++
++__attribute__((weak)) uint32_t
++isaac_vita_vitagl_known_color_present_index(void) {
++	return UINT32_MAX;
++}
++
++__attribute__((weak)) void isaac_vita_vitagl_known_color_probe(
++	const IsaacVitaGlKnownColorProbe *event) {
++	(void)event;
++}
++#endif
++
+ // Shader Patcher memory configuration
+ static unsigned int shader_patcher_buffer_size = 1024 * 1024;
+ static unsigned int shader_patcher_vertex_usse_size = 1024 * 1024;
+@@ -650,6 +668,52 @@ isaac_vitagl_next_display_queue_sequence(void) {
+ 	return sequence;
+ }
+ 
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++static inline __attribute__((always_inline)) uint32_t
++isaac_vitagl_known_color_gate(
++	const struct display_queue_callback_data *cb_data) {
++	const IsaacVitaGlPendingDisplayLineage *lineage =
++		&isaac_pending_display_lineage;
++	uint32_t mask = ISAAC_VITAGL_KNOWN_COLOR_GATE_TAG;
++	uint32_t back = cb_data->isaac_back_index;
++	uint32_t count_valid = gxm_display_buffer_count > 0 &&
++		gxm_display_buffer_count <= DISPLAY_MAX_BUFFER_COUNT;
++	uint32_t back_valid = count_valid && back < gxm_display_buffer_count &&
++		back < DISPLAY_MAX_BUFFER_COUNT;
++
++	if (!system_app_mode)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_NON_SYSTEM;
++	if (count_valid)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_COUNT;
++	if (back_valid && back == gxm_back_buffer_index)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_BACK;
++	if (back_valid && cb_data->addr &&
++	    cb_data->addr == gxm_color_surfaces_addr[back])
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_ADDRESS;
++	if (back_valid && isaac_color_surface_dedicated[back])
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_DEDICATED;
++	if (lineage->begin_count == 1)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_BEGIN_ONE;
++	if (lineage->end_count == 1)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_END_ONE;
++	if (lineage->begin_result == 0)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_BEGIN_OK;
++	if (lineage->end_result == 0)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_END_OK;
++	if (lineage->begin_context == (uint32_t)(uintptr_t)gxm_context &&
++	    lineage->end_context == (uint32_t)(uintptr_t)gxm_context)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_CONTEXT;
++	if (lineage->begin_color_data == (uint32_t)(uintptr_t)cb_data->addr)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_DATA;
++	if (back_valid && lineage->begin_fragment_sync ==
++	    (uint32_t)(uintptr_t)gxm_sync_objects[back])
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_SYNC;
++	if (lineage->mismatch_mask == 0)
++		mask |= ISAAC_VITAGL_KNOWN_COLOR_GATE_MISMATCH;
++	return mask;
++}
++#endif
++
+ static inline __attribute__((always_inline)) void
+ isaac_vitagl_note_display_begin(
+ 	SceGxmContext *context, const SceGxmRenderTarget *render_target,
+@@ -1759,6 +1823,10 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 		struct display_queue_callback_data queue_cb_data = { 0 };
+ #ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
+ 		int32_t queue_result;
++#endif
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++		IsaacVitaGlKnownColorProbe known_color_event = { 0 };
++		uint32_t known_color_selected = 0;
+ #endif
+ 		queue_cb_data.addr = gxm_color_surfaces_addr[gxm_back_buffer_index];
+ #ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
+@@ -1767,9 +1835,62 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 		queue_cb_data.isaac_front_index = gxm_front_buffer_index;
+ 		queue_cb_data.isaac_back_index = gxm_back_buffer_index;
+ #endif
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++		known_color_event.size = sizeof(known_color_event);
++		known_color_event.present_index =
++			isaac_vita_vitagl_known_color_present_index();
++		if (known_color_event.present_index ==
++		    ISAAC_VITAGL_KNOWN_COLOR_PRESENT_INDEX) {
++			uint32_t back = queue_cb_data.isaac_back_index;
++			known_color_selected = 1;
++			known_color_event.sequence = queue_cb_data.isaac_sequence;
++			known_color_event.front_index = gxm_front_buffer_index;
++			known_color_event.back_index = back;
++			known_color_event.address =
++				(uint32_t)(uintptr_t)queue_cb_data.addr;
++			if (back < DISPLAY_MAX_BUFFER_COUNT)
++				known_color_event.dedicated =
++					isaac_color_surface_dedicated[back];
++			known_color_event.color = ISAAC_VITAGL_KNOWN_COLOR_FILL;
++			known_color_event.format =
++				(uint32_t)SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR;
++			known_color_event.x = ISAAC_VITAGL_KNOWN_COLOR_X;
++			known_color_event.y = ISAAC_VITAGL_KNOWN_COLOR_Y;
++			known_color_event.width = ISAAC_VITAGL_KNOWN_COLOR_WIDTH;
++			known_color_event.height = ISAAC_VITAGL_KNOWN_COLOR_HEIGHT;
++			known_color_event.stride_bytes = DISPLAY_STRIDE * 4;
++			known_color_event.sync_object = 0;
++			known_color_event.sync_flags = 0;
++			known_color_event.gate_mask =
++				isaac_vitagl_known_color_gate(&queue_cb_data);
++			known_color_event.fill_result =
++				ISAAC_VITAGL_KNOWN_COLOR_NOT_CALLED;
++			known_color_event.transfer_finish_result =
++				ISAAC_VITAGL_KNOWN_COLOR_NOT_CALLED;
++		}
++#endif
+ #ifdef HAVE_PROFILING
+ 		tick = sceKernelGetProcessTimeLow();
+ #endif
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++		if (known_color_selected && known_color_event.gate_mask ==
++		    ISAAC_VITAGL_KNOWN_COLOR_GATE_ALL) {
++			sceGxmFinish(gxm_context);
++			known_color_event.context_finish_called = 1;
++			known_color_event.fill_result = sceGxmTransferFill(
++				ISAAC_VITAGL_KNOWN_COLOR_FILL,
++				SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR,
++				queue_cb_data.addr,
++				ISAAC_VITAGL_KNOWN_COLOR_X,
++				ISAAC_VITAGL_KNOWN_COLOR_Y,
++				ISAAC_VITAGL_KNOWN_COLOR_WIDTH,
++				ISAAC_VITAGL_KNOWN_COLOR_HEIGHT,
++				DISPLAY_STRIDE * 4, NULL, 0, NULL);
++			known_color_event.transfer_finish_called = 1;
++			known_color_event.transfer_finish_result =
++				sceGxmTransferFinish();
++		}
++#endif
+ #ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
+ 		queue_result = sceGxmDisplayQueueAddEntry(
+ 			gxm_sync_objects[gxm_front_buffer_index],
+@@ -1778,6 +1899,12 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 			&queue_cb_data,
+ 			gxm_sync_objects[gxm_front_buffer_index],
+ 			gxm_sync_objects[gxm_back_buffer_index], queue_result);
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++		if (known_color_selected) {
++			known_color_event.queue_result = queue_result;
++			isaac_vita_vitagl_known_color_probe(&known_color_event);
++		}
++#endif
+ #else
+ 		sceGxmDisplayQueueAddEntry(
+ 			gxm_sync_objects[gxm_front_buffer_index],
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index e6e424b..86d8328 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -167,6 +167,70 @@ void isaac_vitagl_display_queue_probe(
+ 	const IsaacVitaGlDisplayQueueProbe *event);
+ #endif
+ 
++#if defined(HAVE_ISAAC_KNOWN_COLOR_PROBE)
++#ifndef ISAAC_VITAGL_KNOWN_COLOR_PROBE_DEFINED
++#define ISAAC_VITAGL_KNOWN_COLOR_PROBE_DEFINED 1
++#define ISAAC_VITAGL_KNOWN_COLOR_PRESENT_INDEX 2u
++#define ISAAC_VITAGL_KNOWN_COLOR_FILL          0xffff00ffu
++#define ISAAC_VITAGL_KNOWN_COLOR_FORMAT        0x00060000u
++#define ISAAC_VITAGL_KNOWN_COLOR_X             64u
++#define ISAAC_VITAGL_KNOWN_COLOR_Y             64u
++#define ISAAC_VITAGL_KNOWN_COLOR_WIDTH         512u
++#define ISAAC_VITAGL_KNOWN_COLOR_HEIGHT        256u
++#define ISAAC_VITAGL_KNOWN_COLOR_NOT_CALLED    ((int32_t)0x80000000u)
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_TAG       0x00000001u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_NON_SYSTEM 0x00000002u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_COUNT     0x00000004u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_BACK      0x00000008u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_ADDRESS   0x00000010u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_DEDICATED 0x00000020u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_BEGIN_ONE 0x00000040u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_END_ONE   0x00000080u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_BEGIN_OK  0x00000100u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_END_OK    0x00000200u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_CONTEXT   0x00000400u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_DATA      0x00000800u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_SYNC      0x00001000u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_MISMATCH  0x00002000u
++#define ISAAC_VITAGL_KNOWN_COLOR_GATE_ALL       0x00003fffu
++typedef struct IsaacVitaGlKnownColorProbe {
++	uint32_t size;
++	uint32_t present_index;
++	uint32_t sequence;
++	uint32_t front_index;
++	uint32_t back_index;
++	uint32_t address;
++	uint32_t dedicated;
++	uint32_t color;
++	uint32_t format;
++	uint32_t x;
++	uint32_t y;
++	uint32_t width;
++	uint32_t height;
++	uint32_t stride_bytes;
++	uint32_t sync_object;
++	uint32_t sync_flags;
++	uint32_t gate_mask;
++	uint32_t context_finish_called;
++	int32_t fill_result;
++	uint32_t transfer_finish_called;
++	int32_t transfer_finish_result;
++	int32_t queue_result;
++} IsaacVitaGlKnownColorProbe;
++#if defined(__cplusplus)
++static_assert(sizeof(IsaacVitaGlKnownColorProbe) == 88u,
++	"Isaac known-color telemetry ABI drifted");
++#else
++_Static_assert(sizeof(IsaacVitaGlKnownColorProbe) == 88u,
++	"Isaac known-color telemetry ABI drifted");
++#endif
++#endif
++
++uint32_t isaac_vita_vitagl_known_color_present_index(void);
++void isaac_vita_vitagl_known_color_probe(
++	const IsaacVitaGlKnownColorProbe *event);
++#endif
++
+ #ifndef HAVE_GL_HEADERS
+ // clang-format off
+ #define GLbitfield    uint32_t
+diff --git a/source/gxm.c b/source/gxm.c
+index df2a694..fbca5db 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -175,6 +175,9 @@ __attribute__((weak)) void isaac_vitagl_display_queue_probe(
+ #ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
+ _Static_assert(sizeof(IsaacVitaGlKnownColorProbe) == 88,
+ 	"Isaac known-color telemetry ABI drifted");
++_Static_assert((uint32_t)SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR ==
++	ISAAC_VITAGL_KNOWN_COLOR_FORMAT,
++	"Isaac known-color transfer format drifted");
+ 
+ __attribute__((weak)) uint32_t
+ isaac_vita_vitagl_known_color_present_index(void) {
+diff --git a/source/gxm.c b/source/gxm.c
+index 09b99c6..30c1f48 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -1727,9 +1727,43 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 		sceCommonDialogUpdate(&updateParam);
+ 	}
+ 
+-	if (system_app_mode)
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++	IsaacVitaGlKnownColorProbe known_color_event = { 0 };
++	uint32_t known_color_selected = 0;
++	known_color_event.size = sizeof(known_color_event);
++	known_color_event.present_index =
++		isaac_vita_vitagl_known_color_present_index();
++	if (known_color_event.present_index ==
++	    ISAAC_VITAGL_KNOWN_COLOR_PRESENT_INDEX) {
++		known_color_selected = 1;
++		known_color_event.color = ISAAC_VITAGL_KNOWN_COLOR_FILL;
++		known_color_event.format =
++			(uint32_t)SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR;
++		known_color_event.x = ISAAC_VITAGL_KNOWN_COLOR_X;
++		known_color_event.y = ISAAC_VITAGL_KNOWN_COLOR_Y;
++		known_color_event.width = ISAAC_VITAGL_KNOWN_COLOR_WIDTH;
++		known_color_event.height = ISAAC_VITAGL_KNOWN_COLOR_HEIGHT;
++		known_color_event.stride_bytes = DISPLAY_STRIDE * 4;
++		known_color_event.sync_object = 0;
++		known_color_event.sync_flags = 0;
++		known_color_event.gate_mask =
++			ISAAC_VITAGL_KNOWN_COLOR_GATE_TAG;
++		known_color_event.fill_result =
++			ISAAC_VITAGL_KNOWN_COLOR_NOT_CALLED;
++		known_color_event.transfer_finish_result =
++			ISAAC_VITAGL_KNOWN_COLOR_NOT_CALLED;
++		known_color_event.queue_result =
++			ISAAC_VITAGL_KNOWN_COLOR_NOT_CALLED;
++	}
++#endif
++
++	if (system_app_mode) {
+ 		sceSharedFbEnd(shared_fb);
+-	else {
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++		if (known_color_selected)
++			isaac_vita_vitagl_known_color_probe(&known_color_event);
++#endif
++	} else {
+ #ifdef HAVE_RAZOR
+ 		sceGxmPadHeartbeat(&gxm_color_surfaces[gxm_back_buffer_index], gxm_sync_objects[gxm_back_buffer_index]);
+ #ifdef HAVE_DEVKIT
+@@ -1826,10 +1860,6 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 		struct display_queue_callback_data queue_cb_data = { 0 };
+ #ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
+ 		int32_t queue_result;
+-#endif
+-#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
+-		IsaacVitaGlKnownColorProbe known_color_event = { 0 };
+-		uint32_t known_color_selected = 0;
+ #endif
+ 		queue_cb_data.addr = gxm_color_surfaces_addr[gxm_back_buffer_index];
+ #ifdef HAVE_ISAAC_DISPLAY_QUEUE_PROBE
+@@ -1839,37 +1869,18 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 		queue_cb_data.isaac_back_index = gxm_back_buffer_index;
+ #endif
+ #ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
+-		known_color_event.size = sizeof(known_color_event);
+-		known_color_event.present_index =
+-			isaac_vita_vitagl_known_color_present_index();
+-		if (known_color_event.present_index ==
+-		    ISAAC_VITAGL_KNOWN_COLOR_PRESENT_INDEX) {
++		if (known_color_selected) {
+ 			uint32_t back = queue_cb_data.isaac_back_index;
+-			known_color_selected = 1;
+ 			known_color_event.sequence = queue_cb_data.isaac_sequence;
+ 			known_color_event.front_index = gxm_front_buffer_index;
+ 			known_color_event.back_index = back;
+ 			known_color_event.address =
+ 				(uint32_t)(uintptr_t)queue_cb_data.addr;
+ 			if (back < DISPLAY_MAX_BUFFER_COUNT)
+ 				known_color_event.dedicated =
+ 					isaac_color_surface_dedicated[back];
+-			known_color_event.color = ISAAC_VITAGL_KNOWN_COLOR_FILL;
+-			known_color_event.format =
+-				(uint32_t)SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR;
+-			known_color_event.x = ISAAC_VITAGL_KNOWN_COLOR_X;
+-			known_color_event.y = ISAAC_VITAGL_KNOWN_COLOR_Y;
+-			known_color_event.width = ISAAC_VITAGL_KNOWN_COLOR_WIDTH;
+-			known_color_event.height = ISAAC_VITAGL_KNOWN_COLOR_HEIGHT;
+-			known_color_event.stride_bytes = DISPLAY_STRIDE * 4;
+-			known_color_event.sync_object = 0;
+-			known_color_event.sync_flags = 0;
+ 			known_color_event.gate_mask =
+ 				isaac_vitagl_known_color_gate(&queue_cb_data);
+-			known_color_event.fill_result =
+-				ISAAC_VITAGL_KNOWN_COLOR_NOT_CALLED;
+-			known_color_event.transfer_finish_result =
+-				ISAAC_VITAGL_KNOWN_COLOR_NOT_CALLED;
+ 		}
+ #endif
+ #ifdef HAVE_PROFILING
+diff --git a/source/gxm.c b/source/gxm.c
+index db4eb42..a72492c 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -1759,10 +1759,6 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 
+ 	if (system_app_mode) {
+ 		sceSharedFbEnd(shared_fb);
+-#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
+-		if (known_color_selected)
+-			isaac_vita_vitagl_known_color_probe(&known_color_event);
+-#endif
+ 	} else {
+ #ifdef HAVE_RAZOR
+ 		sceGxmPadHeartbeat(&gxm_color_surfaces[gxm_back_buffer_index], gxm_sync_objects[gxm_back_buffer_index]);
+@@ -1914,10 +1910,8 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 			gxm_sync_objects[gxm_front_buffer_index],
+ 			gxm_sync_objects[gxm_back_buffer_index], queue_result);
+ #ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
+-		if (known_color_selected) {
++		if (known_color_selected)
+ 			known_color_event.queue_result = queue_result;
+-			isaac_vita_vitagl_known_color_probe(&known_color_event);
+-		}
+ #endif
+ #else
+ 		sceGxmDisplayQueueAddEntry(
+@@ -1933,6 +1927,10 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 		gxm_front_buffer_index = gxm_back_buffer_index;
+ 		gxm_back_buffer_index = (gxm_back_buffer_index + 1) % gxm_display_buffer_count;
+ 	}
++#ifdef HAVE_ISAAC_KNOWN_COLOR_PROBE
++	if (known_color_selected)
++		isaac_vita_vitagl_known_color_probe(&known_color_event);
++#endif
+ 	needs_scene_reset = GL_TRUE;
+ 	
+ 	// Perform resolution change if there's one pending

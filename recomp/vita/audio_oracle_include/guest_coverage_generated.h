@@ -1,0 +1,18 @@
+#ifndef ISAAC_AUDIO_ORACLE_GUEST_COVERAGE_GENERATED_H
+#define ISAAC_AUDIO_ORACLE_GUEST_COVERAGE_GENERATED_H
+
+/* Focused compile-only mirror of the nine manual KAGE coverage IDs from the
+ * frozen generated corpus.  Production never includes this directory; the
+ * audio gate uses it only to compile both manual A/B implementations without
+ * regenerating or copying the 170 translated translation units. */
+#define GUEST_COVERAGE_MANUAL_KAGE_SET_VSYNC_ID 6766U
+#define GUEST_COVERAGE_MANUAL_KAGE_INITIALIZE_ID 7884U
+#define GUEST_COVERAGE_MANUAL_KAGE_SHUTDOWN_ID 7885U
+#define GUEST_COVERAGE_MANUAL_KAGE_PRESENT_ID 7887U
+#define GUEST_COVERAGE_MANUAL_KAGE_GET_FRAMEBUFFER_WIDTH_ID 7888U
+#define GUEST_COVERAGE_MANUAL_KAGE_GET_FRAMEBUFFER_HEIGHT_ID 7889U
+#define GUEST_COVERAGE_MANUAL_KAGE_INITIALIZE_RENDER_DISPLAY_ID 7899U
+#define GUEST_COVERAGE_MANUAL_KAGE_SOUND_INITIALIZE_ID 8211U
+#define GUEST_COVERAGE_MANUAL_KAGE_GL_PROVIDER_RESOLVER_ID 8251U
+
+#endif

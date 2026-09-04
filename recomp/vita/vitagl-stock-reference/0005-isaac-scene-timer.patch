@@ -1,0 +1,96 @@
+diff --git a/source/gxm.c b/source/gxm.c
+index 490575d..7d861ff 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -23,6 +23,51 @@
+ 
+ #include "shared.h"
+ 
++#ifdef HAVE_ISAAC_GL_TIME_PROFILE
++/* Isaac GL time profile (0005-isaac-scene-timer.patch).  Process-clock
++ * microseconds spent inside the two GXM scene calls.  sceGxmBeginScene blocks
++ * while the render target's previous job is still in flight, so its bracket
++ * is the GPU back-pressure the CPU sees on a draw-target switch, a clear or
++ * the display scene after a present; sceGxmEndScene is the command-list
++ * flush.  Two clock reads per scene edge, nothing else.  The phase profiler
++ * takes and zeroes the sums once per 120-loop window through
++ * vglIsaacSceneTimes on the vitaGL owner thread; the hook is deliberately
++ * absent from vitaGL.h so that header's whole-file hash stays stable. */
++static uint32_t isaac_scene_begin_us = 0;
++static uint32_t isaac_scene_begin_max_us = 0;
++static uint32_t isaac_scene_end_us = 0;
++static uint32_t isaac_scene_count = 0;
++#define ISAAC_SCENE_TIME_BEGIN() uint64_t isaac_scene_t0 = sceKernelGetProcessTimeWide()
++#define ISAAC_SCENE_TIME_END_BEGIN_SCENE() \
++	do { \
++		uint32_t isaac_scene_dt = (uint32_t)(sceKernelGetProcessTimeWide() - isaac_scene_t0); \
++		isaac_scene_begin_us += isaac_scene_dt; \
++		if (isaac_scene_dt > isaac_scene_begin_max_us) \
++			isaac_scene_begin_max_us = isaac_scene_dt; \
++		isaac_scene_count++; \
++	} while (0)
++#define ISAAC_SCENE_TIME_END_END_SCENE() \
++	isaac_scene_end_us += (uint32_t)(sceKernelGetProcessTimeWide() - isaac_scene_t0)
++void vglIsaacSceneTimes(uint32_t *begin_us, uint32_t *end_us, uint32_t *count, uint32_t *begin_max_us) {
++	if (begin_us)
++		*begin_us = isaac_scene_begin_us;
++	if (end_us)
++		*end_us = isaac_scene_end_us;
++	if (count)
++		*count = isaac_scene_count;
++	if (begin_max_us)
++		*begin_max_us = isaac_scene_begin_max_us;
++	isaac_scene_begin_us = 0;
++	isaac_scene_begin_max_us = 0;
++	isaac_scene_end_us = 0;
++	isaac_scene_count = 0;
++}
++#else
++#define ISAAC_SCENE_TIME_BEGIN() ((void)0)
++#define ISAAC_SCENE_TIME_END_BEGIN_SCENE() ((void)0)
++#define ISAAC_SCENE_TIME_END_END_SCENE() ((void)0)
++#endif
++
+ #define MAX_SCENES_PER_FRAME 8 // Maximum amount of scenes per frame allowed by sceGxm per render target
+ 
+ // FIXME: Since we use our own default uniform buffers circular pool, fragment and vertex buffer rings can likely be reduced in size
+@@ -567,7 +612,9 @@ static inline __attribute__((always_inline)) void scene_end(void) {
+ #ifdef HAVE_ISAAC_GXM_STATE_SHADOW
+ 	isaacGxmStateEndScene(gxm_context);
+ #endif
++	ISAAC_SCENE_TIME_BEGIN();
+ 	sceGxmEndScene(gxm_context, NULL, &query_fence);
++	ISAAC_SCENE_TIME_END_END_SCENE();
+ 	if (system_app_mode && vsync_interval)
+ 		sceDisplayWaitVblankStartMulti(vsync_interval);
+ }
+@@ -619,11 +666,13 @@ void scene_reset(void) {
+ 				shared_fb_info.vsync = vsync_interval;
+ 				gxm_back_buffer_index = (shared_fb_info.index + 1) % 2;
+ 			}
++			ISAAC_SCENE_TIME_BEGIN();
+ 			int r = sceGxmBeginScene(gxm_context, 0, gxm_render_target,
+ 				NULL, NULL,
+ 				gxm_sync_objects[gxm_back_buffer_index],
+ 				&gxm_color_surfaces[gxm_back_buffer_index],
+ 				&gxm_depth_stencil_surface);
++			ISAAC_SCENE_TIME_END_BEGIN_SCENE();
+ #ifdef HAVE_ISAAC_GXM_STATE_SHADOW
+ 			isaacGxmStateBeginScene(gxm_context, r);
+ #endif
+@@ -667,6 +716,7 @@ void scene_reset(void) {
+ 				}
+ 			}
+ #endif
++			ISAAC_SCENE_TIME_BEGIN();
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ 			render_target *fbo_rt = (render_target *)active_write_fb->target;
+ #ifdef RECYCLE_RENDERTARGETS
+@@ -679,6 +729,7 @@ void scene_reset(void) {
+ 					NULL, NULL, NULL,
+ 					&active_write_fb->colorbuffer,
+ 					active_write_fb->depthbuffer_ptr);
++			ISAAC_SCENE_TIME_END_BEGIN_SCENE();
+ #ifdef HAVE_ISAAC_GXM_STATE_SHADOW
+ 			isaacGxmStateBeginScene(gxm_context, r);
+ #endif

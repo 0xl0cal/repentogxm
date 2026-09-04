@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Derive the ordered frame-path hot set for ISAAC_VITA_TRANSLATED_CPU_HOT_LAYOUT.
+
+Inputs are the generated corpus (direct ``sub_xxxxxxxx(c)`` call edges), a
+``nm -S`` listing of a previous ARM link (per-function Thumb-2 sizes) and the
+frame roots.  The selection is a breadth-first closure from the roots capped
+at a byte budget (default 2 MiB, the Vita's PL310 L2), so the functions that
+the outer loop reaches within the fewest direct calls are kept.  The emitted
+order is a depth-first preorder over that selection: a callee is placed right
+after the first caller that reaches it, which is what the I-cache and the
+Thumb-2 ``bl`` range benefit from.
+
+Only direct edges are visible statically; virtual calls (Entity::Update and
+friends) reach their targets through guest_call and are not followed.  Replace
+this list with a measured one when device coverage exists; the layout header
+generator does not care how the list was produced.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import glob
+import os
+import re
+import sys
+
+DEFN_RE = re.compile(r"^void (sub_[0-9a-f]{8})\(CPU")
+CALL_RE = re.compile(r"\b(sub_[0-9a-f]{8})\(c\)")
+DEFAULT_ROOTS = (
+    # KAGE Manager tick (owns the Game::Update call at 004b0311) and
+    # Manager::Render (owns Game::Render); see gen_all.py
+    # VITA_FULLSPEED_MANAGER_ROOT_RVA / VITA_FULLSPEED_RENDER_ROOT_RVA.
+    "sub_004b0010",
+    "sub_004b0600",
+)
+
+
+def load_graph(generated_dir: str) -> dict[str, list[str]]:
+    graph: dict[str, list[str]] = {}
+    current = None
+    for path in sorted(glob.glob(os.path.join(generated_dir, "guest_0*.c"))):
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = DEFN_RE.match(line)
+                if match:
+                    current = match.group(1)
+                    graph.setdefault(current, [])
+                    continue
+                if current is None:
+                    continue
+                for call in CALL_RE.finditer(line):
+                    callee = call.group(1)
+                    if callee != current and callee not in graph[current]:
+                        graph[current].append(callee)
+    return graph
+
+
+def load_sizes(path: str) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            fields = line.split()
+            if len(fields) == 4 and fields[3].startswith("sub_"):
+                sizes[fields[3]] = int(fields[1], 16)
+    return sizes
+
+
+def select(graph, sizes, roots, budget):
+    depth = {root: 0 for root in roots}
+    queue = collections.deque(roots)
+    selected: list[str] = []
+    total = 0
+    while queue:
+        function = queue.popleft()
+        size = sizes.get(function, 0)
+        if total + size > budget:
+            continue
+        selected.append(function)
+        total += size
+        for callee in graph.get(function, ()):
+            if callee not in depth:
+                depth[callee] = depth[function] + 1
+                queue.append(callee)
+    return selected, depth, total
+
+
+def order(graph, roots, selected):
+    keep = set(selected)
+    placed: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        stack = [root]
+        while stack:
+            function = stack.pop()
+            if function in seen or function not in keep:
+                continue
+            seen.add(function)
+            placed.append(function)
+            stack.extend(reversed(graph.get(function, ())))
+    for function in selected:          # selected but not reached: keep anyway
+        if function not in seen:
+            seen.add(function)
+            placed.append(function)
+    return placed
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--generated", required=True)
+    parser.add_argument("--sizes", required=True,
+                        help="nm -S output of a prior ARM link")
+    parser.add_argument("--root", action="append", default=[])
+    parser.add_argument("--budget", type=int, default=2 * 1024 * 1024)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args(argv)
+    roots = args.root or list(DEFAULT_ROOTS)
+    graph = load_graph(args.generated)
+    sizes = load_sizes(args.sizes)
+    missing = [root for root in roots if root not in graph]
+    if missing:
+        print(f"roots not in corpus: {missing}", file=sys.stderr)
+        return 2
+    selected, depth, total = select(graph, sizes, roots, args.budget)
+    placed = order(graph, roots, selected)
+    by_depth = collections.Counter(depth[f] for f in selected)
+    with open(args.output, "w", encoding="utf-8", newline="\n") as out:
+        out.write("# ISAAC_VITA_TRANSLATED_CPU hot set: ordered translated "
+                  "functions for the sorted text region.\n")
+        out.write("# Generated by vita_translated_cpu_hot_set.py; "
+                  f"roots={','.join(roots)} budget={args.budget} "
+                  f"selected={len(selected)}\n")
+        out.write(f"# bytes={total} corpus_functions={len(graph)} "
+                  f"reachable={len(depth)}\n")
+        out.write("# depth histogram: " + " ".join(
+            f"d{d}={by_depth[d]}" for d in sorted(by_depth)) + "\n")
+        for function in placed:
+            out.write(function + "\n")
+    print(f"selected {len(selected)} functions, {total} bytes, "
+          f"reachable {len(depth)} of {len(graph)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

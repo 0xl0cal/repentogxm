@@ -1,0 +1,866 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index f84d9c6..e9160cb 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -26,6 +26,40 @@
+ #include "shared.h"
+ #include "utils/glsl_utils.h"
+ #include "utils/shacccg_paramquery.h"
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++#include "isaac_gpu_draw_policy.h"
++#if defined(DRAW_SPEEDHACK) || defined(STRICT_DRAW_COMPLIANCE)
++#error "Isaac GPU draw optimizations require the measured safe draw path"
++#endif
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++#define ISAAC_GXM_SHADER_STATE_INVALIDATE() \
++	isaacGxmStateInvalidate(gxm_context)
++#else
++#define ISAAC_GXM_SHADER_STATE_INVALIDATE() ((void)0)
++#endif
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++#define ISAAC_NOTE_VERTEX_COPY(vertices, stride) \
++	isaac_note_vertex_copy((uint32_t)(vertices), (uint32_t)(stride))
++#else
++#define ISAAC_NOTE_VERTEX_COPY(vertices, stride) ((void)0)
++#endif
++_Static_assert(VERTEX_ATTRIBS_NUM == ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES,
++	"Isaac GPU draw policy attribute ceiling drifted");
++_Static_assert(sizeof(SceGxmVertexAttribute) ==
++		sizeof(isaac_vitagl_attribute_key),
++	"Isaac GPU draw policy attribute ABI drifted");
++_Static_assert(sizeof(SceGxmVertexStream) == sizeof(isaac_vitagl_stream_key),
++	"Isaac GPU draw policy stream ABI drifted");
++_Static_assert(offsetof(SceGxmVertexAttribute, streamIndex) == 0 &&
++	offsetof(SceGxmVertexAttribute, offset) == 2 &&
++	offsetof(SceGxmVertexAttribute, format) == 4 &&
++	offsetof(SceGxmVertexAttribute, componentCount) == 5 &&
++	offsetof(SceGxmVertexAttribute, regIndex) == 6,
++	"Isaac GPU draw policy attribute field layout drifted");
++_Static_assert(offsetof(SceGxmVertexStream, stride) == 0 &&
++	offsetof(SceGxmVertexStream, indexSource) == 2,
++	"Isaac GPU draw policy stream field layout drifted");
++#endif
+ #if defined(HAVE_SHADER_CACHE) || defined(HAVE_TEX_CACHE)
+ #define XXH_STATIC_LINKING_ONLY
+ #define XXH_IMPLEMENTATION
+@@ -77,6 +111,7 @@ char vgl_file_cache_path[256];
+ 			if (count * streams[i].stride > SAFE_DRAW_SIZE_THRESHOLD) { \
+ 				ptrs[i] = (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride; \
+ 			} else { \
++				ISAAC_NOTE_VERTEX_COPY(count, streams[i].stride); \
+ 				ptrs[i] = gpu_alloc_mapped_temp(count * streams[i].stride); \
+ 				vgl_fast_memcpy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
+ 				attributes[i].offset = 0; \
+@@ -94,6 +129,7 @@ char vgl_file_cache_path[256];
+ 			gpu_buf->last_frame = vgl_framecount; \
+ 			attributes[i].offset = 0; \
+ 		} else { \
++			ISAAC_NOTE_VERTEX_COPY(count, streams[i].stride); \
+ 			ptrs[i] = gpu_alloc_mapped_temp(count * streams[i].stride); \
+ 			vgl_fast_memcpy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
+ 			attributes[i].offset = 0; \
+@@ -220,6 +256,7 @@ char vgl_file_cache_path[256];
+ 	
+ #define setup_frag_program() \
+ 	if ((p->blend_info.raw != blend_info.raw) || (is_fbo_float != p->is_fbo_float)) { \
++		ISAAC_GXM_SHADER_STATE_INVALIDATE(); \
+ 		p->is_fbo_float = is_fbo_float; \
+ 		p->blend_info.raw = blend_info.raw; \
+ 		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4); \
+@@ -267,6 +304,11 @@ typedef struct {
+ 	char name[64];
+ } attr_mapping;
+ 
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++typedef struct isaac_vertex_program_cache_entry
++	isaac_vertex_program_cache_entry;
++#endif
++
+ #ifdef STRICT_UNIFORMS_COMPLIANCE
+ typedef union {
+ 	struct {
+@@ -369,12 +411,243 @@ typedef struct {
+ 	attr_mapping *glsl_attr_map;
+ 	void *unif_fbuffer;
+ 	void *unif_vbuffer;
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++	isaac_vertex_program_cache_entry *isaac_vertex_cache;
++	uint8_t isaac_vertex_cache_count;
++#endif
+ } program;
+ 
+ // Internal shaders and array
+ static shader shaders[MAX_CUSTOM_SHADERS];
+ static program progs[MAX_CUSTOM_PROGRAMS];
+ 
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++struct isaac_vertex_program_cache_entry {
++	isaac_vertex_program_cache_entry *next;
++	SceGxmShaderPatcherId shader_id;
++	uint32_t attribute_count;
++	uint32_t stream_count;
++	isaac_vitagl_attribute_key
++		attributes[ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES];
++	isaac_vitagl_stream_key streams[ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES];
++	SceGxmVertexProgram *vertex_program;
++};
++
++static vglIsaacGpuDrawStats isaac_gpu_draw_stats = {
++	.abi_version = 2,
++	.enabled = 1,
++};
++#ifdef HAVE_ISAAC_PHASE_PROFILE
++#define ISAAC_GPU_DRAW_COUNT(field) (isaac_gpu_draw_stats.field++)
++#define ISAAC_GPU_DRAW_ADD(field, value) \
++	(isaac_gpu_draw_stats.field += (value))
++#define ISAAC_GPU_DRAW_MAX(field, value) do { \
++	if ((value) > isaac_gpu_draw_stats.field) \
++		isaac_gpu_draw_stats.field = (value); \
++} while (0)
++#else
++#define ISAAC_GPU_DRAW_COUNT(field) ((void)0)
++#define ISAAC_GPU_DRAW_ADD(field, value) ((void)0)
++#define ISAAC_GPU_DRAW_MAX(field, value) ((void)0)
++#endif
++static SceGxmVertexAttribute
++	isaac_coalesced_attributes[ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES];
++static SceGxmVertexStream isaac_coalesced_stream;
++static isaac_vitagl_attribute_key
++	isaac_attribute_key_scratch[ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES];
++static isaac_vitagl_stream_key
++	isaac_stream_key_scratch[ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES];
++
++static inline void isaac_note_vertex_copy(uint32_t vertices,
++		uint32_t stride) {
++	ISAAC_GPU_DRAW_ADD(vertex_bytes,
++		(uint32_t)((uint64_t)vertices * stride));
++}
++
++static inline void isaac_capture_attribute_key(
++		isaac_vitagl_attribute_key *out,
++		const SceGxmVertexAttribute *attribute) {
++	out->stream_index = attribute->streamIndex;
++	out->offset = attribute->offset;
++	out->format = attribute->format;
++	out->component_count = attribute->componentCount;
++	out->reg_index = attribute->regIndex;
++}
++
++static inline void isaac_capture_stream_key(
++		isaac_vitagl_stream_key *out,
++		const SceGxmVertexStream *stream) {
++	out->stride = stream->stride;
++	out->index_source = stream->indexSource;
++}
++
++static GLboolean isaac_try_coalesce_single_stream(
++		const SceGxmVertexAttribute *attributes,
++		const SceGxmVertexStream *streams,
++		const uintptr_t *stream_bases, uint32_t attribute_count,
++		SceGxmVertexAttribute **draw_attributes,
++		SceGxmVertexStream **draw_streams) {
++	enum isaac_vitagl_coalesce_result result;
++	uint32_t index;
++
++	ISAAC_GPU_DRAW_COUNT(coalesce_attempts);
++	for (index = 0; index < attribute_count &&
++			index < ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES; ++index) {
++		isaac_capture_attribute_key(
++			&isaac_attribute_key_scratch[index], &attributes[index]);
++		isaac_capture_stream_key(
++			&isaac_stream_key_scratch[index], &streams[index]);
++	}
++	result = isaac_vitagl_single_stream_policy(
++		isaac_attribute_key_scratch, isaac_stream_key_scratch,
++		stream_bases, attribute_count);
++	if (result != ISAAC_VITAGL_COALESCE_OK) {
++		switch (result) {
++		case ISAAC_VITAGL_COALESCE_REJECT_COUNT:
++			ISAAC_GPU_DRAW_COUNT(coalesce_reject_count);
++			break;
++		case ISAAC_VITAGL_COALESCE_REJECT_STREAM_INDEX:
++			ISAAC_GPU_DRAW_COUNT(coalesce_reject_stream_index);
++			break;
++		case ISAAC_VITAGL_COALESCE_REJECT_BASE:
++			ISAAC_GPU_DRAW_COUNT(coalesce_reject_base);
++			break;
++		case ISAAC_VITAGL_COALESCE_REJECT_DESCRIPTOR:
++			ISAAC_GPU_DRAW_COUNT(coalesce_reject_descriptor);
++			break;
++		default:
++			break;
++		}
++		return GL_FALSE;
++	}
++
++	for (index = 0; index < attribute_count; ++index) {
++		isaac_coalesced_attributes[index] = attributes[index];
++		isaac_coalesced_attributes[index].streamIndex = 0;
++	}
++	isaac_coalesced_stream = streams[0];
++	*draw_attributes = isaac_coalesced_attributes;
++	*draw_streams = &isaac_coalesced_stream;
++	ISAAC_GPU_DRAW_COUNT(coalesce_hits);
++	ISAAC_GPU_DRAW_ADD(stream_slots_before, attribute_count);
++	ISAAC_GPU_DRAW_COUNT(stream_slots_after);
++	return GL_TRUE;
++}
++
++static GLboolean isaac_vertex_cache_key_matches(
++		const isaac_vertex_program_cache_entry *entry,
++		SceGxmShaderPatcherId shader_id,
++		const SceGxmVertexAttribute *attributes,
++		uint32_t attribute_count, const SceGxmVertexStream *streams,
++		uint32_t stream_count) {
++	uint32_t index;
++
++	if (attribute_count > ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES ||
++			stream_count > ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES ||
++			entry->shader_id != shader_id)
++		return GL_FALSE;
++	for (index = 0; index < attribute_count; ++index)
++		isaac_capture_attribute_key(
++			&isaac_attribute_key_scratch[index], &attributes[index]);
++	for (index = 0; index < stream_count; ++index)
++		isaac_capture_stream_key(
++			&isaac_stream_key_scratch[index], &streams[index]);
++	return isaac_vitagl_layout_key_equal(
++		entry->attributes, entry->attribute_count,
++		entry->streams, entry->stream_count,
++		isaac_attribute_key_scratch, attribute_count,
++		isaac_stream_key_scratch, stream_count);
++}
++
++static void isaac_patch_vertex_program_cached(program *p,
++		SceGxmShaderPatcherId shader_id,
++		const SceGxmVertexAttribute *attributes,
++		uint32_t attribute_count, const SceGxmVertexStream *streams,
++		uint32_t stream_count) {
++	isaac_vertex_program_cache_entry *entry = p->isaac_vertex_cache;
++	int result;
++	uint32_t index;
++
++	ISAAC_GPU_DRAW_COUNT(vertex_program_requests);
++	while (entry) {
++		if (isaac_vertex_cache_key_matches(
++				entry, shader_id, attributes, attribute_count,
++				streams, stream_count)) {
++			p->vprog = entry->vertex_program;
++			ISAAC_GPU_DRAW_COUNT(vertex_program_hits);
++			return;
++		}
++		entry = entry->next;
++	}
++
++	ISAAC_GPU_DRAW_COUNT(vertex_program_misses);
++	ISAAC_GXM_SHADER_STATE_INVALIDATE();
++	result = sceGxmShaderPatcherCreateVertexProgram(
++		gxm_shader_patcher, shader_id, attributes, attribute_count,
++		streams, stream_count, &p->vprog);
++	if (result) {
++		ISAAC_GPU_DRAW_COUNT(vertex_program_create_failures);
++#ifdef LOG_ERRORS
++		vgl_log("Vertex shader patching failed (%s) on shader 0x%X with %d attributes and %d streams.\n",
++			get_gxm_error_literal(result), shader_id,
++			attribute_count, stream_count);
++#endif
++		return;
++	}
++
++	if (p->isaac_vertex_cache_count >=
++			ISAAC_VITAGL_VERTEX_CACHE_CAPACITY) {
++		ISAAC_GPU_DRAW_COUNT(vertex_program_full_fallbacks);
++		return;
++	}
++	entry = vglMalloc(sizeof(*entry));
++	if (!entry) {
++		ISAAC_GPU_DRAW_COUNT(vertex_program_store_failures);
++		return;
++	}
++	entry->next = p->isaac_vertex_cache;
++	entry->shader_id = shader_id;
++	entry->attribute_count = attribute_count;
++	entry->stream_count = stream_count;
++	for (index = 0; index < attribute_count; ++index)
++		isaac_capture_attribute_key(
++			&entry->attributes[index], &attributes[index]);
++	for (index = 0; index < stream_count; ++index)
++		isaac_capture_stream_key(&entry->streams[index], &streams[index]);
++	entry->vertex_program = p->vprog;
++	p->isaac_vertex_cache = entry;
++	p->isaac_vertex_cache_count++;
++	ISAAC_GPU_DRAW_COUNT(vertex_program_stores);
++}
++
++/* The caller must finish the GXM context before releasing entries which may
++ * still be referenced by submitted draws. */
++static void isaac_release_vertex_program_cache(program *p) {
++	isaac_vertex_program_cache_entry *entry = p->isaac_vertex_cache;
++	ISAAC_GXM_SHADER_STATE_INVALIDATE();
++	while (entry) {
++		isaac_vertex_program_cache_entry *next = entry->next;
++		sceGxmShaderPatcherReleaseVertexProgram(
++			gxm_shader_patcher, entry->vertex_program);
++		ISAAC_GPU_DRAW_COUNT(vertex_program_releases);
++		vgl_free(entry);
++		entry = next;
++	}
++	p->isaac_vertex_cache = NULL;
++	p->isaac_vertex_cache_count = 0;
++	p->vprog = NULL;
++}
++
++void vglGetIsaacGpuDrawStats(vglIsaacGpuDrawStats *stats) {
++	if (stats) {
++		*stats = isaac_gpu_draw_stats;
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++		isaacGxmStateSnapshot(stats);
++#endif
++	}
++}
++#endif
++
+ #ifdef HAVE_SHARK_LOG
+ static char *shark_log = NULL;
+ #endif
+@@ -671,6 +944,9 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ }
+ 
+ void reset_custom_shaders(void) {
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++	isaacGxmStateInvalidate(gxm_context);
++#endif
+ 	// Init custom shaders
+ 	for (int i = 0; i < MAX_CUSTOM_SHADERS; i++) {
+ 		shaders[i].valid = GL_FALSE;
+@@ -871,6 +1147,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
+ #endif
+ 
+ 	// Uploading new vertex program
++	ISAAC_GXM_SHADER_STATE_INVALIDATE();
+ 	patch_vertex_program(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+ 	sceGxmSetVertexProgram(gxm_context, p->vprog);
+ 
+@@ -1115,6 +1392,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean
+ #endif
+ 
+ 	// Uploading new vertex program
++	ISAAC_GXM_SHADER_STATE_INVALIDATE();
+ 	patch_vertex_program(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+ 	sceGxmSetVertexProgram(gxm_context, p->vprog);
+ 
+@@ -1159,6 +1437,15 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 	uint32_t draw_start = sceKernelGetProcessTimeLow();
+ #endif
+ 	program *p = &progs[cur_program - 1];
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++	ISAAC_GPU_DRAW_COUNT(draw_elements_requests);
++	if (count > 0) {
++		uint32_t index_width = (index_type & 1u) ? 4u : 2u;
++		ISAAC_GPU_DRAW_ADD(index_count, (uint32_t)count);
++		ISAAC_GPU_DRAW_ADD(index_bytes,
++			(uint32_t)((uint64_t)(uint32_t)count * index_width));
++	}
++#endif
+ 
+ 	// Check if a blend info rebuild is required and upload fragment program
+ 	setup_frag_program();
+@@ -1314,6 +1601,14 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 		}
+ 		top_idx += base_idx + 1;
+ 	}
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++	if (top_idx) {
++		ISAAC_GPU_DRAW_ADD(vertex_count, top_idx);
++		ISAAC_GPU_DRAW_MAX(top_idx_high_water, top_idx);
++	} else if (count > 0) {
++		ISAAC_GPU_DRAW_COUNT(top_idx_unknown);
++	}
++#endif
+ 
+ #ifdef STRICT_DRAW_COMPLIANCE
+ 	// Gathering real attribute data pointers
+@@ -1355,6 +1650,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 			} else
+ #endif
+ 			{
++				ISAAC_NOTE_VERTEX_COPY(top_idx, streams[0].stride);
+ 				ptrs[0] = gpu_alloc_mapped_temp(top_idx * streams[0].stride);
+ 				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * streams[0].stride);
+ 			}
+@@ -1394,17 +1690,54 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 	}
+ #endif
+ 
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++	SceGxmVertexAttribute *draw_attributes = attributes;
++	SceGxmVertexStream *draw_streams = streams;
++	uint32_t draw_stream_count = p->attr_num;
++	uintptr_t isaac_stream_bases[ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES];
++	GLboolean isaac_single_stream;
++	for (int i = 0; i < p->attr_num; i++) {
++		uint8_t attr_idx = p->attr_map[i];
++		GLboolean is_active =
++			(cur_vao->vertex_attrib_state & (1 << attr_idx)) ?
++			GL_TRUE : GL_FALSE;
++		isaac_stream_bases[i] = (uintptr_t)(is_active ?
++			(is_packed ? ptrs[0] : ptrs[i]) :
++			cur_vao->vertex_attrib_value[attr_idx]);
++	}
++	isaac_single_stream = isaac_try_coalesce_single_stream(
++		attributes, streams, isaac_stream_bases, p->attr_num,
++		&draw_attributes, &draw_streams);
++	if (isaac_single_stream)
++		draw_stream_count = 1;
++#endif
++
+ 	// Uploading new vertex program
+-	patch_vertex_program(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++	isaac_patch_vertex_program_cached(
++		p, p->vshader->id, draw_attributes, p->attr_num,
++		draw_streams, draw_stream_count);
++#else
++	patch_vertex_program(gxm_shader_patcher, p->vshader->id, attributes,
++		p->attr_num, streams, p->attr_num, &p->vprog);
++#endif
+ 	sceGxmSetVertexProgram(gxm_context, p->vprog);
+ 
+ 	// Uploading both fragment and vertex uniforms data
+ 	upload_uniforms();
+ 
+ 	// Uploading vertex streams
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++	if (isaac_single_stream)
++		sceGxmSetVertexStream(
++			gxm_context, 0, (void *)isaac_stream_bases[0]);
++#endif
+ 	for (int i = 0; i < p->attr_num; i++) {
+ 		uint8_t attr_idx = p->attr_map[i];
+ 		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++		if (!isaac_single_stream) {
++#endif
+ 		if (is_active) {
+ #ifdef DRAW_SPEEDHACK
+ 			sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
+@@ -1418,6 +1751,9 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 		} else {
+ 			sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
+ 		}
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++		}
++#endif
+ 		if (!p->has_unaligned_attrs) {
+ 			attributes[i].regIndex = i;
+ 			if (!is_active) {
+@@ -1905,6 +2241,10 @@ GLuint glCreateProgram(void) {
+ 			progs[i].num_glsl_attr = 0;
+ 			progs[i].glsl_attr_map = NULL;
+ 			progs[i].is_fbo_float = 0xFF;
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++			progs[i].isaac_vertex_cache = NULL;
++			progs[i].isaac_vertex_cache_count = 0;
++#endif
+ 			for (j = 0; j < VERTEX_ATTRIBS_NUM; j++) {
+ 				progs[i].attr[j].regIndex = 0xDEAD;
+ 			}
+@@ -1989,10 +2329,16 @@ void glDeleteProgram(GLuint prog) {
+ 
+ 	// Grabbing passed program
+ 	program *p = &progs[prog - 1];
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++	isaacGxmStateInvalidate(gxm_context);
++#endif
+ 
+ 	// Releasing both vertex and fragment programs from sceGxmShaderPatcher
+ 	if (p->status) {
+ 		sceGxmFinish(gxm_context);
++#ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
++		isaac_release_vertex_program_cache(p);
++#endif
+ 		if (p->vert_uniforms) {
+ 			vgl_free(p->vert_uniforms);
+ 			if (p->unif_vbuffer) {
+@@ -2378,6 +2724,7 @@ void glLinkProgram(GLuint progr) {
+ #ifdef ENABLE_LEGACY_PIPELINE
+ 	// Creating fragment and vertex program via sceGxmShaderPatcher if using vgl* draw pipeline
+ 	if (p->attr_mode != VGL_ATTRIB_REGULAR) {
++		ISAAC_GXM_SHADER_STATE_INVALIDATE();
+ 		patch_vertex_program(gxm_shader_patcher, p->vshader->id, p->attr, p->attr_num,
+ 			p->stream, p->attr_mode == VGL_ATTRIB_UNPACKED ? p->attr_num : 1, &p->vprog);
+ 		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4);
+diff --git a/source/draw.c b/source/draw.c
+index e9e6c8c..19aef9c 100644
+--- a/source/draw.c
++++ b/source/draw.c
+@@ -328,6 +328,36 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei prim
+ 	restore_polygon_mode(gxm_p);
+ }
+ 
++#ifdef HAVE_ISAAC_CANONICAL_QUAD_ZERO_COPY
++GLboolean vglIsaacDrawCanonicalQuads(GLsizei count) {
++	GLboolean is_draw_legal;
++	uint32_t top_idx;
++
++	THREAD_SAFE()
++	if (!isaac_canonical_quads_idx_ptr || cur_program == 0 || count <= 0 ||
++			count > MAX_IDX_NUMBER || count % 6)
++		return GL_FALSE;
++#ifndef SKIP_ERROR_HANDLING
++	if (phase == MODEL_CREATION)
++		return GL_FALSE;
++#endif
++	top_idx = ((uint32_t)count / 6u) * 4u;
++	prim_is_non_native = GL_FALSE;
++	scene_reset();
++	is_draw_legal = _glDrawElements_CustomShadersIMPL(
++		isaac_canonical_quads_idx_ptr, count, top_idx, 0,
++		SCE_GXM_INDEX_SOURCE_INDEX_16BIT);
++#ifndef SKIP_ERROR_HANDLING
++	if (is_draw_legal)
++#endif
++		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLES,
++			SCE_GXM_INDEX_FORMAT_U16, isaac_canonical_quads_idx_ptr,
++			count);
++	restore_polygon_mode(SCE_GXM_PRIMITIVE_TRIANGLES);
++	return is_draw_legal;
++}
++#endif
++
+ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_indices) {
+ 	THREAD_SAFE()
+ 
+diff --git a/source/ffp.c b/source/ffp.c
+index 5cca83a..c161b0f 100644
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -1137,6 +1137,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ }
+ 
+ void _glDrawArrays_FixedFunctionIMPL(GLint first, GLsizei count) {
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++	isaacGxmStateInvalidate(gxm_context);
++#endif
+ 	uint8_t mask_state = reload_ffp_shaders(NULL, NULL, SCE_GXM_INDEX_SOURCE_INDEX_16BIT);
+ #ifdef HAVE_PROFILING
+ 	uint32_t draw_start = sceKernelGetProcessTimeLow();
+@@ -1420,6 +1423,9 @@ void _glMultiDrawArrays_FixedFunctionIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
+ }
+ 
+ void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, SceGxmIndexSource index_type) {
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++	isaacGxmStateInvalidate(gxm_context);
++#endif
+ 	uint8_t mask_state = reload_ffp_shaders(NULL, NULL, index_type);
+ #ifdef HAVE_PROFILING
+ 	uint32_t draw_start = sceKernelGetProcessTimeLow();
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index d477667..4ed005c 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -302,6 +302,9 @@ void glDeleteRenderbuffers(GLsizei n, const GLuint *ids) {
+ 
+ void glBindFramebuffer(GLenum target, GLuint fb) {
+ 	THREAD_SAFE()
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++	isaacGxmStateInvalidate(gxm_context);
++#endif
+ 
+ 	switch (target) {
+ 	case GL_DRAW_FRAMEBUFFER:
+@@ -795,6 +798,9 @@ void vglReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum forma
+ 
+ void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {
+ 	THREAD_SAFE()
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++	isaacGxmStateInvalidate(gxm_context);
++#endif
+ 
+ 	// Invalidate current write framebuffer binding
+ 	framebuffer *real_write_fb = active_write_fb;
+diff --git a/source/gxm.c b/source/gxm.c
+index 8853f36..490575d 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -564,6 +564,9 @@ void start_shader_patcher(void) {
+ static inline __attribute__((always_inline)) void scene_end(void) {
+ 	// Ends current gxm scene
+ 	query_fence.value++;
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++	isaacGxmStateEndScene(gxm_context);
++#endif
+ 	sceGxmEndScene(gxm_context, NULL, &query_fence);
+ 	if (system_app_mode && vsync_interval)
+ 		sceDisplayWaitVblankStartMulti(vsync_interval);
+@@ -571,6 +574,11 @@ static inline __attribute__((always_inline)) void scene_end(void) {
+ 
+ void scene_reset(void) {
+ 	if (in_use_framebuffer != active_write_fb || needs_scene_reset || dirty_framebuffer || dirty_query) {
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++		/* This invalidation precedes both EndScene and any reset/recovery work;
++		 * a failed BeginScene therefore cannot inherit the prior scene. */
++		isaacGxmStateEndScene(gxm_context);
++#endif
+ 		dirty_framebuffer = GL_FALSE;
+ 		dirty_query = GL_FALSE;
+ 		needs_scene_reset = GL_FALSE;
+@@ -616,6 +624,9 @@ void scene_reset(void) {
+ 				gxm_sync_objects[gxm_back_buffer_index],
+ 				&gxm_color_surfaces[gxm_back_buffer_index],
+ 				&gxm_depth_stencil_surface);
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++			isaacGxmStateBeginScene(gxm_context, r);
++#endif
+ #ifdef LOG_ERRORS
+ 			if (r) {
+ 				vgl_log("%s:%d Scene reset failed due to sceGxmBeginScene erroring (%s) on display.\n", __FILE__, __LINE__, get_gxm_error_literal(r));
+@@ -668,6 +679,9 @@ void scene_reset(void) {
+ 					NULL, NULL, NULL,
+ 					&active_write_fb->colorbuffer,
+ 					active_write_fb->depthbuffer_ptr);
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++			isaacGxmStateBeginScene(gxm_context, r);
++#endif
+ #ifdef LOG_ERRORS
+ 			if (r)
+ 				vgl_log("%s:%d Scene reset failed due to sceGxmBeginScene erroring (%s) on framebuffer 0x%08X.\n", __FILE__, __LINE__, get_gxm_error_literal(r), active_write_fb);
+@@ -1000,4 +1014,4 @@ void vglSetupDisplayRenderTarget(uint8_t size) {
+ 	}
+ #endif
+ 	gxm_display_rt_size = size;
+-}
+\ No newline at end of file
++}
+diff --git a/source/isaac_gxm_state_shadow.c b/source/isaac_gxm_state_shadow.c
+new file mode 100644
+index 0000000..d2c3f53
+--- /dev/null
++++ b/source/isaac_gxm_state_shadow.c
+@@ -0,0 +1,64 @@
++#define ISAAC_GXM_STATE_SHADOW_IMPLEMENTATION
++#include "shared.h"
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++#include "isaac_gxm_state_policy.h"
++
++_Static_assert(sizeof(SceGxmTexture) == ISAAC_GXM_STATE_TEXTURE_BYTES,
++	"Isaac texture state shadow requires the complete 16-byte descriptor");
++
++static isaac_gxm_state_policy isaac_state_policy;
++
++void isaacGxmStateBeginScene(SceGxmContext *context, int result) {
++	isaac_gxm_state_begin_scene(
++		&isaac_state_policy, (uintptr_t)context, result == 0);
++}
++
++void isaacGxmStateEndScene(SceGxmContext *context) {
++	isaac_gxm_state_invalidate(&isaac_state_policy, (uintptr_t)context);
++}
++
++void isaacGxmStateInvalidate(SceGxmContext *context) {
++	isaac_gxm_state_invalidate_values(
++		&isaac_state_policy, (uintptr_t)context);
++}
++
++void isaacGxmSetVertexProgram(
++		SceGxmContext *context, const SceGxmVertexProgram *program) {
++	if (isaac_gxm_state_vertex_program(
++			&isaac_state_policy, (uintptr_t)context, (uintptr_t)program))
++		return;
++	sceGxmSetVertexProgram(context, program);
++}
++
++void isaacGxmSetFragmentProgram(
++		SceGxmContext *context, const SceGxmFragmentProgram *program) {
++	if (isaac_gxm_state_fragment_program(
++			&isaac_state_policy, (uintptr_t)context, (uintptr_t)program))
++		return;
++	sceGxmSetFragmentProgram(context, program);
++}
++
++void isaacGxmSetFragmentTexture(
++		SceGxmContext *context, unsigned int unit,
++		const SceGxmTexture *texture) {
++	if (isaac_gxm_state_fragment_texture(
++			&isaac_state_policy, (uintptr_t)context, unit, texture))
++		return;
++	sceGxmSetFragmentTexture(context, unit, texture);
++}
++
++void isaacGxmStateSnapshot(vglIsaacGpuDrawStats *stats) {
++	stats->vertex_set_hits =
++		isaac_state_policy.counters.vertex_program_hits;
++	stats->vertex_set_misses =
++		isaac_state_policy.counters.vertex_program_misses;
++	stats->fragment_set_hits =
++		isaac_state_policy.counters.fragment_program_hits;
++	stats->fragment_set_misses =
++		isaac_state_policy.counters.fragment_program_misses;
++	stats->texture_set_hits =
++		isaac_state_policy.counters.fragment_texture_hits;
++	stats->texture_set_misses =
++		isaac_state_policy.counters.fragment_texture_misses;
++}
++#endif
+diff --git a/source/isaac_gxm_state_shadow.h b/source/isaac_gxm_state_shadow.h
+new file mode 100644
+index 0000000..2abd6f1
+--- /dev/null
++++ b/source/isaac_gxm_state_shadow.h
+@@ -0,0 +1,21 @@
++#ifndef ISAAC_GXM_STATE_SHADOW_H
++#define ISAAC_GXM_STATE_SHADOW_H
++
++void isaacGxmStateBeginScene(SceGxmContext *context, int result);
++void isaacGxmStateEndScene(SceGxmContext *context);
++void isaacGxmStateInvalidate(SceGxmContext *context);
++void isaacGxmStateSnapshot(vglIsaacGpuDrawStats *stats);
++void isaacGxmSetVertexProgram(
++	SceGxmContext *context, const SceGxmVertexProgram *program);
++void isaacGxmSetFragmentProgram(
++	SceGxmContext *context, const SceGxmFragmentProgram *program);
++void isaacGxmSetFragmentTexture(
++	SceGxmContext *context, unsigned int unit, const SceGxmTexture *texture);
++
++#ifndef ISAAC_GXM_STATE_SHADOW_IMPLEMENTATION
++#define sceGxmSetVertexProgram isaacGxmSetVertexProgram
++#define sceGxmSetFragmentProgram isaacGxmSetFragmentProgram
++#define sceGxmSetFragmentTexture isaacGxmSetFragmentTexture
++#endif
++
++#endif
+diff --git a/source/misc.c b/source/misc.c
+index 1a27d55..dd9d6ef 100644
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -639,6 +639,9 @@ void glDisable(GLenum cap) {
+ 
+ void glClear(GLbitfield mask) {
+ 	THREAD_SAFE()
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++	isaacGxmStateInvalidate(gxm_context);
++#endif
+ 
+ #ifndef SKIP_ERROR_HANDLING
+ 	if (mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) {
+diff --git a/source/shared.h b/source/shared.h
+index 463cb54..0b214c3 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -26,6 +26,9 @@
+ #define _SHARED_H_
+ #include <vitasdk.h>
+ #include "vitaGL.h"
++#ifdef HAVE_ISAAC_GXM_STATE_SHADOW
++#include "isaac_gxm_state_shadow.h"
++#endif
+ 
+ // Internal constants
+ #define TEXTURES_NUM 16384 // Available textures
+@@ -857,6 +860,9 @@ extern GLboolean is_rendering_display; // Flag for when we're rendering without
+ extern uint16_t *default_idx_ptr; // sceGxm mapped progressive indices buffer
+ extern uint16_t *default_quads_idx_ptr; // sceGxm mapped progressive indices buffer for quads
+ extern uint16_t *default_line_strips_idx_ptr; // sceGxm mapped progressive indices buffer for line strips
++#ifdef HAVE_ISAAC_CANONICAL_QUAD_ZERO_COPY
++extern uint16_t *isaac_canonical_quads_idx_ptr;
++#endif
+ #if !defined(HAVE_PTHREAD) && defined(HAVE_SINGLE_THREADED_GC)
+ extern int garbage_collector(unsigned int args, void *arg); // Garbage collector function
+ #endif
+diff --git a/source/vgl.c b/source/vgl.c
+index 5c4f15a..df63701 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -102,6 +102,12 @@ extern GLboolean use_vram_for_usse;
+ uint16_t *default_idx_ptr; // sceGxm mapped progressive indices buffer
+ uint16_t *default_quads_idx_ptr; // sceGxm mapped progressive indices buffer for quads
+ uint16_t *default_line_strips_idx_ptr; // sceGxm mapped progressive indices buffer for line strips
++#ifdef HAVE_ISAAC_CANONICAL_QUAD_ZERO_COPY
++_Static_assert(MAX_IDX_NUMBER == 0xC000,
++	"Isaac canonical quad buffer size drifted");
++/* The same process-lifetime CPU/GXM-mapped pool owns the stock index buffers. */
++uint16_t *isaac_canonical_quads_idx_ptr;
++#endif
+ 
+ // Internal functions
+ #ifndef DISABLE_CIRCULAR_POOL
+@@ -383,6 +389,11 @@ GLboolean vglInitWithCustomSizes(int pool_size, int width, int height, int ram_p
+ 	default_idx_ptr = (uint16_t *)gpu_alloc_mapped_for_cpu(MAX_IDX_NUMBER * sizeof(uint16_t));
+ 	default_quads_idx_ptr = (uint16_t *)gpu_alloc_mapped_for_cpu(MAX_IDX_NUMBER * sizeof(uint16_t));
+ 	default_line_strips_idx_ptr = (uint16_t *)gpu_alloc_mapped_for_cpu(MAX_IDX_NUMBER * sizeof(uint16_t));
++#ifdef HAVE_ISAAC_CANONICAL_QUAD_ZERO_COPY
++	isaac_canonical_quads_idx_ptr =
++		(uint16_t *)gpu_alloc_mapped_for_cpu(
++			MAX_IDX_NUMBER * sizeof(uint16_t));
++#endif
+ 	for (int i = 0; i < MAX_IDX_NUMBER / 6; i++) {
+ 		default_idx_ptr[i * 6] = i * 6;
+ 		default_idx_ptr[i * 6 + 1] = i * 6 + 1;
+@@ -402,6 +413,16 @@ GLboolean vglInitWithCustomSizes(int pool_size, int width, int height, int ram_p
+ 		default_quads_idx_ptr[i * 6 + 3] = i * 4 + 1;
+ 		default_quads_idx_ptr[i * 6 + 4] = i * 4 + 2;
+ 		default_quads_idx_ptr[i * 6 + 5] = i * 4 + 3;
++#ifdef HAVE_ISAAC_CANONICAL_QUAD_ZERO_COPY
++		if (isaac_canonical_quads_idx_ptr) {
++			isaac_canonical_quads_idx_ptr[i * 6] = i * 4;
++			isaac_canonical_quads_idx_ptr[i * 6 + 1] = i * 4 + 2;
++			isaac_canonical_quads_idx_ptr[i * 6 + 2] = i * 4 + 1;
++			isaac_canonical_quads_idx_ptr[i * 6 + 3] = i * 4 + 1;
++			isaac_canonical_quads_idx_ptr[i * 6 + 4] = i * 4 + 2;
++			isaac_canonical_quads_idx_ptr[i * 6 + 5] = i * 4 + 3;
++		}
++#endif
+ 	}
+ 
+ 	// Init default vertex attributes configurations
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index f045fd2..b4b2616 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -25,6 +25,46 @@ extern "C" {
+ 
+ #include <vitashark.h>
+ 
++/* Project-local, opt-in counters for the exact Isaac custom-shader draw
++ * optimizations. The endpoints exist only when at least one pinned Isaac draw
++ * submission feature is enabled. */
++typedef struct vglIsaacGpuDrawStats {
++	uint32_t abi_version;
++	uint32_t enabled;
++	uint32_t draw_elements_requests;
++	uint32_t coalesce_attempts;
++	uint32_t coalesce_hits;
++	uint32_t coalesce_reject_count;
++	uint32_t coalesce_reject_stream_index;
++	uint32_t coalesce_reject_base;
++	uint32_t coalesce_reject_descriptor;
++	uint32_t stream_slots_before;
++	uint32_t stream_slots_after;
++	uint32_t vertex_program_requests;
++	uint32_t vertex_program_hits;
++	uint32_t vertex_program_misses;
++	uint32_t vertex_program_stores;
++	uint32_t vertex_program_full_fallbacks;
++	uint32_t vertex_program_store_failures;
++	uint32_t vertex_program_create_failures;
++	uint32_t vertex_program_releases;
++	uint32_t index_bytes;
++	uint32_t vertex_bytes;
++	uint32_t index_count;
++	uint32_t vertex_count;
++	uint32_t top_idx_high_water;
++	uint32_t top_idx_unknown;
++	uint32_t vertex_set_hits;
++	uint32_t vertex_set_misses;
++	uint32_t fragment_set_hits;
++	uint32_t fragment_set_misses;
++	uint32_t texture_set_hits;
++	uint32_t texture_set_misses;
++} vglIsaacGpuDrawStats;
++
++void vglGetIsaacGpuDrawStats(vglIsaacGpuDrawStats *stats);
++uint8_t vglIsaacDrawCanonicalQuads(int32_t count);
++
+ #ifndef HAVE_GL_HEADERS
+ // clang-format off
+ #define GLbitfield    uint32_t

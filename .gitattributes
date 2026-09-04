@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.patch text eol=lf
+*.patch whitespace=-blank-at-eol,-space-before-tab
+*.sh text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+
+*.vpk binary
+*.bin binary
+*.a binary
+*.suprx binary
+recomp/vita/assets/sce_sys/livearea/contents/template.xml binary
