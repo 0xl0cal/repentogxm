@@ -1,0 +1,31 @@
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1357,3 +1357,8 @@
++#if defined(HAVE_ISAAC_FBO_RT_INTERLUDE_REUSE) && HAVE_ISAAC_FBO_RT_INTERLUDE_REUSE
++#if !defined(HAVE_ISAAC_FBO_RT_REUSE) || FRAME_PURGE_FREQ != 4
++#error "Isaac RT interlude reuse requires RT reuse and four-bucket collection"
++#endif
++#endif
+ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(framebuffer *fb, GLenum attachment, texture *tex, GLuint tex_id) {
+ 	// Extracting texture data
+ 	int old_w = fb->width, old_h = fb->height;
+@@ -1400,11 +1405,16 @@
+ 			 * Keep the original depth, texture and scene-reset path below. */
+ #ifdef HAVE_ISAAC_FBO_RT_REUSE
+ 			uintptr_t isaac_next_rt = 0;
+-			if (isaacFboRtSwitch((uintptr_t)fb, (uintptr_t)fb->target,
++			int isaac_rt_switch = isaacFboRtSwitch((uintptr_t)fb, (uintptr_t)fb->target,
+ 					old_w, old_h, fb->width, fb->height,
+ 					msaa_mode == SCE_GXM_MULTISAMPLE_NONE &&
+ 					vglIsaacSetupFboRenderTargetScenes(0) == 8,
+-					frame_purge_idx, &isaac_next_rt)) {
++					frame_purge_idx, &isaac_next_rt);
++			if (isaac_rt_switch) {
++#if defined(HAVE_ISAAC_FBO_RT_INTERLUDE_REUSE) && HAVE_ISAAC_FBO_RT_INTERLUDE_REUSE
++				if (isaac_rt_switch & ISAAC_FBO_RT_RETIRES_CURRENT)
++					mark_rt_as_dirty(fb->target);
++#endif
+ 				fb->target = (SceGxmRenderTarget *)isaac_next_rt;
+ 			} else
+ #endif

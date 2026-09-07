@@ -1,7 +1,7 @@
 /* Guest CPU model for the recompiled Isaac.
  *
- * Design decisions, each one load-bearing. Two of them differ from the plan
- * written in memory_isaac.md, and both differences make the job smaller.
+ * Design decisions, each one load-bearing. Two of them differ from the
+ * original translation plan, and both differences make the job smaller.
  *
  * 1. GUEST DATA ADDRESS == HOST ADDRESS AT A CHOSEN BASE.
  *    The guest is x86-32 and every target we care about (MSVC x86 for the
@@ -17,8 +17,8 @@
  *    the whole class of bug rather than handling one case of it.
  *
  * 2. INDIRECT DISPATCH KEEPS THE ORIGINAL ADDRESSES.
- *    memory_isaac.md planned to rewrite address-takes into dense indices,
- *    and noted the real risk: one missed address-take puts a raw address in
+ *    The original plan was to rewrite address-takes into dense indices; it
+ *    noted the real risk: one missed address-take puts a raw address in
  *    a register with nothing to map it to. Keeping the guest's own addresses
  *    as the values removes that risk entirely -- there is no rewriting pass
  *    to be incomplete, pointer comparisons and pointer arithmetic keep

@@ -1,10 +1,14 @@
 param(
     [string]$OwnedSourceAsset = '',
     [string]$CapturedVertexGxp = '',
-    [string]$CapturedFragmentGxp = ''
+    [string]$CapturedFragmentGxp = '',
+    [switch]$PlainFastPath,
+    [switch]$PlainVertexPair,
+    [switch]$PlainFp16
 )
 
 $ErrorActionPreference = 'Stop'
+if ($PlainVertexPair -and $PlainFp16) { throw 'PlainFp16 and PlainVertexPair are isolated candidates' }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $runtime = Join-Path $root 'runtime'
@@ -29,7 +33,10 @@ if (-not $installation) {
 $developerShell = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
 
 $sourceExe = Join-Path $work 'coloroffset-source-oracle.exe'
-$policyExe = Join-Path $work 'coloroffset-policy-oracle.exe'
+$policyExe = Join-Path $work $(if ($PlainFp16) { 'coloroffset-policy-fp16-oracle.exe' } elseif ($PlainVertexPair) { 'coloroffset-policy-pair-oracle.exe' } elseif ($PlainFastPath) { 'coloroffset-policy-plain-oracle.exe' } else { 'coloroffset-policy-oracle.exe' })
+$plainDefine = if ($PlainFastPath -or $PlainVertexPair -or $PlainFp16) { '/DHAVE_ISAAC_COLOROFFSET_PLAIN_FASTPATH=1 ' } else { '' }
+if ($PlainVertexPair) { $plainDefine += '/DHAVE_ISAAC_COLOROFFSET_PLAIN_VERTEX_PAIR=1 ' }
+if ($PlainFp16) { $plainDefine += '/DHAVE_ISAAC_COLOROFFSET_PLAIN_FP16=1 ' }
 $objectDirectory = $work + '\\'
 $sourceCommand = '"' + $developerShell + '" -arch=x64 -host_arch=x64 >nul && ' +
     'cl /nologo /std:c11 /O2 /W4 /WX /I"' + $runtime + '" ' +
@@ -37,7 +44,7 @@ $sourceCommand = '"' + $developerShell + '" -arch=x64 -host_arch=x64 >nul && ' +
     '"' + (Join-Path $runtime 'gl_vita_coloroffset_source_oracle.c') + '" ' +
     '/Fe:"' + $sourceExe + '" /Fo:"' + $objectDirectory + '"'
 $policyCommand = '"' + $developerShell + '" -arch=x64 -host_arch=x64 >nul && ' +
-    'cl /nologo /std:c11 /O2 /W4 /WX /I"' + $stock + '" ' +
+    'cl /nologo /std:c11 /O2 /W4 /WX ' + $plainDefine + '/I"' + $stock + '" ' +
     '"' + (Join-Path $stock 'coloroffset_gpu_policy_oracle.c') + '" ' +
     '/Fe:"' + $policyExe + '" /Fo:"' + $objectDirectory + '"'
 

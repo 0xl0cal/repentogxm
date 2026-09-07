@@ -1,0 +1,61 @@
+diff --git a/source/gxm.c b/source/gxm.c
+index fff6c9e..167d992 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -246,6 +246,24 @@ SceUID gc_mutex[2];
+ static int gc_thread_priority = 0x10000100;
+ static int gc_thread_affinity = 0;
+ static uint8_t gxm_display_rt_size = 1; // Number of scenes per frame to use for the display rendertarget
++#ifdef HAVE_ISAAC_FBO_RT_SCENES
++/* Isaac (0007-isaac-fbo-rt-scenes.patch): scenes per frame for the render
++ * targets that scene_reset creates lazily for framebuffer objects.  Stock
++ * vitaGL sizes them for one scene, so when several scenes of a frame run on
++ * the same target the sceGxmEndScene of scene k waits until scene k-1 has
++ * finished on the GPU (measured on the device with the Isaac GL time
++ * profile: the glClear stall is that EndScene wait).  The consumer sets
++ * 1..MAX_SCENES_PER_FRAME once at start-up through
++ * vglIsaacSetupFboRenderTargetScenes, which it declares itself (not in
++ * vitaGL.h, whose whole-file hash must stay stable); a failed
++ * sceGxmCreateRenderTarget for that count falls back to the stock single
++ * slot at the creation site so a framebuffer never stays without a target.
++ * Upstream later added the same knob (f142f14, vglSetupRenderTargetScenesNum). */
++static uint8_t gxm_fbo_rt_size = 1; // Number of scenes per frame to use for fbo rendertargets
++#define ISAAC_FBO_RT_SCENES() gxm_fbo_rt_size
++#else
++#define ISAAC_FBO_RT_SCENES() 1
++#endif
+ #ifdef HAVE_PTHREAD
+ pthread_t gc_thread;
+ #else
+@@ -790,7 +808,14 @@ void scene_reset(void) {
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ 				active_write_fb->target = (SceGxmRenderTarget *)get_free_render_target(active_write_fb->width, active_write_fb->height);
+ #else
+-				int r = setup_render_target(&active_write_fb->target, active_write_fb->width, active_write_fb->height, 1);
++				int r = setup_render_target(&active_write_fb->target, active_write_fb->width, active_write_fb->height, ISAAC_FBO_RT_SCENES());
++#ifdef HAVE_ISAAC_FBO_RT_SCENES
++				if (r && gxm_fbo_rt_size != 1) {
++					// Fail closed: a target sized for several scenes needs more driver memory; fall back to the stock single slot rather than leave the framebuffer without a rendertarget
++					active_write_fb->target = NULL;
++					r = setup_render_target(&active_write_fb->target, active_write_fb->width, active_write_fb->height, 1);
++				}
++#endif
+ #ifdef LOG_ERRORS
+ 				if (r) {
+ 					vgl_log("%s:%d Failed to create a rendertarget of size %dx%d for framebuffer 0x%08X (%s).\n", __FILE__, __LINE__, active_write_fb->width, active_write_fb->height, active_write_fb, get_gxm_error_literal(r));
+@@ -1150,6 +1175,15 @@ void vglSetupShaderPatcher(uint32_t buffer_mem_size, uint32_t vertex_usse_mem_si
+ 	shader_patcher_fragment_usse_size = fragment_usse_mem_size;
+ }
+ 
++#ifdef HAVE_ISAAC_FBO_RT_SCENES
++uint8_t vglIsaacSetupFboRenderTargetScenes(uint8_t size) {
++	// Out-of-range requests are ignored (0 or more than MAX_SCENES_PER_FRAME would fail on every offscreen pass); the effective value is returned for the consumer's banner
++	if (size >= 1 && size <= MAX_SCENES_PER_FRAME)
++		gxm_fbo_rt_size = size;
++	return gxm_fbo_rt_size;
++}
++#endif
++
+ void vglSetupDisplayRenderTarget(uint8_t size) {
+ #ifndef SKIP_ERROR_HANDLING
+ 	if (size > MAX_SCENES_PER_FRAME) {

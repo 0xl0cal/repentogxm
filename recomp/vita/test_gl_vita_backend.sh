@@ -42,7 +42,8 @@ do
 done
 
 for mode in off on fxray texture texture-fxray fbo fbo720 time time-fbo720 \
-    prod-elision prod-loc prod-loc-verify prod-elision-loc-verify
+    prod-elision prod-elision-drop prod-loc prod-loc-verify \
+    prod-elision-loc-verify prod-fill prod-elision-drop-fill
 do
     if [ "$mode" = on ] || [ "$mode" = fbo720 ] || [ "$mode" = time-fbo720 ]; then
         display_define=-DISAAC_VITA_DISPLAY_RASTER_720=1
@@ -84,7 +85,17 @@ do
         prod_define=
         ;;
     esac
-    if [ "$mode" = prod-elision ] || [ "$mode" = prod-elision-loc-verify ]; then
+    # prod-fill / prod-elision-drop-fill: the GL fill census with its
+    # one-frame draw dump, alone and on top of the depth-drop elision (whose
+    # absorbed clears the census must not count).
+    if [ "$mode" = prod-fill ] || [ "$mode" = prod-elision-drop-fill ]; then
+        fill_define="-DISAAC_VITA_GL_FILL_CENSUS=1 -DISAAC_VITA_GL_FILL_CENSUS_DUMP=1"
+    else
+        fill_define=
+    fi
+    if [ "$mode" = prod-elision-drop ] || [ "$mode" = prod-elision-drop-fill ]; then
+        elision_define="-DISAAC_VITA_FBO_CLEAR_ELISION=1 -DISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP=1"
+    elif [ "$mode" = prod-elision ] || [ "$mode" = prod-elision-loc-verify ]; then
         elision_define=-DISAAC_VITA_FBO_CLEAR_ELISION=1
     else
         elision_define=
@@ -110,6 +121,7 @@ do
     "$cc" $oracle_flags $display_define $fxray_define $texture_define \
         $fbo_define $time_define \
         $prod_define $elision_define $location_define $verify_define \
+        $fill_define \
         -DISAAC_GL_VITA_BACKEND_ORACLE=1 \
         -DGUEST_IMAGE_BASE=0x98000000u \
         -I"$root/runtime" \
@@ -123,6 +135,7 @@ do
     "$cc" $production_flags $display_define $fxray_define $texture_define \
         $fbo_define $time_define \
         $production_prod_define $elision_define $location_define $verify_define \
+        $fill_define \
         $production_include \
         -DGUEST_IMAGE_BASE=0x98000000u \
         -I"$root/runtime" -I"$root/vita" \

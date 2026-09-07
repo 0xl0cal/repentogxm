@@ -1,0 +1,69 @@
+diff --git a/source/draw.c b/source/draw.c
+--- a/source/draw.c
++++ b/source/draw.c
+@@ -331,1 +331,4 @@
++#ifdef HAVE_ISAAC_LASER_LIGHT_NEAREST
++#include "isaac_laser_light_nearest.h"
++#endif
+ #ifdef HAVE_ISAAC_CANONICAL_QUAD_ZERO_COPY
+@@ -336,1 +339,1 @@
+-	IsaacLightHaloDraw halo = { SCE_GXM_PRIMITIVE_TRIANGLES, NULL, 0 };
++	IsaacLightHaloDraw halo = { .primitive = SCE_GXM_PRIMITIVE_TRIANGLES };
+@@ -360,4 +363,8 @@
+-		if (halo.indices)
++		if (halo.indices) {
++#ifdef HAVE_ISAAC_LASER_LIGHT_NEAREST
++			isaac_light_halo_draw(gxm_context, &halo);
++#else
+ 			sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLES,
+ 				SCE_GXM_INDEX_FORMAT_U16, halo.indices, halo.count);
+-		else
++#endif
++		} else
+@@ -410,1 +419,1 @@
+-	IsaacLightHaloDraw halo = { gxm_p, NULL, 0 };
++	IsaacLightHaloDraw halo = { .primitive = gxm_p };
+@@ -426,3 +435,7 @@
+ 		if (halo.indices) {
++#ifdef HAVE_ISAAC_LASER_LIGHT_NEAREST
++			isaac_light_halo_draw(gxm_context, &halo);
++#else
+ 			sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLES,
+ 				SCE_GXM_INDEX_FORMAT_U16, halo.indices, halo.count);
++#endif
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1243,2 +1243,7 @@
+     GLsizei count;
++#ifdef HAVE_ISAAC_LASER_LIGHT_NEAREST
++    SceGxmTexture nearest_original;
++    SceGxmTexture nearest_point;
++    GLboolean nearest_ready;
++#endif
+ } IsaacLightHaloDraw;
+diff --git a/source/isaac_gxm_state_shadow.c b/source/isaac_gxm_state_shadow.c
+--- a/source/isaac_gxm_state_shadow.c
++++ b/source/isaac_gxm_state_shadow.c
+@@ -40,8 +40,12 @@
+-void isaacGxmSetFragmentTexture(
++int isaacGxmSetFragmentTexture(
+ 		SceGxmContext *context, unsigned int unit,
+ 		const SceGxmTexture *texture) {
++	int result;
+ 	if (isaac_gxm_state_fragment_texture(
+ 			&isaac_state_policy, (uintptr_t)context, unit, texture))
+-		return;
+-	sceGxmSetFragmentTexture(context, unit, texture);
++		return 0;
++	result = sceGxmSetFragmentTexture(context, unit, texture);
++	if (result != 0)
++		isaac_gxm_state_invalidate_values(&isaac_state_policy, (uintptr_t)context);
++	return result;
+ }
+diff --git a/source/isaac_gxm_state_shadow.h b/source/isaac_gxm_state_shadow.h
+--- a/source/isaac_gxm_state_shadow.h
++++ b/source/isaac_gxm_state_shadow.h
+@@ -12,1 +12,1 @@
+-void isaacGxmSetFragmentTexture(
++int isaacGxmSetFragmentTexture(

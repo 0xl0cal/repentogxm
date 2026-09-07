@@ -107,6 +107,12 @@ def verify_codegen(pe_path: Path) -> None:
                     f"refcount owner became a stub at {root:#x}/{base:#x}")
             require(result["vita_refcount_direct_edges"] == expected,
                     f"refcount edge census changed at {root:#x}/{base:#x}")
+            # The KAGE refcount seam (ISAAC_VITA_KAGE_REFCOUNT_SEAM) rides on
+            # this proof: it is rendered for the three helpers and for nothing
+            # else, and adds none of the tokens counted below.
+            require(bool(result["vita_kage_refcount_seam"]) ==
+                    (root in (0x00007AF0, 0x00007B50, 0x00007B70)),
+                    f"refcount seam selection changed at {root:#x}/{base:#x}")
             text = result["text"]
             require(text.count("guest_direct_translated_target(") ==
                     len(expected),

@@ -1,0 +1,49 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -282,12 +282,22 @@
+-#define setup_frag_program() \
++#if !defined(HAVE_ISAAC_COLOROFFSET_SINGLE_FINAL_BIND) || \
++    !defined(HAVE_ISAAC_COLOROFFSET_STAGING_PROOF) || \
++    !defined(HAVE_ISAAC_COLOROFFSET_FS_PROBE) || HAVE_ISAAC_COLOROFFSET_FS_PROBE != 3
++#error "single final fragment bind requires staging proof and NEUTRAL mode"
++#endif
++
++/* Keep blend/float rebuilds at their original boundary.  Only DrawElements
++ * defers the context bind until the exact variant winner is known. */
++#define isaac_prepare_frag_program() \
+ 	if ((p->blend_info.raw != blend_info.raw) || (is_fbo_float != p->is_fbo_float)) { \
+ 		ISAAC_GXM_SHADER_STATE_INVALIDATE(); \
+ 		p->is_fbo_float = is_fbo_float; \
+ 		p->blend_info.raw = blend_info.raw; \
+ 		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4); \
+-	} \
++	}
++#define setup_frag_program() \
++	isaac_prepare_frag_program(); \
+ 	sceGxmSetFragmentProgram(gxm_context, p->fprog);
+ 	
+ #define align_attributes(attributes, streams) \
+ 	if (p->has_unaligned_attrs) { \
+ 		attributes = temp_attributes; \
+@@ -2510,8 +2520,8 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32
+ 		ISAAC_COLOROFFSET_STAGING_UNKNOWN;
+ #endif
+ 
+-	// Check if a blend info rebuild is required and upload fragment program
+-	setup_frag_program();
++	// Prepare stock blend/float state now; bind the final winner before uniforms.
++	isaac_prepare_frag_program();
+ 
+ 	// Uploading fragment textures on relative texture units
+ 	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
+@@ -2838,6 +2848,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32
+ 		}
+ #endif
+-		if (isaac_opaque_fragment)
+-			sceGxmSetFragmentProgram(gxm_context, isaac_opaque_fragment);
++		/* Rejected/unavailable variants must explicitly restore the stock program. */
++		sceGxmSetFragmentProgram(gxm_context,
++			isaac_opaque_fragment ? isaac_opaque_fragment : p->fprog);
+ 	}
+ #endif

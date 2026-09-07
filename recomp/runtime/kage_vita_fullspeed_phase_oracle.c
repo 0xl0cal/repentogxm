@@ -314,7 +314,8 @@ int main(void)
         CHECK(strstr(scheduler[window], "viol(d,p,g,s,o)=0,0,0,0,0 ") != NULL);
         CHECK(strstr(scheduler[window], "reset=0 drop(t,us)=") != NULL);
         CHECK(line_length(timing[window]) > 0u &&
-              line_length(timing[window]) < 384u);
+              line_length(timing[window]) <= 512u);
+        CHECK(strstr(timing[window], "gap(n,min,50,95,max)=") != NULL);
         CHECK(line_length(counts[window]) > 0u &&
               line_length(counts[window]) < 384u);
 #if defined(ISAAC_VITA_GUEST_LOOKUP_CACHE)
@@ -353,7 +354,9 @@ int main(void)
     game_pointer[0] = find_line("[kage-vita] ph120.r ");
     CHECK(timing[0] != NULL && counts[0] != NULL &&
           scheduler[0] != NULL && game_pointer[0] != NULL);
-    CHECK(line_length(timing[0]) > 0u && line_length(timing[0]) < 384u);
+    /* The additive CPU Present-return gaps use the same durable bound as s.
+     * The profile fixture separately pins 433 bytes (470 with oth). */
+    CHECK(line_length(timing[0]) > 0u && line_length(timing[0]) <= 512u);
     CHECK(line_length(counts[0]) > 0u && line_length(counts[0]) < 384u);
 #if defined(ISAAC_VITA_GUEST_LOOKUP_CACHE)
     CHECK(guest_cache[0] != NULL);

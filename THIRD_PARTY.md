@@ -75,6 +75,22 @@ itself as public-domain software and includes the Unlicense statement.
 Frozen source:
 <https://github.com/tessel/miniz/blob/dee3e1992f0abbe42c1871590f6f7246b517db46/miniz.c>
 
+### libdeflate v1.26
+
+[`recomp/runtime/vendor/libdeflate-strict/`](recomp/runtime/vendor/libdeflate-strict/)
+holds eight decompressor files of Eric Biggers' libdeflate v1.26, pinned at
+commit `92e6a0db9fa848d742f9eb286c92afc60f2c3dda`, altered to refuse every
+DEFLATE construct outside a single complete final block (the alterations are
+listed in that directory's `README.md`). Upstream is MIT licensed; Copyright
+2016 Eric Biggers and Copyright 2024 Google LLC. The licence text is kept in
+[`recomp/runtime/vendor/libdeflate-strict/COPYING`](recomp/runtime/vendor/libdeflate-strict/COPYING)
+and in every imported source header. The subset is compiled into the release
+eboot by `ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT` as a bounded first-IDAT
+probe of the native PNG path; the original inflater remains the fallback.
+
+Frozen source:
+<https://github.com/ebiggers/libdeflate/tree/92e6a0db9fa848d742f9eb286c92afc60f2c3dda>
+
 ### zlib 1.1.4
 
 The guarded PNG fast paths implement altered fixed-width forms of frozen zlib
@@ -101,14 +117,43 @@ The inflate side of zlib 1.1.4 is also vendored byte-identical under
 Frozen licence/source:
 <https://github.com/madler/zlib/blob/v1.1.4/zlib.h>
 
+### zlib-ng 2.2.4 (prior art only)
+
+The PNG-only NEON Adler-32 helper `recomp/runtime/host_vita_native_png_adler.c`
+follows the decomposition into byte columns, prior-vector prefix sums and
+deferred weighted multiplies of zlib-ng 2.2.4's ARM NEON Adler implementation
+(credited there to Mark Adler and ARM Holdings; authors Adenilson Cavalcanti
+and Adam Stylinski; zlib licence) as a new compact 16-byte/4096-byte
+implementation, not a copy of its loop, prologue, wrappers or API. The NEON
+match-copy helper of the native PNG inflater
+(`recomp/runtime/host_vita_native_png_lz_neon.h`) shares zlib-ng's
+distance-class idea from `chunkset_tpl.h` and `chunkset_neon.c` without
+copying its overread schedule or lookup tables. Both are default OFF
+(`ISAAC_VITA_NATIVE_PNG_ADLER_NEON`, `ISAAC_VITA_NATIVE_PNG_LZ_NEON`) and are
+checked for exactness against the scalar code by
+`recomp/test_vita_native_png_adler_neon.py` and
+`recomp/test_vita_native_png_lz_neon.py`.
+
+Sources:
+<https://github.com/zlib-ng/zlib-ng/blob/2.2.4/arch/arm/adler32_neon.c>,
+<https://github.com/zlib-ng/zlib-ng/blob/2.2.4/chunkset_tpl.h>,
+<https://github.com/zlib-ng/zlib-ng/blob/2.2.4/arch/arm/chunkset_neon.c>.
+
 ### libpng 1.4.20 and the PNG filter specification
 
 The native row-unfilter implementation in
 `recomp/runtime/host_vita_png_unfilter_native.c` was written for this project
-and validated against the PNG filter specification and libpng 1.4.20
-`png_read_filter_row`. It is plainly different from libpng's later NEON
-kernels, which are not copied. The proof and exact references are in
-[`recomp/vita/PNG_UNFILTER_NATIVE_PROOF.md`](recomp/vita/PNG_UNFILTER_NATIVE_PROOF.md).
+and validated against the PNG filter specification
+(<https://www.w3.org/TR/png-3/#9Filters>) and libpng 1.4.20
+`png_read_filter_row` (filters 0-4 only; any other filter type falls back to
+the translated code so the original error path stays observable). It is
+plainly different from libpng's later NEON kernels, which are not copied:
+those consume whole vectors over libpng-owned padded rows, this helper uses
+bounded chunks plus a scalar tail inside the exact guest row. Its exactness
+against an independent expression of the PNG equations is proven by
+`recomp/runtime/host_vita_png_unfilter_native_oracle.c` (433,613 cases, also
+under AddressSanitizer and UndefinedBehaviorSanitizer). Default OFF
+(`ISAAC_VITA_PNG_NATIVE_UNFILTER`).
 
 libpng 1.4.20 is Copyright (c) 2000-2002, 2004, 2006-2016 Glenn
 Randers-Pehrson and derives from earlier work by Glenn Randers-Pehrson,
@@ -120,6 +165,22 @@ Library is supplied as-is without warranty.
 
 Frozen reference/licence:
 <https://github.com/pnggroup/libpng/blob/v1.4.20/png.h>
+
+The later `host_vita_native_png_rgba_neon.h` uses the PNG equations and the
+lane-wise Paeth approach from the official libpng 1.6.37 ARM NEON source as
+references. Its bounded byte-based loads/stores and scalar-tail integration
+are project code, not libpng's padded-row kernels. Reference attribution:
+Copyright (c) 2018 Cosmin Truta; Copyright (c) 2014, 2016 Glenn Randers-Pehrson;
+written by James Yu (2013), based on Mans Rullgard's assembly (2011), under
+the libpng licence. Scope: only Sub, Average and Paeth rows with four 8-bit
+channels, in bounded four-pixel blocks (exactly sixteen source bytes per
+block, no padding read, no alignment assumed) with the existing scalar
+equations for the tail; Up is unchanged. Exactness against independent PNG
+equations is checked by `recomp/test_vita_native_png_rgba_neon.py`, which
+runs the ARM build of the decoder under emulation (1,752 cases per mode with
+enforced memory bounds). Default OFF (`ISAAC_VITA_NATIVE_PNG_RGBA_NEON`).
+Reference source:
+<https://github.com/pnggroup/libpng/blob/v1.6.37/arm/filter_neon_intrinsics.c>.
 
 ### Specialist Dance loading animation
 

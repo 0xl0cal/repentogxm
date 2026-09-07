@@ -6,7 +6,8 @@ Runs against a generated Vita corpus (`--generated-dir`) and checks, from the
 emitted text alone and independently of the emitter's own analysis:
 
 flag state
-  * every translated body opens with `GUEST_FLAGS_DECL;`;
+  * every translated body opens with `GUEST_FLAGS_DECL;`, after the one
+    independently pinned WAV entry-only native try when present;
   * no generated statement addresses the flag state through the CPU any more
     (`SET_FLAGS(c,`, `cc_*(c)`, `fl_*(c)`, `c->f_*`): all of it goes through
     GUEST_FL, so one compile definition decides where the state lives;
@@ -31,6 +32,12 @@ general registers (GUEST_GPR_LOCAL)
   must reload first, and the matching standalone `GUEST_GPR_RELOAD(c);` must
   close it at the same brace depth inside the same preprocessor block.
   * every body opens with `GUEST_FLAGS_DECL; GUEST_GPR_DECL;`.
+  * only the exact WAV Seek entry try may precede those declarations. There
+    are no loaded locals yet: refusal continues to the original declarations,
+    while success returns directly with the helper's CPU state.
+  * six pinned room-reset partial-publication blocks are independently checked
+    with their complete predecessor span, then restored to full publication
+    for this state-machine check; no generic partial-sync exemption exists.
 
 xmm zero-fill elision
   Reported as statistics (loads emitted without the `(xmm_t){0}` fill versus
@@ -41,6 +48,7 @@ xmm zero-fill elision
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import re
 import sys
@@ -122,7 +130,40 @@ def fail(message: str) -> None:
     raise SystemExit(message)
 
 
+def wav_buffered_rewind_entry_original(name: str, body: str) -> str:
+    """Recognize one exact entry seam, never a generic unflushed host call.
+
+    The helper runs before locals exist. Its false path preserves CPU state;
+    its true path owns the complete return. Keep the existing coverage guard,
+    ordering and immediate original declarations independently of gen_all.
+    """
+    if ("ISAAC_VITA_WAV_BUFFERED_REWIND" not in body and
+            "isaac_vita_wav_buffered_rewind_try" not in body):
+        return body
+    if name != "sub_0059c690":
+        raise ValueError("WAV entry try escaped exact Seek owner")
+    prefix = (
+        "#if defined(__vita__) && defined(ISAAC_VITA_WAV_BUFFERED_REWIND) && "
+        "ISAAC_VITA_WAV_BUFFERED_REWIND\n"
+        "    extern int isaac_vita_wav_buffered_rewind_try(CPU *__restrict);\n"
+        "    if (!g_guest_coverage_functions && !g_guest_coverage_cases &&\n"
+        "            isaac_vita_wav_buffered_rewind_try(c)) return;\n"
+        "#endif\n")
+    declarations = "    GUEST_FLAGS_DECL;\n    GUEST_GPR_DECL;\n"
+    if not body.startswith(prefix + declarations):
+        raise ValueError("WAV entry try guard/order/declarations changed")
+    body = body[len(prefix):]
+    if ("ISAAC_VITA_WAV_BUFFERED_REWIND" in body or
+            "isaac_vita_wav_buffered_rewind_try" in body):
+        raise ValueError("WAV entry try duplicated or moved inside locals")
+    return body
+
+
 def check_flags(name: str, body: str, stats: dict, problems: list) -> None:
+    try:
+        body = wav_buffered_rewind_entry_original(name, body)
+    except ValueError as error:
+        problems.append(f"{name}: {error}")
     first = body.split("\n", 1)[0].strip()
     if first != "GUEST_FLAGS_DECL;":
         problems.append(f"{name}: body does not open with GUEST_FLAGS_DECL; "
@@ -180,7 +221,60 @@ def _foreign_calls(code: str):
     return out
 
 
+def room_reset_publication_original(name: str, body: str) -> str:
+    """Independent, exact exception; no new generic partial-sync rule.
+
+    Restore only the six byte-for-byte reviewed dual-spelled blocks, then
+    independently pin the entire straight-line predecessor span. Any mask,
+    call, reload, mode guard, incoming label or intervening observer drift is
+    an error. The ordinary GPR state-machine still checks the restored body.
+    """
+    if "ROOM_RESET_DIRTY_PUBLISH" not in body:
+        return body
+    if name != "sub_00520160":
+        raise ValueError("room-reset partial publication escaped exact owner")
+    guard = ("#if defined(__vita__) && defined(ISAAC_VITA_ROOM_RESET_DIRTY_PUBLISH) && "
+             "ISAAC_VITA_ROOM_RESET_DIRTY_PUBLISH && GUEST_GPR_LOCAL && "
+             "!GUEST_GENERATED_STACK_GUARD && !defined(GUEST_CHECKED_MEMORY)")
+    # Deliberately not imported from gen_all: drift must fail this oracle.
+    sites = ((0x520385, 0x3063a0, ("ecx", "esp")),
+             (0x52038d, 0x2da0d0, ("ecx", "esp")),
+             (0x52039e, 0x20480, ("eax", "ecx", "esp")),
+             (0x5203a8, 0x5eb08e, ("esp",)),
+             (0x5203b3, 0x2da0d0, ("ecx", "esp")),
+             (0x5203bb, 0x1ad80, ("ecx", "esp")))
+    for site, callee, dirty in sites:
+        push = f"GPUSH(0x{site + 5:x}U); GUEST_STACK_CALLSITE_BARRIER();"
+        call = f"sub_{callee:08x}(c); GUEST_GPR_RELOAD(c);"
+        original = f"    {push} GUEST_GPR_FLUSH(c); {call}\n"
+        expected = "\n".join((
+            guard,
+            f"    /* ROOM_RESET_DIRTY_PUBLISH site {site:08x}: full reload retained. */",
+            "    " + push,
+            "    " + " ".join(f"c->{r} = GR({r});" for r in dirty),
+            "    " + call, "#else", original.rstrip("\n"), "#endif", ""))
+        if body.count(expected) != 1:
+            raise ValueError(f"room-reset partial publication block changed at {site:08x}")
+        body = body.replace(expected, original)
+    if "ROOM_RESET_DIRTY_PUBLISH" in body:
+        raise ValueError("unrecognized room-reset partial publication")
+    start = body.index("    /* 0052037b ")
+    end = body.index("    /* 005203c0 ")
+    anchor = ("    GPUSH(0x52037bU); GUEST_STACK_CALLSITE_BARRIER(); "
+              "GUEST_GPR_FLUSH(c); sub_002c4260(c); GUEST_GPR_RELOAD(c);\n")
+    if (not body[:start].endswith(anchor) or
+            hashlib.sha256(body[start:end].encode()).hexdigest() !=
+            "083a92d402cc27c440ee84eb9e459d89bf3f797057e0a5c8b799fb097bc2e4c9"):
+        raise ValueError("room-reset partial publication predecessor span changed")
+    return body
+
+
 def check_gpr(name: str, body: str, stats: dict, problems: list) -> None:
+    try:
+        body = wav_buffered_rewind_entry_original(name, body)
+        body = room_reset_publication_original(name, body)
+    except ValueError as error:
+        problems.append(f"{name}: {error}")
     lines = body.split("\n")
     head = [line.strip() for line in lines[:2]]
     if head != ["GUEST_FLAGS_DECL;", "GUEST_GPR_DECL;"]:

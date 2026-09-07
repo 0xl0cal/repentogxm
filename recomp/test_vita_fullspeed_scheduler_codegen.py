@@ -8,6 +8,7 @@ import copy
 import hashlib
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -16,6 +17,8 @@ sys.path.insert(0, str(HERE))
 import gen_all as G  # noqa: E402
 from gpr_locals import legacy_text  # noqa: E402
 from image import DEFAULT_BASE, Image  # noqa: E402
+from vita.test_kage_vita_fullspeed_scheduler import compiler, run  # noqa: E402
+from vita.test_kage_vita_phase_profile import function_body  # noqa: E402
 
 PE_SIZE = 8_650_240
 PE_SHA256 = "31846486979cfa07c8c968221553052c3ff603518681ca11912d445f96ca9404"
@@ -160,10 +163,10 @@ def verify_app(result: dict[str, object]) -> str:
     # fenced label at the continuation instruction.
     render_query = "if (!kage_pc_backend_fullspeed_plan_render("
     skipped_note = "kage_pc_backend_note_render_skipped();"
-    skip_jump = "goto L_0048bdff;"
+    skip_jump = "goto L_vita_fullspeed_render_done;"
     limiter_query = "if (kage_pc_backend_fullspeed_bypass_limiter())"
     for marker in (render_query, skipped_note, skip_jump, limiter_query,
-                   "L_0048bdff:"):
+                   "L_vita_fullspeed_render_done:"):
         if text.count(marker) != 1:
             raise AssertionError(
                 f"application cadence marker absent or duplicated: {marker}"
@@ -175,13 +178,13 @@ def verify_app(result: dict[str, object]) -> str:
     render_entry = text.index("kage_pc_backend_note_render_entry();")
     render_call = text.index("/* 0048bdfa  call 0x4b0600 */")
     render_return = text.index("kage_pc_backend_note_render_return();")
-    resume_label = text.index("L_0048bdff:")
+    resume_label = text.index("L_vita_fullspeed_render_done:")
     continuation = text.index("/* 0048bdff  cmp dword ptr")
-    # The resume label precedes the Render-return heartbeat, so a skipped
-    # frame still notes the return exactly as the old else-branch did.
+    # A skipped frame has no Render entry and therefore no Render return.
+    # Its Update sample is already closed by note_render_skipped above.
     if not (
         render_gate < skipped < skip < render_entry < render_call <
-        resume_label < render_return < continuation
+        render_return < resume_label < continuation
     ):
         raise AssertionError("render gate no longer brackets only Render")
 
@@ -199,6 +202,165 @@ def verify_app(result: dict[str, object]) -> str:
         raise AssertionError("cadence scheduler lost the pinned loop-head edge")
     assert_read_only(feature_blocks(text), 3)
     return text
+
+
+def execute_app_render_seam(result: dict[str, object]) -> None:
+    """Run newly generated C, not a hand-written model of its skip branch.
+
+    Reuse the existing phase oracle's two 120-tick windows and its real
+    scheduler/profiler assertions. Only guest memory and Manager::Render are
+    stand-ins; the entry/return/skip hooks are extracted from production.
+    """
+    runtime = HERE / "runtime"
+    text = str(result["text"])
+    marker = ("#if defined(__vita__) && "
+              "defined(ISAAC_VITA_FULLSPEED_SCHEDULER)\n")
+    start = text.index(marker, text.index("/* 0048bdf5  call 0x4b0010 */"))
+    end = text.index("    /* explicit PC no-Lua main-loop bypass", start)
+    fragment = text[start:end]
+    if "GUEST_GPR_RELOAD(c); goto L_vita_fullspeed_render_done;" not in fragment:
+        raise AssertionError("render skip must reload GPR locals before leaving its seam")
+
+    # Recreate ce33caba's control-flow error as a negative control. With the
+    # feature OFF, moving its fenced label must change no generated C token.
+    done = marker + "L_vita_fullspeed_render_done:\n#endif\n"
+    legacy = fragment.replace(done, "").replace(
+        "goto L_vita_fullspeed_render_done;", "goto L_0048bdff;")
+    return_heartbeat = "    /* explicit PC Render return heartbeat; original follows */"
+    legacy = legacy.replace(return_heartbeat,
+                            marker + "L_0048bdff:\n#endif\n" + return_heartbeat)
+    def without_feature(value: str) -> str:
+        for block in feature_blocks(value):
+            value = value.replace(block, "")
+        return value
+    if without_feature(fragment) != without_feature(legacy):
+        raise AssertionError("cadence skip fix changes feature-OFF generated C")
+
+    hooks_source = (runtime / "kage_vita_generated_hooks.c").read_text(encoding="utf-8")
+    hooks = []
+    for name in ("entry", "return", "skipped"):
+        signature = f"void kage_pc_backend_note_render_{name}(void)"
+        hooks.append(signature + "\n" + function_body(hooks_source, signature))
+
+    helpers = r'''
+#include <assert.h>
+#include "kage_vita_stall_probe.h"
+static CPU *s_seam_cpu;
+static uint32_t s_seam_counter, s_seam_frame, s_seam_render_us;
+static uint32_t s_seam_expected_eax;
+static int s_seam_rendered;
+static uint32_t seam_read32(uint32_t address)
+{
+    switch (address) {
+    case GUEST_IMAGE_BASE + 0x007fd680u: return 0x10000000u;
+    case GUEST_IMAGE_BASE + 0x007fd65cu: return 0x20000000u;
+    case 0x10000000u + 0x0004a264u: return s_seam_counter;
+    case 0x20000000u + 0x001a30dcu: return s_seam_frame;
+    default: assert(!"unexpected generated memory read"); return 0u;
+    }
+}
+static uint8_t seam_read8(uint32_t address)
+{
+    assert(address == 0x10000000u + 0x00029e73u);
+    return 0u;
+}
+int kage_pc_backend_mode(void) { return 1; }
+int kage_pc_backend_fullspeed_plan_render(uint32_t manager, uint32_t counter,
+    uint32_t interpolation, uint32_t game, uint32_t frame)
+{
+    int rendered = kage_vita_fullspeed_scheduler_plan_render(
+        manager, counter, interpolation, game, frame);
+    /* Synthetic seam clobber: missing GPR reload must fail even though the
+     * present production observer happens not to modify the CPU. */
+    s_seam_cpu->eax = s_seam_expected_eax = 0x12345678u;
+    return rendered;
+}
+static void sub_004b0600(CPU *c)
+{
+    assert(c->esp == 0x30000000u - 4u);
+    s_seam_rendered = 1;
+    kage_vita_fullspeed_scheduler_note_render_body(
+        0x10000000u, s_seam_counter, 0u);
+    s_now += s_seam_render_us;
+    kage_vita_fullspeed_scheduler_note_present();
+    kage_vita_phase_profile_note_present_enter();
+    s_now += 100u;
+    kage_vita_phase_profile_note_present_return();
+    s_now += 400u;
+    c->esp += 4u;
+    c->eax = s_seam_expected_eax = 0x87654321u;
+}
+@HOOKS@
+static int generated_render_seam(uint32_t counter, uint32_t frame, uint32_t us)
+{
+    CPU state = {0};
+    CPU *c = &state;
+    state.esp = 0x30000000u;
+    state.eax = 0x11111111u;
+    s_seam_cpu = c;
+    s_seam_counter = counter;
+    s_seam_frame = frame;
+    s_seam_render_us = us;
+    s_seam_rendered = 0;
+    GUEST_GPR_DECL;
+    /* Mock the one synthetic stack store, not GPR FLUSH/RELOAD. */
+#undef GPUSH
+#define GPUSH(value) do { assert((value) == 0x0048bdffu); GR(esp) -= 4u; } while (0)
+#define ld32(address) seam_read32(address)
+#define ld8(address) seam_read8(address)
+#define __vita__ 1
+@FRAGMENT@
+L_0048be0d:
+#undef __vita__
+#undef ld8
+#undef ld32
+    /* This is reached through the original guest continuation in both arms. */
+    assert(GR(eax) == s_seam_expected_eax);
+    assert(GR(esp) == 0x30000000u);
+    GUEST_GPR_FLUSH(c);
+    return s_seam_rendered;
+}
+'''.replace("@HOOKS@", "\n".join(hooks))
+    oracle = (runtime / "kage_vita_fullspeed_phase_oracle.c").read_text(encoding="utf-8")
+    begin = oracle.index("        render = kage_vita_fullspeed_scheduler_plan_render(")
+    finish = oracle.index("        kage_vita_fullspeed_scheduler_snapshot(&after);", begin)
+    oracle = oracle[:begin] + (
+        "        render = generated_render_seam(manager_counter, game_frame, render_us);\n"
+        "        if (render) ++renders[window];\n"
+    ) + oracle[finish:]
+
+    with tempfile.TemporaryDirectory(prefix="isaac-generated-cadence-") as temporary:
+        directory = Path(temporary)
+        cc = compiler()
+        for local, broken in ((0, False), (1, False), (1, True)):
+            source = directory / f"render-{local}-{int(broken)}.c"
+            binary = source.with_suffix(".exe")
+            implementation = helpers.replace("@FRAGMENT@", legacy if broken else fragment)
+            source.write_text(oracle.replace("int main(void)", implementation + "\nint main(void)"),
+                              encoding="utf-8")
+            run([cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                 f"-I{runtime}", f"-I{HERE / 'vita'}",
+                 "-DISAAC_KAGE_VITA_PHASE_PROFILE_ORACLE=1",
+                 "-DISAAC_VITA_PHASE_PROFILE=1", "-DISAAC_VITA_FULLSPEED_SCHEDULER=1",
+                 '-DISAAC_VITA_PHASE_PROFILE_BUILD_ID="fullspeed:phase-oracle"',
+                 '-DISAAC_VITA_FULLSPEED_SCHEDULER_BUILD_ID="fullspeed:phase-oracle"',
+                 f"-DGUEST_GPR_LOCAL={local}", "-DGUEST_GENERATED_STACK_GUARD=0",
+                 f"-DGUEST_IMAGE_BASE=0x{VITA_IMAGE_BASE:08x}u",
+                 str(runtime / "kage_vita_fullspeed_scheduler.c"),
+                 str(runtime / "kage_vita_phase_profile.c"), str(source), "-o", str(binary)])
+            try:
+                output = run([str(binary)])
+            except RuntimeError as error:
+                if not broken or "kage_vita_fullspeed_scheduler_bypass_limiter()" not in str(error):
+                    raise
+            else:
+                if broken:
+                    raise AssertionError("ce33caba render-return regression was not detected")
+                if "Vita cadence30/phase integration oracle: PASS" not in output:
+                    raise AssertionError(f"unexpected generated-seam result: {output}")
+    print("Vita generated render seam: PASS (GPR memory/locals; real scheduler/profiler; "
+          "240 ticks each; skipped Update closed; continuation preserved; "
+          "ce33caba negative control rejected; feature-OFF text identical)")
 
 
 def verify_manager(result: dict[str, object]) -> str:
@@ -344,6 +506,10 @@ def expect_pin_failure(
         translate(image, mutated, root, switch_info)
     except RuntimeError as exc:
         needles = (needle,) if isinstance(needle, str) else needle
+        if root == GAME_UPDATE_ROOT:
+            # The independent simulation-cadence body pin now runs before
+            # the fullspeed pin and may reject the same mutated bytes first.
+            needles += ("simulation cadence Game::Update body/caller identity changed",)
         if not any(value in str(exc) for value in needles):
             raise AssertionError(
                 f"wrong failure for mutation 0x{rva:08x}: {exc}"
@@ -470,6 +636,7 @@ def main() -> int:
             vita_results[GAME_PUBLISH_ROOT]
         ),
     }
+    execute_app_render_seam(vita_results[APP_ROOT])
     for root, markers in {
         APP_ROOT: (
             "kage_pc_backend_fullspeed_plan_render(",

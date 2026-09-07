@@ -23,6 +23,7 @@
 #include "host_vita_heap.h"
 #include "host_vita_lua.h"
 #include "host_vita_startup.h"
+#include "kage_vita_deep_profile.h"
 #if defined(ISAAC_VITA_GUEST_SAMPLER)
 /* Sampler builds: a Lua error longjmps over guest_call's publish/restore
  * wrapper (guest.c), so each callback frame keeps the enclosing indirect
@@ -713,8 +714,10 @@ int isaac_vita_lua_arena_reserve(void)
 }
 #endif
 
-#if defined(ISAAC_VITA_LUA_GC_PROFILE)
-/* GC profile (host_vita_lua_gc.c): arena occupancy for the window line. */
+#if defined(ISAAC_VITA_LUA_GC_PROFILE) || defined(ISAAC_VITA_HEAP_CENSUS)
+/* GC profile (host_vita_lua_gc.c): arena occupancy for the window line.
+ * ISAAC_VITA_HEAP_CENSUS: the same three numbers as lua(l,pk,fb) of
+ * ph120.mem (kage_vita_phase_profile.c), read outside every lock. */
 void isaac_vita_lua_arena_stats(uint32_t *live_kb, uint32_t *peak_kb,
                                 uint32_t *fallbacks)
 {
@@ -910,6 +913,7 @@ static void vita_lua_beat_note_import(CPU *c, uint32_t index)
 
 static int vita_lua_call_guest(lua_State *state, uint32_t target)
 {
+    KAGE_VITA_DEEP_SCOPE(KVD_LUA_CALLBACK);
 #if ISAAC_VITA_LUA_SCOPE_FASTPATH
     /* The trampoline runs inside the import scope that owns the slot (Lua
      * code executes only under an import of the owning CPU), so the slot
@@ -943,6 +947,9 @@ static int vita_lua_call_guest(lua_State *state, uint32_t target)
 #endif
 #if defined(ISAAC_VITA_LUA_GC_PROFILE)
     isaac_vita_lua_gc_profile_note_callback(target);
+#endif
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+    const uint32_t deep_callback_mark = kage_vita_deep_depth();
 #endif
 
     if (setjmp(frame->escape) == 0) {
@@ -982,6 +989,9 @@ static int vita_lua_call_guest(lua_State *state, uint32_t target)
         }
 #endif
     }
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+    kage_vita_deep_unwind(deep_callback_mark);
+#endif
 #if defined(ISAAC_VITA_GUEST_SAMPLER)
     /* Normal return: guest_call's wrapper already restored this value.
      * longjmp(frame->escape): the wrapper's store was skipped; restore here. */
@@ -1230,7 +1240,13 @@ static void vita_lua_native_index_verify(lua_State *L, uint32_t target,
             lua_pushvalue(L, i);
         callback_mark = s_vita_lua_callback_top;
         require_mark = s_vita_lua_require_top;
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+        const uint32_t deep_verify_mark = kage_vita_deep_depth();
+#endif
         status = lua_pcall(L, base, LUA_MULTRET, 0);
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+        kage_vita_deep_unwind(deep_verify_mark);
+#endif
         if (!vita_lua_recover_callbacks(c, callback_mark) ||
             !vita_lua_recover_requires(c, require_mark)) {
             why = "callback recovery";
@@ -2387,6 +2403,7 @@ static int vita_lua_gcstep_clamp(CPU *__restrict c, int what, int data)
 
 static void vita_lua_gc_import(CPU *__restrict c)
 {
+    KAGE_VITA_DEEP_SCOPE(KVD_LUA_GC);
     int what = (int32_t)vita_lua_arg(c, 1U);
     int data = (int32_t)vita_lua_arg(c, 2U);
 #if defined(VITA_LUA_GC_HOOK)
@@ -2407,6 +2424,10 @@ static void vita_lua_gc_import(CPU *__restrict c)
 
 static void vita_lua_pcallk_import(CPU *__restrict c)
 {
+    KAGE_VITA_DEEP_SCOPE(KVD_LUA_PCALL);
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+    uint32_t deep_mark = kage_vita_deep_depth();
+#endif
     int callback_mark;
     int require_mark;
     int result;
@@ -2429,6 +2450,11 @@ static void vita_lua_pcallk_import(CPU *__restrict c)
         (int32_t)vita_lua_arg(c, 2U),
         vita_lua_index((int32_t)vita_lua_arg(c, 3U)),
         (lua_KContext)(int32_t)vita_lua_arg(c, 4U), NULL);
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+    /* Lua errors can bypass ordinary C cleanup in callbacks/GC. Discard
+     * those abandoned diagnostic scopes, keeping incomplete time explicit. */
+    kage_vita_deep_unwind(deep_mark);
+#endif
 #if defined(ISAAC_VITA_LUA_GC_PROFILE)
     /* GC profile (host_vita_lua_gc.c): a Lua error inside lua_gc longjmps
      * past its import frame; restore the nesting depth like the marks. */
@@ -2956,6 +2982,14 @@ int isaac_vita_lua_seam_enter(CPU *__restrict c, int *root)
 {
     uintptr_t expected = 0U;
     *root = 0;
+#if ISAAC_VITA_LUA_SCOPE_FASTPATH
+    /* Same nested-owner proof as vita_lua_scope_enter above: getClass and
+     * getExact commonly re-enter from an import-owned callback. Only c's
+     * own thread publishes c, so observing that owner needs no failing CAS.
+     * Keep NULL on the original path: CAS(0, 0) succeeds with root=1. */
+    if (c != NULL && vita_lua_active_load_relaxed() == (uintptr_t)c)
+        return 1;
+#endif
     if (vita_lua_active_compare_exchange(&expected, (uintptr_t)c)) {
         *root = 1;
         return 1;

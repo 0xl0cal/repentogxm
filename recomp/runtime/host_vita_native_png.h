@@ -4,6 +4,31 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef ISAAC_VITA_NATIVE_PNG_TINFL_HEADER_RESET
+#define ISAAC_VITA_NATIVE_PNG_TINFL_HEADER_RESET 0
+#endif
+#ifndef ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+#define ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT 0
+#endif
+#ifndef ISAAC_VITA_NATIVE_PNG_REUSE
+#define ISAAC_VITA_NATIVE_PNG_REUSE 0
+#endif
+#ifndef ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+#define ISAAC_VITA_NATIVE_PNG_REUSE_TINFL 0
+#endif
+#ifndef ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+#define ISAAC_VITA_NATIVE_PNG_REUSE_LARGE 0
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE && !ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+#error "Large PNG reuse requires observed history-safe tinfl reuse"
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE_TINFL && !ISAAC_VITA_NATIVE_PNG_REUSE
+#error "PNG tinfl reuse requires the independent PNG reuse reserve"
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE && !ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+#error "PNG reuse admits only strict successful decodes"
+#endif
+
 /* Native whole-image PNG decode for the frozen KAGE ImagePng loader
  * (ISAAC_VITA_NATIVE_PNG).
  *
@@ -19,7 +44,10 @@
  *             png_read_row(png_ptr, rows[y], NULL);       <- 0x5a139d
  *
  * followed by the game's premultiply / palette expansion, SetTexelData,
- * png_read_end and png_destroy_read_struct.  None of that is touched.  The
+ * png_read_end and png_destroy_read_struct. The optional ROW_BATCH caller
+ * seam serves the already-decoded middle rows together; first/final calls,
+ * subsequent transforms/upload/end/destroy and rejected paths stay original.
+ * The
  * expensive part is png_read_row (sub_005b1500, guest_0175.c): the
  * translated zlib 1.1.4 inflate, the row unfilter and the memcpy into the
  * texel buffer.  It is the only libpng entry the loop calls, its sole caller
@@ -146,7 +174,13 @@
 #define ISAAC_NP_SCRATCH_RETAIN_BYTES   (4U * 1024U * 1024U)
 #endif
 #ifndef ISAAC_NP_STAGING_BYTES
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+/* Capacity only: the large-input path keeps the original 64KiB read/feed
+ * boundaries. Reading 128KiB at once changes scratch after a short read. */
+#define ISAAC_NP_STAGING_BYTES          (128U * 1024U)
+#else
 #define ISAAC_NP_STAGING_BYTES          (64U * 1024U)
+#endif
 #endif
 #define ISAAC_NP_TINFL_STATE_BYTES      0x2af0U
 
@@ -224,6 +258,12 @@ typedef struct isaac_np_result {
     uint32_t last_filter;       /* filter byte of the last row */
     uint32_t filters[5];        /* rows per filter type */
     uint32_t io_us;             /* time inside the read callback */
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+    uint32_t strict_attempts, strict_successes, strict_refusals;
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+    uint32_t reuse_history_safe;
+#endif
 } isaac_np_result;
 
 typedef struct isaac_np_work {
@@ -240,6 +280,12 @@ typedef struct isaac_np_work {
  * Any other status leaves the caller to rewind the stream. */
 int isaac_np_decode(const isaac_np_params *params, isaac_np_read_fn read,
                     void *ctx, isaac_np_work *work, isaac_np_result *out);
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+struct IsaacNpReuse;
+int isaac_np_decode_reusing(const isaac_np_params *params, isaac_np_read_fn read,
+    void *ctx, isaac_np_work *work, isaac_np_result *out,
+    struct IsaacNpReuse *reuse);
+#endif
 
 const char *isaac_np_status_name(int status);
 uint32_t isaac_np_crc32(uint32_t crc, const void *data, uint32_t bytes);

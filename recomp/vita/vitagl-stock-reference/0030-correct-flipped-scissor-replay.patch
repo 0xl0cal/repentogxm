@@ -1,0 +1,20 @@
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -778,7 +778,15 @@ void scene_reset(void) {
+ 		}
+ 
+ #ifndef DISABLE_TILE_CLIPPER
+-		if (scissor_test_state)
++		if (scissor_test_state) {
++#ifndef HAVE_UNFLIPPED_FBOS
++			if (!is_rendering_display) {
++				/* Match update_scissor_test; region.y still belongs to its mask. */
++				uint32_t y = region.gl_y > 0 ? region.gl_y : 0;
++				sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, region.x, y, region.x + region.w - 1, y + region.h - 1);
++			} else
++#endif
+ 			sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, region.x, region.y, region.x + region.w - 1, region.y + region.h - 1);
++		}
+ #endif
+ 	}

@@ -91,6 +91,12 @@ uint64_t sceKernelGetProcessTimeWide(void);
 void     vglSetupRuntimeShaderCompiler(
              int optimization, int vertex, int fragment, int compiler);
 void     vglSetupDisplayRenderTarget(uint8_t scenes_per_frame);
+/* 0007-isaac-fbo-rt-scenes.patch hook (consumer-declared, absent from
+ * vitaGL.h): stores 1..8 and returns the value in effect. */
+uint8_t  vglIsaacSetupFboRenderTargetScenes(uint8_t size);
+/* 0009-isaac-fbo-valid-region.patch mode hook (consumer-declared, absent
+ * from vitaGL.h): 0 = observe, nonzero = apply; returns the mode stored. */
+uint8_t  vglIsaacSetupFboValidRegion(uint8_t apply);
 GLboolean vglInitExtended(
               int legacy_pool, int width, int height,
               int ram_threshold, int multisample_mode);

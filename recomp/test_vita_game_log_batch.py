@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 from pathlib import Path
 
 import pefile
@@ -66,6 +67,18 @@ def main() -> int:
     for rva in FFLUSH_SITES:
         require(pe.get_data(rva, len(FFLUSH_CALL)) == FFLUSH_CALL,
                 f"fflush callsite changed at {rva:08x}")
+    # Room::Init pushes descriptor+8/+12/name, exact format, INFO=0, then
+    # calls this logger. This is a template log event, not a grid-room ID.
+    require(pe.get_data(0x003B10E0, 0x31) == bytes.fromhex(
+        "8bb5fcfaffff8bbde4faffff8d4614c687f5110000018378141072028b00"
+        "50ff760cff760868a0dcb4006a00e81fd21a00"),
+        "Room logger argument/call/return proof changed")
+    require(pe.get_data(0x0074DCA0, 16) == b"Room %d.%d(%s)\n\0",
+            "Room format literal changed")
+    require(pe.get_data(0x0055E42C, 46) == bytes.fromhex(
+        "8d45102bca506a00ff750cb8002800002bc1508d81e807c00050"
+        "e8153babff8b08ff700483c90251ff151466a000"),
+        "logger fixed-buffer/va_list vsprintf provenance changed")
 
     root = args.root.resolve()
     crt = (root / "recomp/runtime/host_vita_crt.c").read_text("utf-8")
@@ -75,6 +88,14 @@ def main() -> int:
     gate_source = (root / "recomp/vita/vita_raw_allocator_gate.py").read_text(
         "utf-8"
     )
+    for macro, expected in (
+            ("ISAAC_VITA_CRT_ROOM_LOG_ORIGIN_RETURN_RVA", 0x003B1111),
+            ("ISAAC_VITA_CRT_ROOM_LOG_FORMAT_VA", 0x9874DCA0),
+            ("ISAAC_VITA_CRT_ROOM_LOG_BUFFER_VA", 0x988007E8),
+            ("ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END", 0x98802FE8)):
+        match = re.search(r"#define\s+" + macro + r"\s+(0x[0-9a-fA-F]+)U", header)
+        require(match is not None and int(match[1], 16) == expected,
+                f"Room source constant differs from frozen PE: {macro}")
     require(header.count("#define ISAAC_VITA_CRT_LOG_BATCH_SIZE      8U") == 1,
             "bounded batch size is not frozen at eight")
     for marker in (
@@ -94,6 +115,14 @@ def main() -> int:
             "canonical build wrapper does not pin the feature")
     require('GAME_LOG_BATCH_CACHE_KEY = "ISAAC_VITA_GAME_LOG_BATCH"' in gate_source,
             "allocator closure does not fail-close the feature")
+    require('"${ISAAC_RUNTIME}/host_vita_crt.c"\n'
+            '          "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"\n'
+            '          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_ROOM_LOG_MARKERS=1' in cmake,
+            "Room marker definition escaped CRT/phase owners")
+    for marker in ("arguments != frame + 16U", "written >= count",
+                   "guest_stack_contains(c, c->ebp, 24U)",
+                   "count != ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END - buffer"):
+        require(marker in crt, f"Room marker guard missing: {marker}")
 
     if args.generated_dir is not None:
         units = list(args.generated_dir.glob("guest_[0-9][0-9][0-9][0-9].c"))
@@ -117,6 +146,11 @@ def main() -> int:
                 "generated fflush return word is not exact raw RVA")
         require("c->ebp = (uint32_t)(c->esp);" in logger_body,
                 "generated logger lost the EBP frame used by the boundary")
+        require(logger_body.count("gpush_generated(c, 0x55e45aU)") == 1,
+                "generated vsprintf return word is not exact raw RVA")
+        room_body = exact_body("void sub_003b0e80(CPU *__restrict c)")
+        require(room_body.count("gpush_generated(c, 0x3b1111U)") == 1,
+                "generated Room caller return word changed")
 
     print(
         "Vita exact game-log INFO batch frozen contract: PASS "

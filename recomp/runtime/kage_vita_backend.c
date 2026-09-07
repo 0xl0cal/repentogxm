@@ -5,6 +5,7 @@
  * session inactive.  A later Initialize reuses the real context instead of
  * trying to manufacture or recreate a GLFW object. */
 #include "kage_vita_backend.h"
+#include "kage_vita_deep_profile.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -113,6 +114,57 @@ void kage_vita_first_frame_note_present_return(uint32_t present_count);
 # define KAGE_VITA_STOCK_DISPLAY_RT_SCENES_VALUE KAGE_VITA_RENDER_TARGET_SCENES
 #else
 # define KAGE_VITA_STOCK_DISPLAY_RT_SCENES_VALUE 1u
+#endif
+/* ISAAC_VITA_STOCK_FBO_RT_SCENES=N (2..8): scenes per frame for the GXM render
+ * targets stock vitaGL creates lazily for framebuffer objects, through the
+ * 0007-isaac-fbo-rt-scenes.patch hook.  vitaGL sizes them for one scene, and
+ * the game runs three offscreen passes per frame on one manager FBO, so with
+ * one scene slot the sceGxmEndScene of pass k waits until pass k-1 has
+ * finished on the GPU (prof-v12 ph120.gt: the glClear c bucket is that
+ * EndScene wait, 12.7 ms/frame steady, 72 ms in bursts).  The hook is not
+ * declared in vitaGL.h (the 0004 shader cache hashes that header), returns
+ * the value in effect (out-of-range requests are ignored by the patch), and
+ * the banner prints that returned value so the hardware record names what
+ * vitaGL will really use.  A 1024x1024 target at 8 scenes costs ~0.95 MB more
+ * GXM driver memory than at 1. */
+#if defined(ISAAC_VITA_STOCK_FBO_RT_SCENES)
+# if (ISAAC_VITA_STOCK_FBO_RT_SCENES) < 1 || (ISAAC_VITA_STOCK_FBO_RT_SCENES) > 8
+#  error "ISAAC_VITA_STOCK_FBO_RT_SCENES must be 1..8 (MAX_SCENES_PER_FRAME)"
+# endif
+uint8_t vglIsaacSetupFboRenderTargetScenes(uint8_t size);
+static uint8_t s_stock_fbo_rt_scenes = 1u;
+# define KAGE_VITA_STOCK_FBO_RT_SCENES_BANNER " fbo-rt-scenes=%u"
+# define KAGE_VITA_STOCK_FBO_RT_SCENES_ARG (unsigned)s_stock_fbo_rt_scenes,
+#else
+# define KAGE_VITA_STOCK_FBO_RT_SCENES_BANNER ""
+# define KAGE_VITA_STOCK_FBO_RT_SCENES_ARG
+#endif
+/* ISAAC_VITA_STOCK_FBO_VALID_REGION=1 (observe) | 2 (on): the mode hook of
+ * 0009-isaac-fbo-valid-region.patch.  The game's offscreen attachments are
+ * pow2 textures larger than what it draws (1024x1024 for the 960x540
+ * surface) and stock vitaGL begins every FBO scene with a NULL
+ * SceGxmValidRegion, so the padding is cleared, drawn and stored on every
+ * offscreen pass.  Observe mode only counts the FBO scenes whose logical rect
+ * (the guest's last glViewport) is known and smaller than the attachment and
+ * the guest viewport violations apply mode would clip; apply mode passes that
+ * rect as the valid region and clamps the tile-clipper region to it (NULL if
+ * stale, unanchored or oversized).  The hook is not declared in vitaGL.h (the
+ * 0004 shader cache hashes that header), returns the mode in effect and the
+ * banner prints it so the hardware record names what vitaGL really does.
+ * The counters come back through kage_vita_phase_profile.c (ph120.gx
+ * vr(s,p,u,a,e,v,c), ph120.vz). */
+#if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+# if (ISAAC_VITA_STOCK_FBO_VALID_REGION) < 1 || (ISAAC_VITA_STOCK_FBO_VALID_REGION) > 2
+#  error "ISAAC_VITA_STOCK_FBO_VALID_REGION must be 1 (observe) or 2 (on)"
+# endif
+uint8_t vglIsaacSetupFboValidRegion(uint8_t apply);
+static uint8_t s_stock_fbo_valid_region_apply = 0u;
+# define KAGE_VITA_STOCK_FBO_VALID_REGION_BANNER " fbo-valid-region=%s"
+# define KAGE_VITA_STOCK_FBO_VALID_REGION_ARG \
+    (s_stock_fbo_valid_region_apply ? "on" : "observe"),
+#else
+# define KAGE_VITA_STOCK_FBO_VALID_REGION_BANNER ""
+# define KAGE_VITA_STOCK_FBO_VALID_REGION_ARG
 #endif
 
 #if defined(ISAAC_VITA_IO_PROFILE)
@@ -290,10 +342,13 @@ static void kage_vita_backend_memory_snapshot_after_init(void)
 
 static int kage_vita_log_heartbeat(unsigned count)
 {
-    /* Give short diagnostic runs dense early evidence, then settle at one
-     * record per 120 frames.  This is intentionally tied to real guest
-     * presents, not input samples or texture uploads. */
-#if defined(ISAAC_VITA_PHASE_PROFILE)
+    /* Only explicitly requested diagnostics get dense early evidence and
+     * then one record per 120 guest presents. Turning PHASE_PROFILE off must
+     * not silently enable a different periodic observer. Keep the cadence
+     * receipt's existing heartbeat/clock even without stage diagnostics. */
+#if defined(ISAAC_VITA_PHASE_PROFILE) || \
+    !((defined(ISAAC_VITA_STAGE_HEARTBEAT) && ISAAC_VITA_STAGE_HEARTBEAT) || \
+      (defined(ISAAC_VITA_SIM_CADENCE_RECEIPT) && ISAAC_VITA_SIM_CADENCE_RECEIPT))
     (void)count;
     return 0;
 #else
@@ -441,6 +496,26 @@ int kage_vita_backend_initialize(uint32_t width, uint32_t height)
     vglSetupDisplayRenderTarget(
         (uint8_t)KAGE_VITA_RENDER_TARGET_SCENES);
 #endif
+#if defined(ISAAC_VITA_STOCK_FBO_RT_SCENES)
+    /* Offscreen (FBO) render targets: N scene slots instead of vitaGL's one,
+     * so the three offscreen passes of a frame on the manager FBO no longer
+     * serialize CPU and GPU at each sceGxmEndScene (see the value macro).
+     * The patch stores the request only when it is 1..MAX_SCENES_PER_FRAME
+     * and returns what it will use; the creation site falls back to one slot
+     * if sceGxmCreateRenderTarget refuses the larger target (ph120.gx rt(x)).
+     * Once per process: the warm re-initialize after Shutdown reuses the
+     * vitaGL context and returns before this block. */
+    s_stock_fbo_rt_scenes = vglIsaacSetupFboRenderTargetScenes(
+        (uint8_t)ISAAC_VITA_STOCK_FBO_RT_SCENES);
+#endif
+#if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+    /* Offscreen valid region (0009): 0 = observe (count only), 1 = apply the
+     * logical rect to every FBO sceGxmBeginScene.  Once per process like the
+     * FBO scenes request above; the banner prints the mode the patch
+     * returned.  The display render target is never touched. */
+    s_stock_fbo_valid_region_apply = vglIsaacSetupFboValidRegion(
+        (uint8_t)((ISAAC_VITA_STOCK_FBO_VALID_REGION) == 2));
+#endif
 
 #if defined(ISAAC_VITA_VITAGL_CACHED_MEM)
     /* vitaGL copies every client vertex array and uniform block into its RAM
@@ -519,14 +594,20 @@ int kage_vita_backend_initialize(uint32_t width, uint32_t height)
         "[kage-vita] vitaGL ready: profile=stock-vitagl-reference "
         "source=73dd57a display=" KAGE_VITA_DISPLAY_WIDTH_TEXT "x"
         KAGE_VITA_DISPLAY_HEIGHT_TEXT " panel=960x544 "
-        "logical=960x540 rt-scenes=%u GL=%s\n",
-        (unsigned)KAGE_VITA_STOCK_DISPLAY_RT_SCENES_VALUE, s_gl_version);
+        "logical=960x540 rt-scenes=%u" KAGE_VITA_STOCK_FBO_RT_SCENES_BANNER
+        KAGE_VITA_STOCK_FBO_VALID_REGION_BANNER " GL=%s\n",
+        (unsigned)KAGE_VITA_STOCK_DISPLAY_RT_SCENES_VALUE,
+        KAGE_VITA_STOCK_FBO_RT_SCENES_ARG
+        KAGE_VITA_STOCK_FBO_VALID_REGION_ARG s_gl_version);
 # else
     sceClibPrintf(
         "[kage-vita] vitaGL ready: profile=stock-vitagl-reference "
         "source=73dd57a physical=960x544 logical=960x540 "
-        "rt-scenes=%u GL=%s\n",
-        (unsigned)KAGE_VITA_STOCK_DISPLAY_RT_SCENES_VALUE, s_gl_version);
+        "rt-scenes=%u" KAGE_VITA_STOCK_FBO_RT_SCENES_BANNER
+        KAGE_VITA_STOCK_FBO_VALID_REGION_BANNER " GL=%s\n",
+        (unsigned)KAGE_VITA_STOCK_DISPLAY_RT_SCENES_VALUE,
+        KAGE_VITA_STOCK_FBO_RT_SCENES_ARG
+        KAGE_VITA_STOCK_FBO_VALID_REGION_ARG s_gl_version);
 # endif
 #else
 # if defined(ISAAC_VITA_DISPLAY_RASTER_720)
@@ -543,11 +624,34 @@ int kage_vita_backend_initialize(uint32_t width, uint32_t height)
         (unsigned)KAGE_VITA_RENDER_TARGET_SCENES, s_gl_version);
 # endif
 #endif
+#if defined(ISAAC_VITA_GL_FILL_CENSUS)
+    {
+        /* Boot receipt of the diagnostic build: the census itself is proven
+         * per window by the bid-tagged ph120.fa/ph120.fp records; this line
+         * pins the dump knob and its thresholds, which leave no other trace
+         * until a dump fires. */
+        uint32_t dump_render_p50_us;
+        uint32_t dump_min_window;
+        uint32_t dump_window;
+        uint32_t dump_frames;
+        uint32_t dump = gl_vita_backend_fill_census_dump_config(
+            &dump_render_p50_us, &dump_min_window, &dump_window,
+            &dump_frames);
+
+        sceClibPrintf(
+            "[kage-vita] GL fill census: on records=ph120.fa,ph120.fp "
+            "dump=%u rnd_us=%u min_win=%u win=%u frames=%u\n",
+            (unsigned)dump, (unsigned)dump_render_p50_us,
+            (unsigned)dump_min_window, (unsigned)dump_window,
+            (unsigned)dump_frames);
+    }
+#endif
     return 1;
 }
 
 void kage_vita_backend_deactivate(void)
 {
+    gl_vita_backend_attrib_sync();
     /* Join the diagnostic reader before any process-owned guest/backend state
      * can be released.  Stop is idempotent across ordinary and final teardown. */
     KAGE_VITA_STALL_STOP();
@@ -560,11 +664,23 @@ void kage_vita_backend_deactivate(void)
 
 int kage_vita_backend_present(void)
 {
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+    /* This includes the transition's Present inside Manager::Update, not
+     * just the ordinary Render phase. It is API wall time, not GPU time. */
+    KAGE_VITA_DEEP_SCOPE(KVD_GPU_WAIT);
+#endif
     if (!kage_vita_backend_ready()) {
         kage_vita_set_error("Vita KAGE Present requested before initialize");
         return 0;
     }
+#if defined(ISAAC_VITA_GL_WRAPPER_TIME)
+    /* ph120.gw p bucket: this whole method (attribute sync, loading finish,
+     * shader-cache/fill-census bookkeeping, the swap, the heartbeat) on the
+     * gt clock; its gt body is the vglSwapBuffers bracket below. */
+    uint64_t wrapper_started_at = sceKernelGetProcessTimeWide();
+#endif
     KAGE_VITA_STALL_NOTE_PRESENT_ENTER(s_present_count);
+    gl_vita_backend_attrib_sync();
     /* Belt-and-suspenders fallback.  The generated loop-head hook normally
      * drains the CPU loading overlay before Update/Render starts; Present is
      * the final boundary at which the display callback must be gone. */
@@ -579,8 +695,13 @@ int kage_vita_backend_present(void)
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     gl_vita_backend_fbo_present();
 #endif
+#if defined(ISAAC_VITA_GL_FILL_CENSUS)
+    /* Pass ordinal reset + one-frame dump state machine; no logging here. */
+    gl_vita_backend_fill_census_present();
+#endif
     KAGE_VITA_PHASE_PROFILE_PRESENT_ENTER();
-#if defined(ISAAC_VITA_GL_TIME_PROFILE)
+#if defined(ISAAC_VITA_GL_TIME_PROFILE) && \
+    (!defined(ISAAC_VITA_GL_TIME_SDK_SPARSE) || !ISAAC_VITA_GL_TIME_SDK_SPARSE)
     {
         /* Same bracket as the GL boundary buckets: the swap ends the display
          * scene (sceGxmEndScene) and queues the flip; it is the sixth bucket
@@ -657,6 +778,11 @@ int kage_vita_backend_present(void)
             s_present_count, elapsed_ms);
 #endif
     }
+#if defined(ISAAC_VITA_GL_WRAPPER_TIME)
+    isaac_vita_gl_wrapper_time_add(
+        &g_isaac_vita_gl_wrapper_time.wrapper[ISAAC_VITA_GL_WRAPPER_PRESENT],
+        wrapper_started_at, sceKernelGetProcessTimeWide());
+#endif
     return 1;
 }
 

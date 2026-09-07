@@ -1,0 +1,41 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -2664,4 +2664,8 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 	enum isaac_coloroffset_staging_result isaac_neutral_staging =
+ 		ISAAC_COLOROFFSET_STAGING_UNKNOWN;
++#if defined(HAVE_ISAAC_LASER_HALO_PROFILE) && HAVE_ISAAC_LASER_HALO_PROFILE && \
++    defined(HAVE_ISAAC_COLOROFFSET_STAGING_PLAIN_FUSION) && HAVE_ISAAC_COLOROFFSET_STAGING_PLAIN_FUSION
++	uint32_t isaac_ordinary_white_proof = 0u;
++#endif
+ #endif
+ 
+@@ -2868,6 +2872,14 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 						count, base_idx, isaac_coloroffset_original_index_type))
++#if defined(HAVE_ISAAC_LASER_HALO_PROFILE) && HAVE_ISAAC_LASER_HALO_PROFILE && \
++    defined(HAVE_ISAAC_COLOROFFSET_STAGING_PLAIN_FUSION) && HAVE_ISAAC_COLOROFFSET_STAGING_PLAIN_FUSION
++					isaac_neutral_staging = isaac_coloroffset_copy_and_prove_white(
++						ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]],
++						(size_t)top_idx * isaac_copy_stride, top_idx, isaac_copy_stride,
++						&isaac_ordinary_white_proof);
++#else
+ 					isaac_neutral_staging = isaac_coloroffset_copy_and_prove_neutral(
+ 						ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]],
+ 						(size_t)top_idx * isaac_copy_stride, top_idx, isaac_copy_stride);
++#endif
+ 				if (isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_UNKNOWN)
+ 					vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * isaac_copy_stride);
+@@ -2955,4 +2967,13 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 				SceGxmFragmentProgram *isaac_probe_fragment = NULL;
+ 				if (isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_PLAIN) {
++#if defined(HAVE_ISAAC_LASER_HALO_PROFILE) && HAVE_ISAAC_LASER_HALO_PROFILE && \
++    defined(HAVE_ISAAC_COLOROFFSET_STAGING_PLAIN_FUSION) && HAVE_ISAAC_COLOROFFSET_STAGING_PLAIN_FUSION
++					/* Already inside staged/single-stream/PLAIN admission.
++					 * Recovery since the copy may change the live output format.
++					 * Halo staging never supplies an ordinary proof. */
++					if (!is_fbo_float)
++						isaac_white_profile_commit(isaac_ordinary_white_proof);
++					isaac_ordinary_white_proof = 0u;
++#endif
+ 					isaac_probe_fragment = isaac_plain_vertex_pair_select(p, &isaac_pair_vertex);
+ 					if (!isaac_probe_fragment)

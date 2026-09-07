@@ -122,6 +122,14 @@ int isaac_vita_archive_cache_close(isaac_vita_archive_cache_file *file);
 int isaac_vita_archive_cache_force_discard(
     isaac_vita_archive_cache_file *file);
 
+/* A fresh native stream for the CRT's descriptor recovery: never a cache
+ * hit and never retained by this module.  The idle stream is dropped first
+ * exactly as before any other miss, so the recovery (which still holds the
+ * dead stream until the fresh one is positioned) cannot raise the FILE peak
+ * by two.  Returns NULL with errno set exactly as fopen would. */
+FILE *isaac_vita_archive_cache_reopen_native(const char *native_path,
+                                             const char *mode);
+
 /* Close and forget the idle stream, if any.  This is also the shutdown edge.
  * Calling it more than once is harmless. */
 int isaac_vita_archive_cache_drop(void);

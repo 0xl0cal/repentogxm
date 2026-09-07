@@ -200,6 +200,45 @@ int isaac_vita_guest_heap_telemetry_snapshot_get(
 void isaac_vita_guest_heap_telemetry_log_final(void);
 #endif
 
+#ifdef ISAAC_VITA_HEAP_CENSUS
+/* ISAAC_VITA_HEAP_CENSUS (ph120.mem): the heap-lock-protected half of the
+ * per-window heap receipt.  One call takes the guest heap spin lock exactly
+ * once and copies O(1) scalars: the live ledger count and its live requested
+ * bytes (floor-lifetime totals), the overflow-mspace telemetry and the room
+ * slab fast snapshot.  mallinfo(), the Lua arena and vitaGL are read by the
+ * caller outside the lock (mallinfo walks newlib bins and takes newlib's own
+ * lock; see the stagemem precedent in host_vita_heap.c).  Every field is
+ * uint32_t so the phase-profile oracle compiles the reader without any Vita
+ * header.  Fields a feature did not compile in stay zero and clear `valid`
+ * only when their accounting is genuinely inconsistent.  heap_total_bytes is
+ * the fixed newlib arena contract (81 MiB): the arena grows lazily, so
+ * headroom is heap_total_bytes - uordblks and the largest-allocatable bound
+ * is keepcost + (heap_total_bytes - arena), never fordblks alone. */
+typedef struct isaac_vita_guest_heap_census_locked {
+    uint32_t heap_total_bytes;
+    uint32_t ledger_live_count;
+    uint32_t ledger_live_requested_bytes;
+    uint32_t overflow_live_count;
+    uint32_t overflow_live_requested_bytes;
+    uint32_t overflow_native_failures;
+    uint32_t overflow_pool_failures;
+    uint32_t overflow_capacity_bytes;
+    uint32_t overflow_internal_requested_bytes;
+    uint32_t slab_pages;
+    uint32_t slab_live_slots;
+    uint32_t slab_page_bytes;
+    uint32_t ogg_slot_live;
+    uint32_t terminal;
+    uint32_t valid;
+} isaac_vita_guest_heap_census_locked;
+
+/* Returns 1 when the heap is initialised and every compiled-in accounting
+ * source reported consistent (== out->valid); 0 otherwise.  Never logs,
+ * never allocates, never touches newlib. */
+int isaac_vita_guest_heap_census_window_locked_get(
+    isaac_vita_guest_heap_census_locked *out);
+#endif
+
 #ifdef ISAAC_VITA_HEAP_RANGE_LEASE
 /* Pin the one live guest allocation which wholly contains [range, range+size).
  * The returned non-zero token is never reused.  While it is live, exact-base
@@ -215,7 +254,16 @@ uint32_t isaac_vita_guest_heap_lease_containing(
 int isaac_vita_guest_heap_lease_release(uint32_t token);
 #if defined(ISAAC_VITA_PNG_NATIVE_UNFILTER) || \
     defined(ISAAC_VITA_PNG_INFLATE_FLUSH_FASTPATH) || \
-    defined(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH)
+    defined(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH) || \
+    defined(ISAAC_VITA_WAV_BUFFERED_REWIND) || \
+    defined(ISAAC_VITA_ARCHIVE_XOR_FASTPATH) || \
+    defined(ISAAC_VITA_LIGHT_SURFACE_RASTER_416) || \
+    (defined(ISAAC_VITA_RENDER_SURFACE_RASTER_432) && \
+     ISAAC_VITA_RENDER_SURFACE_RASTER_432) || \
+    defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE) || \
+    defined(ISAAC_VITA_ROOM_GRID_INIT_NATIVE) || \
+    defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH) || \
+    defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION)
 /* Hot counterpart for frozen native seams whose private ABI supplies exact
  * candidate allocation bases.  Prove each with an O(1) ledger lookup rather
  * than scanning the 524288-entry range table.  The lease keeps free/realloc

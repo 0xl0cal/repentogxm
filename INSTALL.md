@@ -18,7 +18,8 @@ This is an alpha. [STATUS.md](STATUS.md) lists what works and what does not.
 - Your own copy of `libshacccg.suprx` at `ur0:data/libshacccg.suprx`
   (section 1).
 - About 1.5 GiB free on `ux0:`. The game resources alone are about 1 GiB.
-- A PC installation of Repentance, for the resources (version check below).
+- A PC installation of Repentance v1.7.9b, for the resources (version check
+  below).
 - Only if you build the VPK yourself: a PC with Python 3.10 or newer and the
   soft-float VitaSDK (section 3).
 
@@ -32,16 +33,19 @@ sha256: 31846486979cfa07c8c968221553052c3ff603518681ca11912d445f96ca9404
 
 Any other file is rejected with `unsupported unpacked PE`.
 
-To check that your resources are the right version, look at one file:
+The port is generated from Repentance v1.7.9b (build J835), so the resources
+must come from that version. To check yours, look at two files:
 
 ```text
 resources/packed/animations.a
 size:   660,301 bytes
 sha256: 182e071934fc2d4600506bb326bb8d3946861bfa7ce3c4404d524d68ada8abf5
+resources/packed/repentance.a
+size:   385,003,320 bytes
 ```
 
-`resources/packed` is about 1 GiB. Other resource versions have not been
-tested.
+`resources/packed` holds 22 archives (`*.a`), about 1.06 GB in total.
+Resources of another game version are untested.
 
 ## 1. Install the platform prerequisites
 
@@ -124,13 +128,14 @@ people:
   path must point at an unmodified, extracted `lua-5.3.3` source tree.
 - `--heap-mb` sets the game heap. Leave it at the default 81.
 
-What this script builds is a plain configuration: Lua off unless you pass
-`--lua`, the 60 FPS output mode off, and none of the performance options that
-the measured builds in [STATUS.md](STATUS.md) use. Those builds are configured
-directly with CMake
-from `recomp/vita/`; the switches are the `option(ISAAC_VITA_...)` lines in
-`recomp/vita/CMakeLists.txt`. The performance numbers in STATUS.md do not
-apply to a build made with the defaults above.
+This script builds a plain configuration: Lua off unless you pass `--lua`,
+the 60 FPS output mode off, none of the performance options of the released
+VPK. The complete option set of the release is
+[release/v0.1.1-alpha.cmake](release/v0.1.1-alpha.cmake), a CMake initial
+cache; its header gives the three commands that reproduce the release build
+(corpus generation with `--generate-only`, `cmake -C`, `ninja`). The numbers
+in [STATUS.md](STATUS.md) do not apply to a build made with the defaults
+above.
 
 ## 4. Install and launch
 
@@ -149,15 +154,16 @@ ux0:data/isaacr001/Documents/My Games/Binding of Isaac Repentance/
 The first file is the port's own log. The folder holds the game's saves and the
 game's own `log.txt`.
 
-Loading takes time. Measured on the development console at native 960x544:
+Loading takes time. Measured on the development console at native 960x544
+with the EID mod loaded:
 
-- launch to title screen: about 26 s (2026-09-03 build)
-- starting a run or Continue: 5.3 to 5.5 s (2026-09-04, EID mod loaded)
-- changing floor: 1.5 to 4.3 s (2026-09-04, EID mod loaded)
-- entering a room: 0.9 to 1.7 s (2026-09-04, EID mod loaded)
+- process start to the main menu: about 4 s
+- Continue from the main menu: about 7 s
+- changing floor: 1.5 to 4.3 s
+- entering a room: 0.9 to 1.1 s when resources load; ordinary revisits far less
 
-These stalls are known and a fix is in progress. If the loading display stays
-much longer than this, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+If the loading display stays much longer than this, see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## Mods
 
@@ -188,9 +194,8 @@ after the save was made. `log.txt` then says
 `Cannot continue a game that doesn't have the same modding state`. That is the
 game's own rule. Restore the same mod state or start a new run.
 
-EID (95 scripts, 19 MB) loads and draws item descriptions on the test Vita
-(first seen 2026-09-03) and was enabled in the 2026-09-04 sessions. It is the
-only mod that has been tested.
+EID (95 scripts, 19 MB) loads and draws item descriptions and was enabled in
+every measured session. It is the only mod that has been tested.
 
 ## Save / Mod Manager
 
@@ -205,8 +210,8 @@ app. It can:
 The FTP server has no password. Anyone on your network can change files under
 `ux0:data/isaacr001` while it runs. Turn it on only for the transfer.
 
-The Manager has not been tested on a real Vita yet. Its code passes host tests
-only. Until it has, use VitaShell for backups.
+The Manager has not been tested on a real Vita; its code passes host tests
+only. Use VitaShell for backups.
 
 ## Updating without losing saves
 
@@ -228,8 +233,8 @@ ux0:data/isaacr001/Documents/My Games/Binding of Isaac Repentance/
    ```
 
    It writes them into a new folder under `Documents/Isaac Vita Save Backups`
-   on the PC and never overwrites an existing backup. This path has not been
-   tested against a real Vita.
+   on the PC and never overwrites an existing backup. Untested against a real
+   Vita.
 3. Note the SHA-256 of the installed `ux0:app/ISAACR001/eboot.bin` (the
    "eboot hash" in reports): copy the file to a PC and run
    `certutil -hashfile eboot.bin SHA256` (Windows) or `sha256sum eboot.bin`.

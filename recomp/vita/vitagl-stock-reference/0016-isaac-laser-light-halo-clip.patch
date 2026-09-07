@@ -1,0 +1,175 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index cad96f3..d33241b 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -2501,4 +2501,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean
+ 	return GL_TRUE;
+ }
+ 
+-GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, SceGxmIndexSource index_type) {
++#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++#include "isaac_laser_light_halo_vitagl.h"
++#endif
++GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, SceGxmIndexSource index_type ISAAC_LIGHT_HALO_DECL) {
+@@ -2744,7 +2747,25 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 			} else
+ #endif
+ 			{
++				GLboolean halo_staged = GL_FALSE;
++#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++				if (isaac_coloroffset_neutral_metadata_is_eligible(
++						p, isaac_coloroffset_fragment_exact,
++						isaac_coloroffset_texture, attributes, streams,
++						count, base_idx, isaac_coloroffset_original_index_type)) {
++					halo_staged = isaac_light_halo_try_stage(isaac_coloroffset_texture,
++						(uint32_t)p->frag_texunits[0]->sampler_index,
++						(void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]],
++						top_idx, idx_buf, count, halo_submission, &ptrs[0], &top_idx);
++					if (halo_staged) {
++						idx_buf = halo_submission->indices;
++						count = halo_submission->count;
++						isaac_neutral_staging = ISAAC_COLOROFFSET_STAGING_PLAIN;
++					}
++				}
++#endif
+ 				ISAAC_NOTE_VERTEX_COPY(top_idx, isaac_copy_stride);
++				if (!halo_staged) {
+ 				ptrs[0] = gpu_alloc_mapped_temp(top_idx * isaac_copy_stride);
+ 				if (isaac_coloroffset_neutral_metadata_is_eligible(
+ 						p, isaac_coloroffset_fragment_exact,
+@@ -2755,6 +2776,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 						(size_t)top_idx * isaac_copy_stride, top_idx, isaac_copy_stride);
+ 				if (isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_UNKNOWN)
+ 					vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * isaac_copy_stride);
++				}
+ 			}
+ 		}	
+ 	} else {
+diff --git a/source/draw.c b/source/draw.c
+index 19aef9c..e2645f4 100644
+--- a/source/draw.c
++++ b/source/draw.c
+@@ -332,6 +332,9 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei prim
+ GLboolean vglIsaacDrawCanonicalQuads(GLsizei count) {
+ 	GLboolean is_draw_legal;
+ 	uint32_t top_idx;
++#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++	IsaacLightHaloDraw halo = { SCE_GXM_PRIMITIVE_TRIANGLES, NULL, 0 };
++#endif
+ 
+ 	THREAD_SAFE()
+ 	if (!isaac_canonical_quads_idx_ptr || cur_program == 0 || count <= 0 ||
+@@ -346,13 +349,21 @@ GLboolean vglIsaacDrawCanonicalQuads(GLsizei count) {
+ 	scene_reset();
+ 	is_draw_legal = _glDrawElements_CustomShadersIMPL(
+ 		isaac_canonical_quads_idx_ptr, count, top_idx, 0,
+-		SCE_GXM_INDEX_SOURCE_INDEX_16BIT);
++		SCE_GXM_INDEX_SOURCE_INDEX_16BIT ISAAC_LIGHT_HALO_ARG(&halo));
+ #ifndef SKIP_ERROR_HANDLING
+ 	if (is_draw_legal)
++#endif
++	{
++#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++		if (halo.indices)
++			sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLES,
++				SCE_GXM_INDEX_FORMAT_U16, halo.indices, halo.count);
++		else
+ #endif
+ 		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLES,
+ 			SCE_GXM_INDEX_FORMAT_U16, isaac_canonical_quads_idx_ptr,
+ 			count);
++	}
+ 	restore_polygon_mode(SCE_GXM_PRIMITIVE_TRIANGLES);
+ 	return is_draw_legal;
+ }
+@@ -394,8 +405,11 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
+ 		src = idx16;
+ 	}
+ 	
++#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++	IsaacLightHaloDraw halo = { gxm_p, NULL, 0 };
++#endif
+ 	if (cur_program != 0)
+-		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, 0, 0, type != GL_UNSIGNED_INT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
++		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, 0, 0, type != GL_UNSIGNED_INT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT ISAAC_LIGHT_HALO_ARG(type == GL_UNSIGNED_SHORT && !gpu_buf && mode == GL_TRIANGLES ? &halo : NULL));
+ 	else {
+ 		if (!(ffp_vertex_attrib_state & (1 << 0)))
+ 			return;
+@@ -406,6 +420,12 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
+ 	if (is_draw_legal)
+ #endif
+ 	{
++#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++		if (halo.indices) {
++			sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLES,
++				SCE_GXM_INDEX_FORMAT_U16, halo.indices, halo.count);
++		} else
++#endif
+ 		if (type == GL_UNSIGNED_SHORT) {
+ 			setup_elements_indices(uint16_t);
+ 			sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, ptr, count);
+@@ -441,7 +461,7 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const GLv
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+ 	uint16_t *src = gpu_buf ? (uint16_t *)((uint8_t *)gpu_buf->ptr + (uint32_t)gl_indices) : (uint16_t *)gl_indices;
+ 	if (cur_program != 0)
+-		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, 0, baseVertex, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
++		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, 0, baseVertex, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT ISAAC_LIGHT_HALO_ARG(NULL));
+ 	else {
+ 		if (!(ffp_vertex_attrib_state & (1 << 0)))
+ 			return;
+@@ -488,7 +508,7 @@ void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, G
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+ 	uint16_t *src = gpu_buf ? (uint16_t *)((uint8_t *)gpu_buf->ptr + (uint32_t)gl_indices) : (uint16_t *)gl_indices;
+ 	if (cur_program != 0)
+-		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, end + 1, 0, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
++		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, end + 1, 0, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT ISAAC_LIGHT_HALO_ARG(NULL));
+ 	else {
+ 		if (!(ffp_vertex_attrib_state & (1 << 0)))
+ 			return;
+@@ -533,7 +553,7 @@ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsize
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+ 	uint16_t *src = gpu_buf ? (uint16_t *)((uint8_t *)gpu_buf->ptr + (uint32_t)gl_indices) : (uint16_t *)gl_indices;
+ 	if (cur_program != 0)
+-		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, end + baseVertex + 1, baseVertex, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
++		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, end + baseVertex + 1, baseVertex, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT ISAAC_LIGHT_HALO_ARG(NULL));
+ 	else {
+ 		if (!(ffp_vertex_attrib_state & (1 << 0)))
+ 			return;
+@@ -578,7 +598,7 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
+ 
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+ 	uint16_t *src = gpu_buf ? (uint16_t *)((uint8_t *)gpu_buf->ptr + (uint32_t)gl_indices) : (uint16_t *)gl_indices;
+-	GLboolean is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, 0, 0, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INSTANCE_16BIT : SCE_GXM_INDEX_SOURCE_INSTANCE_32BIT);
++	GLboolean is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, 0, 0, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INSTANCE_16BIT : SCE_GXM_INDEX_SOURCE_INSTANCE_32BIT ISAAC_LIGHT_HALO_ARG(NULL));
+ 
+ #ifndef SKIP_ERROR_HANDLING
+ 	if (is_draw_legal)
+diff --git a/source/shared.h b/source/shared.h
+index 0b214c3..9d6f8d0 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1235,10 +1235,23 @@ GLenum gxm_blend_to_gl(SceGxmBlendFactor factor); // Converts SceGxmBlendFactor
+ GLenum gxm_blend_eq_to_gl(SceGxmBlendFunc factor); // Converts SceGxmBlendFunc to GL blend func equivalent
+ 
+ /* custom_shaders.c */
++#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++typedef struct {
++    SceGxmPrimitiveType primitive;
++    uint16_t *indices;
++    GLsizei count;
++} IsaacLightHaloDraw;
++#define ISAAC_LIGHT_HALO_DECL , IsaacLightHaloDraw *halo_submission
++#define ISAAC_LIGHT_HALO_ARG(value) , value
++uint32_t isaacLaserLightHaloAtlasInfo(texture *tex, uint32_t *premultiplied);
++#else
++#define ISAAC_LIGHT_HALO_DECL
++#define ISAAC_LIGHT_HALO_ARG(value)
++#endif
+ void reset_custom_shaders(void); // Resets custom shaders
+ float *reserve_attrib_pool(uint8_t count);
+ void _vglDrawObjects_CustomShadersIMPL(); // vglDrawObjects implementation for rendering with custom shaders
+-GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, GLboolean is_short); // glDrawElements implementation for rendering with custom shaders
++GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, GLboolean is_short ISAAC_LIGHT_HALO_DECL); // glDrawElements implementation for rendering with custom shaders
+ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean instanced); // glDrawArrays implementation for rendering with custom shaders
+ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *idx_buf, const GLint *first, const GLsizei *count, GLint lowest, GLsizei highest, GLsizei drawcount); // glMultiDrawArrays implementation for rendering with custom shaders
+ 

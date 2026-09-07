@@ -272,6 +272,7 @@ def expected_source_tests(root: Path) -> None:
         "ISAAC_VITA_SAVE_READER_DIRECT_EDGES": "OFF",
         "ISAAC_VITA_MEMSET_THUNK_FASTPATH": "OFF",
         "ISAAC_VITA_KAGE_MUTEX_SEAM": "OFF",
+        "ISAAC_VITA_KAGE_REFCOUNT_SEAM": "OFF",
         "ISAAC_VITA_SYNC_INLINE_FASTPATH": "OFF",
         "ISAAC_VITA_FLOOR_THUNK_FASTPATH": "OFF",
         "ISAAC_VITA_TEXTURE_CHURN_PROFILE": "OFF",
@@ -519,6 +520,59 @@ def expected_source_tests(root: Path) -> None:
             baseline - kage_mutex_on_sources):
         raise AssertionError(
             "KAGE mutex seam allocator closure lost its exact one-file delta"
+        )
+    must_fail(
+        "KAGE refcount seam without the mutex seam",
+        lambda: gate.expected_sources(
+            source_root, manifest,
+            {**cache, "ISAAC_VITA_KAGE_REFCOUNT_SEAM": "ON",
+             "ISAAC_VITA_SYNC_INLINE_FASTPATH": "ON"},
+        ),
+        "requires ISAAC_VITA_KAGE_MUTEX_SEAM=ON",
+    )
+    must_fail(
+        "KAGE refcount seam without the inline sync fast path",
+        lambda: gate.expected_sources(
+            source_root, manifest,
+            {**cache, "ISAAC_VITA_KAGE_REFCOUNT_SEAM": "ON",
+             "ISAAC_VITA_KAGE_MUTEX_SEAM": "ON"},
+        ),
+        "requires ISAAC_VITA_SYNC_INLINE_FASTPATH=ON",
+    )
+    for key in ("ISAAC_VITA_TRANSLATED_CPU",
+                "ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL"):
+        must_fail(
+            f"KAGE refcount seam with {key}=OFF in the cache",
+            lambda key=key: gate.expected_sources(
+                source_root, manifest,
+                {**cache, "ISAAC_VITA_KAGE_REFCOUNT_SEAM": "ON",
+                 "ISAAC_VITA_KAGE_MUTEX_SEAM": "ON",
+                 "ISAAC_VITA_SYNC_INLINE_FASTPATH": "ON",
+                 "ISAAC_VITA_TRANSLATED_CPU": "ON",
+                 "ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL": "ON",
+                 key: "OFF"},
+            ),
+            f"requires {key}=ON",
+        )
+    # With both keys present and ON (the real cache) the closure is the
+    # exact one-file delta over the mutex-ON set; the keys add no source.
+    kage_refcount_on_sources = gate.expected_sources(
+        source_root, manifest,
+        {**cache, "ISAAC_VITA_KAGE_REFCOUNT_SEAM": "ON",
+         "ISAAC_VITA_KAGE_MUTEX_SEAM": "ON",
+         "ISAAC_VITA_SYNC_INLINE_FASTPATH": "ON",
+         "ISAAC_VITA_TRANSLATED_CPU": "ON",
+         "ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL": "ON"},
+    )
+    expected_kage_refcount_delta = {
+        (runtime_root / "host_vita_kage_refcount_seam.c").resolve(),
+    }
+    if (kage_refcount_on_sources - kage_mutex_on_sources !=
+            expected_kage_refcount_delta or
+            kage_mutex_on_sources - kage_refcount_on_sources):
+        raise AssertionError(
+            "KAGE refcount seam allocator closure lost its exact one-file "
+            "delta over the mutex seam"
         )
     floor_on_sources = gate.expected_sources(
         source_root, manifest,

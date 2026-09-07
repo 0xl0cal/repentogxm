@@ -1,0 +1,176 @@
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index 156bbb6..80724d6 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -277,7 +277,7 @@ void glDeleteFramebuffers(GLsizei n, const GLuint *ids) {
+ 			}
+ #ifndef DEPTH_STENCIL_HACK
+ 			if (fb->depthbuffer_ptr) {
+-				mark_as_dirty(fb->depthbuffer_ptr->depthData);
++				mark_as_dirty(isaacNativeResourceRetireDepth(fb->depthbuffer_ptr->depthData));
+ 			}
+ #endif
+ 		}
+@@ -364,7 +364,7 @@ void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbu
+ 	// Discarding any previously bound hidden depth buffers
+ 	if (fb->depthbuffer_ptr) {
+ #ifndef DEPTH_STENCIL_HACK
+-		mark_as_dirty(fb->depthbuffer_ptr->depthData);
++		mark_as_dirty(isaacNativeResourceRetireDepth(fb->depthbuffer_ptr->depthData));
+ #endif
+ 	}
+ 	fb->depthbuffer_ptr = NULL;
+@@ -396,7 +396,7 @@ void glNamedFramebufferRenderbuffer(GLuint target, GLenum attachment, GLenum ren
+ 	// Discarding any previously bound hidden depth buffers
+ 	if (fb->depthbuffer_ptr) {
+ #ifndef DEPTH_STENCIL_HACK
+-		mark_as_dirty(fb->depthbuffer_ptr->depthData);
++		mark_as_dirty(isaacNativeResourceRetireDepth(fb->depthbuffer_ptr->depthData));
+ #endif
+ 		fb->depthbuffer_ptr = NULL;
+ 	}
+diff --git a/source/gxm.c b/source/gxm.c
+index 585b615..128933a 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -69,11 +69,13 @@ static uint32_t isaac_depth_created = 0; // Offscreen depth/stencil buffers crea
+ 		if (isaac_scene_dt > isaac_scene_begin_max_us) \
+ 			isaac_scene_begin_max_us = isaac_scene_dt; \
+ 		isaac_scene_count++; \
++		isaacNativeResourceSceneBegin(active_write_fb ? active_write_fb->width : DISPLAY_WIDTH, active_write_fb ? active_write_fb->height : DISPLAY_HEIGHT, r); \
+ 	} while (0)
+ #define ISAAC_SCENE_TIME_END_END_SCENE() \
+ 	do { \
+ 		uint32_t isaac_scene_dt = (uint32_t)(sceKernelGetProcessTimeWide() - isaac_scene_t0); \
+ 		isaac_scene_end_us += isaac_scene_dt; \
++		isaacNativeResourceSceneEnd(isaac_scene_dt); \
+ 		if (old_framebuffer) { \
+ 			isaac_scene_end_fbo_us += isaac_scene_dt; \
+ 			isaac_scene_end_ordinal_us[isaac_scene_fbo_ordinal < 3 ? isaac_scene_fbo_ordinal : 3] += isaac_scene_dt; \
+@@ -590,6 +592,7 @@ void garbage_collector(void *arg) {
+ #else
+ int garbage_collector(unsigned int args, void *arg) {
+ #endif
++	uint64_t isaac_gc_t0 = sceKernelGetProcessTimeWide();
+ #ifndef HAVE_SINGLE_THREADED_GC
+ 	for (;;) {
+ 		// Waiting for garbage collection request
+@@ -599,6 +602,7 @@ int garbage_collector(unsigned int args, void *arg) {
+ 		for (int i = 0; i < FRAME_PURGE_LIST_SIZE; i++) {
+ 			if (frame_purge_list[frame_purge_clean_idx][i]) {
+ 				vgl_free(frame_purge_list[frame_purge_clean_idx][i]);
++				isaacNativeResourceGcObject();
+ 				frame_purge_list[frame_purge_clean_idx][i] = NULL;
+ 			} else
+ 				break;
+@@ -614,6 +618,7 @@ int garbage_collector(unsigned int args, void *arg) {
+ 		frame_purge_idx = (frame_purge_idx + 1) % FRAME_PURGE_FREQ;
+ 		frame_elem_purge_idx = 0;
+ 		frame_rt_purge_idx = 0;
++		isaacNativeResourceEvent(ISAAC_NR_GC, 0, 0, sceKernelGetProcessTimeWide() - isaac_gc_t0, 0);
+ #ifndef HAVE_SINGLE_THREADED_GC
+ 		sceKernelSignalSema(gc_mutex[1], 1);
+ 	}
+@@ -798,6 +803,7 @@ void init_display_color_surfaces(GLboolean is_swap) {
+ }
+ 
+ void init_depth_stencil_buffer(uint32_t w, uint32_t h, SceGxmDepthStencilSurface *surface, GLboolean has_stencil) {
++	uint64_t isaac_depth_t0 = sceKernelGetProcessTimeWide();
+ 	// Calculating sizes for depth and stencil surfaces
+ 	unsigned int depth_stencil_width = VGL_ALIGN(w, SCE_GXM_TILE_SIZEX);
+ #ifndef DEPTH_STENCIL_HACK
+@@ -839,6 +845,7 @@ void init_depth_stencil_buffer(uint32_t w, uint32_t h, SceGxmDepthStencilSurface
+ 	sceGxmDepthStencilSurfaceSetForceStoreMode(surface, SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED);
+ #endif
+ 	ISAAC_SCENE_TIME_DEPTH_CREATED(surface);
++	isaacNativeResourceDepth(surface->depthData, w, h, sceKernelGetProcessTimeWide() - isaac_depth_t0, !surface->depthData || (has_stencil && !surface->stencilData));
+ }
+ 
+ void init_display_depth_stencil_surfaces(void) {
+diff --git a/source/shared.h b/source/shared.h
+index 9d6f8d0..fadded8 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -26,6 +26,9 @@
+ #define _SHARED_H_
+ #include <vitasdk.h>
+ #include "vitaGL.h"
++#ifdef HAVE_ISAAC_NATIVE_RESOURCE_PROFILE
++#include "isaac_native_resource_profile_internal.h"
++#endif
+ #ifdef HAVE_ISAAC_GXM_STATE_SHADOW
+ #include "isaac_gxm_state_shadow.h"
+ #endif
+@@ -1379,7 +1382,7 @@ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(frameb
+ 			}
+ 			if (fb->depthbuffer_ptr) {
+ #ifndef DEPTH_STENCIL_HACK
+-				mark_as_dirty(fb->depthbuffer_ptr->depthData);
++				mark_as_dirty(isaacNativeResourceRetireDepth(fb->depthbuffer_ptr->depthData));
+ #endif
+ 				fb->depthbuffer_ptr = NULL;
+ 				fb->depthbuffer_state &= ~DEPTHBUFFER_READY;
+diff --git a/source/textures.c b/source/textures.c
+index b408a13..7e4e626 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -1881,7 +1881,7 @@ void glDeleteTextures(GLsizei n, const GLuint *gl_textures) {
+ 						if (fb) {
+ 							gpu_free_texture(&texture_slots[i]);
+ 							if (fb->depthbuffer_ptr) {
+-								mark_as_dirty(fb->depthbuffer_ptr->depthData);
++								mark_as_dirty(isaacNativeResourceRetireDepth(fb->depthbuffer_ptr->depthData));
+ 								fb->depthbuffer_ptr = NULL;
+ 								fb->depthbuffer_state = DEPTHBUFFER_MISSING;
+ 							}
+diff --git a/source/utils/gpu_utils.c b/source/utils/gpu_utils.c
+index 36b40f0..ef09ce9 100644
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -220,7 +220,9 @@ void *gpu_alloc_mapped_aligned_for_cpu(size_t alignment, size_t size) {
+ 	vgl_log("%s:%d gpu_alloc_mapped_aligned_for_cpu failed with a requested size of %u bytes, attempting to forcefully free required memory.\n", __FILE__, __LINE__, size);
+ #endif
+ 	unsafe_allocator_counter = 0;
++	uint64_t isaac_recovery_cpu_t0 = sceKernelGetProcessTimeWide();
+ 	res = gpu_alloc_mapped_aligned_unsafe_for_cpu(alignment, size);
++	isaacNativeResourceRecovery(ISAAC_NR_RECOVER_CPU, (uint32_t)size, sceKernelGetProcessTimeWide() - isaac_recovery_cpu_t0, !res);
+ 
+ #ifdef LOG_ERRORS
+ 	if (!res) {
+@@ -249,7 +251,9 @@ void *gpu_alloc_mapped_aligned_for_gpu(size_t alignment, size_t size) {
+ 	vgl_log("%s:%d gpu_alloc_mapped_aligned_for_gpu failed with a requested size of %u bytes, attempting to forcefully free required memory.\n", __FILE__, __LINE__, size);
+ #endif
+ 	unsafe_allocator_counter = 0;
++	uint64_t isaac_recovery_gpu_t0 = sceKernelGetProcessTimeWide();
+ 	res = gpu_alloc_mapped_aligned_unsafe_for_gpu(alignment, size);
++	isaacNativeResourceRecovery(ISAAC_NR_RECOVER_GPU, (uint32_t)size, sceKernelGetProcessTimeWide() - isaac_recovery_gpu_t0, !res);
+ 
+ #ifdef LOG_ERRORS
+ 	if (!res) {
+diff --git a/source/utils/mem_utils.h b/source/utils/mem_utils.h
+index 80f3f86..22d0cb6 100644
+--- a/source/utils/mem_utils.h
++++ b/source/utils/mem_utils.h
+@@ -77,9 +77,9 @@ void __mark_rt_as_dirty(render_target *rt);
+ 	if (frame_rt_purge_idx >= FRAME_PURGE_RENDERTARGETS_LIST_SIZE) { \
+ 		vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_RENDERTARGETS_LIST_SIZE.\n", __FILE__, __LINE__); \
+ 	} \
+-	frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x
++	frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = isaacNativeResourceRetireRT(x)
+ #else
+-#define _mark_rt_as_dirty(x) frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x
++#define _mark_rt_as_dirty(x) frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = isaacNativeResourceRetireRT(x)
+ #endif
+ #define mark_rt_as_dirty(x) __mark_rt_as_dirty((render_target *)x)
+ #else
+@@ -88,8 +88,8 @@ void __mark_rt_as_dirty(render_target *rt);
+ 	if (frame_rt_purge_idx >= FRAME_PURGE_RENDERTARGETS_LIST_SIZE) { \
+ 		vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_RENDERTARGETS_LIST_SIZE.\n", __FILE__, __LINE__); \
+ 	} \
+-	frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x
++	frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = isaacNativeResourceRetireRT(x)
+ #else
+-#define mark_rt_as_dirty(x) frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x
++#define mark_rt_as_dirty(x) frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = isaacNativeResourceRetireRT(x)
+ #endif
+ #endif

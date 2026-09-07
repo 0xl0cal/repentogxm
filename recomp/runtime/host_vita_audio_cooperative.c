@@ -1,4 +1,5 @@
 #include "host_vita_audio_cooperative.h"
+#include "kage_vita_deep_profile.h"
 
 #ifndef ISAAC_VITA_AUDIO
 #define ISAAC_VITA_AUDIO 0
@@ -293,6 +294,7 @@ static uint64_t s_audio_cooperative_poll_time;
 static void audio_cooperative_poll_interval(
     CPU *__restrict c, uint64_t minimum_interval_us, const char *route)
 {
+    KAGE_VITA_DEEP_SCOPE(KVD_AUDIO_PUMP);
     CPU saved;
     uint32_t manager;
     uint32_t preserved_low_water;

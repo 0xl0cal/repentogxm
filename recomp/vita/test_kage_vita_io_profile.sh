@@ -27,7 +27,13 @@ arm_flags="$flags -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=softfp -mthumb -ffuncti
     -o "$work/kage-vita-io-profile-host-oracle"
 "$work/kage-vita-io-profile-host-oracle"
 
-shadow_flags="-std=gnu11 -O2 -Wall -Wextra -Werror -Wno-maybe-uninitialized -fno-pie -ffunction-sections -fdata-sections -DGUEST_IMAGE_BASE=0x98000000u -DISAAC_VITA_IO_PROFILE=1 -DISAAC_VITA_ARCHIVE_FILE_CACHE=1 -DISAAC_VITA_CRT_QSORT_HOST_ORACLE=1 -I$root/vita/qsort_oracle_include -I$root/runtime -I$root/vita"
+window_flags="-std=gnu11 -O2 -Wall -Wextra -Werror -DISAAC_VITA_IO_PROFILE_ORACLE=1 -DISAAC_VITA_IO_WINDOW_PROFILE=1 -I$root/runtime"
+"$host_cc" $window_flags \
+    "$root/runtime/kage_vita_io_profile_oracle.c" \
+    -o "$work/kage-vita-io-window-host-oracle"
+"$work/kage-vita-io-window-host-oracle"
+
+shadow_flags="-std=gnu11 -O2 -Wall -Wextra -Werror -Wno-maybe-uninitialized -fno-pie -ffunction-sections -fdata-sections -DGUEST_IMAGE_BASE=0x98000000u -DISAAC_VITA_IO_PROFILE=1 -DISAAC_VITA_ARCHIVE_FILE_CACHE=1 -DISAAC_VITA_CRT_RAW_ARCHIVE_ORACLE=1 -DISAAC_VITA_CRT_QSORT_HOST_ORACLE=1 -I$root/vita/qsort_oracle_include -I$root/runtime -I$root/vita"
 "$host_cc" $shadow_flags \
     "$root/runtime/host_vita_archive_cache.c" \
     "$root/runtime/guest_stack_legacy_oracle_stub.c" -x c - \
@@ -38,6 +44,38 @@ shadow_flags="-std=gnu11 -O2 -Wall -Wextra -Werror -Wno-maybe-uninitialized -fno
 #include <string.h>
 
 #include "host_vita_crt.c"
+
+/* The raw-archive path is not exercised here; ISAAC_VITA_CRT_RAW_ARCHIVE_ORACLE
+ * only keeps the Vita I/O headers out of this host build. */
+int32_t isaac_vita_crt_raw_archive_oracle_open(const char *path)
+{
+    (void)path;
+    return -1;
+}
+
+int32_t isaac_vita_crt_raw_archive_oracle_pread(
+    int32_t descriptor, void *buffer, uint32_t size, uint64_t offset)
+{
+    (void)descriptor;
+    (void)buffer;
+    (void)size;
+    (void)offset;
+    return -1;
+}
+
+int32_t isaac_vita_crt_raw_archive_oracle_get_size(
+    int32_t descriptor, int64_t *size)
+{
+    (void)descriptor;
+    (void)size;
+    return -1;
+}
+
+int32_t isaac_vita_crt_raw_archive_oracle_close(int32_t descriptor)
+{
+    (void)descriptor;
+    return -1;
+}
 
 #define CHECK(condition) do { \
     if (!(condition)) { \

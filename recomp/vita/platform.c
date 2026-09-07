@@ -68,6 +68,30 @@ void isaac_vita_log_sink_file(const char *line, unsigned int size)
 {
     log_write(line, size);
 }
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+#define ISAAC_LOG_BATCH_OPEN() \
+    sceIoOpen(ISAAC_LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777)
+#define ISAAC_LOG_BATCH_WRITE(fd, data, size) sceIoWrite(fd, data, size)
+#define ISAAC_LOG_BATCH_CLOSE(fd) sceIoClose(fd)
+#define ISAAC_LOG_BATCH_DEBUG(line, size) sceClibPrintf("%s", line)
+#include "host_vita_log_file_batch_private.h"
+#undef ISAAC_LOG_BATCH_OPEN
+#undef ISAAC_LOG_BATCH_WRITE
+#undef ISAAC_LOG_BATCH_CLOSE
+#undef ISAAC_LOG_BATCH_DEBUG
+
+void isaac_vita_log_sink_file_batch(char *payload, const uint16_t *lengths,
+                                   unsigned records)
+{
+#if defined(ISAAC_VITA_CONTINUE_PROFILE)
+    isaac_vita_continue_profile_log_begin();
+#endif
+    isaac_vita_log_file_batch_emit(payload, lengths, records);
+#if defined(ISAAC_VITA_CONTINUE_PROFILE)
+    isaac_vita_continue_profile_log_end();
+#endif
+}
+#endif
 #endif
 
 int isaac_vita_get_win32_filetime(uint64_t *filetime)
@@ -147,6 +171,7 @@ void isaac_vita_log(const char *format, ...)
     va_list args;
     int body_length;
     int line_length;
+    uint32_t timestamp_us;
 
     va_start(args, format);
     body_length = vsnprintf(body, sizeof(body), format, args);
@@ -155,10 +180,12 @@ void isaac_vita_log(const char *format, ...)
         return;
     body[sizeof(body) - 1u] = '\0';
 
+    /* One low-word sample keeps seconds/milliseconds coherent at rollover. */
+    timestamp_us = sceKernelGetProcessTimeLow();
     line_length = snprintf(
         line, sizeof(line), "[%u.%03u thr 0x%x] %s\n",
-        (unsigned)(sceKernelGetProcessTimeLow() / 1000000u),
-        (unsigned)((sceKernelGetProcessTimeLow() / 1000u) % 1000u),
+        (unsigned)(timestamp_us / 1000000u),
+        (unsigned)((timestamp_us / 1000u) % 1000u),
         (unsigned)sceKernelGetThreadId(), body);
     if (line_length <= 0)
         return;

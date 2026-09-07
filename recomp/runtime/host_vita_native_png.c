@@ -10,6 +10,20 @@
 
 #include "host_vita_native_png.h"
 #include "host_vita_archive_miniz_native.h"
+#include "host_vita_native_png_rgba_neon.h"
+#include "host_vita_native_png_adler.h"
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+#include "host_vita_png_reuse.h"
+#endif
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+#include "host_vita_native_png_libdeflate.h"
+#endif
+
+#if ISAAC_VITA_NATIVE_PNG_ADLER_NEON
+#define NP_MINIZ_DECODE isaac_vita_png_miniz_native
+#else
+#define NP_MINIZ_DECODE isaac_vita_archive_miniz_native
+#endif
 
 #if defined(ISAAC_VITA_NATIVE_PNG_ORACLE) || !defined(__vita__)
 #define NP_HOST_BUILD 1
@@ -107,8 +121,12 @@ static uint32_t np_be32(const uint8_t *p)
  * the first row, which the specification defines as an all-zero row. */
 static void np_unfilter_sub(uint8_t *row, uint32_t n, uint32_t bpp)
 {
-    uint32_t i;
-    for (i = bpp; i < n; ++i)
+    uint32_t i = bpp;
+#if ISAAC_NP_RGBA_NEON_AVAILABLE
+    if (bpp == 4U && n >= 16U)
+        i = np_rgba_sub_blocks(row, NULL, n);
+#endif
+    for (; i < n; ++i)
         row[i] = (uint8_t)(row[i] + row[i - bpp]);
 }
 
@@ -129,15 +147,21 @@ static void np_unfilter_up(uint8_t *row, const uint8_t *prev, uint32_t n)
 static void np_unfilter_avg(uint8_t *row, const uint8_t *prev, uint32_t n,
                             uint32_t bpp)
 {
-    uint32_t i;
+    uint32_t i = 0U;
+#if ISAAC_NP_RGBA_NEON_AVAILABLE
+    if (bpp == 4U && n >= 16U)
+        i = np_rgba_avg_blocks(row, prev, n);
+#endif
     if (prev) {
-        for (i = 0U; i < bpp && i < n; ++i)
+        for (; i < bpp && i < n; ++i)
             row[i] = (uint8_t)(row[i] + (prev[i] >> 1));
-        for (i = bpp; i < n; ++i)
+        for (; i < n; ++i)
             row[i] = (uint8_t)(row[i] +
                                (((uint32_t)row[i - bpp] + prev[i]) >> 1));
     } else {
-        for (i = bpp; i < n; ++i)
+        if (i < bpp)
+            i = bpp;
+        for (; i < n; ++i)
             row[i] = (uint8_t)(row[i] + (row[i - bpp] >> 1));
     }
 }
@@ -145,15 +169,19 @@ static void np_unfilter_avg(uint8_t *row, const uint8_t *prev, uint32_t n,
 static void np_unfilter_paeth(uint8_t *row, const uint8_t *prev, uint32_t n,
                               uint32_t bpp)
 {
-    uint32_t i;
+    uint32_t i = 0U;
     if (!prev) {
         /* above and upper-left are zero: the predictor is always `left` */
         np_unfilter_sub(row, n, bpp);
         return;
     }
-    for (i = 0U; i < bpp && i < n; ++i)
+#if ISAAC_NP_RGBA_NEON_AVAILABLE
+    if (bpp == 4U && n >= 16U)
+        i = np_rgba_paeth_blocks(row, prev, n);
+#endif
+    for (; i < bpp && i < n; ++i)
         row[i] = (uint8_t)(row[i] + prev[i]);
-    for (i = bpp; i < n; ++i) {
+    for (; i < n; ++i) {
         int a = row[i - bpp];
         int b = prev[i];
         int c = prev[i - bpp];
@@ -195,8 +223,13 @@ static void np_gamma_row(uint8_t *row, uint32_t rowbytes, uint32_t color_type,
     }
 }
 
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+int isaac_np_decode_reusing(const isaac_np_params *p, isaac_np_read_fn read,
+    void *ctx, isaac_np_work *work, isaac_np_result *out, IsaacNpReuse *reuse)
+#else
 int isaac_np_decode(const isaac_np_params *p, isaac_np_read_fn read,
                     void *ctx, isaac_np_work *work, isaac_np_result *out)
+#endif
 {
     const uint32_t flags = NP_TINFL_PARSE_ZLIB_HEADER |
                            NP_TINFL_HAS_MORE_INPUT |
@@ -210,6 +243,13 @@ int isaac_np_decode(const isaac_np_params *p, isaac_np_read_fn read,
     uint32_t crc;
     uint32_t y;
     int done = 0;
+#if ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+    uint32_t history_unsafe = 0U;
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+    uint32_t read_limit;
+    int retain_first;
+#endif
 
     memset(out, 0, sizeof(*out));
     out->status = ISAAC_NP_REJECT_PARAM;
@@ -227,12 +267,39 @@ int isaac_np_decode(const isaac_np_params *p, isaac_np_read_fn read,
     total = (uint64_t)p->height * stride;
     if (total > 0xffffffffULL)
         return out->status;
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+    /* Reuse storage must be independent from ALL bytes of decoder scratch,
+     * including bytes a later failed speculative decode could observe. */
+    if (!isaac_np_reuse_begin(reuse, work->raw, (uint32_t)total) ||
+        !isaac_np_reuse_disjoint(reuse, work->staging, work->staging_bytes) ||
+        !isaac_np_reuse_disjoint(reuse, work->tinfl_state, ISAAC_NP_TINFL_STATE_BYTES) ||
+        !isaac_np_reuse_disjoint(reuse, work->last_row_pre_gamma, p->rowbytes) ||
+        (p->gamma_table && !isaac_np_reuse_disjoint(reuse, p->gamma_table, 256U)))
+        reuse = NULL;
+#endif
     cur = work->raw;
     end = work->raw + (uint32_t)total;
     remaining = p->first_remaining;
     crc = p->crc_entry;
     out->chunks = 1U;
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+    /* Retain a larger compressed key without changing cold/error read or
+     * inflater-call boundaries. The first prefix is ALWAYS decoded normally;
+     * a late hit can skip only the tail inflate and whole unfilter/gamma. */
+    read_limit = work->staging_bytes < 65536U ? work->staging_bytes : 65536U;
+    retain_first = p->first_remaining > 65536U &&
+        p->first_remaining <= ISAAC_NP_REUSE_INPUT_BYTES &&
+        p->first_remaining <= work->staging_bytes;
+#endif
+#if ISAAC_VITA_NATIVE_PNG_TINFL_HEADER_RESET
+    /* State zero starts a new stream. The local tinfl adaptation preloads
+     * scalar coroutine fields, so initialize the whole asserted header;
+     * its table builders initialize every lookup/tree/code byte they read.
+     * No archive caller or externally visible state blob uses this reset. */
+    memset(work->tinfl_state, 0, ISAAC_VITA_ARCHIVE_MINIZ_HEADER_BYTES);
+#else
     memset(work->tinfl_state, 0, ISAAC_NP_TINFL_STATE_BYTES);
+#endif
 
 #define NP_READ(dst, n)                                                   \
     do {                                                                  \
@@ -250,6 +317,9 @@ int isaac_np_decode(const isaac_np_params *p, isaac_np_read_fn read,
     while (!done) {
         uint32_t n;
         uint32_t in_pos = 0U;
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+        uint8_t *input = work->staging;
+#endif
 
         if (remaining == 0U) {
             /* The translated loop: png_crc_finish (read + compare the
@@ -274,17 +344,70 @@ int isaac_np_decode(const isaac_np_params *p, isaac_np_read_fn read,
             ++out->chunks;
             continue;
         }
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+        n = remaining < read_limit ? remaining : read_limit;
+        if (retain_first && out->chunks == 1U)
+            input += out->idat_bytes;
+        NP_READ(input, n);
+        crc = isaac_np_crc32(crc, input, n);
+#else
         n = remaining < work->staging_bytes ? remaining : work->staging_bytes;
         NP_READ(work->staging, n);
         crc = isaac_np_crc32(crc, work->staging, n);
+#endif
         remaining -= n;
         out->idat_bytes += n;
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+        /* The earlier prefix has already run through unchanged tinfl. On a
+         * short tail read NP_READ returns with precisely those prefix writes.
+         * No speculative read/decode replay or hash-only match is involved. */
+        if (retain_first && out->chunks == 1U && remaining == 0U &&
+            out->idat_bytes == p->first_remaining &&
+            isaac_np_reuse_load(reuse, p, work->staging, p->first_remaining,
+                                crc, work, out))
+            return out->status;
+#endif
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+        /* Only the original first IDAT, wholly staged, before any tinfl use.
+         * The decoder context is typed local stack storage. Refusal does not
+         * reread input, recount CRC/IO, or mutate the virgin tinfl state. */
+        if (out->chunks == 1U && remaining == 0U &&
+            out->idat_bytes == p->first_remaining && n == p->first_remaining &&
+            n <= 65536U && cur == work->raw) {
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+            if (isaac_np_reuse_load(reuse, p, work->staging, n, crc, work, out))
+                return out->status;
+#endif
+            ++out->strict_attempts;
+            if (isaac_np_libdeflate_try(work->staging, n, work->raw,
+                                      (uint32_t)total)) {
+                ++out->strict_successes;
+                cur = end;
+                done = 1;
+                break;
+            }
+            ++out->strict_refusals;
+        }
+#endif
         while (in_pos < n) {
             uint32_t in_size = n - in_pos;
             uint32_t out_size = (uint32_t)(end - cur);
-            int st = isaac_vita_archive_miniz_native(
+            int st =
+#if ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+                isaac_vita_png_miniz_reuse(
+#else
+                NP_MINIZ_DECODE(
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+                work->tinfl_state, input + in_pos, &in_size,
+#else
                 work->tinfl_state, work->staging + in_pos, &in_size,
-                work->raw, cur, &out_size, flags);
+#endif
+                work->raw, cur, &out_size, flags
+#if ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+                , &history_unsafe
+#endif
+                );
             in_pos += in_size;
             cur += out_size;
             if (st == ISAAC_VITA_ARCHIVE_MINIZ_DONE) {
@@ -345,12 +468,44 @@ int isaac_np_decode(const isaac_np_params *p, isaac_np_read_fn read,
     }
     out->crc_final = crc;
     out->status = ISAAC_NP_OK;
+#if ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+    /* The entire original stream has produced exact output and passed Adler,
+     * unfilter and shape checks. Complete tables + positive produced history
+     * make that output independent of the scratch contents at entry. */
+    out->reuse_history_safe = history_unsafe == 0U;
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+    if ((out->strict_successes == 1U && out->strict_refusals == 0U)
+#if ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+        || out->reuse_history_safe
+#endif
+        )
+        isaac_np_reuse_store(reuse, p, work->staging, p->first_remaining, work, out);
+#endif
     return out->status;
 }
+
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+int isaac_np_decode(const isaac_np_params *p, isaac_np_read_fn read,
+    void *ctx, isaac_np_work *work, isaac_np_result *out)
+{
+    return isaac_np_decode_reusing(p, read, ctx, work, out, NULL);
+}
+#endif
 
 /* ------------------------------------------------------------------------
  * Guest wrapper (Vita eboot only). */
 #if !NP_HOST_BUILD
+
+#include "kage_vita_deep_profile.h"
+#if defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH)
+#include "host_vita_heap.h"
+#include "host_vita_texel_scratch.h"
+#include <errno.h>
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+static IsaacNpReuse s_reuse;
+#endif
 
 void isaac_vita_log(const char *format, ...);
 void __real_sub_005b1500(CPU *__restrict c);
@@ -359,6 +514,18 @@ void __real_sub_005b1500(CPU *__restrict c);
 #define NP_RECEIPT 1
 #else
 #define NP_RECEIPT 0
+#endif
+
+/* Durations are consumed only by WINDOW, RECEIPT or VERIFY. Keep the
+ * default path exact, and retain timing whenever any consumer is compiled
+ * in. The optional core clock ABI below remains available to other callers;
+ * only this private Vita wrapper supplies NULL in the consumer-free mode. */
+#if !defined(ISAAC_VITA_NATIVE_PNG_CLOCK_ELISION) || \
+    !ISAAC_VITA_NATIVE_PNG_CLOCK_ELISION || NP_RECEIPT || \
+    defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+#define NP_TIMING 1
+#else
+#define NP_TIMING 0
 #endif
 
 enum {
@@ -420,12 +587,144 @@ static struct np_stats {
     uint32_t verify_images, verify_diff_images, verify_diff_bytes;
     uint32_t verify_state_bad, verify_pos_bad;
     uint32_t gamma_images;
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+    uint32_t strict_attempts, strict_successes, strict_refusals;
+#endif
 } s_stats;
 
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+#include "host_vita_png_window_profile.h"
+void isaac_vita_png_window_snapshot(IsaacVitaPngWindowSnapshot *out)
+{
+    if (!out)
+        return;
+#define NP_SNAPSHOT(f) out->f = s_stats.f
+    NP_SNAPSHOT(images); NP_SNAPSHOT(native); NP_SNAPSHOT(fallbacks);
+    NP_SNAPSHOT(passthrough); NP_SNAPSHOT(busy); NP_SNAPSHOT(abandoned);
+    NP_SNAPSHOT(rows); NP_SNAPSHOT(kib); NP_SNAPSHOT(alloc_refused);
+    NP_SNAPSHOT(reserved); NP_SNAPSHOT(oversize); NP_SNAPSHOT(rewind_unsafe);
+    NP_SNAPSHOT(fb_shape); NP_SNAPSHOT(fb_state); NP_SNAPSHOT(fb_stream);
+    NP_SNAPSHOT(fb_memory); NP_SNAPSHOT(fb_decode);
+    NP_SNAPSHOT(decode_us); NP_SNAPSHOT(io_us); NP_SNAPSHOT(serve_us);
+    NP_SNAPSHOT(translated_us);
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+    NP_SNAPSHOT(strict_attempts); NP_SNAPSHOT(strict_successes);
+    NP_SNAPSHOT(strict_refusals);
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+    out->reuse_lookups = s_reuse.lookups;
+    out->reuse_hits = s_reuse.hits;
+    out->reuse_stores = s_reuse.stores;
+    out->reuse_evictions = s_reuse.evictions;
+    out->reuse_skipped = s_reuse.skipped;
+    out->reuse_hit_kib = s_reuse.hit_kib;
+#endif
+#undef NP_SNAPSHOT
+    out->decode_max_ever = s_stats.decode_us_max;
+    out->translated_max_ever = s_stats.translated_us_max;
+    out->active = s_ses.active;
+    out->mode = s_ses.mode;
+}
+#endif
+
+#if NP_TIMING
 static uint64_t np_now_us(void)
 {
     return (uint64_t)sceKernelGetProcessTimeWide();
 }
+#endif
+
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+#include <errno.h>
+/* Bounded owner-thread cards, emitted only at a phase report. The normal PNG
+ * singleton already has that ownership contract. No filenames/guest pointers
+ * are retained. Outcome groups: 0 no strict attempt, 1 success-only,
+ * 2 refusal-only, 3 mixed/other. Their time is the WHOLE native PNG attempt,
+ * not time in libdeflate alone, and includes nested physical reads. */
+typedef struct {
+    uint64_t us, raw, compressed;
+    uint32_t id, loop, width, height, channels, status, crc, group;
+} np_deep_card;
+static struct {
+    np_deep_card top[8];
+    struct { uint64_t us, raw, compressed; uint32_t calls, failed; } group[4];
+    uint32_t count, seen, omitted, bad_clock, saturated;
+} s_np_deep;
+static uint64_t np_deep_clock(void)
+{
+    const int saved_errno = errno;
+    const uint64_t now = np_now_us();
+    errno = saved_errno;
+    return now;
+}
+static void np_deep_add(uint64_t *value, uint64_t add)
+{
+    if (add > UINT64_MAX - *value) { *value = UINT64_MAX; s_np_deep.saturated = 1u; }
+    else *value += add;
+}
+static void np_deep_inc(uint32_t *value)
+{
+    if (*value == UINT32_MAX) s_np_deep.saturated = 1u;
+    else ++*value;
+}
+static void np_deep_note(const np_session *s, const isaac_np_result *result,
+                         uint64_t begin, uint64_t end)
+{
+    uint32_t group = 0u, slot = 0u, i;
+    np_deep_card card = {0};
+    np_deep_inc(&s_np_deep.seen);
+    if (end < begin) { np_deep_inc(&s_np_deep.bad_clock); return; }
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+    if (result->strict_attempts)
+        group = result->strict_successes && !result->strict_refusals ? 1u :
+            (!result->strict_successes && result->strict_refusals ? 2u : 3u);
+#endif
+    card.us = end - begin;
+    card.raw = (uint64_t)s->height * (s->rowbytes + 1u);
+    card.compressed = result->stream_bytes;
+    card.id = s_stats.images; card.loop = kage_vita_deep_loop();
+    card.width = s->width; card.height = s->height; card.channels = s->channels;
+    card.status = (uint32_t)result->status; card.crc = result->crc_final; card.group = group;
+    np_deep_inc(&s_np_deep.group[group].calls);
+    if (result->status != ISAAC_NP_OK) np_deep_inc(&s_np_deep.group[group].failed);
+    np_deep_add(&s_np_deep.group[group].us, card.us);
+    np_deep_add(&s_np_deep.group[group].raw, card.raw);
+    np_deep_add(&s_np_deep.group[group].compressed, card.compressed);
+    if (s_np_deep.count < 8u) slot = s_np_deep.count++;
+    else {
+        np_deep_inc(&s_np_deep.omitted);
+        for (i = 1u; i < 8u; ++i)
+            if (s_np_deep.top[i].us < s_np_deep.top[slot].us) slot = i;
+        if (card.us <= s_np_deep.top[slot].us) return;
+    }
+    s_np_deep.top[slot] = card;
+}
+#define NP_DEEP_U64(v) (uint32_t)((v) >> 32), (uint32_t)(v)
+void isaac_vita_png_deep_report(const char *bid, uint32_t window)
+{
+    uint32_t i;
+    int saved_errno = errno;
+    isaac_vita_log("[kage-vita] dp.pngh bid=%.32s win=%u bytes=%u records=%u attempts=%u retained=%u omitted=%u clock=%u sat=%u extra_clocks=%u:%u\n",
+        bid, window, (unsigned)sizeof s_np_deep, 5u + s_np_deep.count, s_np_deep.seen, s_np_deep.count,
+        s_np_deep.omitted, s_np_deep.bad_clock, s_np_deep.saturated,
+        NP_DEEP_U64((uint64_t)s_np_deep.seen * 2u));
+    for (i = 0u; i < 4u; ++i)
+        isaac_vita_log("[kage-vita] dp.pngg bid=%.32s win=%u group=%u n=%u failed=%u us=%u:%u raw=%u:%u stream=%u:%u\n",
+            bid, window, i, s_np_deep.group[i].calls, s_np_deep.group[i].failed,
+            NP_DEEP_U64(s_np_deep.group[i].us), NP_DEEP_U64(s_np_deep.group[i].raw),
+            NP_DEEP_U64(s_np_deep.group[i].compressed));
+    for (i = 0u; i < s_np_deep.count; ++i) {
+        const np_deep_card *p = &s_np_deep.top[i];
+        isaac_vita_log("[kage-vita] dp.png bid=%.32s win=%u slot=%u image=%u loop=%u whc=%u,%u,%u status=%u crc=%08x group=%u us=%u:%u raw=%u:%u stream=%u:%u\n",
+            bid, window, i, p->id, p->loop, p->width, p->height, p->channels,
+            p->status, p->crc, p->group, NP_DEEP_U64(p->us), NP_DEEP_U64(p->raw),
+            NP_DEEP_U64(p->compressed));
+    }
+    memset(&s_np_deep, 0, sizeof s_np_deep);
+    errno = saved_errno;
+}
+#undef NP_DEEP_U64
+#endif
 
 /* Scratch: host-owned SceKernel user memory, never the tracked guest heap.
  * The reserve (ISAAC_NP_RESERVE_BYTES, see the header) is one memblock taken
@@ -447,6 +746,39 @@ static struct np_reserve {
     uint32_t bytes;
     int tried;
 } s_reserve;
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+#ifndef ISAAC_VITA_NATIVE_PNG_REUSE_MB
+#define ISAAC_VITA_NATIVE_PNG_REUSE_MB 4U
+#endif
+/* Optional memory cost is explicit and independent of the existing raw
+ * scratch. Allocation happens before vitaGL partitions the remaining RAM;
+ * refusal disables reuse without changing the original decoder path. */
+static void np_reuse_reserve(void)
+{
+    const SceSize size = ISAAC_VITA_NATIVE_PNG_REUSE_MB * 1024U * 1024U;
+    void *base = NULL;
+    SceUID uid = sceKernelAllocMemBlock("isaac_np_reuse",
+        SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, size, NULL);
+    if (uid < 0) {
+        isaac_vita_log("KAGE VITA PNG REUSE: disabled alloc=0x%08x bytes=%u",
+                      (unsigned)uid, (unsigned)size);
+        return;
+    }
+    if (sceKernelGetMemBlockBase(uid, &base) < 0 || !base) {
+        (void)sceKernelFreeMemBlock(uid);
+        isaac_vita_log("KAGE VITA PNG REUSE: disabled no-base bytes=%u", (unsigned)size);
+        return;
+    }
+    isaac_np_reuse_init(&s_reuse, (uint8_t *)base, (uint32_t)size);
+    isaac_vita_log("KAGE VITA PNG REUSE: ready bytes=%u slots=%u "
+        "key=exact-single-idat+geometry+gamma admit=strict-success"
+#if ISAAC_VITA_NATIVE_PNG_REUSE_TINFL
+        "+observed-safe-tinfl"
+#endif
+        ,
+        (unsigned)size, (unsigned)ISAAC_NP_REUSE_SLOTS);
+}
+#endif
 
 _Static_assert(ISAAC_NP_RESERVE_BYTES <= ISAAC_NP_SCRATCH_MAX_BYTES,
                "native PNG reserve above the decoder's scratch bound");
@@ -482,6 +814,9 @@ int isaac_vita_native_png_reserve(void)
     s_reserve.uid = uid;
     s_reserve.base = base;
     s_reserve.bytes = (uint32_t)size;
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+    np_reuse_reserve();
+#endif
     isaac_vita_log(
         "KAGE VITA NATIVE PNG RESERVE: status=ready base=0x%08x bytes=%u "
         "rgba_rows@1024=%u rgba_rows@2048=%u (height*(rowbytes+1) <= bytes)",
@@ -599,12 +934,28 @@ static void np_log_init(void)
     isaac_vita_log(
         "KAGE VITA NATIVE PNG: seam=png_read_row@%08x decoder=tinfl-v1.15 "
         "unfilter=native gamma=guest-table scratch_max=%u retain=%u "
-        "staging=%u reserve=%u receipt=%s verify=%s build=%s",
+        "staging=%u reserve=%u rgba-neon=%u adler-neon=%u tinfl-reset=%s receipt=%s verify=%s build=%s"
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+        " libdeflate-strict=1"
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+        " reuse=exact-independent-reserve"
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE_LARGE
+        " reuse-large=late-128k/read-64k"
+#endif
+#if defined(ISAAC_VITA_NATIVE_PNG_LZ_NEON) && ISAAC_VITA_NATIVE_PNG_LZ_NEON
+        " lz-neon=1"
+#endif
+        ,
         (unsigned)ISAAC_NP_READ_ROW_RVA,
         (unsigned)ISAAC_NP_SCRATCH_MAX_BYTES,
         (unsigned)ISAAC_NP_SCRATCH_RETAIN_BYTES,
         (unsigned)ISAAC_NP_STAGING_BYTES,
         (unsigned)(s_reserve.base ? s_reserve.bytes : 0U),
+        (unsigned)ISAAC_NP_RGBA_NEON_AVAILABLE,
+        (unsigned)ISAAC_NP_ADLER_NEON_AVAILABLE,
+        ISAAC_VITA_NATIVE_PNG_TINFL_HEADER_RESET ? "header" : "full",
 #if defined(ISAAC_VITA_NATIVE_PNG_RECEIPT)
         "on",
 #else
@@ -801,11 +1152,15 @@ static void np_finish_translated(np_session *s)
 static void np_translated_row(CPU *__restrict c, np_session *s, uint32_t row,
                               uint32_t eax0)
 {
+#if NP_TIMING
     uint64_t t0 = np_now_us();
+#endif
     uint32_t rn;
 
     np_call_real(c, eax0, s->png, row);
+#if NP_TIMING
     s->translated_us += (uint32_t)(np_now_us() - t0);
+#endif
     rn = ld32(s->png + ISAAC_NP_PNG_ROW_NUMBER);
     if (rn >= s->height || rn <= s->next_row) {
         s->next_row = rn;
@@ -917,7 +1272,9 @@ static void np_finish_native(np_session *s)
 /* Native serve: one row per call, exactly the translated epilogue. */
 static void np_serve_row(CPU *__restrict c, np_session *s, uint32_t row)
 {
+#if NP_TIMING
     uint64_t t0 = np_now_us();
+#endif
     uint32_t k = s->next_row;
     uint32_t stride = s->rowbytes + 1U;
     const uint8_t *src = s->raw + (size_t)k * stride + 1;
@@ -931,12 +1288,95 @@ static void np_serve_row(CPU *__restrict c, np_session *s, uint32_t row)
     (void)gpop(c);
     if (s->next_row == s->height) {
         np_write_final_state(s);
+#if NP_TIMING
         s->serve_us += (uint32_t)(np_now_us() - t0);
+#endif
         np_finish_native(s);
         return;
     }
+#if NP_TIMING
     s->serve_us += (uint32_t)(np_now_us() - t0);
+#endif
 }
+
+#if defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH)
+/* Frozen ImagePng 005a13a2, immediately after the first original read-row
+ * call. The decoder has already accepted the complete image; this is never
+ * used by translated/VERIFY/interlaced/error paths. Keep the original final
+ * iteration so the caller restores its exact registers, flags, stack and
+ * libpng final state. No guest callback is skipped on an eligible session. */
+int isaac_vita_native_png_middle_rows_try(CPU *__restrict c)
+{
+    static unsigned engaged_logged;
+    const int saved_errno = errno;
+    np_session *s = &s_ses;
+    uint32_t token = 0u, base, stride, y, skipped;
+    int result = 0;
+#if NP_TIMING
+    uint64_t t0;
+#endif
+    if (!c || c->fault || !s->active || s->mode != NP_MODE_SERVE ||
+        s->next_row != 1u || s->height < 3u || c->ebx != s->png ||
+        c->edi != s->height || !s->raw ||
+        c->ebp < 0x43cu ||
+        !guest_stack_contains(c, c->ebp - 0x43cu, 0x444u) ||
+        !guest_stack_contains(c, c->esp, 4u) ||
+        ld32(c->ebp - 0x43cu) != c->esi ||
+        ld32(c->ebp - 0x438u) != s->height ||
+        ld32(c->ebp - 0x418u) != s->png ||
+        ld32(c->ebp - 0x410u) != 1u ||
+        (ld32(c->ebp + 4u) != 0x005a0c7eu &&
+         ld32(c->ebp + 4u) != 0x005a0d62u) ||
+        ld32(s->png + ISAAC_NP_PNG_ROW_NUMBER) != 1u)
+        goto done;
+    token = isaac_vita_guest_heap_lease_exact_range(
+        (const void *)(uintptr_t)c->esi, (const void *)(uintptr_t)c->esi,
+        (size_t)s->height * 4u);
+    if (!token)
+        goto done;
+    base = ld32(c->esi);
+    stride = ld32(c->esi + 4u) - base;
+    if (base != c->edx || !base || stride < s->rowbytes ||
+        (uint64_t)base + (uint64_t)(s->height - 1u) * stride + s->rowbytes > UINT32_MAX)
+        goto release;
+    /* The table is leased and read-only for the whole batch. Reject aliases,
+     * null/nonlinear destinations and altered row pointers before any copy. */
+    for (y = 1u; y < s->height; ++y)
+        if (ld32(c->esi + y * 4u) != base + y * stride)
+            goto release;
+#if NP_TIMING
+    t0 = np_now_us();
+#endif
+    if (!isaac_vita_texel_scratch_png_middle_rows(base, stride,
+            s->rowbytes, s->height, s->raw))
+        goto release;
+    skipped = s->height - 2u;
+    s->next_row += skipped;
+    st32(s->png + ISAAC_NP_PNG_ROW_NUMBER, s->next_row);
+    c->esi += skipped * 4u;
+    c->edi -= skipped;
+#if NP_TIMING
+    s->serve_us += (uint32_t)(np_now_us() - t0);
+#endif
+    result = 1;
+release:
+    if (!isaac_vita_guest_heap_lease_release(token)) {
+        errno = saved_errno;
+        guest_fault(c, c->esi, "PNG row batch table lease release failed");
+        result = -1;
+    }
+done:
+    if (result > 0 && !engaged_logged) {
+        engaged_logged = 1u;
+        isaac_vita_log("KAGE VITA PNG ROW BATCH: engaged middle=%u "
+            "height=%u rowbytes=%u first-final=original",
+            (unsigned)(s->height - 2u), (unsigned)s->height,
+            (unsigned)s->rowbytes);
+    }
+    errno = saved_errno;
+    return result;
+}
+#endif
 
 #if defined(ISAAC_VITA_NATIVE_PNG_VERIFY)
 static void np_verify_finish(CPU *__restrict c, np_session *s)
@@ -1128,7 +1568,9 @@ static void np_start(CPU *__restrict c, uint32_t png, uint32_t row,
     np_guest_io io;
     uint8_t *raw;
     uint32_t p0 = 0U;
+#if NP_TIMING
     uint64_t t0;
+#endif
 
     ++s_stats.images;
     np_session_reset();
@@ -1141,7 +1583,9 @@ static void np_start(CPU *__restrict c, uint32_t png, uint32_t row,
         np_begin_translated(c, png, row, eax0, reason);
         return;
     }
+#if NP_TIMING
     t0 = np_now_us();
+#endif
     /* The stream must be seekable for the rewind; probe before any byte is
      * consumed (a seek to the current position is a no-op). */
     if (!np_guest_tell(c, s->stream, &p0)) {
@@ -1172,10 +1616,34 @@ static void np_start(CPU *__restrict c, uint32_t png, uint32_t row,
     work.staging_bytes = ISAAC_NP_STAGING_BYTES;
     work.tinfl_state = s_tinfl_state;
     work.last_row_pre_gamma = s_last_row;
+#if NP_TIMING
     work.now_us = np_now_us;
+#else
+    work.now_us = NULL;
+#endif
     io.c = c;
     io.stream = s->stream;
-    (void)isaac_np_decode(&params, np_guest_read, &io, &work, &result);
+    {
+        KAGE_VITA_DEEP_SCOPE_BYTES(KVD_PNG_DECODE,
+            (uint64_t)s->height * (s->rowbytes + 1u));
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+        uint64_t deep_png_begin = np_deep_clock();
+#endif
+#if ISAAC_VITA_NATIVE_PNG_REUSE
+        (void)isaac_np_decode_reusing(&params, np_guest_read, &io, &work, &result,
+                                    &s_reuse);
+#else
+        (void)isaac_np_decode(&params, np_guest_read, &io, &work, &result);
+#endif
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+        np_deep_note(s, &result, deep_png_begin, np_deep_clock());
+#endif
+    }
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+    s_stats.strict_attempts += result.strict_attempts;
+    s_stats.strict_successes += result.strict_successes;
+    s_stats.strict_refusals += result.strict_refusals;
+#endif
     if (result.status != ISAAC_NP_OK) {
         static const char *const names[ISAAC_NP_STATUS_COUNT] = {
             "decode-ok", "decode-read", "decode-crc", "decode-not-idat",
@@ -1208,7 +1676,9 @@ static void np_start(CPU *__restrict c, uint32_t png, uint32_t row,
     s->last_filter = result.last_filter;
     memcpy(s->filters, result.filters, sizeof(s->filters));
     s->io_us = result.io_us;
+#if NP_TIMING
     s->decode_us = (uint32_t)(np_now_us() - t0);
+#endif
     s->next_row = 0U;
     s->v_first_row = -1;
     s->v_first_off = -1;

@@ -1,0 +1,45 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -160,6 +160,15 @@
+ 		disable_draw_attrib(i) \
+ 	}
+ 
++/* A sampler is reflected in frag_uniforms even when no default buffer exists.
++ * Keep dirty clearing and named UBO binding outside this size-only decision. */
++#ifdef HAVE_ISAAC_SKIP_ZERO_FRAGMENT_UNIFORM
++#define ISAAC_FRAGMENT_DEFAULT_UNIFORM_NEEDED(p) \
++	((p)->fshader->unif_buf_size != 0u)
++#else
++#define ISAAC_FRAGMENT_DEFAULT_UNIFORM_NEEDED(p) 1
++#endif
++
+ #ifndef HAVE_FFP_SHADER_SUPPORT
+ #define upload_uniforms() \
+ 	if (p->vert_uniforms && dirty_shader_vert_unifs) { \
+@@ -168,8 +177,10 @@
+ 		dirty_shader_vert_unifs = GL_FALSE; \
+ 	} \
+ 	if (p->frag_uniforms && dirty_shader_frag_unifs) { \
+-		void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size); \
+-		vgl_fast_memcpy(buffer, p->unif_fbuffer, p->fshader->unif_buf_size); \
++		if (ISAAC_FRAGMENT_DEFAULT_UNIFORM_NEEDED(p)) { \
++			void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size); \
++			vgl_fast_memcpy(buffer, p->unif_fbuffer, p->fshader->unif_buf_size); \
++		} \
+ 		dirty_shader_frag_unifs = GL_FALSE; \
+ 	} \
+ 	if (p->vert_ubos) { \
+@@ -221,8 +232,10 @@
+ 		dirty_shader_vert_unifs = GL_FALSE; \
+ 	} \
+ 	if (p->frag_uniforms && dirty_shader_frag_unifs) { \
+-		void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size); \
+-		vgl_fast_memcpy(buffer, p->unif_fbuffer, p->fshader->unif_buf_size); \
++		if (ISAAC_FRAGMENT_DEFAULT_UNIFORM_NEEDED(p)) { \
++			void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size); \
++			vgl_fast_memcpy(buffer, p->unif_fbuffer, p->fshader->unif_buf_size); \
++		} \
+ 		dirty_shader_frag_unifs = GL_FALSE; \
+ 	} \
+ 	if (p->vert_ubos) { \

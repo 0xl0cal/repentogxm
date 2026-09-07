@@ -102,6 +102,15 @@ int isaac_vita_anm2_scratch_malloc(
 int isaac_vita_anm2_scratch_free(
     void *pointer, isaac_vita_anm2_scratch_decision *decision);
 
+#if defined(ISAAC_VITA_ANM2_POOL_INIT) && ISAAC_VITA_ANM2_POOL_INIT
+/* Complete the frozen initializers only while this exact segment is live in
+ * its just-acquired scratch session. Holds the existing ownership lock across
+ * all writes; rejection writes nothing. Ordinary guest-heap pools are excluded. */
+int isaac_vita_anm2_scratch_init_pool(
+    unsigned index, uint32_t pool,
+    uint32_t guest_stack_floor, uint32_t guest_stack_ceiling);
+#endif
+
 #ifdef ISAAC_VITA_ANM2_SCRATCH_ORACLE
 typedef struct isaac_vita_anm2_scratch_snapshot {
     uintptr_t base;

@@ -79,6 +79,37 @@ void vglSetupDisplayRenderTarget(uint8_t scenes_per_frame)
     ++s_display_target_setup_calls;
 }
 
+/* 0007 hook stand-in with the patch's semantics: 1..8 is stored and the value
+ * in effect is returned; anything else leaves the stock single slot. */
+static unsigned s_fbo_target_setup_calls;
+static uint8_t s_fbo_target_requested;
+static uint8_t s_fbo_target_scenes = 1u;
+uint8_t vglIsaacSetupFboRenderTargetScenes(uint8_t size)
+{
+    ++s_fbo_target_setup_calls;
+    s_fbo_target_requested = size;
+    if (size >= 1u && size <= 8u)
+        s_fbo_target_scenes = size;
+    return s_fbo_target_scenes;
+}
+
+/* 0009 hook stand-in with the patch's semantics: 0 = observe (count only),
+ * nonzero = apply; the mode stored is returned for the banner. */
+static unsigned s_fbo_valid_region_setup_calls;
+static uint8_t s_fbo_valid_region_requested;
+static uint8_t s_fbo_valid_region_apply;
+uint8_t vglIsaacSetupFboValidRegion(uint8_t apply)
+{
+    ++s_fbo_valid_region_setup_calls;
+    s_fbo_valid_region_requested = apply;
+    s_fbo_valid_region_apply = apply ? 1u : 0u;
+    return s_fbo_valid_region_apply;
+}
+#if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+# define ORACLE_VALID_REGION_WORD \
+    ((ISAAC_VITA_STOCK_FBO_VALID_REGION) == 2 ? "on" : "observe")
+#endif
+
 GLboolean vglInitExtended(
     int legacy_pool, int width, int height,
     int ram_threshold, int multisample_mode)
@@ -158,6 +189,9 @@ int main(void)
     CHECK(s_shader_setup_calls == 0u);
     CHECK(s_extended_init_calls == 0u);
 
+    CHECK(s_fbo_target_setup_calls == 0u);
+    CHECK(s_fbo_valid_region_setup_calls == 0u);
+
     CHECK(kage_vita_backend_initialize(960u, 540u));
     CHECK(s_shader_setup_calls == 1u);
     CHECK(s_shader_optimization == SHARK_OPT_UNSAFE);
@@ -165,6 +199,26 @@ int main(void)
     CHECK(s_shader_fragment == SHARK_ENABLE);
     CHECK(s_shader_compiler == SHARK_ENABLE);
     CHECK(s_display_target_setup_calls == 0u);
+#if defined(ISAAC_VITA_STOCK_FBO_RT_SCENES)
+    /* The 0007 hook is called exactly once per initialize, before vglInit,
+     * with the configured count; the banner prints the returned value. */
+    CHECK(s_fbo_target_setup_calls == 1u);
+    CHECK(s_fbo_target_requested == (uint8_t)ISAAC_VITA_STOCK_FBO_RT_SCENES);
+    CHECK(s_fbo_target_scenes == (uint8_t)ISAAC_VITA_STOCK_FBO_RT_SCENES);
+#else
+    CHECK(s_fbo_target_setup_calls == 0u);
+#endif
+#if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+    /* The 0009 mode hook is called exactly once per initialize, before
+     * vglInit, with 1 for ON and 0 for OBSERVE; the banner prints the mode
+     * it returned. */
+    CHECK(s_fbo_valid_region_setup_calls == 1u);
+    CHECK(s_fbo_valid_region_requested ==
+          (uint8_t)((ISAAC_VITA_STOCK_FBO_VALID_REGION) == 2));
+    CHECK(s_fbo_valid_region_apply == s_fbo_valid_region_requested);
+#else
+    CHECK(s_fbo_valid_region_setup_calls == 0u);
+#endif
     CHECK(s_extended_init_calls == 1u);
     CHECK(s_custom_init_calls == 0u);
     CHECK(s_init_legacy_pool == 0);
@@ -194,6 +248,40 @@ int main(void)
 #else
     CHECK(strstr(s_logs, "physical=960x544 logical=960x540") != NULL);
 #endif
+#if defined(ISAAC_VITA_STOCK_FBO_RT_SCENES)
+    {
+        char banner[96];
+
+# if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+        /* Both knobs: the 0009 word follows the 0007 count. */
+        snprintf(banner, sizeof banner,
+                 " rt-scenes=1 fbo-rt-scenes=%u fbo-valid-region=%s GL=",
+                 (unsigned)ISAAC_VITA_STOCK_FBO_RT_SCENES,
+                 ORACLE_VALID_REGION_WORD);
+# else
+        snprintf(banner, sizeof banner, " rt-scenes=1 fbo-rt-scenes=%u GL=",
+                 (unsigned)ISAAC_VITA_STOCK_FBO_RT_SCENES);
+# endif
+        CHECK(strstr(s_logs, banner) != NULL);
+    }
+#else
+# if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+    {
+        char banner[64];
+
+        snprintf(banner, sizeof banner,
+                 " rt-scenes=1 fbo-valid-region=%s GL=",
+                 ORACLE_VALID_REGION_WORD);
+        CHECK(strstr(s_logs, banner) != NULL);
+    }
+# else
+    CHECK(strstr(s_logs, " rt-scenes=1 GL=") != NULL);
+# endif
+    CHECK(strstr(s_logs, "fbo-rt-scenes") == NULL);
+#endif
+#if !defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+    CHECK(strstr(s_logs, "fbo-valid-region") == NULL);
+#endif
 
     CHECK(kage_vita_backend_present());
     CHECK(s_swap_calls == 1u);
@@ -212,11 +300,32 @@ int main(void)
 #else
     CHECK(s_viewport_calls == viewport_calls_before);
 #endif
+#if defined(ISAAC_VITA_STOCK_FBO_RT_SCENES)
+    /* The warm re-initialize reuses the vitaGL context and never reaches the
+     * setup block: exactly one request per process. */
+    CHECK(s_fbo_target_setup_calls == 1u);
+    CHECK(s_fbo_target_scenes == (uint8_t)ISAAC_VITA_STOCK_FBO_RT_SCENES);
+#else
+    CHECK(s_fbo_target_setup_calls == 0u);
+#endif
+#if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+    /* Same for the 0009 mode hook. */
+    CHECK(s_fbo_valid_region_setup_calls == 1u);
+#else
+    CHECK(s_fbo_valid_region_setup_calls == 0u);
+#endif
 
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720)
-    puts("Stock vitaGL host oracle: PASS (720x408 init; 720x405 viewport; 960x540 logical)");
+    printf("Stock vitaGL host oracle: PASS (720x408 init; 720x405 viewport; 960x540 logical");
 #else
-    puts("Stock vitaGL host oracle: PASS (960x544 init; display raster OFF)");
+    printf("Stock vitaGL host oracle: PASS (960x544 init; display raster OFF");
 #endif
+#if defined(ISAAC_VITA_STOCK_FBO_RT_SCENES)
+    printf("; fbo rt-scenes=%u", (unsigned)ISAAC_VITA_STOCK_FBO_RT_SCENES);
+#endif
+#if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
+    printf("; fbo valid-region=%s", ORACLE_VALID_REGION_WORD);
+#endif
+    puts(")");
     return 0;
 }

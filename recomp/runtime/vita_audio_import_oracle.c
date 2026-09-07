@@ -1,5 +1,6 @@
 /* Native executable oracle for every frozen x86 OpenAL cdecl adapter. */
 #include <limits.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +29,17 @@
 #endif
 #ifdef ISAAC_VITA_AUDIO_REFILL_HOOKS
 #include "host_vita_audio_refill.h"
+#endif
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+#include "host_vita_static_sfx_profile.h"
+static uint64_t s_sfx_now;
+static unsigned s_sfx_clock_reads;
+uint64_t isaac_vita_get_process_time(void)
+{
+    ++s_sfx_clock_reads;
+    errno = EIO; /* optional measurement must not leak this into the loader */
+    return s_sfx_now;
+}
 #endif
 
 #ifdef ISAAC_VITA_AUDIO_MANUAL_ORACLE
@@ -431,6 +443,9 @@ void alGenBuffers(ALsizei count, ALuint *buffers)
 {
     ALsizei index;
 
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+    s_sfx_now += 7U;
+#endif
     s_capture.operation = OP_GEN_BUFFERS;
     s_capture.u[0] = (uint32_t)count;
     s_capture.p[0] = (uintptr_t)buffers;
@@ -654,6 +669,9 @@ void alSourcef(ALuint source, ALenum parameter, ALfloat value)
 void alBufferData(ALuint buffer, ALenum format, const ALvoid *data,
                   ALsizei size, ALsizei frequency)
 {
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+    s_sfx_now += 31U;
+#endif
     s_capture.operation = OP_BUFFER_DATA;
     s_capture.u[0] = buffer;
     s_capture.u[1] = (uint32_t)format;
@@ -1842,6 +1860,223 @@ static void test_refill_hooks_through_adapters(void)
 }
 #endif
 
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+/* Existing ABI fixture, actual production wrappers/adapters. The original
+ * loaders and clock/AL driver are mocks: this is not a WAV decoder test. */
+void __wrap_sub_005a3b30(CPU *c);
+void __wrap_sub_005a36a0(CPU *c);
+void __wrap_sub_005bf4e0(CPU *c);
+void __wrap_sub_005be5b0(CPU *c);
+void __wrap_sub_005bf4c0(CPU *c);
+static unsigned s_sfx_mode, s_sfx_wav_calls, s_sfx_ogg_calls, s_sfx_riff_calls;
+static unsigned s_sfx_play_calls, s_sfx_override_calls;
+static CPU s_sfx_result;
+
+static void sfx_mock_import(CPU *c, const char *name,
+                             const uint32_t *args, unsigned count)
+{
+    unsigned i;
+    uint32_t stack = s_base + STACK_OFFSET;
+    st32(stack, UINT32_C(0x12345678));
+    for (i = 0U; i < count; ++i)
+        st32(stack + 4U + i * 4U, args[i]);
+    c->esp = stack;
+    CHECK(isaac_vita_audio_import_counted(c, name, NULL) == 1,
+          "static SFX mock import not handled");
+    CHECK(c->fault == NULL && c->esp == stack + 4U,
+          "static SFX instrumentation changed adapter completion");
+}
+
+void __real_sub_005bf4e0(CPU *c)
+{
+    (void)c;
+    ++s_sfx_riff_calls;
+    s_sfx_now += (s_sfx_riff_calls & 1U) ? 11U : 23U;
+}
+
+void __real_sub_005a36a0(CPU *c)
+{
+    ++s_sfx_ogg_calls;
+    s_sfx_now += 101U;
+    *c = s_sfx_result;
+    errno = ERANGE;
+}
+
+void __real_sub_005be5b0(CPU *c)
+{
+    uint32_t args[5] = {0x7101U, 0x1101U, s_base + DATA_OFFSET, 4096U, 44100U};
+    ++s_sfx_play_calls;
+    sfx_mock_import(c, ISAAC_VITA_AUDIO_BUFFER_DATA_NAME, args, 5U);
+    s_mock_al_error = (ALenum)0xa005U;
+    sfx_mock_import(c, ISAAC_VITA_AUDIO_GET_ERROR_NAME, args, 0U);
+    s_sfx_now += 19U;
+    *c = s_sfx_result;
+}
+
+void __real_sub_005bf4c0(CPU *c)
+{
+    ++s_sfx_override_calls;
+    s_sfx_now += 13U; /* Original virtual preparation, before base Play. */
+    /* Deliberately bypass the base wrapper: this is the actual same-TU
+     * edge in guest_0177.c, including the existing native import hooks. */
+    __real_sub_005be5b0(c);
+    errno = ERANGE;
+}
+
+void __real_sub_005a3b30(CPU *c)
+{
+    uint32_t args[5] = {1U, s_base + DATA_OFFSET, 0U, 0U, 0U};
+    ++s_sfx_wav_calls;
+    CHECK(errno == EDOM, "clock changed original loader input errno");
+    if (s_sfx_mode == 0U || s_sfx_mode == 6U) {
+        if (s_sfx_mode == 6U) {
+            isaac_vita_static_sfx_window busy, expected;
+            memset(&busy, 0x5a, sizeof busy);
+            expected = busy;
+            CHECK(isaac_vita_static_sfx_profile_take_window(&busy) == 0 &&
+                  memcmp(&busy, &expected, sizeof busy) == 0,
+                  "active-load snapshot consumed or wrote output");
+        }
+        __wrap_sub_005bf4e0(c);
+        __wrap_sub_005bf4e0(c);
+        sfx_mock_import(c, ISAAC_VITA_AUDIO_GEN_BUFFERS_NAME, args, 2U);
+        args[0] = 0x7101U; args[1] = 0x1101U;
+        args[2] = s_base + DATA_OFFSET; args[3] = 4096U; args[4] = 44100U;
+        sfx_mock_import(c, ISAAC_VITA_AUDIO_BUFFER_DATA_NAME, args, 5U);
+        s_mock_al_error = (ALenum)0xa004U;
+        sfx_mock_import(c, ISAAC_VITA_AUDIO_GET_ERROR_NAME, args, 0U);
+        s_sfx_now += 17U;
+    } else if (s_sfx_mode == 3U) {
+        s_sfx_now -= 5U;
+    } else if (s_sfx_mode == 4U) {
+        s_sfx_now += (uint64_t)UINT32_MAX + 1U;
+    } else if (s_sfx_mode == 5U) {
+        CPU other = *c;
+        __wrap_sub_005a36a0(&other);
+        CHECK(isaac_vita_static_sfx_profile_native_begin(&other) == UINT64_MAX,
+              "foreign CPU admitted to outer static load");
+    } else {
+        s_sfx_now += 13U;
+    }
+    *c = s_sfx_result;
+    errno = ERANGE;
+}
+
+static void test_static_sfx_profile(void)
+{
+    isaac_vita_static_sfx_window w, empty;
+    CPU c;
+    unsigned native_errors, reads, mode;
+    memset(&empty, 0, sizeof empty);
+    CHECK(sizeof w == 28U * sizeof(uint32_t), "static SFX snapshot ABI drift");
+    CHECK(isaac_vita_static_sfx_profile_take_window(NULL) == 0,
+          "NULL static SFX snapshot accepted");
+    CHECK(isaac_vita_static_sfx_profile_take_window(&w) == 1 &&
+          memcmp(&w, &empty, sizeof w) == 0,
+          "ordinary adapter calls counted as static sample loads");
+    reads = s_sfx_clock_reads;
+    memset(&c, 0, sizeof c);
+    CHECK(isaac_vita_static_sfx_profile_native_begin(&c) == UINT64_MAX,
+          "unowned CPU sampled");
+    isaac_vita_static_sfx_profile_upload_end(&c, UINT64_MAX, 123);
+    isaac_vita_static_sfx_profile_create_end(&c, UINT64_MAX);
+    isaac_vita_static_sfx_profile_error(&c, 0xa005U);
+    __wrap_sub_005bf4e0(&c);
+    CHECK(reads == s_sfx_clock_reads, "unowned path performed clock reads");
+    s_sfx_riff_calls = 0U;
+    for (mode = 0U; mode <= 6U; ++mode) {
+        s_sfx_mode = mode;
+        memset(&c, 0, sizeof c);
+        memset(&s_sfx_result, 0x39, sizeof s_sfx_result);
+        s_sfx_result.eax = mode == 1U ? 0xabcdef00U : 0xabcdef01U;
+        s_sfx_result.fault = mode == 2U ? "mock loader fault" : NULL;
+        s_sfx_now = 1000U;
+        errno = EDOM;
+        native_errors = s_get_error_calls;
+        __wrap_sub_005a3b30(&c);
+        CHECK(memcmp(&c, &s_sfx_result, sizeof c) == 0,
+              "static wrapper changed original CPU state");
+        CHECK(errno == ERANGE, "static wrapper changed original errno result");
+        CHECK(isaac_vita_static_sfx_profile_take_window(NULL) == 0,
+              "NULL take consumed completed load");
+        CHECK(isaac_vita_static_sfx_profile_take_window(&w) == 1,
+              "completed static scope remained locked");
+        CHECK(w.wav.count == 1U && w.ogg.count == 0U,
+              "whole-load count/nested suppression drift");
+        CHECK(w.wav_failed == (mode == 1U) && w.faulted == (mode == 2U),
+              "original AL result/fault attribution drift");
+        if (mode == 0U || mode == 6U) {
+            CHECK(w.wav.sum_us == 89U && w.wav.max_us == 89U &&
+                  w.riff.count == 2U && w.riff.sum_us == 34U &&
+                  w.riff.max_us == 23U && w.create.count == 1U &&
+                  w.create.sum_us == 7U && w.upload.count == 1U &&
+                  w.upload.sum_us == 31U && w.upload_bytes == 4096U,
+                  "static nested timing/bytes differ from native boundaries");
+            CHECK(w.error_queries == 1U && w.al_errors == 1U &&
+                  w.last_al_error == 0xa004U &&
+                  s_get_error_calls == native_errors + 1U,
+                  "static profile queried/consumed extra AL error");
+        } else {
+            CHECK(s_get_error_calls == native_errors,
+                  "static profiler introduced AL error query");
+        }
+        CHECK(w.bad_clock == (mode == 3U), "clock rollback not excluded");
+        if (mode == 3U)
+            CHECK(w.wav.sum_us == 0U && w.wav.max_us == 0U,
+                  "clock rollback emitted huge elapsed duration");
+        CHECK(w.overflow == (mode == 4U), "duration saturation flag drift");
+        if (mode == 4U)
+            CHECK(w.wav.sum_us == UINT32_MAX && w.wav.max_us == UINT32_MAX,
+                  "duration overflow wrapped");
+        CHECK(w.skipped == (mode == 5U), "nested load not counted skipped");
+        CHECK(isaac_vita_static_sfx_profile_take_window(&w) == 1 &&
+              memcmp(&w, &empty, sizeof w) == 0,
+              "static snapshot did not take-and-zero");
+    }
+    memset(&c, 0, sizeof c);
+    s_sfx_result.fault = NULL;
+    s_sfx_result.eax = 0U;
+    __wrap_sub_005a36a0(&c);
+    CHECK(isaac_vita_static_sfx_profile_take_window(&w) == 1 &&
+          w.ogg.count == 1U && w.ogg.sum_us == 101U && w.ogg_failed == 1U &&
+          w.wav.count == 0U && w.riff.count == 0U,
+          "memory OGG whole-load scope attribution drift");
+    CHECK(s_sfx_wav_calls == 7U && s_sfx_ogg_calls == 2U,
+          "wrapper repeated or skipped original loader");
+    /* Real static uploads are later than WAV Load, in this separate method.
+     * AL is deliberately zero although Play returns void. */
+    memset(&c, 0, sizeof c);
+    native_errors = s_get_error_calls;
+    __wrap_sub_005be5b0(&c);
+    CHECK(memcmp(&c, &s_sfx_result, sizeof c) == 0,
+          "Play wrapper changed original CPU result");
+    CHECK(isaac_vita_static_sfx_profile_take_window(&w) == 1 &&
+          w.play.count == 1U && w.play.sum_us == 50U &&
+          w.upload.count == 1U && w.upload.sum_us == 31U &&
+          w.upload_bytes == 4096U && w.wav.count == 0U &&
+          w.ogg.count == 0U && w.wav_failed == 0U && w.ogg_failed == 0U &&
+          w.error_queries == 1U && w.al_errors == 1U &&
+          w.last_al_error == 0xa005U && s_get_error_calls == native_errors + 1U,
+          "later static Play/upload scope missing or void AL misread");
+    memset(&c, 0, sizeof c);
+    native_errors = s_get_error_calls;
+    __wrap_sub_005bf4c0(&c);
+    CHECK(memcmp(&c, &s_sfx_result, sizeof c) == 0 && errno == ERANGE,
+          "Play override wrapper changed original CPU/errno result");
+    CHECK(isaac_vita_static_sfx_profile_take_window(&w) == 1 &&
+          w.play.count == 1U && w.play.sum_us == 63U &&
+          w.play.max_us == 63U && w.upload.count == 1U &&
+          w.upload.sum_us == 31U && w.upload_bytes == 4096U &&
+          w.wav.count == 0U && w.ogg.count == 0U &&
+          w.wav_failed == 0U && w.ogg_failed == 0U && w.skipped == 0U &&
+          w.error_queries == 1U && w.al_errors == 1U &&
+          s_get_error_calls == native_errors + 1U &&
+          s_sfx_override_calls == 1U && s_sfx_play_calls == 2U,
+          "same-TU Play override missed upload, double counted or replayed original");
+    puts("Static SFX scopes: PASS (actual adapters; mocked loaders/AL/clock; CPU, errno, nested/busy/take-zero, raw error count, rollback/saturation)");
+}
+#endif
+
 int main(void)
 {
     void *memory = map_guest_test_memory();
@@ -1859,6 +2094,9 @@ int main(void)
     test_all_adapters();
     test_a005_attribution_and_folding();
     test_a005_source_play_attribution();
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+    test_static_sfx_profile();
+#endif
 #ifdef ISAAC_VITA_AUDIO_REFILL_HOOKS
     test_refill_hooks_through_adapters();
 #endif

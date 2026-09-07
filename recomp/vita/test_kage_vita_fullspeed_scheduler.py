@@ -78,6 +78,16 @@ def verify_source_contract(root: Path) -> None:
     for needle in required_cmake:
         if needle not in cmake:
             raise AssertionError(f"CMake scheduler contract lost: {needle}")
+    if not re.search(r'option\(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE\s+"[^"]+" OFF\)', cmake):
+        raise AssertionError("full-head advance must remain default OFF")
+    head_build = cmake[cmake.index('      if(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE)'):]
+    head_build = head_build[:head_build.index('      endif()')]
+    if head_build.count('"${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"') != 1 or \
+            'ISAAC_VITA_FULLSPEED_HEAD_ADVANCE=1' not in head_build or \
+            'ISAAC_VITA_FULLSPEED_GENERATED_OWNERS' in head_build:
+        raise AssertionError("full-head advance must alter only scheduler runtime flags")
+    if 'ISAAC_VITA_FULLSPEED_HEAD_ADVANCE requires FULLSPEED_SCHEDULER=ON and FULLSPEED_SERVICE_RESERVE=ON' not in cmake:
+        raise AssertionError("full-head advance dependencies lost")
     for owner in (
             "APP", "MANAGER", "GAME_UPDATE", "RENDER", "GAME_PUBLISH"):
         if cmake.count(f"ISAAC_FULLSPEED_{owner}_OWNER_MATCH") != 2:
@@ -278,6 +288,50 @@ def main() -> int:
         ])
         scheduler_exit_stdout = run([str(scheduler_exit_exe)])
 
+        head_flags = ["-DISAAC_VITA_FULLSPEED_SCHEDULER=1",
+                      "-DISAAC_VITA_FULLSPEED_SERVICE_RESERVE=1"]
+        head_stdout = []
+        for exit_sites in (False, True):
+            head_exe = output / f"scheduler-head-{int(exit_sites)}.exe"
+            flags = head_flags + ["-DISAAC_VITA_FULLSPEED_HEAD_ADVANCE=1"]
+            if exit_sites:
+                flags += ["-DISAAC_VITA_FULLSPEED_EXIT_ZERO_FRAME_SITES=1"]
+            run(common + flags + [
+                str(runtime / "kage_vita_fullspeed_scheduler.c"),
+                str(runtime / "kage_vita_fullspeed_scheduler_oracle.c"),
+                "-o", str(head_exe),
+            ])
+            head_stdout.append(run([str(head_exe)]))
+        # An explicit zero is as OFF as absence, including emitted host code.
+        head_off_assembly = []
+        for defined_zero in (False, True):
+            assembly = output / f"head-off-{int(defined_zero)}.s"
+            flags = head_flags + (["-DISAAC_VITA_FULLSPEED_HEAD_ADVANCE=0"]
+                                  if defined_zero else [])
+            run(common + flags + ["-S",
+                str(runtime / "kage_vita_fullspeed_scheduler.c"),
+                "-o", str(assembly)])
+            head_off_assembly.append(assembly.read_bytes())
+        if head_off_assembly[0] != head_off_assembly[1]:
+            raise AssertionError("HEAD_ADVANCE=0 changes emitted OFF code")
+
+        # The existing oversleep model must stay identical when the heavy
+        # render cost refuses head advance; no replacement timing framework.
+        heavy_exes = []
+        for enabled in (False, True):
+            exe = output / f"overshoot-head-{int(enabled)}.exe"
+            flags = head_flags + (["-DISAAC_VITA_FULLSPEED_HEAD_ADVANCE=1"]
+                                  if enabled else [])
+            run(common + flags + [str(runtime / "kage_vita_fullspeed_scheduler.c"),
+                str(vita / "host_tests" / "kage_vita_fullspeed_overshoot_model.c"),
+                "-o", str(exe)])
+            heavy_exes.append(exe)
+        for render in (34000, 55000):
+            for overshoot in (180, 900):
+                args = ["200000", str(overshoot), str(render), "17000"]
+                if run([str(heavy_exes[0])] + args) != run([str(heavy_exes[1])] + args):
+                    raise AssertionError("head advance altered refused heavy-render model")
+
         def compile_phase(cache_enabled: bool) -> str:
             suffix = "cache-on" if cache_enabled else "cache-off"
             phase_exe = output / (
@@ -342,6 +396,9 @@ def main() -> int:
     if scheduler_expected not in scheduler_exit_stdout:
         raise AssertionError(
             f"unexpected exit-site scheduler oracle: {scheduler_exit_stdout!r}")
+    for stdout in head_stdout:
+        if scheduler_expected not in stdout or "Vita full-head advance: PASS" not in stdout:
+            raise AssertionError(f"unexpected full-head oracle: {stdout!r}")
     if phase_expected not in phase_cache_off_stdout or \
             "records=6; ordered/bounded t,c,a,s,r,w" not in \
             phase_cache_off_stdout or \
@@ -367,6 +424,8 @@ def main() -> int:
             f"unexpected scheduler-ON lifecycle oracle: {lifecycle_on_stdout!r}"
         )
     print(scheduler_stdout.strip())
+    print(head_stdout[0].splitlines()[0])
+    print("Full-head OFF emitted-code identity and refused heavy oversleep model: PASS")
     print(phase_cache_off_stdout.strip())
     print(phase_cache_on_stdout.strip())
     print(lifecycle_off_stdout.strip())

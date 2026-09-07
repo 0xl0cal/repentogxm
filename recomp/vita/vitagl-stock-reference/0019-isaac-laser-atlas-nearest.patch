@@ -1,0 +1,136 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 74662e3..82000c5 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -2511,6 +2511,9 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean
+ #ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
+ #include "isaac_laser_light_halo_vitagl.h"
+ #endif
++#ifdef HAVE_ISAAC_LASER_ATLAS_NEAREST
++#include "isaac_laser_atlas_nearest.h"
++#endif
+ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, SceGxmIndexSource index_type ISAAC_LIGHT_HALO_DECL) {
+ 	SceGxmVertexProgram *isaac_pair_vertex = NULL;
+ 	static GLboolean isaac_pair_was_bound = GL_FALSE;
+@@ -2958,6 +2961,10 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 			}
+ 		}
+ 	}
++#ifdef HAVE_ISAAC_LASER_ATLAS_NEAREST
++	isaac_laser_atlas_nearest_prepare(p, isaac_coloroffset_fragment_exact,
++		isaac_coloroffset_texture, halo_submission);
++#endif
+ #ifdef HAVE_PROFILING
+ 	shaders_draw_profiler_cnt += sceKernelGetProcessTimeLow() - draw_start;
+ 	shaders_draw_cnt++;
+diff --git a/source/draw.c b/source/draw.c
+index bfcd6af..ec36884 100644
+--- a/source/draw.c
++++ b/source/draw.c
+@@ -328,14 +328,14 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei prim
+ 	restore_polygon_mode(gxm_p);
+ }
+ 
+-#ifdef HAVE_ISAAC_LASER_LIGHT_NEAREST
++#if defined(HAVE_ISAAC_LASER_LIGHT_NEAREST) || defined(HAVE_ISAAC_LASER_ATLAS_NEAREST)
+ #include "isaac_laser_light_nearest.h"
+ #endif
+ #ifdef HAVE_ISAAC_CANONICAL_QUAD_ZERO_COPY
+ GLboolean vglIsaacDrawCanonicalQuads(GLsizei count) {
+ 	GLboolean is_draw_legal;
+ 	uint32_t top_idx;
+-#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++#if defined(HAVE_ISAAC_LASER_LIGHT_HALO_CLIP) || defined(HAVE_ISAAC_LASER_ATLAS_NEAREST)
+ 	IsaacLightHaloDraw halo = { .primitive = SCE_GXM_PRIMITIVE_TRIANGLES };
+ #endif
+ 
+@@ -353,10 +353,14 @@ GLboolean vglIsaacDrawCanonicalQuads(GLsizei count) {
+ 	is_draw_legal = _glDrawElements_CustomShadersIMPL(
+ 		isaac_canonical_quads_idx_ptr, count, top_idx, 0,
+ 		SCE_GXM_INDEX_SOURCE_INDEX_16BIT ISAAC_LIGHT_HALO_ARG(&halo));
+-#ifndef SKIP_ERROR_HANDLING
++#if !defined(SKIP_ERROR_HANDLING) || defined(HAVE_ISAAC_LASER_ATLAS_NEAREST)
+ 	if (is_draw_legal)
+ #endif
+ 	{
++#ifdef HAVE_ISAAC_LASER_ATLAS_NEAREST
++		isaac_laser_atlas_draw(gxm_context, &halo, SCE_GXM_PRIMITIVE_TRIANGLES,
++			isaac_canonical_quads_idx_ptr, count);
++#else
+ #ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
+ 		if (halo.indices) {
+ #ifdef HAVE_ISAAC_LASER_LIGHT_NEAREST
+@@ -370,6 +374,7 @@ GLboolean vglIsaacDrawCanonicalQuads(GLsizei count) {
+ 		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLES,
+ 			SCE_GXM_INDEX_FORMAT_U16, isaac_canonical_quads_idx_ptr,
+ 			count);
++#endif
+ 	}
+ 	restore_polygon_mode(SCE_GXM_PRIMITIVE_TRIANGLES);
+ 	return is_draw_legal;
+@@ -412,7 +417,7 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
+ 		src = idx16;
+ 	}
+ 	
+-#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++#if defined(HAVE_ISAAC_LASER_LIGHT_HALO_CLIP) || defined(HAVE_ISAAC_LASER_ATLAS_NEAREST)
+ 	IsaacLightHaloDraw halo = { .primitive = gxm_p };
+ #endif
+ 	if (cur_program != 0)
+@@ -423,13 +428,16 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
+ 		_glDrawElements_FixedFunctionIMPL(src, count, 0, 0, type != GL_UNSIGNED_INT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
+ 	}
+ 
+-#ifndef SKIP_ERROR_HANDLING
++#if !defined(SKIP_ERROR_HANDLING) || defined(HAVE_ISAAC_LASER_ATLAS_NEAREST)
+ 	if (is_draw_legal)
+ #endif
+ 	{
+ #ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
+ 		if (halo.indices) {
+-#ifdef HAVE_ISAAC_LASER_LIGHT_NEAREST
++#ifdef HAVE_ISAAC_LASER_ATLAS_NEAREST
++			isaac_laser_atlas_draw(gxm_context, &halo, SCE_GXM_PRIMITIVE_TRIANGLES,
++				halo.indices, halo.count);
++#elif defined(HAVE_ISAAC_LASER_LIGHT_NEAREST)
+ 			isaac_light_halo_draw(gxm_context, &halo);
+ #else
+ 			sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLES,
+@@ -439,7 +447,11 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
+ #endif
+ 		if (type == GL_UNSIGNED_SHORT) {
+ 			setup_elements_indices(uint16_t);
++#ifdef HAVE_ISAAC_LASER_ATLAS_NEAREST
++			isaac_laser_atlas_draw(gxm_context, &halo, gxm_p, ptr, count);
++#else
+ 			sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, ptr, count);
++#endif
+ 		} else if (type == GL_UNSIGNED_INT) {
+ 			setup_elements_indices(uint32_t);
+ 			sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U32, ptr, count);
+diff --git a/source/shared.h b/source/shared.h
+index 8e75d7f..1c41794 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1235,16 +1235,19 @@ GLenum gxm_blend_to_gl(SceGxmBlendFactor factor); // Converts SceGxmBlendFactor
+ GLenum gxm_blend_eq_to_gl(SceGxmBlendFunc factor); // Converts SceGxmBlendFunc to GL blend func equivalent
+ 
+ /* custom_shaders.c */
+-#ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++#if defined(HAVE_ISAAC_LASER_LIGHT_HALO_CLIP) || defined(HAVE_ISAAC_LASER_ATLAS_NEAREST)
+ typedef struct {
+     SceGxmPrimitiveType primitive;
+     uint16_t *indices;
+     GLsizei count;
+-#ifdef HAVE_ISAAC_LASER_LIGHT_NEAREST
++#if defined(HAVE_ISAAC_LASER_LIGHT_NEAREST) || defined(HAVE_ISAAC_LASER_ATLAS_NEAREST)
+     SceGxmTexture nearest_original;
+     SceGxmTexture nearest_point;
+     GLboolean nearest_ready;
+ #endif
++#ifdef HAVE_ISAAC_LASER_ATLAS_NEAREST
++    GLboolean atlas_nearest_ready;
++#endif
+ } IsaacLightHaloDraw;
+ #define ISAAC_LIGHT_HALO_DECL , IsaacLightHaloDraw *halo_submission
+ #define ISAAC_LIGHT_HALO_ARG(value) , value

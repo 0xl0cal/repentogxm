@@ -84,6 +84,23 @@ void vglSetupDisplayRenderTarget(uint8_t scenes_per_frame)
     s_render_target_scenes = scenes_per_frame;
 }
 
+/* 0007 hook stand-in (stock profile only; the overlay profile never calls
+ * it): stores 1..8 and returns the value in effect. */
+uint8_t vglIsaacSetupFboRenderTargetScenes(uint8_t size)
+{
+    static uint8_t scenes = 1u;
+
+    if (size >= 1u && size <= 8u)
+        scenes = size;
+    return scenes;
+}
+
+/* 0009 hook stand-in: 0 = observe, nonzero = apply; returns the mode. */
+uint8_t vglIsaacSetupFboValidRegion(uint8_t apply)
+{
+    return apply ? 1u : 0u;
+}
+
 GLboolean vglInitWithCustomThreshold(
     int legacy_pool, int width, int height,
     int ram_threshold, int cdram_threshold,

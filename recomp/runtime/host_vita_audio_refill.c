@@ -243,7 +243,7 @@ void isaac_vita_audio_refill_note_buffer_data(
     uint32_t return_address, uint32_t format, uint32_t bytes,
     uint32_t frequency)
 {
-    uint64_t now = isaac_vita_get_process_time();
+    uint64_t now;
     uint32_t count;
 
     if (!ISAAC_VITA_AUDIO_REFILL_IS_SITE(
@@ -257,6 +257,7 @@ void isaac_vita_audio_refill_note_buffer_data(
         return;
     }
 
+    now = isaac_vita_get_process_time();
     count = s_refill.refills == UINT32_MAX ? UINT32_MAX : ++s_refill.refills;
     s_refill.last_bytes = bytes;
     s_refill.last_frequency = frequency;

@@ -10,7 +10,9 @@
 #include <string.h>
 
 #include "host_vita_memory.h"
+#include "kage_vita_deep_profile.h"
 #include "host_vita_import_id.h"
+#include "host_vita_png_texel_init.h"
 
 /* Full memblock queries are a diagnostic catastrophic-mover policy: they are
  * deliberately OFF unless the owning build enables this source explicitly,
@@ -345,6 +347,19 @@ static void vita_memory_memset(CPU *__restrict c)
             vita_memory_return_address(c), destination, 0U, count, &probe);
         return;
     }
+#if ISAAC_VITA_PNG_TEXEL_INIT_ELISION
+    if (count && value == 0 && vita_memory_return_address(c) ==
+            ISAAC_VITA_PNG_TEXEL_INIT_RETURN_RVA) {
+        int elide = isaac_vita_png_texel_init_try(c, destination, value, count);
+        if (elide < 0)
+            return; /* Terminal fault: no fallback, EAX change or cdecl pop. */
+        if (elide > 0) {
+            c->eax = destination;
+            vita_memory_cdecl_return(c);
+            return;
+        }
+    }
+#endif
     if (count)
         memset((void *)(uintptr_t)destination, value, (size_t)count);
     c->eax = destination;
@@ -353,6 +368,7 @@ static void vita_memory_memset(CPU *__restrict c)
 
 static void vita_memory_memcpy(CPU *__restrict c)
 {
+    KAGE_VITA_DEEP_SCOPE_BYTES(KVD_MEMCPY, vita_memory_arg(c, 2U));
     uint32_t destination = vita_memory_arg(c, 0U);
     uint32_t source = vita_memory_arg(c, 1U);
     uint32_t count = vita_memory_arg(c, 2U);
@@ -384,6 +400,7 @@ static void vita_memory_memcpy(CPU *__restrict c)
 
 static void vita_memory_memmove(CPU *__restrict c)
 {
+    KAGE_VITA_DEEP_SCOPE_BYTES(KVD_MEMMOVE, vita_memory_arg(c, 2U));
     uint32_t destination = vita_memory_arg(c, 0U);
     uint32_t source = vita_memory_arg(c, 1U);
     uint32_t count = vita_memory_arg(c, 2U);

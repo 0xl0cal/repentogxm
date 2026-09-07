@@ -1206,8 +1206,8 @@ static void host_SteamAPI_Shutdown(CPU *__restrict c)
  * This works because `guest.h` defines guest address == host address and the
  * process is 32-bit, so the address of a static object is itself a valid
  * guest pointer.  That equality is the one assumption here; if the Vita
- * backend ever moves to an offset-based memory model (see memory-nfs.md,
- * where `m_memory + address` is used) these need to move into guest space and
+ * backend ever moves to an offset-based memory model (an earlier design
+ * used `m_memory + address`) these need to move into guest space and
  * this comment is the reason why. */
 static uint32_t s_crt_commode;
 static uint32_t s_guest_tm[9];

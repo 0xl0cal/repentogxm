@@ -90,9 +90,10 @@ def _verify_generator(pe_path: Path) -> None:
             assert result["vita_laser_profile"] is True
             source = legacy_text(result["text"])
             comment_at = source.index("    /* %08x" % spec["site"])
+            # GPR/flags lowering can change the condition's spelling.  The
+            # full frozen-body check above authenticates the original branch.
             original_at = source.index(
-                "    " + spec["statement"], comment_at
-            )
+                "goto L_%08x;" % spec["epilogue_site"], comment_at)
             block_at = source.index(begin_block, original_at)
             next_at = source.index(
                 "    /* %08x" % spec["window_end"], block_at
@@ -124,6 +125,18 @@ def _verify_generator(pe_path: Path) -> None:
             assert "st8(" not in begin_block and "st32(" not in begin_block
             assert "st8(" not in end_block and "st32(" not in end_block
             assert "goto " not in begin_block and "goto " not in end_block
+            skip_block = "\n".join(G.render_vita_laser_ring_shadow_skip(spec))
+            if spec["shadow"]:
+                skip_at = source.index(skip_block)
+                assert block_at < skip_at < next_at
+                assert source.count(skip_block) == 1
+                assert skip_block.splitlines()[1] == "    goto L_004d65b9;"
+                assert "/* 004d65b9  mov al, 1 */" in source
+                assert "/* 004d65be  mov dword ptr fs:[0], ecx */" in source
+                assert "/* 004d65cb  ret 4 */" in source
+            else:
+                assert skip_block == ""
+                assert "ISAAC_VITA_LASER_RING_SHADOW_SKIP" not in source
             rendered_by_base[(root, base)] = (begin_block, end_block)
         assert (rendered_by_base[(root, DEFAULT_BASE)] ==
                 rendered_by_base[(root, VITA_BASE)])
@@ -189,6 +202,13 @@ def _verify_build_switch() -> None:
     assert '"^void sub_004d(1330|5090)' in cmake
     assert build_tool.count('"-DISAAC_VITA_LASER_PROFILE=OFF"') == 2
     assert '"ISAAC_VITA_LASER_PROFILE": False' in build_tool
+    option = re.search(
+        r"option\(ISAAC_VITA_LASER_RING_SHADOW_SKIP\s+.*?\s+(ON|OFF)\)",
+        cmake, flags=re.S,
+    )
+    assert option is not None and option.group(1) == "OFF"
+    assert cmake.count("ISAAC_VITA_LASER_RING_SHADOW_SKIP=1") == 1
+    assert "--laser-ring-shadow-skip" in build_tool
 
 
 def run(pe_path: Path) -> None:

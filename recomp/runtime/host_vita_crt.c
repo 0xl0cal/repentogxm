@@ -25,6 +25,9 @@
 #endif
 
 #include "host_vita_crt.h"
+#if defined(ISAAC_VITA_CRT_ATOF_SMALLINT) && ISAAC_VITA_CRT_ATOF_SMALLINT
+#include "host_vita_atof_smallint.h"
+#endif
 #include "host_vita_import_id.h"
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
 #if !defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
@@ -59,6 +62,21 @@ int isaac_vita_crt_seek_shadow_oracle_fstat(int descriptor,
 #define vita_crt_shadow_native_fstat fstat
 #endif
 #endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+#if !defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
+#error ISAAC_VITA_CRT_DESCRIPTOR_RECOVER requires the ARCHIVE_FILE_CACHE token layout
+#endif
+/* The fresh handle is positioned through the seek shadow's counted seams
+ * when that oracle is linked, so its pinned syscall counts see the one real
+ * seek; production resolves both to libc. */
+#if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
+#define vita_crt_recover_native_fseek vita_crt_shadow_native_fseek
+#define vita_crt_recover_native_ftell vita_crt_shadow_native_ftell
+#else
+#define vita_crt_recover_native_fseek fseek
+#define vita_crt_recover_native_ftell ftell
+#endif
+#endif
 #include "host_vita_heap.h"
 #include "host_vita_startup.h"
 #include "third_party/musl_fmt_fp/musl_fmt_fp.h"
@@ -67,6 +85,9 @@ int isaac_vita_crt_seek_shadow_oracle_fstat(int descriptor,
 #endif
 #include "platform.h"
 #include "vita_host_services.h"
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
+#include "kage_vita_phase_profile.h"
+#endif
 
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
 #ifndef ISAAC_VITA_CRT_RAW_ARCHIVE_LONG_MAX
@@ -200,6 +221,16 @@ typedef struct vita_crt_file_token {
         char name[ISAAC_VITA_CRT_SEEK_SHADOW_NAME_CAPACITY];
     } seek_shadow;
 #endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    /* Read-only tokens retain the resolved native path and mode: a
+     * descriptor SceIofilemgr invalidated (ENODEV after suspend/resume) is
+     * reopened there at the logical cursor.  path[0] == 0 means the token is
+     * not recoverable (write side, or a path over the bound). */
+    struct {
+        char path[ISAAC_VITA_STARTUP_PATH_MAX + 1U];
+        char mode[4];
+    } recover;
+#endif
 #else
     FILE *stream;
 #endif
@@ -211,6 +242,14 @@ typedef struct vita_crt_file_token {
 } vita_crt_file_token;
 
 static vita_crt_file_token s_file_tokens[ISAAC_VITA_CRT_FILE_TOKEN_COUNT];
+#if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
+/* All access is under s_file_lock.  This stores no FILE pointer.  Invalidate
+ * at both token-publication sites: the remembered linear-search first match
+ * cannot then be superseded by a newly published, lower-index duplicate. */
+static uint32_t s_file_lookup_hint = ISAAC_VITA_CRT_FILE_TOKEN_COUNT;
+static uint32_t s_file_lookup_hits;
+static uint32_t s_file_lookup_misses;
+#endif
 
 static FILE *vita_crt_dynamic_stream(const vita_crt_file_token *entry)
 {
@@ -340,6 +379,11 @@ static size_t vita_crt_raw_archive_fread(vita_crt_file_token *entry,
         errno = EOVERFLOW;
         return 0U;
     }
+    /* Match newlib __srefill_r: sticky EOF does not issue another read.
+     * A successful raw fseek already clears EOF (but not the error flag).
+     * Retain the validation/zero-size ordering above and leave errno alone. */
+    if (entry->raw_archive.eof)
+        return 0U;
     requested = (uint32_t)(size * count);
     while (complete < requested) {
         uint32_t remaining = requested - complete;
@@ -1125,6 +1169,242 @@ _Static_assert(ISAAC_VITA_CRT_IO_SHADOW_VARIANT_COUNT == 4U &&
 _Static_assert(ISAAC_VITA_CRT_STANDARD_STREAM_COUNT +
                ISAAC_VITA_CRT_FILE_TOKEN_COUNT + 1U <= FOPEN_MAX,
                "Vita archive cache exceeds newlib FILE capacity");
+#endif
+
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+/* SceIofilemgr drops every open ux0: descriptor of the process across an
+ * application suspend/resume or PS-button interception.  The next
+ * sceIoRead/sceIoLseek on such a descriptor fails with
+ * SCE_ERROR_ERRNO_ENODEV, which both lanes surface as errno ENODEV: newlib
+ * through fread -> __srefill_r -> __sread -> _read_r, the raw lane through
+ * vita_crt_raw_archive_errno.  The idle archive stream already survives this
+ * (a failed cache reset falls back to a fresh fopen); a live token did not,
+ * and ArchivedFile then faulted on "block header is invalid".  Every
+ * read-only token retains its native path and mode at fopen.  A failed
+ * fread/fseek on such a token is recovered exactly once: fresh handle first,
+ * positioned at the logical cursor recorded before the call (no syscall:
+ * raw position, deferred SEEK_END, or newlib's _offset - _r), then the dead
+ * handle is closed, the fresh one swapped into the slot (the published token
+ * value is the slot address and does not change) and the whole call redone.
+ * Anything that cannot be done exactly leaves the token untouched and lets
+ * the ordinary failure path run. */
+typedef struct vita_crt_descriptor_recover_stats {
+    uint32_t enodev;        /* ENODEV failures on tokens with a retained path */
+    uint32_t recovered;     /* ... redone on a fresh handle (one receipt each) */
+    uint32_t unknown_pos;   /* ... abandoned: logical cursor unknown */
+    uint32_t reopen_fail;   /* ... abandoned: fresh open, size or seek failed */
+    uint32_t redo_fail;     /* redone calls that failed again */
+} vita_crt_descriptor_recover_stats;
+
+typedef struct vita_crt_descriptor_recover_receipt {
+    char key[ISAAC_VITA_ARCHIVE_CACHE_KEY_CAPACITY];
+    const char *lane;
+    const char *op;
+    long position;
+} vita_crt_descriptor_recover_receipt;
+
+static vita_crt_descriptor_recover_stats s_descriptor_recover;
+
+static void vita_crt_recover_clear(vita_crt_file_token *entry)
+{
+    entry->recover.path[0] = '\0';
+    entry->recover.mode[0] = '\0';
+}
+
+/* Caller owns s_file_lock.  Only "r"/"rb" tokens are recoverable: a write
+ * or update stream has buffered state no reopen can reproduce.  A path over
+ * the bound leaves the token unrecoverable rather than truncated. */
+static void vita_crt_recover_publish(vita_crt_file_token *entry,
+                                     const char *mode,
+                                     const char *native_path)
+{
+    size_t path_length = strlen(native_path);
+    size_t mode_length = strlen(mode);
+
+    vita_crt_recover_clear(entry);
+    if (mode[0] != 'r' || strchr(mode, '+') != NULL ||
+        path_length >= sizeof entry->recover.path ||
+        mode_length >= sizeof entry->recover.mode)
+        return;
+    memcpy(entry->recover.path, native_path, path_length + 1U);
+    memcpy(entry->recover.mode, mode, mode_length + 1U);
+}
+
+/* Caller owns s_file_lock.  The logical cursor of a live token without a
+ * syscall, or -1 when it is not known exactly.  A raw token keeps it
+ * arithmetically.  A newlib FILE with a deferred SEEK_END sits at
+ * size + pending_offset; otherwise newlib's own ftell arithmetic applies,
+ * _offset - _r, which is exact only while __SOFF says _offset is (a failed
+ * read or seek clears it, so this must run before the native call). */
+static long vita_crt_recover_position(const vita_crt_file_token *entry,
+                                      FILE *stream)
+{
+    if (entry->raw_archive.live) {
+        if ((uint64_t)entry->raw_archive.position >
+            (uint64_t)ISAAC_VITA_CRT_RAW_ARCHIVE_LONG_MAX)
+            return -1L;
+        return (long)entry->raw_archive.position;
+    }
+    if (!stream)
+        return -1L;
+#if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
+    if (entry->seek_shadow.pending_end && entry->seek_shadow.size_valid) {
+        int64_t target = entry->seek_shadow.size +
+            (int64_t)entry->seek_shadow.pending_offset;
+
+        if (target < 0 ||
+            target > (int64_t)ISAAC_VITA_CRT_RAW_ARCHIVE_LONG_MAX)
+            return -1L;
+        return (long)target;
+    }
+#endif
+#if defined(__NEWLIB__)
+    if ((stream->_flags & (__SOFF | __SRD)) == (__SOFF | __SRD) &&
+        !(stream->_flags & __SWR) && stream->_ub._base == NULL)
+        return (long)stream->_offset - (long)stream->_r;
+    return -1L;
+#else
+    /* Host oracles: libc exposes no cursor field, so one real ftell. */
+    return ftell(stream);
+#endif
+}
+
+/* Caller owns s_file_lock.  A fresh SceIo descriptor on the retained path;
+ * the archive must still have the size recorded at open.  The dead
+ * descriptor goes only once the fresh one is ready; the kernel already
+ * dropped it, so its close result carries nothing. */
+static int vita_crt_recover_raw(vita_crt_file_token *entry)
+{
+    int32_t descriptor = vita_crt_raw_sce_open(entry->recover.path);
+    int64_t size = 0;
+
+    if (descriptor < 0) {
+        ++s_descriptor_recover.reopen_fail;
+        return 0;
+    }
+    if (vita_crt_raw_sce_get_size(descriptor, &size) < 0 ||
+        size != entry->raw_archive.size) {
+        (void)vita_crt_raw_sce_close(descriptor);
+        ++s_descriptor_recover.reopen_fail;
+        return 0;
+    }
+    (void)vita_crt_raw_sce_close(entry->raw_archive.descriptor);
+    entry->raw_archive.descriptor = descriptor;
+    return 1;
+}
+
+/* Caller owns s_file_lock.  A fresh newlib FILE on the retained path with
+ * the 16 KiB buffer the open path installs, seeked to `position` when the
+ * redo depends on the cursor (a SEEK_SET whose ftell must agree, as the
+ * cache reset demands).  The dead FILE is discarded afterwards through the
+ * cache module's close seam and never enters the idle slot. */
+static int vita_crt_recover_stream(vita_crt_file_token *entry,
+                                   long position, int need_position)
+{
+    isaac_vita_archive_cache_file discard =
+        ISAAC_VITA_ARCHIVE_CACHE_FILE_INITIALIZER;
+    FILE *fresh;
+
+    if (need_position && position < 0L) {
+        ++s_descriptor_recover.unknown_pos;
+        return 0;
+    }
+    fresh = isaac_vita_archive_cache_reopen_native(
+        entry->recover.path, entry->recover.mode);
+    if (!fresh) {
+        ++s_descriptor_recover.reopen_fail;
+        return 0;
+    }
+    (void)setvbuf(fresh, NULL, _IOFBF, ISAAC_VITA_CRT_FILE_READ_BUFFER_SIZE);
+    if (need_position &&
+        (vita_crt_recover_native_fseek(fresh, position, SEEK_SET) != 0 ||
+         vita_crt_recover_native_ftell(fresh) != position)) {
+        discard.stream = fresh;
+        (void)isaac_vita_archive_cache_force_discard(&discard);
+        ++s_descriptor_recover.reopen_fail;
+        return 0;
+    }
+    discard.stream = entry->file.stream;
+    (void)isaac_vita_archive_cache_force_discard(&discard);
+    entry->file.stream = fresh;
+#if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
+    /* The fresh handle's real cursor is the logical one: nothing deferred. */
+    if (need_position)
+        entry->seek_shadow.pending_end = 0U;
+#endif
+    return 1;
+}
+
+#if defined(ISAAC_VITA_IO_PROFILE)
+/* The fresh FILE starts with an empty buffer the replay model never saw. */
+static void vita_crt_recover_note_io_shadow(vita_crt_file_token *entry)
+{
+    if (!s_io_profile_active || !entry->file.key[0] ||
+        entry->raw_archive.live)
+        return;
+    if (!entry->io_shadow.selected)
+        vita_crt_io_shadow_select_unknown(&entry->io_shadow);
+    else
+        vita_crt_io_shadow_invalidate(&entry->io_shadow);
+}
+#endif
+
+/* Caller owns s_file_lock.  One recovery attempt for a call that failed
+ * with ENODEV on a token with a retained path.  Returns 1 when the token
+ * owns a fresh handle at the recorded cursor and the caller must redo the
+ * call from its start; 0 leaves the token untouched.  The receipt is filled
+ * for the caller to log once the lock is released. */
+static int vita_crt_recover_token(vita_crt_file_token *entry, long position,
+                                  int need_position, const char *op,
+                                  vita_crt_descriptor_recover_receipt *receipt)
+{
+    const char *name;
+    size_t length;
+    int saved_errno = errno;
+    int recovered;
+
+    ++s_descriptor_recover.enodev;
+    if (entry->raw_archive.live) {
+        if (position < 0L) {
+            ++s_descriptor_recover.unknown_pos;
+            recovered = 0;
+        } else {
+            recovered = vita_crt_recover_raw(entry);
+            if (recovered)
+                entry->raw_archive.position = position;
+        }
+    } else {
+        recovered = vita_crt_recover_stream(entry, position, need_position);
+    }
+    errno = saved_errno;
+    if (!recovered)
+        return 0;
+    ++s_descriptor_recover.recovered;
+#if defined(ISAAC_VITA_IO_PROFILE)
+    vita_crt_recover_note_io_shadow(entry);
+#endif
+    name = strrchr(entry->recover.path, '/');
+    name = entry->file.key[0] ? entry->file.key
+        : name ? name + 1 : entry->recover.path;
+    length = strlen(name);
+    if (length >= sizeof receipt->key)
+        length = sizeof receipt->key - 1U;
+    memcpy(receipt->key, name, length);
+    receipt->key[length] = '\0';
+    receipt->lane = entry->raw_archive.live ? "raw" : "newlib";
+    receipt->op = op;
+    receipt->position = position;
+    return 1;
+}
+
+/* Never under s_file_lock. */
+static void vita_crt_recover_log_receipt(
+    const vita_crt_descriptor_recover_receipt *receipt)
+{
+    isaac_vita_log(
+        "arcdiag v1 tag=descriptor-recover-v1 key=%s lane=%s pos=%ld op=%s",
+        receipt->key, receipt->lane, receipt->position, receipt->op);
+}
 #endif
 
 /* The focused qsort host oracle compiles this complete translation unit on
@@ -2374,6 +2654,44 @@ static int vita_crt_stdio_format(CPU *__restrict c, uint32_t format,
     }
 }
 
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
+/* Observe only the completed, non-truncated frozen logger invocation.  These
+ * are pure checks: unlike guest_stack_address they cannot fault or change the
+ * guest stack low-water mark.  The ordinary formatter has already consumed
+ * both %d arguments.  Its fixed output capacity is disjoint from the checked
+ * stack ranges, so rereading those two words cannot see an output overwrite.
+ * Do not read the descriptor, Room object, name string or formatted output. */
+static void vita_crt_room_log_completed(
+    CPU *__restrict c, uint32_t buffer, uint32_t count, uint32_t format,
+    uint32_t arguments, uint32_t written, int standard)
+{
+    uint32_t frame;
+    int saved_errno;
+
+    if (format != ISAAC_VITA_CRT_ROOM_LOG_FORMAT_VA || !standard ||
+        buffer < ISAAC_VITA_CRT_ROOM_LOG_BUFFER_VA ||
+        buffer >= ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END ||
+        count != ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END - buffer ||
+        written >= count || !guest_stack_contains(c, c->esp, 4U) ||
+        ld32(c->esp) != ISAAC_VITA_CRT_VSPRINTF_TIMER_RETURN_RVA ||
+        c->ebp > UINT32_MAX - 24U ||
+        !guest_stack_contains(c, c->ebp, 24U))
+        return;
+    frame = c->ebp;
+    if (arguments != frame + 16U ||
+        !(frame + 24U <= buffer || frame >= ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END) ||
+        !(c->esp + 4U <= buffer || c->esp >= ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END) ||
+        ld32(frame + 4U) != ISAAC_VITA_CRT_ROOM_LOG_ORIGIN_RETURN_RVA ||
+        ld32(frame + 8U) != 0U || ld32(frame + 12U) != format ||
+        memcmp((const void *)(uintptr_t)format, ISAAC_VITA_CRT_ROOM_LOG_FORMAT,
+               sizeof ISAAC_VITA_CRT_ROOM_LOG_FORMAT) != 0)
+        return;
+    saved_errno = errno;
+    kage_vita_phase_profile_room_log(ld32(arguments), ld32(arguments + 4U));
+    errno = saved_errno;
+}
+#endif
+
 static void vita_crt_stdio_common_vsprintf(CPU *__restrict c)
 {
     uint32_t buffer = vita_crt_arg(c, 2U);
@@ -2412,6 +2730,10 @@ static void vita_crt_stdio_common_vsprintf(CPU *__restrict c)
             st8(buffer + out.written, 0U);
         c->eax = out.written <= count ? out.written : UINT32_MAX;
     }
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
+    vita_crt_room_log_completed(
+        c, buffer, count, format, arguments, out.written, standard);
+#endif
     vita_crt_cdecl_return(c);
 }
 
@@ -2693,6 +3015,19 @@ static void vita_crt_file_unlock(void)
     __sync_lock_release(&s_file_lock);
 }
 
+#if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
+int isaac_vita_crt_file_lookup_hint_get(uint32_t out[2])
+{
+    if (!out || __sync_lock_test_and_set(&s_file_lock, 1U))
+        return 0;
+    __sync_synchronize();
+    out[0] = s_file_lookup_hits;
+    out[1] = s_file_lookup_misses;
+    vita_crt_file_unlock();
+    return 1;
+}
+#endif
+
 #undef VITA_CRT_SPIN_HINT
 
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
@@ -2784,6 +3119,36 @@ void isaac_vita_crt_seek_shadow_report(const char *why)
         (unsigned)snapshot.top_name[name_order[2]].count,
         snapshot.top_name[name_order[3]].name,
         (unsigned)snapshot.top_name[name_order[3]].count);
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    isaac_vita_crt_descriptor_recover_report(why);
+#endif
+    errno = saved_errno;
+}
+#endif
+
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+/* One bounded counter line.  Never under s_file_lock while logging. */
+void isaac_vita_crt_descriptor_recover_report(const char *why)
+{
+    vita_crt_descriptor_recover_stats snapshot;
+    uint32_t retained = 0U;
+    uint32_t index;
+    int saved_errno = errno;
+
+    vita_crt_file_lock();
+    snapshot = s_descriptor_recover;
+    for (index = 0U; index < ISAAC_VITA_CRT_FILE_TOKEN_COUNT; ++index) {
+        if (vita_crt_dynamic_file_is_live(&s_file_tokens[index]) &&
+            s_file_tokens[index].recover.path[0])
+            ++retained;
+    }
+    vita_crt_file_unlock();
+    isaac_vita_log(
+        "KAGE VITA CRT DESCRIPTOR RECOVER: why=%s enodev=%u recovered=%u "
+        "unknown_pos=%u reopen_fail=%u redo_fail=%u retained=%u",
+        why, (unsigned)snapshot.enodev, (unsigned)snapshot.recovered,
+        (unsigned)snapshot.unknown_pos, (unsigned)snapshot.reopen_fail,
+        (unsigned)snapshot.redo_fail, (unsigned)retained);
     errno = saved_errno;
 }
 #endif
@@ -3091,7 +3456,10 @@ void isaac_vita_crt_archive_cache_shutdown(void)
 #endif
     vita_crt_file_unlock();
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
+    /* The seek shadow report also emits the descriptor-recover line. */
     isaac_vita_crt_seek_shadow_report("shutdown");
+#elif defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    isaac_vita_crt_descriptor_recover_report("shutdown");
 #endif
     errno = saved_errno;
 #endif
@@ -3128,10 +3496,31 @@ static int vita_crt_find_file_token_unlocked(uint32_t token, FILE **stream,
             return 1;
         }
     }
+#if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
+    i = s_file_lookup_hint;
+    if (i < ISAAC_VITA_CRT_FILE_TOKEN_COUNT &&
+        vita_crt_dynamic_file_is_live(&s_file_tokens[i]) &&
+        s_file_tokens[i].token == token) {
+        if (stream)
+            *stream = vita_crt_dynamic_stream(&s_file_tokens[i]);
+        if (dynamic_index)
+            *dynamic_index = (int)i;
+        if (standard_index)
+            *standard_index = -1;
+        if (s_file_lookup_hits != UINT32_MAX)
+            ++s_file_lookup_hits;
+        return 1;
+    }
+    if (s_file_lookup_misses != UINT32_MAX)
+        ++s_file_lookup_misses;
+#endif
     for (i = 0U; i < ISAAC_VITA_CRT_FILE_TOKEN_COUNT; ++i) {
         FILE *dynamic = vita_crt_dynamic_stream(&s_file_tokens[i]);
         if (vita_crt_dynamic_file_is_live(&s_file_tokens[i]) &&
             s_file_tokens[i].token == token) {
+#if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
+            s_file_lookup_hint = i;
+#endif
             if (stream)
                 *stream = dynamic;
             if (dynamic_index)
@@ -3210,6 +3599,12 @@ static int vita_crt_fopen_async_write_locked(CPU *__restrict c,
         return 1;
     }
     s_file_tokens[i].token = token;
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    vita_crt_recover_clear(&s_file_tokens[i]);
+#endif
+#if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
+    s_file_lookup_hint = ISAAC_VITA_CRT_FILE_TOKEN_COUNT;
+#endif
     c->eax = token;
     vita_crt_file_unlock();
     errno = saved_errno;
@@ -3394,6 +3789,9 @@ static void vita_crt_fopen(CPU *__restrict c)
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     vita_crt_seek_shadow_publish(&s_file_tokens[i], mode, native_path);
 #endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    vita_crt_recover_publish(&s_file_tokens[i], mode, native_path);
+#endif
 #if defined(ISAAC_VITA_IO_PROFILE)
     s_file_tokens[i].io_shadow = opened_shadow;
 #endif
@@ -3401,6 +3799,9 @@ static void vita_crt_fopen(CPU *__restrict c)
     s_file_tokens[i].stream = stream;
 #endif
     s_file_tokens[i].token = token;
+#if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
+    s_file_lookup_hint = ISAAC_VITA_CRT_FILE_TOKEN_COUNT;
+#endif
     c->eax = token;
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
     if (opened_entry.file.key[0]) {
@@ -3654,6 +4055,9 @@ static void vita_crt_fclose(CPU *__restrict c)
         vita_crt_seek_shadow_note_write();
     vita_crt_seek_shadow_clear(&s_file_tokens[index]);
 #endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    vita_crt_recover_clear(&s_file_tokens[index]);
+#endif
     s_file_tokens[index].token = 0U;
 #if defined(ISAAC_VITA_GAME_LOG_BATCH)
     if (tracked) {
@@ -3749,6 +4153,14 @@ static void vita_crt_fread(CPU *__restrict c)
     int32_t raw_position_before = -1;
     int raw_position_valid = 0;
 #endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    vita_crt_descriptor_recover_receipt recover_receipt =
+        { { 0 }, NULL, NULL, -1L };
+    long recover_position = -1L;
+    int recover_armed = 0;
+    int recovered = 0;
+    uint8_t recover_raw_error = 0U;
+#endif
 
     if (!vita_crt_file_buffer_range(
             c, buffer, size, count, "fread guest range overflow", &bytes))
@@ -3764,6 +4176,17 @@ static void vita_crt_fread(CPU *__restrict c)
         guest_fault(c, token, "fread received an unknown FILE token");
         return;
     }
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    /* Before the deferred SEEK_END is applied: that real seek fails on a
+     * dead descriptor too and would leave nothing to recover the cursor
+     * from.  One branch on the hot path for tokens without a path. */
+    if (index >= 0 && s_file_tokens[index].recover.path[0]) {
+        recover_armed = 1;
+        recover_position =
+            vita_crt_recover_position(&s_file_tokens[index], stream);
+        recover_raw_error = s_file_tokens[index].raw_archive.error;
+    }
+#endif
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     vita_crt_seek_shadow_apply(stream, index);
     vita_crt_seek_shadow_note_cursor_op(index);
@@ -3882,6 +4305,27 @@ static void vita_crt_fread(CPU *__restrict c)
         result = vita_crt_native_fread(
             (void *)(uintptr_t)buffer, size, count, stream);
     read_errno = errno;
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    if (recover_armed && result < count && read_errno == ENODEV &&
+        vita_crt_recover_token(&s_file_tokens[index], recover_position, 1,
+                               "fread", &recover_receipt)) {
+        /* The whole request again from the recorded cursor: a partial
+         * element newlib already copied is read again, not skipped. */
+        stream = vita_crt_dynamic_stream(&s_file_tokens[index]);
+        recovered = 1;
+        errno = 0;
+        if (s_file_tokens[index].raw_archive.live) {
+            s_file_tokens[index].raw_archive.error = recover_raw_error;
+            result = vita_crt_raw_archive_fread(
+                &s_file_tokens[index], (void *)(uintptr_t)buffer, size,
+                count);
+        } else {
+            result = vita_crt_native_fread(
+                (void *)(uintptr_t)buffer, size, count, stream);
+        }
+        read_errno = errno;
+    }
+#endif
 #if defined(ISAAC_VITA_EXIT_MENU_PROFILE)
     isaac_vita_exit_menu_profile_fread_end(
         (uint32_t)((uint64_t)size * (uint64_t)result));
@@ -3891,6 +4335,10 @@ static void vita_crt_fread(CPU *__restrict c)
         vita_crt_file_ferror(stream, index);
 #else
         ferror(stream);
+#endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    if (recovered && failed)
+        ++s_descriptor_recover.redo_fail;
 #endif
 #if defined(ISAAC_VITA_IO_PROFILE)
     if (s_io_profile_active) {
@@ -3996,6 +4444,12 @@ static void vita_crt_fread(CPU *__restrict c)
     vita_crt_file_unlock();
     errno = read_errno;
     vita_crt_file_errno_restore(saved_errno, failed, EIO);
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    if (recovered) {
+        vita_crt_recover_log_receipt(&recover_receipt);
+        errno = saved_errno;
+    }
+#endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
     if (log_anomaly) {
         vita_crt_archive_diag_log_event(
@@ -4083,6 +4537,13 @@ static void vita_crt_fseek(CPU *__restrict c)
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     int report_due = 0;
 #endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    vita_crt_descriptor_recover_receipt recover_receipt =
+        { { 0 }, NULL, NULL, -1L };
+    long recover_position = -1L;
+    int recover_armed = 0;
+    int recovered = 0;
+#endif
 
     vita_crt_file_lock();
     if (!vita_crt_find_file_token_unlocked(
@@ -4107,6 +4568,18 @@ static void vita_crt_fseek(CPU *__restrict c)
     if (track_archive_seek)
         position_before = vita_crt_file_ftell(stream, index);
 #endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    /* Raw tokens seek arithmetically and never reach the kernel here.  Only
+     * a SEEK_CUR redo depends on the cursor; SEEK_SET and SEEK_END are redone
+     * on the fresh handle as they are. */
+    if (index >= 0 && s_file_tokens[index].recover.path[0] &&
+        !s_file_tokens[index].raw_archive.live) {
+        recover_armed = 1;
+        if (origin == SEEK_CUR)
+            recover_position =
+                vita_crt_recover_position(&s_file_tokens[index], stream);
+    }
+#endif
     errno = 0;
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
     result = vita_crt_file_fseek(stream, index, (long)offset, origin);
@@ -4114,6 +4587,22 @@ static void vita_crt_fseek(CPU *__restrict c)
     result = fseek(stream, (long)offset, origin);
 #endif
     seek_errno = errno;
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    if (recover_armed && result != 0 && seek_errno == ENODEV &&
+        vita_crt_recover_token(&s_file_tokens[index], recover_position,
+                               origin == SEEK_CUR, "fseek",
+                               &recover_receipt)) {
+        /* Through the lane dispatcher again, so the seek shadow's deferred
+         * state is exactly what a first-time success would have left. */
+        stream = vita_crt_dynamic_stream(&s_file_tokens[index]);
+        recovered = 1;
+        errno = 0;
+        result = vita_crt_file_fseek(stream, index, (long)offset, origin);
+        seek_errno = errno;
+        if (result != 0)
+            ++s_descriptor_recover.redo_fail;
+    }
+#endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
     if (track_archive_seek ||
         (result != 0 && index >= 0 && s_file_tokens[index].file.key[0])) {
@@ -4166,6 +4655,12 @@ static void vita_crt_fseek(CPU *__restrict c)
     vita_crt_file_unlock();
     errno = seek_errno;
     vita_crt_file_errno_restore(saved_errno, result != 0, EIO);
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    if (recovered) {
+        vita_crt_recover_log_receipt(&recover_receipt);
+        errno = saved_errno;
+    }
+#endif
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     if (report_due) {
         isaac_vita_crt_seek_shadow_report("periodic");
@@ -4958,6 +5453,9 @@ static void vita_crt_atof(CPU *__restrict c)
             "atof received a null guest pointer",
             "atof input is unreadable or exceeds 4095 bytes"))
         return;
+#if defined(ISAAC_VITA_CRT_ATOF_SMALLINT) && ISAAC_VITA_CRT_ATOF_SMALLINT
+    if (!isaac_vita_atof_smallint(text, &value))
+#endif
     value = strtod(text, NULL);
     errno = saved_errno;
     fpush(c, value);

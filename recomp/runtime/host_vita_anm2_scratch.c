@@ -36,6 +36,9 @@ typedef struct anm2_scratch_state {
     uint32_t acquired_count;
     uint32_t freed_count;
     uint32_t peak_live;
+#if defined(ISAAC_VITA_ANM2_POOL_INIT) && ISAAC_VITA_ANM2_POOL_INIT
+    uint32_t bulk_init;
+#endif
     uint8_t live[ISAAC_VITA_ANM2_SEGMENT_COUNT];
 } anm2_scratch_state;
 
@@ -465,6 +468,9 @@ int isaac_vita_anm2_scratch_malloc(
         s_state.acquired_count = 0U;
         s_state.freed_count = 0U;
         s_state.peak_live = 0U;
+#if defined(ISAAC_VITA_ANM2_POOL_INIT) && ISAAC_VITA_ANM2_POOL_INIT
+        s_state.bulk_init = 0U;
+#endif
         ++s_state.session_id;
         if (!s_state.session_id)
             ++s_state.session_id;
@@ -551,16 +557,75 @@ int isaac_vita_anm2_scratch_free(
         if (!complete || anm2_scratch_should_log_session(s_state.session_id))
             isaac_vita_log(
                 "ANM2 scratch free summary: session=%u acquired=%u freed=%u "
-                "peak=%u complete=%s",
+                "peak=%u complete=%s"
+#if defined(ISAAC_VITA_ANM2_POOL_INIT) && ISAAC_VITA_ANM2_POOL_INIT
+                " bulk_init=%u"
+#endif
+                ,
                 (unsigned)s_state.session_id,
                 (unsigned)s_state.acquired_count,
                 (unsigned)s_state.freed_count,
                 (unsigned)s_state.peak_live,
-                complete ? "yes" : "no");
+                complete ? "yes" : "no"
+#if defined(ISAAC_VITA_ANM2_POOL_INIT) && ISAAC_VITA_ANM2_POOL_INIT
+                , (unsigned)s_state.bulk_init
+#endif
+                );
     }
     anm2_scratch_unlock();
     return ISAAC_VITA_ANM2_SCRATCH_HANDLED;
 }
+
+#if defined(ISAAC_VITA_ANM2_POOL_INIT) && ISAAC_VITA_ANM2_POOL_INIT
+int isaac_vita_anm2_scratch_init_pool(
+    unsigned index, uint32_t pool,
+    uint32_t guest_stack_floor, uint32_t guest_stack_ceiling)
+{
+    /* Copied from frozen 00002120 and the six 00009b40 caller loops. Do not
+     * memset whole records: the untouched padding has observable old bytes. */
+    static const uint32_t color[11] = {
+        0x3f800000U, 0x3f800000U, 0x3f800000U, 0x3f800000U,
+        0U, 0U, 0U, 0U, 0U, 0U, 0U
+    };
+    static const uint32_t zero = 0U;
+    uintptr_t base;
+    uint8_t *record;
+    unsigned i, stride;
+
+    if (index >= ISAAC_VITA_ANM2_SEGMENT_COUNT || !anm2_scratch_try_lock())
+        return 0;
+    base = atomic_load_explicit(&s_published_base, memory_order_relaxed);
+    if (s_state.poisoned || s_state.guest_heap_fallback || s_state.uid < 0 ||
+        !base || base > UINT32_MAX - ISAAC_VITA_ANM2_MEMBLOCK_BYTES ||
+        base + s_sites[index].offset != pool || !s_state.live[index] ||
+        s_state.acquired_count != index + 1U ||
+        s_state.live_count != index + 1U || s_state.freed_count != 0U ||
+        s_state.guest_stack_floor != guest_stack_floor ||
+        s_state.guest_stack_ceiling != guest_stack_ceiling) {
+        anm2_scratch_unlock();
+        return 0;
+    }
+    record = (uint8_t *)(uintptr_t)pool;
+    stride = index < 4U ? 84U : 108U;
+    for (i = 0U; i < 5000U; ++i, record += stride) {
+        if (index < 4U) {
+            memcpy(record, &zero, 4U);
+            memcpy(record + 4U, &zero, 4U);
+            memcpy(record + 0x10U, &zero, 4U);
+            memcpy(record + 0x14U, &zero, 4U);
+            memcpy(record + 0x18U, color, sizeof color);
+            record[0x48U] = 0U;
+        } else {
+            memset(record, 0, 0x28U);
+            memcpy(record + 0x30U, color, sizeof color);
+            record[0x60U] = 0U;
+        }
+    }
+    ++s_state.bulk_init;
+    anm2_scratch_unlock();
+    return 1;
+}
+#endif
 
 #ifdef ISAAC_VITA_ANM2_SCRATCH_ORACLE
 int isaac_vita_anm2_scratch_oracle_snapshot(

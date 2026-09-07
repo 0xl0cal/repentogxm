@@ -49,6 +49,58 @@ def function_body(source: str, name: str) -> str:
     return match.group("body")
 
 
+def check_present_heartbeat(backend: str, cmake: str, temp: Path) -> None:
+    """Compile the real backend selector, not a duplicated reference helper."""
+    match = re.search(
+        r"static int kage_vita_log_heartbeat\(unsigned count\)\s*\{.*?\n\}",
+        backend, re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError("backend heartbeat selector missing")
+    start = cmake.index("    if(ISAAC_VITA_STAGE_HEARTBEAT)\n")
+    scope = cmake[start:cmake.index("    endif()", start)]
+    for name in ("kage_vita_generated_hooks.c", "kage_vita_backend.c"):
+        if scope.count('"${ISAAC_RUNTIME}/' + name + '"') != 1:
+            raise AssertionError(f"stage heartbeat definition owner lost: {name}")
+
+    # PHASE still suppresses this legacy report; SIM explicitly opts into
+    # the original cadence even with STAGE off. Defined-zero means off too.
+    variants = (
+        ("default", (), 0),
+        ("zero", ("ISAAC_VITA_STAGE_HEARTBEAT=0", "ISAAC_VITA_SIM_CADENCE_RECEIPT=0"), 0),
+        ("stage", ("ISAAC_VITA_STAGE_HEARTBEAT=1",), 1),
+        ("cadence", ("ISAAC_VITA_SIM_CADENCE_RECEIPT=1",), 1),
+        ("both", ("ISAAC_VITA_STAGE_HEARTBEAT=1", "ISAAC_VITA_SIM_CADENCE_RECEIPT=1"), 1),
+        ("phase", ("ISAAC_VITA_PHASE_PROFILE=1",), 0),
+        ("phase-stage", ("ISAAC_VITA_PHASE_PROFILE=1", "ISAAC_VITA_STAGE_HEARTBEAT=1"), 0),
+        ("phase-cadence", ("ISAAC_VITA_PHASE_PROFILE=1", "ISAAC_VITA_SIM_CADENCE_RECEIPT=1"), 0),
+    )
+    source = temp / "present_heartbeat.c"
+    source.write_text("#include <limits.h>\n" + match.group(0) + r'''
+static int check(unsigned count)
+{
+    int early = count == 1 || count == 2 || count == 4 || count == 8 ||
+                count == 16 || count == 32 || count == 64;
+    int wanted = EXPECT_HEARTBEAT && count != 0 &&
+                 (early || count % 120 == 0);
+    return kage_vita_log_heartbeat(count) == wanted;
+}
+int main(void)
+{
+    for (unsigned count = 0; count <= 10000; ++count)
+        if (!check(count)) return 1;
+    return check(UINT_MAX) ? 0 : 2;
+}
+''', encoding="utf-8")
+    for name, defines, expected in variants:
+        executable = temp / ("heartbeat-" + name + ".exe")
+        run([compiler(), "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+             *("-D" + value for value in defines),
+             "-DEXPECT_HEARTBEAT=" + str(expected), str(source), "-o", str(executable)])
+        run([str(executable)])
+    print("present heartbeat selector: PASS (8 modes, 10002 counts each)")
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[2]
     runtime = root / "recomp" / "runtime"
@@ -117,6 +169,7 @@ def main() -> int:
             raise AssertionError(f"raw gate cadence contract lost: {needle}")
 
     with tempfile.TemporaryDirectory(prefix="isaac-sim-cadence-") as temp:
+        check_present_heartbeat(backend, cmake, Path(temp))
         executable = Path(temp) / (
             "sim_cadence_oracle.exe" if __import__("os").name == "nt"
             else "sim_cadence_oracle"

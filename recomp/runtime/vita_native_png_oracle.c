@@ -197,13 +197,16 @@ int main(int argc, char **argv)
     work.raw = raw;
     work.staging = (uint8_t *)malloc(staging_bytes);
     work.staging_bytes = staging_bytes;
-    work.tinfl_state = calloc(1U, ISAAC_NP_TINFL_STATE_BYTES);
+    work.tinfl_state = malloc(ISAAC_NP_TINFL_STATE_BYTES);
     work.last_row_pre_gamma = last;
     work.now_us = NULL;
     if (!raw || !last || !work.staging || !work.tinfl_state) {
         fprintf(stderr, "out of memory\n");
         return 2;
     }
+    /* A fresh allocation must not accidentally hide incomplete stream reset.
+     * The production decoder, not the fixture allocator, owns initialization. */
+    memset(work.tinfl_state, 0xa5, ISAAC_NP_TINFL_STATE_BYTES);
     src.data = file;
     src.size = truncate_at < file_size ? truncate_at : file_size;
     src.pos = pos;
@@ -237,6 +240,10 @@ int main(int argc, char **argv)
             fclose(lf);
         }
     }
+#if ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT
+    printf("strict=%u/%u/%u\n", result.strict_attempts,
+           result.strict_successes, result.strict_refusals);
+#endif
     free(raw);
     free(last);
     free(work.staging);

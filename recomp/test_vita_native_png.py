@@ -428,12 +428,55 @@ def fault_cases(oracle, png: Path, work: Path):
     return results
 
 
+def strict_cases(oracle, work: Path):
+    """Small admission/fallback boundaries; opt-in only, same whole-PNG oracle."""
+    def image(payload, height=1):
+        return (SIG + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, height, 8, 6, 0, 0, 0)) +
+                chunk(b"IDAT", payload) + chunk(b"IEND", b""))
+    raw = bytes((0, 1, 0, 1, 0))
+    stored = zlib.compress(raw, 0)
+    cases = [
+        ("stored", stored, "ok", "1/1/0", None),
+        ("stored-exact-staging", stored, "ok", "1/1/0", len(stored)),
+        ("stored-short-staging", zlib.compress(raw * 2, 0), "ok", "0/0/0", 16),
+        ("fixed-refusal", zlib.compress(raw, 6), "ok", "1/0/1", None),
+        ("singleton-valid", bytes.fromhex("78010dc1010900000080a0fa7fba1017000b0003"), "ok", "1/0/1", None),
+        ("singleton-invalid", bytes.fromhex("78010dc1010900000080a0fa7fba101f000b0003"), "extra", "1/0/1", None),
+        ("nonexact-success", stored + b"\x00", "extra", "1/0/1", None),
+        ("bad-adler", stored[:-1] + bytes([stored[-1] ^ 1]), "inflate", "1/0/1", None),
+        ("wrong-output-small", zlib.compress(raw[:-1], 0), "truncated", "1/0/1", None),
+        ("wrong-output-large", zlib.compress(raw + b"\x00", 0), "extra", "1/0/1", None),
+    ]
+    results = {}
+    for name, payload, status, counts, staging in cases:
+        path = work / ("strict-" + name + ".png")
+        path.write_bytes(image(payload, 2 if name == "stored-short-staging" else 1))
+        extra = ["--staging", str(staging)] if staging is not None else []
+        fields = run_oracle(oracle, path, work / "strict.raw", *extra)
+        assert fields["status"] == status and fields["strict"] == counts, (name, fields)
+        a, s, r = map(int, fields["strict"].split("/"))
+        assert a == s + r
+        results[name] = fields
+    # A short first IDAT is tried and refused; no subsequent chunk is tried.
+    # A leading empty IDAT advances the chunk counter before any probe.
+    for name, sizes in (("split-idat", [3, 2]), ("empty-first", [0])):
+        path = work / ("strict-" + name + ".png")
+        path.write_bytes(rebuild(image(stored), sizes))
+        fields = run_oracle(oracle, path, work / "strict.raw")
+        expected = "1/0/1" if name == "split-idat" else "0/0/0"
+        assert fields["status"] == "ok" and fields["strict"] == expected, (name, fields)
+        results[name] = fields
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--oracle", required=True)
     parser.add_argument("--corpus", action="append", default=[])
     parser.add_argument("--keep", default=None,
                         help="directory to keep the generated corpus in")
+    parser.add_argument("--strict", action="store_true",
+                        help="also check strict first-IDAT admission and old-tinfl fallback")
     parser.add_argument("pngs", nargs="*")
     args = parser.parse_args()
     rng = random.Random(20260903)
@@ -483,6 +526,8 @@ def main() -> int:
           f"({gamma_checked} also through two gamma tables, {staging_checked} "
           f"through 16/37-byte staging), {unsupported} unsupported shapes "
           f"refused, fault cases: {faults}")
+    if args.strict:
+        print("strict first-IDAT boundaries:", strict_cases(args.oracle, work_dir))
     return 0
 
 

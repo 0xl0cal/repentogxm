@@ -22,40 +22,34 @@ Valve, Sony, or the maintainers of any dependency named below.
 ## Does it work?
 
 Yes: title screen, menus, rooms, bosses, pause, Continue, Exit to menu, Vita
-controls, music and effects, saves. It is early and not smooth everywhere.
-Output is the Vita's native 960x544 with no resolution downgrade. Game logic
-runs at its normal 30 updates per second (measured 29.85 to 30.00); the port
-shows up to 60 frames per second.
+controls, music and effects, saves, and the External Item Descriptions (EID)
+mod. Output is the Vita's native 960x544. Game logic runs at its normal 30
+updates per second; the port presents up to 60 frames per second.
 
 [Video of v0.1.0-alpha](https://www.youtube.com/watch?v=R6Imi5NVfwI) (at first lags cause of EID warning, sorry)
 
-Measured on one PS Vita on 2026-09-04 with the External Item Descriptions
-(EID) mod loaded:
+The current release is v0.1.1-alpha (2026-09-07);
+[release/RELEASE_NOTES.md](release/RELEASE_NOTES.md) lists what changed.
+Measured on one PS Vita with EID loaded ([STATUS.md](STATUS.md) names the
+build behind each number):
 
-| Scene | Result | Cause / status |
-|---|---|---|
-| Menus | 59-60 FPS, render about 10 ms per frame | fine |
-| Ordinary rooms | mostly 60 FPS (render 8-12 ms per frame); on a morning build almost every 2-second stretch had one frame over 33 ms (a visible hitch), so the average over such a stretch was 42-51 FPS | hitches and load stalls, see below |
-| Dense rooms (many enemies and effects) | 35-37 FPS | per-object reference counting under a lock in translated code; fix in progress |
-| Boss fights with Brimstone | about 50 FPS with hitches | CPU cost in update and render plus waits for the GPU; not fully attributed |
-| Laser rooms (Circle of Protection) | about 30 FPS | the CPU waits for the GPU at the end of every offscreen render pass, most likely because vitaGL gives the offscreen render target one scene slot per frame; a fix is being built and is not yet measured |
-| Worst room found (two Brimstone monsters + Circle of Protection + Azazel's Brimstone) | 6-7 FPS | the same wait plus more than 100 ms of GPU fill per frame from the laser layers; the fill cost needs its own fix |
-| Room entry | 0.9-1.7 s stall | sprites and sounds are reloaded on every entry; fix in progress |
-| Floor change; run start or Continue | 1.5-4.3 s; 5.3-5.5 s | asset reload plus a full Lua garbage collection per floor |
-| Long sessions | a 27-minute session filled the game's 81 MiB heap and the game stopped on "Exit game"; saves were written first | heap use grows over play time; fix in progress |
+| Scene | Result |
+|---|---|
+| Menus | 60 FPS |
+| Rooms with enemies | 55-59 FPS |
+| Dense rooms (about 78 draw calls per frame) | 33-34 FPS |
+| Laser-heavy rooms (Circle of Protection, Brimstone) | slower than ordinary rooms; not measured on this build |
+| Door transition with resource loads | 0.9-1.1 s stall |
+| Floor change | 1.5-4.3 s |
+| Continue from the main menu; process start to the menu | about 7 s; about 4 s |
 
-Audio is OpenAL Soft; music is decoded by a native Vorbis decoder on CPU core
-2. No audio underruns were logged in the measured sessions, but the music
-stream can run dry and restart during a load stall. EID loads and shows item
-descriptions; measured before the latest build's Lua changes, it cost about
-2.7 ms per frame in rooms and 8-10 ms while a description box is on screen,
-which breaks 60 FPS. No other mod has been tested.
+Below 60 FPS the cost is CPU render time: translated game code, vitaGL draws
+and Lua; laser rooms add GPU fill on the laser layers. Music can run dry and
+restart during a load stall. An open EID description box costs 8-10 ms of Lua
+per frame and breaks 60 FPS. No other mod has been tested.
 
-Not tested on the current builds: PS TV, suspend/resume, language switching,
-front-touch zones, a full run to a final boss, and the Utero II floor (an
-earlier report of that floor rendering black has not been re-tested). The
-longest measured sessions were 20-27 minutes. [STATUS.md](STATUS.md) has the
-per-build tables; [PLAN.md](PLAN.md) the priorities.
+Not tested: PS TV, language switching, front-touch zones, a full run to a
+final boss. [PLAN.md](PLAN.md) lists the priorities.
 
 ## How it works
 
@@ -80,10 +74,11 @@ This repository contains **no game executable, generated C code, gameplay
 resources, saves, keys, Sony modules or firmware**. The only tracked artwork
 is the LiveArea images in `recomp/vita/assets/sce_sys/`. Ready-made VPKs are on
 the Releases page; they contain the recompiled game code but no resources.
-Everything else comes from your own legally obtained PC copy of Repentance.
-Building from source additionally needs exactly one unpacked 32-bit
-executable; any other file is rejected (how to unpack it is not described
-here):
+Everything else comes from your own legally obtained PC copy of Repentance
+v1.7.9b, the version the port is generated from; resources of other versions
+are untested. Building from source additionally needs exactly one unpacked
+32-bit executable; any other file is rejected (how to unpack it is not
+described here):
 
 ```text
 size:   8,650,240 bytes
@@ -104,8 +99,8 @@ You need:
   `ux0:data/isaacr001/resources/`.
 
 The title ID is `ISAACR001`. The app appears in LiveArea as `The Binding of
-Isaac: Repentance` with a second button, `SAVE / MOD MANAGER` (not yet tested
-on real hardware). Everything the port writes lives under `ux0:data/isaacr001/`,
+Isaac: Repentance` with a second button, `SAVE / MOD MANAGER` (untested on
+hardware). Everything the port writes lives under `ux0:data/isaacr001/`,
 outside the app directory:
 
 - saves and the game's `log.txt`:
@@ -121,14 +116,14 @@ saved without a mod cannot be continued after enabling one; that is the game's
 own rule, not a port bug. When reporting a problem, include the SHA-256 of the
 installed `ux0:app/ISAACR001/eboot.bin`, the port log and the game's `log.txt`.
 
-VPKs are on the Releases page. Full install, update and Vita3K instructions are in
+VPKs are on the Releases page. Install, update and Vita3K instructions are in
 [INSTALL.md](INSTALL.md); known failures in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## Building from source
 
-Host requirements: Python 3.10 or newer (the pinned Pillow release needs it),
-the packages in `requirements.txt`, Git, CMake (Ninja for `--release`), and
-the **soft-float** VitaSDK (`vitasdk-softfp`), not the default hard-float one.
+Host requirements: Python 3.10 or newer, the packages in `requirements.txt`,
+Git, CMake (Ninja for `--release`), and the **soft-float** VitaSDK
+(`vitasdk-softfp`), not the default hard-float one.
 
 ```bash
 python -m pip install -r requirements.txt
@@ -139,30 +134,26 @@ python tools/build_vita.py \
 
 To run Lua mods add `--lua --lua-source /abs/path/to/lua-5.3.3` (a pristine
 Lua 5.3.3 source tree); a build without Lua crashes at startup if a mod is
-enabled. `--heap-mb` sets the game heap (default 81 MiB; see `--help`).
+enabled. `--heap-mb` sets the game heap (default 81 MiB).
 `python tools/build_vita.py --help` lists the rest. The script checks the
 executable hash and the generated code and stops on any mismatch.
 
-`build_vita.py` builds a baseline configuration. The builds measured above
-were configured with CMake directly and turn on options the script does not
-expose: translated-code CPU optimizations, native Vorbis and PNG decoders,
-asynchronous logging and others. Expect the baseline build to be slower; on a
-2026-09-02 build without the native decoder (720x408, Lua off), audio alone
-dropped game updates from 30 to about 20 per second. The option list and build
-details are in [recomp/vita/README.md](recomp/vita/README.md).
+`build_vita.py` builds a slower baseline configuration. The released VPK turns
+on options the script does not expose (translated-code CPU optimizations,
+native Vorbis and PNG decoders, asynchronous logging and others); its exact
+option set is [release/v0.1.1-alpha.cmake](release/v0.1.1-alpha.cmake), a
+CMake initial cache whose header lists the three commands that reproduce the
+build. The option reference is [recomp/vita/README.md](recomp/vita/README.md).
 
 ## Broken or in progress
 
-- dense rooms drop to 35-37 FPS (per-object locking in translated code); boss
-  fights with Brimstone to about 50 FPS (cause not fully attributed);
-- laser rooms drop to 30 FPS (the CPU waits for the GPU between render
-  passes; fix being built) and the worst room to 6-7 FPS (GPU fill cost of the
-  laser layers; no fix yet);
-- room entry stalls about 1 s, floor changes 1.5-4 s (asset reload);
-- the game's heap fills up over a long session and the game stops on exit;
+- rooms below 60 FPS (table above), laser-heavy rooms lower;
+- load stalls: door transitions with resource loads 0.9-1.1 s, Continue about
+  7 s, floor changes up to 4 s;
+- the game heap can fill up over a long session; seen once after 27 minutes,
+  when the game stopped on "Exit game" after writing the saves;
 - the on-device Save/Mod Manager and the PC sync tool are untested on hardware;
-- no controller remapping UI;
-- provenance and licensing review for a public release is unfinished.
+- no controller remapping UI.
 
 ## Repository layout
 
@@ -170,7 +161,8 @@ details are in [recomp/vita/README.md](recomp/vita/README.md).
 - `recomp/vita/` -- the Vita CMake project, host runtime, vitaGL and OpenAL
   patches, the Manager, tests;
 - `tools/` -- `build_vita.py`, the PC/Vita sync tool, release audit helpers;
-- `release/` -- release notes (text only; no binaries, no checksums yet).
+- `release/` -- release notes and the per-release CMake configuration (text
+  only; binaries and their checksums are on the GitHub Releases page).
 
 ## PC/Vita sync
 

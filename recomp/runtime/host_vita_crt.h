@@ -5,6 +5,13 @@
 
 #include "guest.h"
 
+#if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
+/* Cumulative saturating dynamic-token hint hits/misses, under the existing
+ * FILE lock.  Standard-stream resolutions are excluded; no clock or reset.
+ * A single try-lock returns 0 on busy/NULL without changing output. */
+int isaac_vita_crt_file_lookup_hint_get(uint32_t out[2]);
+#endif
+
 /* The measured calls after the first four Vita clock/identity imports.
  * Keep IAT, call, and return RVAs beside the exact PE import name: this is
  * executable evidence for the order, not a guessed collection of CRT APIs. */
@@ -389,6 +396,14 @@
 #define ISAAC_VITA_CRT_VSPRINTF_OPTIONS_PATH        0x25U
 #define ISAAC_VITA_CRT_VSPRINTF_OPTIONS_TIMER       0x26U
 #define ISAAC_VITA_CRT_VSPRINTF_FIXED_CALL_COUNT    15U
+
+/* Frozen Room::Init -> logger -> vsprintf seam (PE 31846486979cfa07...).
+ * The printed pair comes from the room descriptor, NOT a unique grid index. */
+#define ISAAC_VITA_CRT_ROOM_LOG_ORIGIN_RETURN_RVA  0x003b1111U
+#define ISAAC_VITA_CRT_ROOM_LOG_FORMAT_VA          0x9874dca0U
+#define ISAAC_VITA_CRT_ROOM_LOG_FORMAT             "Room %d.%d(%s)\n"
+#define ISAAC_VITA_CRT_ROOM_LOG_BUFFER_VA          0x988007e8U
+#define ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END         0x98802fe8U
 
 /* The frozen PE imports exactly one scanf-family entry.  The local sscanf
  * adapter at 0x003f0ef0 expands the ordinary variadic call into this seven-
@@ -1082,6 +1097,12 @@ int isaac_vita_crt_io_profile_stop_and_snapshot(
  * counter lines (why = loading-complete | periodic | shutdown).  Not defined
  * when the option is compiled out; callers guard on the macro. */
 void isaac_vita_crt_seek_shadow_report(const char *why);
+
+/* ISAAC_VITA_CRT_DESCRIPTOR_RECOVER only: one bounded "KAGE VITA CRT
+ * DESCRIPTOR RECOVER" counter line (recovered=N is the session total).  The
+ * seek shadow report and the archive-cache shutdown emit it; not defined when
+ * the option is compiled out. */
+void isaac_vita_crt_descriptor_recover_report(const char *why);
 
 /* Returns one only when NAME was handled.  Zero is a mutation-free handoff:
  * the outer Vita import dispatcher remains responsible for the exact loud

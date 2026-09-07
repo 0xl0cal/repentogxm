@@ -1,0 +1,93 @@
+diff --git a/source/draw.c b/source/draw.c
+--- a/source/draw.c
++++ b/source/draw.c
+@@ -23,1 +23,9 @@
+ #include "shared.h"
++#if defined(HAVE_ISAAC_GL_TIME_SDK_SPARSE) && HAVE_ISAAC_GL_TIME_SDK_SPARSE
++#define ISAAC_SDK_SPARSE_DRAW_OWNER
++#include "isaac_sdk_sparse_profile_internal.h"
++#undef ISAAC_SDK_SPARSE_DRAW_OWNER
++#else
++#define ISAAC_SDK_CANONICAL_BEGIN() ((void)0)
++#define ISAAC_SDK_CANONICAL_END() ((void)0)
++#endif
+@@ -347,3 +355,4 @@ GLboolean vglIsaacDrawCanonicalQuads(GLsizei count) {
+ 	top_idx = ((uint32_t)count / 6u) * 4u;
+ 	prim_is_non_native = GL_FALSE;
++	ISAAC_SDK_CANONICAL_BEGIN();
+ 	scene_reset();
+@@ -375,2 +384,3 @@ GLboolean vglIsaacDrawCanonicalQuads(GLsizei count) {
+ 	restore_polygon_mode(SCE_GXM_PRIMITIVE_TRIANGLES);
++	ISAAC_SDK_CANONICAL_END();
+ 	return is_draw_legal;
+diff --git a/source/misc.c b/source/misc.c
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -23,1 +23,8 @@
+ #include "shared.h"
++#if defined(HAVE_ISAAC_GL_TIME_SDK_SPARSE) && HAVE_ISAAC_GL_TIME_SDK_SPARSE
++#include "isaac_sdk_sparse_profile_internal.h"
++#else
++#define ISAAC_SDK_BEGIN(name) ((void)0)
++#define ISAAC_SDK_END(kind, name) ((void)0)
++#endif
++
+@@ -649,3 +656,4 @@ void glClear(GLbitfield mask) {
+ #endif
++	ISAAC_SDK_BEGIN(isaac_sdk_clear_t0);
+ 	scene_reset();
+ 
+@@ -676,8 +684,12 @@ void glClear(GLbitfield mask) {
++	ISAAC_SDK_BEGIN(isaac_sdk_vertex_t0);
+ 	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vbuffer);
++	ISAAC_SDK_END(ISAAC_SDK_CLEAR_VERTEX, isaac_sdk_vertex_t0);
+ 	sceGxmSetUniformDataF(vbuffer, clear_position, 0, 4, &clear_vertices->x);
+ 	sceGxmSetUniformDataF(vbuffer, clear_depth, 0, 1, &clear_depth_value);
+ 
++	ISAAC_SDK_BEGIN(isaac_sdk_fragment_t0);
+ 	sceGxmReserveFragmentDefaultUniformBuffer(gxm_context, &fbuffer);
++	ISAAC_SDK_END(ISAAC_SDK_CLEAR_FRAGMENT, isaac_sdk_fragment_t0);
+ 	sceGxmSetUniformDataF(fbuffer, clear_color, 0, 4, &clear_rgba_val.r);
+ 
+ 	// Disable fragment program if not clearing color buffer. Depth and stencil clears are unaffected.
+@@ -720,1 +732,3 @@ void glClear(GLbitfield mask) {
++	ISAAC_SDK_BEGIN(isaac_sdk_clear_draw_t0);
+ 	sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++	ISAAC_SDK_END(ISAAC_SDK_CLEAR_DRAW, isaac_sdk_clear_draw_t0);
+@@ -741,3 +755,4 @@ void glClear(GLbitfield mask) {
+ 	vglRestoreFragmentUniformBuffer();
+ 	vglRestoreVertexUniformBuffer();
++	ISAAC_SDK_END(ISAAC_SDK_CLEAR, isaac_sdk_clear_t0);
+ }
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -23,1 +23,15 @@
+ #include "shared.h"
++#if defined(HAVE_ISAAC_GL_TIME_SDK_SPARSE) && HAVE_ISAAC_GL_TIME_SDK_SPARSE
++#include "isaac_sdk_sparse_profile_internal.h"
++#define ISAAC_SDK_SCENE_CLOCK() isaacSdkSparseClock()
++/* Count actual attempts, including the optional valid-region retry. The
++ * existing scene bracket may enclose both attempts; it is not one SDK call. */
++#define sceGxmBeginScene(...) \
++	(++isaac_sdk_sparse.begin_calls, sceGxmBeginScene(__VA_ARGS__))
++#define sceGxmEndScene(...) \
++	(++isaac_sdk_sparse.end_calls, sceGxmEndScene(__VA_ARGS__))
++#else
++#define ISAAC_SDK_SCENE_CLOCK() sceKernelGetProcessTimeWide()
++#define ISAAC_SDK_BEGIN(name) ((void)0)
++#define ISAAC_SDK_END(kind, name) ((void)0)
++#endif
+@@ -65,1 +79,1 @@
+-#define ISAAC_SCENE_TIME_BEGIN() uint64_t isaac_scene_t0 = sceKernelGetProcessTimeWide()
++#define ISAAC_SCENE_TIME_BEGIN() uint64_t isaac_scene_t0 = ISAAC_SDK_SCENE_CLOCK()
+@@ -68,1 +82,1 @@
+-		uint32_t isaac_scene_dt = (uint32_t)(sceKernelGetProcessTimeWide() - isaac_scene_t0); \
++		uint32_t isaac_scene_dt = (uint32_t)(ISAAC_SDK_SCENE_CLOCK() - isaac_scene_t0); \
+@@ -76,1 +90,1 @@
+-		uint32_t isaac_scene_dt = (uint32_t)(sceKernelGetProcessTimeWide() - isaac_scene_t0); \
++		uint32_t isaac_scene_dt = (uint32_t)(ISAAC_SDK_SCENE_CLOCK() - isaac_scene_t0); \
+@@ -1154,1 +1168,3 @@ void vglSwapBuffers(GLboolean has_commondialog) {
++		ISAAC_SDK_BEGIN(isaac_sdk_queue_t0);
+ 		sceGxmDisplayQueueAddEntry(gxm_sync_objects[gxm_front_buffer_index], gxm_sync_objects[gxm_back_buffer_index], &queue_cb_data);
++		ISAAC_SDK_END(ISAAC_SDK_QUEUE, isaac_sdk_queue_t0);

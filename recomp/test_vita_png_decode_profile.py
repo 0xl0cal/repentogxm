@@ -395,10 +395,20 @@ def verify_build_switches() -> None:
         'ISAAC_VITA_PNG_DECODE_PROFILE_BUILD_ID=\\"'
         '${ISAAC_VITA_GUEST_LINK_ID}\\"'
     ) in cmake
+    # Count the profiler's owner list, not independent native PNG/inflate
+    # options, comments and linker wrappers elsewhere in the same project.
+    profile_start = cmake.index(
+        "  if(ISAAC_VITA_PNG_DECODE_PROFILE OR ISAAC_VITA_PNG_WINDOW_PROFILE)\n"
+        "    # gen_all proves eight unique frozen owners"
+    )
+    profile_end = cmake.index(
+        "  if(ISAAC_VITA_ANM2_MISSING_LAYER_GUARD)", profile_start
+    )
+    profile_scope = cmake[profile_start:profile_end]
     for root in (
             "sub_005a0c50", "sub_005a0cd0", "sub_005b1500",
             "sub_005c5fb0", "sub_005c6fa0", "sub_005d6d80"):
-        count = cmake.count(root)
+        assert profile_scope.count(root) == 1, root
         if root == "sub_005b1500":
             # ISAAC_VITA_NATIVE_PNG wraps the same png_read_row seam at link
             # time (GNU ld --wrap); that one line is the only other mention.
@@ -406,8 +416,6 @@ def verify_build_switches() -> None:
             assert cmake.count(wrap) == 1
             native = cmake.split("if(ISAAC_VITA_NATIVE_PNG)", 1)[1]
             assert wrap in native.split("else()", 1)[0]
-            count -= 1
-        assert count == 1, root
     assert f'"{name}": png_decode_profile' in build
     assert "--png-decode-profile" in build
     assert "kage_vita_png_decode_profile.c" in raw_gate

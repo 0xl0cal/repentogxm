@@ -58,6 +58,11 @@ static uint64_t s_drop_reported_at_us;
 #if defined(ISAAC_VITA_LOG_ASYNC_ORACLE)
 isaac_vita_log_async_sink_fn g_isaac_vita_log_async_oracle_file_sink;
 isaac_vita_log_async_sink_fn g_isaac_vita_log_async_oracle_printf_sink;
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+isaac_vita_log_async_batch_sink_fn
+    g_isaac_vita_log_async_oracle_file_batch_sink;
+int g_isaac_vita_log_async_oracle_sink_lock_fail;
+#endif
 uint64_t g_isaac_vita_log_async_oracle_now_us;
 uint32_t g_isaac_vita_log_async_oracle_wakes;
 uint32_t g_isaac_vita_log_async_oracle_lock_faults;
@@ -80,6 +85,10 @@ static void log_async_ring_unlock(void)
 
 static int log_async_sink_lock(void)
 {
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+    if (g_isaac_vita_log_async_oracle_sink_lock_fail)
+        return 0;
+#endif
     if (s_oracle_sink_locked)
         ++g_isaac_vita_log_async_oracle_lock_faults;
     s_oracle_sink_locked = 1;
@@ -264,6 +273,53 @@ static void log_async_sink(unsigned sink, const char *line, uint32_t length)
         log_async_sink_printf(line, (unsigned)length);
 }
 
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+/* Called only with the sink lock. The first record was popped normally;
+ * collect a bounded adjacent prefix in one ring-lock interval, never waiting
+ * for additional records. No shared pending buffer survives this call. */
+static uint32_t log_async_sink_file_group(const unsigned char *first,
+                                          uint32_t length, uint32_t limit)
+{
+    char payload[ISAAC_VITA_LOG_ASYNC_FILE_BATCH_BYTES + 1u];
+    uint16_t lengths[ISAAC_VITA_LOG_ASYNC_FILE_BATCH_RECORDS];
+    uint32_t records = 1u;
+    uint32_t bytes = length;
+
+    memcpy(payload, first, length);
+    lengths[0] = (uint16_t)length;
+    if (limit > ISAAC_VITA_LOG_ASYNC_FILE_BATCH_RECORDS)
+        limit = ISAAC_VITA_LOG_ASYNC_FILE_BATCH_RECORDS;
+    log_async_ring_lock();
+    while (records < limit && s_used != 0u) {
+        unsigned char header[ISAAC_VITA_LOG_ASYNC_HEADER_BYTES];
+        uint32_t i;
+        uint32_t next;
+
+        /* Peek without consuming a PRINTF or a record that exceeds the cap. */
+        for (i = 0u; i < ISAAC_VITA_LOG_ASYNC_HEADER_BYTES; ++i)
+            header[i] = s_ring[(s_head + i) % ISAAC_VITA_LOG_ASYNC_RING_BYTES];
+        next = (uint32_t)header[0] | ((uint32_t)header[1] << 8);
+        if (header[2] != ISAAC_VITA_LOG_ASYNC_SINK_FILE ||
+                next > ISAAC_VITA_LOG_ASYNC_FILE_BATCH_BYTES - bytes)
+            break;
+        log_async_ring_take(header, ISAAC_VITA_LOG_ASYNC_HEADER_BYTES);
+        log_async_ring_take((unsigned char *)payload + bytes, next);
+        bytes += next;
+        lengths[records++] = (uint16_t)next;
+        ++s_sunk;
+    }
+    log_async_ring_unlock();
+    payload[bytes] = '\0';
+#if defined(ISAAC_VITA_LOG_ASYNC_ORACLE)
+    if (g_isaac_vita_log_async_oracle_file_batch_sink)
+        g_isaac_vita_log_async_oracle_file_batch_sink(payload, lengths, records);
+#else
+    isaac_vita_log_sink_file_batch(payload, lengths, records);
+#endif
+    return records;
+}
+#endif
+
 static int log_async_snprintf(char *buffer, size_t size, const char *format,
                               ...)
 {
@@ -316,8 +372,17 @@ static uint32_t log_async_drain(unsigned char *buffer, int force_report)
     int locked = log_async_sink_lock();
 
     while (log_async_pop(buffer, &sink, &length)) {
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+        if (locked && sink == ISAAC_VITA_LOG_ASYNC_SINK_FILE)
+            count += log_async_sink_file_group(buffer, length,
+                                               64u - (count & 63u));
+        else {
+#endif
         log_async_sink(sink, (const char *)buffer, length);
         ++count;
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+        }
+#endif
         /* Under sustained overload the ring may never empty; keep the drop
          * report flowing (rate bounded) every 64 lines. */
         if ((count & 63u) == 0u)

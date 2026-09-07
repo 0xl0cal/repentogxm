@@ -34,7 +34,10 @@
  *     released (the same 24-frame exhaustion happens again);
  *   - hostile: the trampoline entered with no active import scope (native
  *     lua_pcall from the oracle) raises the exact "no active guest CPU"
- *     text -- the relaxed load's empty-slot fallback. */
+ *     text -- the relaxed load's empty-slot fallback;
+ *   - native getClass/getExact seam owner protocol: root, repeated nested
+ *     re-entry, foreign owner (including a real second thread), nested leave
+ *     retaining the owner, root release, owner change and null legacy input. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,6 +133,7 @@ static unsigned s_under_calls;
 static unsigned s_foreign_rejected;
 static unsigned s_thread_rejected;
 static unsigned s_released_roots;
+static unsigned s_seam_checks;
 
 static char s_nested_name[] = "nested";
 static char s_argerr_name[] = "argerr_long";
@@ -749,6 +753,87 @@ static int check_no_scope(lua_State *L)
     return 0;
 }
 
+typedef struct seam_thread_probe {
+    int entered;
+    int root;
+} seam_thread_probe;
+
+static DWORD WINAPI seam_foreign_thread(LPVOID argument)
+{
+    seam_thread_probe *probe = (seam_thread_probe *)argument;
+    probe->root = -1;
+    probe->entered = isaac_vita_lua_seam_enter(&s_cpu_b, &probe->root);
+    if (probe->entered)
+        isaac_vita_lua_seam_leave(&s_cpu_b, probe->root);
+    return 0;
+}
+
+/* Exercise the actual exported production seam, not a replay of its CAS or
+ * relaxed-read algorithm. No Lua operation/finalizer is replaced by this test.
+ * The same cases must pass with ISAAC_VITA_LUA_SCOPE_FASTPATH both ON and OFF. */
+static int check_seam_scope(void)
+{
+    int root_a, root_b, nested, null_root;
+    unsigned iteration;
+    HANDLE thread;
+    seam_thread_probe probe = { -1, -1 };
+
+#define SEAM_CHECK(condition, message) do { \
+    if (!(condition)) return fail(message); \
+    ++s_seam_checks; \
+} while (0)
+
+    SEAM_CHECK(isaac_vita_lua_seam_enter(NULL, &null_root) && null_root == 1,
+               "null seam root changed its legacy CAS(0, 0) result");
+    isaac_vita_lua_seam_leave(NULL, null_root);
+    SEAM_CHECK(isaac_vita_lua_seam_enter(&s_cpu_a, &root_a) && root_a == 1,
+               "native seam root did not acquire empty owner");
+    SEAM_CHECK(!isaac_vita_lua_seam_enter(NULL, &null_root) && null_root == 0,
+               "null seam input did not reject a foreign owner");
+    for (iteration = 0U; iteration < 4096U; ++iteration) {
+        SEAM_CHECK(isaac_vita_lua_seam_enter(&s_cpu_a, &nested) && nested == 0,
+                   "native seam nested entry claimed root ownership");
+        isaac_vita_lua_seam_leave(&s_cpu_a, nested);
+    }
+    SEAM_CHECK(!isaac_vita_lua_seam_enter(&s_cpu_b, &root_b) &&
+               root_b == 0 && !s_cpu_b.fault,
+               "native seam foreign entry must fall back without faulting");
+    thread = CreateThread(NULL, 0U, seam_foreign_thread, &probe, 0U, NULL);
+    SEAM_CHECK(thread != NULL, "native seam foreign thread creation failed");
+    SEAM_CHECK(WaitForSingleObject(thread, 5000U) == WAIT_OBJECT_0,
+               "native seam foreign thread did not finish");
+    CloseHandle(thread);
+    SEAM_CHECK(probe.entered == 0 && probe.root == 0 && !s_cpu_b.fault,
+               "native seam failed the actual second-thread foreign probe");
+    isaac_vita_lua_seam_leave(&s_cpu_a, root_a);
+    SEAM_CHECK(isaac_vita_lua_seam_enter(&s_cpu_b, &root_b) && root_b == 1,
+               "native seam root release left the owner held");
+    isaac_vita_lua_seam_leave(&s_cpu_b, root_b);
+
+    SEAM_CHECK(isaac_vita_lua_seam_enter(&s_cpu_a, &root_a) && root_a == 1,
+               "native seam owner-change probe could not acquire root");
+    isaac_vita_lua_abort_cpu(&s_cpu_a);
+    SEAM_CHECK(isaac_vita_lua_seam_enter(&s_cpu_b, &root_b) && root_b == 1,
+               "native seam owner-change probe could not replace owner");
+    isaac_vita_lua_seam_leave(&s_cpu_a, root_a);
+    SEAM_CHECK(s_cpu_a.fault &&
+               strcmp(s_cpu_a.fault, "Lua bridge owner changed during call") == 0,
+               "native seam changed the owner-loss diagnostic");
+    SEAM_CHECK(isaac_vita_lua_seam_enter(&s_cpu_b, &nested) && nested == 0,
+               "failed native seam release cleared the replacement owner");
+    isaac_vita_lua_seam_leave(&s_cpu_b, nested);
+    isaac_vita_lua_seam_leave(&s_cpu_b, root_b);
+    s_cpu_a.fault = NULL;
+    s_cpu_a.fault_addr = 0U;
+    SEAM_CHECK(isaac_vita_lua_seam_enter(&s_cpu_a, &root_a) && root_a == 1,
+               "native seam could not recover after owner loss");
+    isaac_vita_lua_seam_leave(&s_cpu_a, root_a);
+    SEAM_CHECK(!s_cpu_a.fault && !s_cpu_b.fault,
+               "native seam probe left an unexpected guest fault");
+#undef SEAM_CHECK
+    return 0;
+}
+
 int main(void)
 {
     lua_State *L;
@@ -763,6 +848,8 @@ int main(void)
     s_max_text[sizeof s_max_text - 1U] = '\0';
     bind_cpu(&s_cpu_a, s_stack_a);
     bind_cpu(&s_cpu_b, s_stack_b);
+    if (check_seam_scope())
+        return 1;
     s_entered = CreateEventA(NULL, FALSE, FALSE, NULL);
     s_released = CreateEventA(NULL, FALSE, FALSE, NULL);
     if (!s_entered || !s_released)
@@ -843,12 +930,13 @@ int main(void)
     printf("Lua scope oracle fastpath=%d: rounds=%u nested=%u depth=%u "
            "(recovered_direct_raise=%u) argerr=%u+%u(255-cap) fault=%u "
            "errstack=%u cdecl_broken=%u+%u depth_exhausted=%ux%u frames "
-           "noscope=%u foreign_rejected=%u (thread=%u) released=%u: PASS\n",
+           "noscope=%u foreign_rejected=%u (thread=%u) released=%u "
+           "seam_checks=%u: PASS\n",
            (int)ISAAC_VITA_LUA_SCOPE_FASTPATH, (unsigned)ROUNDS,
            s_nested_calls, s_depth_calls, s_depth_errors, s_argerr_calls,
            s_argerr_max_calls, s_fault_calls, s_errstack_calls, s_over_calls,
            s_under_calls, (unsigned)ROUNDS, (unsigned)CALLBACK_FRAMES,
            (unsigned)(1U + ROUNDS), s_foreign_rejected, s_thread_rejected,
-           s_released_roots);
+           s_released_roots, s_seam_checks);
     return 0;
 }

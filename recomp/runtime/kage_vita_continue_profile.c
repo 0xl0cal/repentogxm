@@ -7,6 +7,7 @@
  * logging.
  */
 #include "kage_vita_continue_profile.h"
+#include "gl_vita_backend.h"
 
 #include <limits.h>
 #include <stddef.h>
@@ -487,6 +488,7 @@ static int continue_overlay_begin(uint32_t kind_run, uint32_t stage,
         gl_vita_backend_fbo_present();
     }
 #endif
+    gl_vita_backend_attrib_sync();
     vglSwapBuffers(GL_FALSE);
     ++s_overlay_swaps;
     return 1;
@@ -504,6 +506,7 @@ static void continue_overlay_stage(uint32_t kind_run, uint32_t stage)
         (s_overlay_phase << CONTINUE_OVERLAY_PHASE_SHIFT) |
         (stage & CONTINUE_OVERLAY_STAGE_MASK);
     continue_overlay_store(snapshot);
+    gl_vita_backend_attrib_sync();
     vglSwapBuffers(GL_FALSE);
     ++s_overlay_swaps;
 }

@@ -1,3 +1,358 @@
+#if defined(ISAAC_VITA_IO_WINDOW_PROFILE)
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "kage_vita_io_profile.h"
+/* Like the existing logical-shadow fixture, include the actual owner so
+ * contention can be exercised without a production-only test hook/thread. */
+#include "kage_vita_io_profile.c"
+
+int __wrap_sceIoOpen(const char *, int, int);
+int __wrap_sceIoClose(int);
+int __wrap_sceIoRead(int, void *, unsigned int);
+int __wrap_sceIoPread(int, void *, unsigned int, int64_t);
+long __wrap_sceIoLseek32(int, long, int);
+int64_t __wrap_sceIoLseek(int, int64_t, int);
+int __wrap_sceIoWrite(int, const void *, unsigned int);
+int __wrap_sceIoPwrite(int, const void *, unsigned int, int64_t);
+int __wrap_sceIoSync(const char *, unsigned int);
+int __wrap_sceIoSyncByFd(int, int);
+
+static uint64_t s_now;
+static uint64_t s_duration;
+static unsigned s_clocks;
+static int s_fd = 1;
+static int s_result;
+static int s_native_errno = 41;
+static int s_entry_errno;
+static int s_open_flags;
+static int s_open_mode;
+static const char *s_open_path;
+static int64_t s_offset;
+static int s_origin;
+static int s_take_during_read;
+static int s_reuse_during_close;
+static int s_reverse;
+static const void *s_write_buffer;
+static unsigned int s_write_size;
+static int s_descriptor;
+static const char *s_sync_device;
+static unsigned int s_sync_flags;
+static int s_sync_fd_flags;
+static kage_vita_io_window_snapshot s_mid_read;
+
+#define CHECK(condition) do { \
+    if (!(condition)) { \
+        fprintf(stderr, "Vita window I/O oracle failed at line %d: %s\n", \
+                __LINE__, #condition); \
+        return 1; \
+    } \
+} while (0)
+
+uint64_t sceKernelGetProcessTimeWide(void)
+{
+    ++s_clocks;
+    errno = 999; /* even a clock which changes errno must not change I/O */
+    return s_now;
+}
+
+static void native_end(void)
+{
+    s_entry_errno = errno;
+    s_now = s_reverse ? s_now - s_duration : s_now + s_duration;
+    errno = s_native_errno;
+}
+
+int __real_sceIoOpen(const char *path, int flags, int mode)
+{
+    s_open_path = path;
+    s_open_flags = flags;
+    s_open_mode = mode;
+    native_end();
+    return s_fd;
+}
+
+int __real_sceIoClose(int descriptor)
+{
+    (void)descriptor;
+    if (s_reuse_during_close) {
+        s_reuse_during_close = 0;
+        (void)__wrap_sceIoOpen("ux0:/data/options.ini", 1, 0);
+    }
+    native_end();
+    return s_result;
+}
+
+int __real_sceIoRead(int descriptor, void *buffer, unsigned int size)
+{
+    (void)descriptor;
+    (void)size;
+    if (s_take_during_read) {
+        s_take_during_read = 0;
+        kage_vita_io_window_take(&s_mid_read);
+    }
+    if (s_result > 0 && buffer)
+        *(unsigned char *)buffer = 0x5a;
+    native_end();
+    return s_result;
+}
+
+int __real_sceIoPread(int descriptor, void *buffer, unsigned int size,
+                     int64_t offset)
+{
+    s_offset = offset;
+    return __real_sceIoRead(descriptor, buffer, size);
+}
+
+long __real_sceIoLseek32(int descriptor, long offset, int origin)
+{
+    (void)descriptor;
+    s_offset = offset;
+    s_origin = origin;
+    native_end();
+    return offset;
+}
+
+int64_t __real_sceIoLseek(int descriptor, int64_t offset, int origin)
+{
+    (void)descriptor;
+    s_offset = offset;
+    s_origin = origin;
+    native_end();
+    return offset;
+}
+
+int __real_sceIoWrite(int descriptor, const void *buffer, unsigned int size)
+{
+    s_descriptor = descriptor;
+    s_write_buffer = buffer;
+    s_write_size = size;
+    native_end();
+    return s_result;
+}
+
+int __real_sceIoPwrite(int descriptor, const void *buffer, unsigned int size,
+                      int64_t offset)
+{
+    s_offset = offset;
+    return __real_sceIoWrite(descriptor, buffer, size);
+}
+
+int __real_sceIoSync(const char *device, unsigned int flags)
+{
+    s_sync_device = device;
+    s_sync_flags = flags;
+    native_end();
+    return s_result;
+}
+
+int __real_sceIoSyncByFd(int descriptor, int flags)
+{
+    s_descriptor = descriptor;
+    s_sync_fd_flags = flags;
+    native_end();
+    return s_result;
+}
+
+int main(void)
+{
+    kage_vita_io_window_snapshot a;
+    unsigned char buffer[16] = {0};
+    char bounded[1024];
+    const char *path = "ux0:/data/isaacr001/resources/packed/afterbirthp.a";
+    unsigned clocks;
+    unsigned i;
+    static const struct {
+        const char *path;
+        uint32_t file_class;
+    } classes[] = {
+        {"UX0:\\data\\resources\\packed\\MUSIC.A", KAGE_IO_ARCHIVE},
+        {"ux0:/data/resources/gfx/a.png", KAGE_IO_RESOURCE},
+        {"ux0:/data/Documents/My Games/save.dat", KAGE_IO_SAVE},
+        {"ux0:/data/config.ini", KAGE_IO_CONFIG},
+        {"ux0:/data/shaders/a.gxp", KAGE_IO_SHADER},
+        {"ux0:/data/first-arm-fault.log", KAGE_IO_LOG},
+        {"ux0:/data/log.txt", KAGE_IO_LOG},
+        {"ux0:/data/catalog.txt", KAGE_IO_OTHER}
+    };
+    kage_vita_io_window_take(NULL);
+    kage_vita_io_window_take(&a);
+    CHECK(s_clocks == 0 && a.abi_version == KAGE_VITA_IO_WINDOW_ABI);
+    CHECK(a.snapshot_valid == 1 && a.take_misses == 0 && a.record_drops == 0);
+    s_duration = 50;
+    errno = 77;
+    CHECK(__wrap_sceIoOpen(path, 0x123, 0x1ff) == 1);
+    CHECK(s_open_path == path && s_open_flags == 0x123 && s_open_mode == 0x1ff);
+    CHECK(s_entry_errno == 77 && errno == s_native_errno);
+    s_result = 7;
+    s_duration = 90;
+    CHECK(__wrap_sceIoRead(1, buffer, 16) == 7 && buffer[0] == 0x5a);
+    s_duration = 123456;
+    CHECK(__wrap_sceIoPread(1, buffer, 14, INT64_C(0x123456789)) == 7);
+    CHECK(s_offset == INT64_C(0x123456789));
+    s_result = -5;
+    s_duration = 10;
+    CHECK(__wrap_sceIoRead(1, buffer, 13) == -5);
+    CHECK(__wrap_sceIoLseek32(1, -9, 2) == -9 && s_origin == 2);
+    CHECK(__wrap_sceIoLseek(1, INT64_C(0x123456789), 0) == INT64_C(0x123456789));
+    CHECK(s_offset == INT64_C(0x123456789) && s_origin == 0);
+    clocks = s_clocks;
+    kage_vita_io_window_take(&a);
+    CHECK(s_clocks == clocks && clocks == 12);
+    CHECK(a.op[KAGE_IO_OPEN].calls == 1 && a.op[KAGE_IO_OPEN].time_us == 50);
+    CHECK(a.op[KAGE_IO_READ].calls == 2 && a.op[KAGE_IO_READ].errors == 1);
+    CHECK(a.op[KAGE_IO_READ].requested_bytes == 29 && a.op[KAGE_IO_READ].returned_bytes == 7);
+    CHECK(a.op[KAGE_IO_PREAD].calls == 1 && a.op[KAGE_IO_PREAD].time_us == 123456);
+    CHECK(a.op[KAGE_IO_SEEK32].errors == 1 && a.op[KAGE_IO_SEEK64].errors == 0);
+    CHECK(a.max_op == KAGE_IO_PREAD && a.max_class == KAGE_IO_ARCHIVE);
+    CHECK(a.max_us == 123456 && a.max_requested_bytes == 14 && a.max_error == 0);
+    CHECK(a.class_us[KAGE_IO_ARCHIVE] == 123626 && a.unknown_calls == 0);
+    kage_vita_io_window_take(&a);
+    CHECK(a.max_us == 0 && a.op[KAGE_IO_READ].calls == 0);
+
+    /* The map survives reset; completion after a take belongs to next window. */
+    s_take_during_read = 1;
+    s_result = 1;
+    CHECK(__wrap_sceIoRead(1, buffer, 1) == 1);
+    CHECK(s_mid_read.op[KAGE_IO_READ].calls == 0);
+    kage_vita_io_window_take(&a);
+    CHECK(a.op[KAGE_IO_READ].calls == 1 && a.max_class == KAGE_IO_ARCHIVE);
+
+    /* 1 and 64 intentionally hash to the same slot; no false old-fd class. */
+    s_fd = 64;
+    CHECK(__wrap_sceIoOpen("ux0:/data/shaders/a.gxp", 1, 0) == 64);
+    CHECK(__wrap_sceIoRead(1, buffer, 1) == 1);
+    CHECK(__wrap_sceIoRead(64, buffer, 1) == 1);
+    kage_vita_io_window_take(&a);
+    CHECK(a.map_collisions == 1 && a.unknown_calls == 1);
+    CHECK(a.class_us[KAGE_IO_SHADER] == 20 && a.class_us[KAGE_IO_UNKNOWN] == 10);
+    s_result = -7;
+    CHECK(__wrap_sceIoClose(64) == -7);
+    CHECK(__wrap_sceIoRead(64, buffer, 1) == -7);
+    kage_vita_io_window_take(&a);
+    CHECK(a.op[KAGE_IO_CLOSE].errors == 1 && a.unknown_calls == 1);
+
+    /* Reopen before old Close returns: removal must not erase the new fd. */
+    CHECK(__wrap_sceIoOpen(path, 1, 0) == 64);
+    s_reuse_during_close = 1;
+    s_result = 0;
+    CHECK(__wrap_sceIoClose(64) == 0);
+    kage_vita_io_window_take(&a);
+    s_result = 1;
+    CHECK(__wrap_sceIoRead(64, buffer, 1) == 1);
+    kage_vita_io_window_take(&a);
+    CHECK(a.max_class == KAGE_IO_CONFIG && a.unknown_calls == 0);
+
+    s_fd = -3;
+    CHECK(__wrap_sceIoOpen(NULL, 0, 0) == -3);
+    kage_vita_io_window_take(&a);
+    CHECK(a.op[KAGE_IO_OPEN].errors == 1 && a.max_class == KAGE_IO_UNKNOWN);
+    memset(bounded, 'x', sizeof bounded);
+    s_fd = 2;
+    CHECK(__wrap_sceIoOpen(bounded, 1, 0) == 2);
+    kage_vita_io_window_take(&a);
+    CHECK(a.max_class == KAGE_IO_UNKNOWN);
+    s_now = 1000;
+    s_reverse = 1;
+    CHECK(__wrap_sceIoRead(2, buffer, 1) == 1);
+    kage_vita_io_window_take(&a);
+    CHECK(a.clock_reversals == 1 && a.op[KAGE_IO_READ].time_us == 0);
+    s_reverse = 0;
+    s_duration = UINT64_MAX;
+    for (i = 0; i < 2; ++i) {
+        s_now = 0;
+        CHECK(__wrap_sceIoRead(2, buffer, UINT32_MAX) == 1);
+    }
+    kage_vita_io_window_take(&a);
+    CHECK(a.op[KAGE_IO_READ].time_us == UINT64_MAX);
+    CHECK(a.op[KAGE_IO_READ].requested_bytes == UINT64_C(8589934590));
+    CHECK(a.max_us == UINT64_MAX && a.class_us[KAGE_IO_UNKNOWN] == UINT64_MAX);
+    s_duration = 5;
+    for (i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
+        s_now = 0;
+        CHECK(__wrap_sceIoOpen(classes[i].path, 1, 0) == 2);
+        kage_vita_io_window_take(&a);
+        CHECK(a.max_class == classes[i].file_class);
+    }
+    /* A preempted owner cannot strand the native caller or snapshot. */
+    s_fd = 1;
+    CHECK(__wrap_sceIoOpen(path, 1, 0) == 1);
+    kage_vita_io_window_take(&a);
+    __atomic_store_n(&s_window_lock, 1U, __ATOMIC_RELEASE);
+    CHECK(__wrap_sceIoClose(1) == 1); /* map loss still invalidates the old fd */
+    CHECK(__wrap_sceIoOpen("ux0:/options.ini", 1, 0) == 1);
+    kage_vita_io_window_take(&a);
+    CHECK(a.snapshot_valid == 0 && a.op[KAGE_IO_READ].calls == 0);
+    __atomic_store_n(&s_window_lock, 0U, __ATOMIC_RELEASE);
+    CHECK(__wrap_sceIoRead(1, buffer, 1) == 1);
+    kage_vita_io_window_take(&a);
+    CHECK(a.snapshot_valid == 1 && a.take_misses == 1);
+    CHECK(a.record_drops == 2 && a.map_drops == 2);
+    CHECK(a.unknown_calls == 1 && a.max_class == KAGE_IO_UNKNOWN);
+    CHECK(a.op[KAGE_IO_READ].calls == 1 && a.op[KAGE_IO_OPEN].calls == 0);
+    CHECK(__wrap_sceIoOpen("ux0:/options.ini", 1, 0) == 1);
+    kage_vita_io_window_take(&a);
+    CHECK(__wrap_sceIoRead(1, buffer, 1) == 1);
+    kage_vita_io_window_take(&a);
+    CHECK(a.max_class == KAGE_IO_CONFIG && a.take_misses == 0);
+    CHECK(a.record_drops == 0 && a.map_drops == 0 && a.unknown_calls == 0);
+    /* Appended buckets preserve the original six ABI indices. */
+    CHECK(KAGE_IO_OPEN == 0 && KAGE_IO_SEEK64 == 5 && KAGE_IO_WRITE == 6);
+    CHECK(KAGE_IO_PWRITE == 7 && KAGE_IO_SYNC == 8 && KAGE_IO_SYNC_BY_FD == 9);
+    CHECK(__wrap_sceIoOpen("ux0:/data/log.txt", 1, 0) == 1);
+    kage_vita_io_window_take(&a);
+    s_result = 3;
+    s_duration = 123;
+    errno = 78;
+    clocks = s_clocks;
+    CHECK(__wrap_sceIoWrite(1, buffer, sizeof buffer) == 3);
+    CHECK(s_descriptor == 1 && s_write_buffer == buffer && s_write_size == sizeof buffer);
+    CHECK(buffer[0] == 0x5a && s_entry_errno == 78 && errno == s_native_errno);
+    s_result = -12;
+    CHECK(__wrap_sceIoWrite(1, buffer, 9) == -12);
+    s_result = 2;
+    s_duration = 234;
+    CHECK(__wrap_sceIoPwrite(1, buffer, 7, INT64_C(0x876543210)) == 2);
+    CHECK(s_offset == INT64_C(0x876543210) && s_write_size == 7);
+    s_result = -13;
+    CHECK(__wrap_sceIoPwrite(1, buffer, 4, INT64_C(-27)) == -13);
+    CHECK(s_offset == -27 && s_write_buffer == buffer);
+    s_duration = 345;
+    s_result = 0;
+    CHECK(__wrap_sceIoSyncByFd(1, -7) == 0);
+    CHECK(s_descriptor == 1 && s_sync_fd_flags == -7);
+    s_result = -14;
+    CHECK(__wrap_sceIoSyncByFd(1, 8) == -14);
+    s_duration = 456;
+    s_result = 0;
+    path = "ux0:";
+    CHECK(__wrap_sceIoSync(path, UINT32_MAX) == 0);
+    CHECK(s_sync_device == path && s_sync_flags == UINT32_MAX);
+    s_result = -15;
+    CHECK(__wrap_sceIoSync(NULL, 5) == -15);
+    CHECK(s_sync_device == NULL && s_sync_flags == 5);
+    kage_vita_io_window_take(&a);
+    CHECK(s_clocks == clocks + 16);
+    CHECK(a.op[KAGE_IO_WRITE].calls == 2 && a.op[KAGE_IO_WRITE].errors == 1);
+    CHECK(a.op[KAGE_IO_WRITE].requested_bytes == 25 && a.op[KAGE_IO_WRITE].returned_bytes == 3);
+    CHECK(a.op[KAGE_IO_PWRITE].calls == 2 && a.op[KAGE_IO_PWRITE].errors == 1);
+    CHECK(a.op[KAGE_IO_PWRITE].requested_bytes == 11 && a.op[KAGE_IO_PWRITE].returned_bytes == 2);
+    CHECK(a.op[KAGE_IO_SYNC].calls == 2 && a.op[KAGE_IO_SYNC].errors == 1);
+    CHECK(a.op[KAGE_IO_SYNC_BY_FD].calls == 2 && a.op[KAGE_IO_SYNC_BY_FD].errors == 1);
+    CHECK(a.op[KAGE_IO_SYNC].returned_bytes == 0 && a.op[KAGE_IO_SYNC_BY_FD].requested_bytes == 0);
+    CHECK(a.class_us[KAGE_IO_LOG] == 1404 && a.class_us[KAGE_IO_UNKNOWN] == 912);
+    CHECK(a.max_us == 456 && a.max_op == KAGE_IO_SYNC && a.max_class == KAGE_IO_UNKNOWN);
+    __atomic_store_n(&s_window_lock, 1U, __ATOMIC_RELEASE);
+    CHECK(__wrap_sceIoWrite(1, buffer, 1) == -15);
+    CHECK(__wrap_sceIoSync(NULL, 0) == -15);
+    __atomic_store_n(&s_window_lock, 0U, __ATOMIC_RELEASE);
+    kage_vita_io_window_take(&a);
+    CHECK(a.record_drops == 2 && a.map_drops == 1);
+    puts("Vita window native-I/O profile oracle: PASS (native calls only, no per-call logs)");
+    return 0;
+}
+#else
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -359,3 +714,4 @@ int main(void)
     puts("Vita startup native-I/O profile oracle: PASS");
     return 0;
 }
+#endif

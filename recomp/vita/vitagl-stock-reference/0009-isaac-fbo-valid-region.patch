@@ -1,0 +1,327 @@
+diff --git a/source/gxm.c b/source/gxm.c
+index 371653f..c91eaef 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -156,6 +156,182 @@ void vglIsaacSceneWaits(uint32_t *fbo_us, uint32_t *display_us, uint32_t *max_us
+ #define ISAAC_SCENE_TIME_DEPTH_CREATED(surface) ((void)0)
+ #endif
+ 
++#ifdef HAVE_ISAAC_FBO_VALID_REGION
++/* Isaac FBO valid region (0009-isaac-fbo-valid-region.patch).  The game's
++ * offscreen colour attachments are power-of-two textures larger than what
++ * it draws into them (1024x1024 for a 960x540 surface, 512x512 for 480x270)
++ * and its RenderTarget::Bind sets glViewport(0, 0, logical w, logical h)
++ * right after glBindFramebuffer + glFramebufferTexture2D.  Stock vitaGL
++ * begins every FBO scene with a NULL SceGxmValidRegion and update_scissor_test
++ * clips to the whole texture, so the padding rows and columns take the clear
++ * quad, the mask-update quad and the colour write-back of every offscreen
++ * pass.  This patch derives the logical rect from gl_viewport (the guest's
++ * last glViewport, which vitaGL already records) at the FBO sceGxmBeginScene
++ * of scene_reset and, in apply mode, passes it as the valid region and clamps
++ * the tile-clipper region to it (tests.c update_scissor_test and the
++ * scene_reset re-apply); in observe mode it only counts.
++ *
++ * Fail closed: the rect is used only when the guest set it after the current
++ * framebuffer binding and colour attachment (isaacFboRegionNoteViewport
++ * records the write framebuffer, its attached texture and the attachment
++ * size it saw; a mismatch at BeginScene means the viewport predates the
++ * bind/attach), when it is anchored at (0, 0) and when it fits inside the
++ * attachment; anything else keeps NULL.  A rect equal to the attachment also
++ * keeps NULL (nothing to trim).  If sceGxmBeginScene rejects the region the
++ * scene is begun again with NULL.  A guest glViewport that leaves the rect
++ * derived for the open FBO scene (no scene reset pending) counts as a
++ * violation in both modes, so an observe run proves the game's sequence
++ * before apply mode clips anything; in apply mode it also stops applying for
++ * the rest of the run, but the open scene stays clipped, so the counter must
++ * read 0 in observe mode before apply mode is run at all.  The display
++ * render target is never touched.  vitaGL's own viewport re-applies
++ * (scene_reset, validate_viewport) are not guest viewports and do not
++ * refresh the record.
++ *
++ * Whether the SGX skips tile load/store outside the valid region (the GPU
++ * saving this patch is after) or only clips fragments, as the vita3k model
++ * does, is unverified until the device A/B.  The hooks are consumer-declared
++ * (kage_vita_backend.c, kage_vita_phase_profile.c), not in vitaGL.h, whose
++ * whole-file hash must stay stable. */
++#ifdef HAVE_SHARED_RENDERTARGETS
++#error "0009-isaac-fbo-valid-region.patch supports the stock per-framebuffer render targets only"
++#endif
++#define ISAAC_FBO_REGION_CENSUS 4 // Distinct (texture w, texture h, rect w, rect h) tuples remembered per run
++static uint8_t isaac_fbo_region_apply = 0; // 0 = observe only, 1 = pass the region to sceGxmBeginScene
++static uint8_t isaac_fbo_region_active = 0; // The open FBO scene was begun with isaac_fbo_region (apply mode)
++static uint8_t isaac_fbo_region_known = 0; // isaac_fbo_region holds the rect derived for the open FBO scene (both modes)
++static uint8_t isaac_fbo_region_internal_viewport = 0; // A vitaGL-internal glViewport re-apply is running
++static SceGxmValidRegion isaac_fbo_region = { 0, 0 };
++static framebuffer *isaac_fbo_region_vp_fb = NULL; // Write framebuffer when the guest last set gl_viewport
++static texture *isaac_fbo_region_vp_tex = NULL; // Its colour attachment at that time
++static int isaac_fbo_region_vp_w = 0; // Its attachment width at that time
++static int isaac_fbo_region_vp_h = 0; // Its attachment height at that time
++static uint32_t isaac_fbo_region_counters[8] = { 0, 0, 0, 0, 0, 0, 0, 0 }; // s, p, u, a, e, v, c, o (vglIsaacFboValidRegionStats)
++static uint32_t isaac_fbo_region_census[ISAAC_FBO_REGION_CENSUS * 5] = { 0 }; // tex w, tex h, rect w, rect h, scenes this window
++static GLboolean isaac_fbo_region_scene_reset_pending(void); // needs_scene_reset, defined after the stock flag below
++
++static void isaac_fbo_region_census_note(uint32_t tex_w, uint32_t tex_h, uint32_t rect_w, uint32_t rect_h) {
++	int i;
++	for (i = 0; i < ISAAC_FBO_REGION_CENSUS; i++) {
++		uint32_t *entry = &isaac_fbo_region_census[i * 5];
++		if (entry[0] == 0) {
++			entry[0] = tex_w;
++			entry[1] = tex_h;
++			entry[2] = rect_w;
++			entry[3] = rect_h;
++		}
++		if (entry[0] == tex_w && entry[1] == tex_h && entry[2] == rect_w && entry[3] == rect_h) {
++			entry[4]++;
++			return;
++		}
++	}
++	isaac_fbo_region_counters[7]++; // A fifth distinct tuple: counted, not remembered
++}
++
++// Called by scene_reset right before the FBO sceGxmBeginScene; NULL keeps the stock behaviour
++static const SceGxmValidRegion *isaac_fbo_region_for_scene(void) {
++	framebuffer *fb = active_write_fb;
++	isaac_fbo_region_active = 0;
++	isaac_fbo_region_known = 0;
++	isaac_fbo_region_counters[0]++; // s: FBO scenes begun
++	if (isaac_fbo_region_vp_fb != fb || isaac_fbo_region_vp_tex != fb->tex || isaac_fbo_region_vp_w != fb->width || isaac_fbo_region_vp_h != fb->height
++		|| gl_viewport.x != 0 || gl_viewport.y != 0 || gl_viewport.w <= 0 || gl_viewport.h <= 0 || gl_viewport.w > fb->width || gl_viewport.h > fb->height) {
++		isaac_fbo_region_counters[2]++; // u: rect unknown (viewport predates the bind/attach), unanchored or oversized
++		return NULL;
++	}
++	isaac_fbo_region_census_note((uint32_t)fb->width, (uint32_t)fb->height, (uint32_t)gl_viewport.w, (uint32_t)gl_viewport.h);
++	if (gl_viewport.w == fb->width && gl_viewport.h == fb->height)
++		return NULL; // Nothing to trim
++	isaac_fbo_region_counters[1]++; // p: rect known and smaller than the attachment
++	isaac_fbo_region.xMax = (uint32_t)gl_viewport.w - 1;
++	isaac_fbo_region.yMax = (uint32_t)gl_viewport.h - 1;
++	isaac_fbo_region_known = 1; // Both modes: isaacFboRegionNoteViewport checks the guest against this rect
++	if (!isaac_fbo_region_apply)
++		return NULL;
++	isaac_fbo_region_active = 1;
++	return &isaac_fbo_region;
++}
++#define ISAAC_FBO_REGION_FOR_SCENE() isaac_fbo_region_for_scene()
++// After the FBO sceGxmBeginScene: a rejected region is retried with NULL (fail closed), an accepted one is counted
++#define ISAAC_FBO_REGION_RETRY_NULL(r, call) \
++	do { \
++		if (isaac_fbo_region_active) { \
++			if (r) { \
++				isaac_fbo_region_counters[4]++; \
++				isaac_fbo_region_active = 0; \
++				isaac_fbo_region_known = 0; \
++				(r) = (call); \
++			} else { \
++				isaac_fbo_region_counters[3]++; \
++			} \
++		} \
++	} while (0)
++#define ISAAC_FBO_REGION_INTERNAL_VIEWPORT_BEGIN() (isaac_fbo_region_internal_viewport = 1)
++#define ISAAC_FBO_REGION_INTERNAL_VIEWPORT_END() (isaac_fbo_region_internal_viewport = 0)
++
++// misc.c glViewport, guest viewports only (skip_viewport_override and the internal re-applies excluded)
++void isaacFboRegionNoteViewport(int x, int y, int w, int h) {
++	if (isaac_fbo_region_internal_viewport)
++		return;
++	isaac_fbo_region_vp_fb = active_write_fb;
++	isaac_fbo_region_vp_tex = active_write_fb ? active_write_fb->tex : NULL;
++	isaac_fbo_region_vp_w = active_write_fb ? active_write_fb->width : 0;
++	isaac_fbo_region_vp_h = active_write_fb ? active_write_fb->height : 0;
++	// A viewport outside the rect derived for the open FBO scene is a violation only while the next draw would continue that scene
++	// (same scene_reset condition).  Counted in both modes so observe mode proves the sequence; in apply mode the run stops applying.
++	if (isaac_fbo_region_known && !is_rendering_display && in_use_framebuffer == active_write_fb && !isaac_fbo_region_scene_reset_pending() && !dirty_framebuffer && !dirty_query
++		&& (x < 0 || y < 0 || w < 0 || h < 0 || (uint32_t)(x + w) > isaac_fbo_region.xMax + 1 || (uint32_t)(y + h) > isaac_fbo_region.yMax + 1)) {
++		isaac_fbo_region_counters[5]++; // v
++		isaac_fbo_region_apply = 0;
++	}
++}
++
++// tests.c/scene_reset tile clipper: keep the region clip inside the valid region of the open FBO scene.  A clip that lies wholly
++// outside the region collapses to a one-pixel sliver at the region edge rather than an empty clip (the callers pass
++// SCE_GXM_REGION_CLIP_OUTSIDE); the guest never scissors outside its viewport, so this case is unreachable today.
++void isaacFboRegionClampClip(int *x_min, int *y_min, int *x_max, int *y_max) {
++	int region_x_max = (int)isaac_fbo_region.xMax, region_y_max = (int)isaac_fbo_region.yMax;
++	if (!isaac_fbo_region_active || is_rendering_display)
++		return;
++	if (*x_max <= region_x_max && *y_max <= region_y_max)
++		return;
++	if (*x_max > region_x_max)
++		*x_max = region_x_max;
++	if (*y_max > region_y_max)
++		*y_max = region_y_max;
++	if (*x_min > *x_max)
++		*x_min = *x_max;
++	if (*y_min > *y_max)
++		*y_min = *y_max;
++	isaac_fbo_region_counters[6]++; // c
++}
++
++// Consumer setup, once before vglInit: 0 = observe (count only), 1 = apply; returns the mode in effect
++uint8_t vglIsaacSetupFboValidRegion(uint8_t apply) {
++	isaac_fbo_region_apply = apply ? 1 : 0;
++	return isaac_fbo_region_apply;
++}
++
++// Take-and-zero: counters[8] = s (FBO scenes begun), p (rect known and smaller than the attachment), u (rect unknown/unanchored/oversized -> NULL), a (begun with the region), e (region rejected by sceGxmBeginScene, begun again with NULL), v (viewport violations, applying stopped), c (region clips clamped), o (census overflow); census[ISAAC_FBO_REGION_CENSUS * 5] = tex w, tex h, rect w, rect h, scenes this window per distinct tuple in first-seen order (the tuples persist, the counts are zeroed)
++void vglIsaacFboValidRegionStats(uint32_t *counters, uint32_t *census) {
++	int i;
++	for (i = 0; i < 8; i++) {
++		counters[i] = isaac_fbo_region_counters[i];
++		isaac_fbo_region_counters[i] = 0;
++	}
++	for (i = 0; i < ISAAC_FBO_REGION_CENSUS * 5; i++)
++		census[i] = isaac_fbo_region_census[i];
++	for (i = 0; i < ISAAC_FBO_REGION_CENSUS; i++)
++		isaac_fbo_region_census[i * 5 + 4] = 0;
++}
++#else
++#define ISAAC_FBO_REGION_FOR_SCENE() NULL
++#define ISAAC_FBO_REGION_RETRY_NULL(r, call) ((void)0)
++#define ISAAC_FBO_REGION_INTERNAL_VIEWPORT_BEGIN() ((void)0)
++#define ISAAC_FBO_REGION_INTERNAL_VIEWPORT_END() ((void)0)
++#define isaacFboRegionClampClip(x_min, y_min, x_max, y_max) ((void)0)
++#endif
++
+ #define MAX_SCENES_PER_FRAME 8 // Maximum amount of scenes per frame allowed by sceGxm per render target
+ 
+ // FIXME: Since we use our own default uniform buffers circular pool, fragment and vertex buffer rings can likely be reduced in size
+@@ -199,6 +375,12 @@ GLboolean dirty_framebuffer = GL_FALSE; // Flag whether current in use framebuff
+ GLboolean dirty_query = GL_FALSE; // Flag whether occlusion queries needs results
+ static GLboolean needs_end_scene = GL_FALSE; // Flag for gxm end scene requirement at scene reset
+ static GLboolean needs_scene_reset = GL_TRUE; // Flag for when a scene reset is required
++#ifdef HAVE_ISAAC_FBO_VALID_REGION
++// Isaac 0009: read by isaacFboRegionNoteViewport above (defined here, after the stock flag it reads)
++static GLboolean isaac_fbo_region_scene_reset_pending(void) {
++	return needs_scene_reset;
++}
++#endif
+ 
+ SceGxmContext *gxm_context; // sceGxm context instance
+ GLenum vgl_error = GL_NO_ERROR; // Error returned by glGetError
+@@ -832,6 +1014,8 @@ void scene_reset(void) {
+ 				}
+ 			}
+ #endif
++			// Isaac 0009: the guest's logical rect as the valid region of this offscreen scene, NULL when unknown (observe mode, stale or oversized viewport)
++			const SceGxmValidRegion *isaac_fbo_valid_region = ISAAC_FBO_REGION_FOR_SCENE();
+ 			ISAAC_SCENE_TIME_BEGIN();
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ 			render_target *fbo_rt = (render_target *)active_write_fb->target;
+@@ -842,9 +1026,10 @@ void scene_reset(void) {
+ #else
+ 			int r = sceGxmBeginScene(gxm_context, 0, active_write_fb->target,
+ #endif
+-					NULL, NULL, NULL,
++					isaac_fbo_valid_region, NULL, NULL,
+ 					&active_write_fb->colorbuffer,
+ 					active_write_fb->depthbuffer_ptr);
++			ISAAC_FBO_REGION_RETRY_NULL(r, sceGxmBeginScene(gxm_context, 0, active_write_fb->target, NULL, NULL, NULL, &active_write_fb->colorbuffer, active_write_fb->depthbuffer_ptr));
+ 			ISAAC_SCENE_TIME_END_BEGIN_SCENE();
+ #ifdef HAVE_ISAAC_GXM_STATE_SHADOW
+ 			isaacGxmStateBeginScene(gxm_context, r);
+@@ -859,7 +1044,9 @@ void scene_reset(void) {
+ 		if (old_framebuffer != in_use_framebuffer) {
+ 			dirty_scissor_state = GL_TRUE;
+ 			old_framebuffer = in_use_framebuffer;
++			ISAAC_FBO_REGION_INTERNAL_VIEWPORT_BEGIN();
+ 			glViewport(gl_viewport.x, gl_viewport.y, gl_viewport.w, gl_viewport.h);
++			ISAAC_FBO_REGION_INTERNAL_VIEWPORT_END();
+ #ifndef HAVE_UNFLIPPED_FBOS
+ 			change_cull_mode();
+ #endif
+@@ -868,8 +1055,11 @@ void scene_reset(void) {
+ 		}
+ 
+ #ifndef DISABLE_TILE_CLIPPER
+-		if (scissor_test_state)
+-			sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, region.x, region.y, region.x + region.w - 1, region.y + region.h - 1);
++		if (scissor_test_state) {
++			int clip_x_min = region.x, clip_y_min = region.y, clip_x_max = region.x + region.w - 1, clip_y_max = region.y + region.h - 1;
++			isaacFboRegionClampClip(&clip_x_min, &clip_y_min, &clip_x_max, &clip_y_max);
++			sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, clip_x_min, clip_y_min, clip_x_max, clip_y_max);
++		}
+ #endif
+ 	}
+ 	
+diff --git a/source/misc.c b/source/misc.c
+index dd9d6ef..f961a98 100644
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -318,6 +318,11 @@ void glFrontFace(GLenum mode) {
+ 		change_cull_mode();
+ }
+ 
++#ifdef HAVE_ISAAC_FBO_VALID_REGION
++// Isaac 0009-isaac-fbo-valid-region.patch (gxm.c), deliberately not in shared.h or vitaGL.h
++void isaacFboRegionNoteViewport(int x, int y, int w, int h);
++#endif
++
+ void glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+ 	THREAD_SAFE()
+ 
+@@ -344,6 +349,10 @@ void glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+ 		gl_viewport.y = y;
+ 		gl_viewport.w = width;
+ 		gl_viewport.h = height;
++#ifdef HAVE_ISAAC_FBO_VALID_REGION
++		// Isaac 0009 (gxm.c): remember which framebuffer/attachment this guest viewport was set for; detect a viewport leaving the active valid region
++		isaacFboRegionNoteViewport(x, y, width, height);
++#endif
+ 	} else
+ 		skip_viewport_override = GL_FALSE;
+ }
+diff --git a/source/tests.c b/source/tests.c
+index aad6b0e..3531037 100644
+--- a/source/tests.c
++++ b/source/tests.c
+@@ -23,6 +23,14 @@
+ 
+ #include "shared.h"
+ 
++#ifdef HAVE_ISAAC_FBO_VALID_REGION
++// Isaac 0009-isaac-fbo-valid-region.patch (gxm.c), deliberately not in shared.h or vitaGL.h: the tile clipper stays inside the valid region of the open FBO scene
++void isaacFboRegionClampClip(int *x_min, int *y_min, int *x_max, int *y_max);
++#define ISAAC_FBO_REGION_CLAMP_CLIP(x_min, y_min, x_max, y_max) isaacFboRegionClampClip(&(x_min), &(y_min), &(x_max), &(y_max))
++#else
++#define ISAAC_FBO_REGION_CLAMP_CLIP(x_min, y_min, x_max, y_max) ((void)0)
++#endif
++
+ // Depth Test
+ GLboolean depth_test_state = GL_FALSE; // Current state for GL_DEPTH_TEST
+ SceGxmDepthFunc depth_func = SCE_GXM_DEPTH_FUNC_LESS; // Current in-use depth test func
+@@ -285,8 +293,12 @@ void update_scissor_test() {
+ 		region.h = active_h - region.y;
+ 
+ #ifndef DISABLE_TILE_CLIPPER
+-	// Invalidating internal tile based region clip
+-	sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, 0, 0, active_w - 1, active_h - 1);
++	// Invalidating internal tile based region clip (Isaac 0009: no wider than the valid region of the open FBO scene)
++	{
++		int clip_x_min = 0, clip_y_min = 0, clip_x_max = active_w - 1, clip_y_max = active_h - 1;
++		ISAAC_FBO_REGION_CLAMP_CLIP(clip_x_min, clip_y_min, clip_x_max, clip_y_max);
++		sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, clip_x_min, clip_y_min, clip_x_max, clip_y_max);
++	}
+ #endif
+ 	
+ 	if (scissor_test_state) {
+@@ -342,13 +354,16 @@ void update_scissor_test() {
+ #ifndef DISABLE_TILE_CLIPPER
+ 	// Reducing GPU workload by performing tile granularity clipping
+ 	if (scissor_test_state) {
++		int clip_x_min = region.x, clip_y_min = region.y, clip_x_max = region.x + region.w - 1, clip_y_max = region.y + region.h - 1;
+ #ifndef HAVE_UNFLIPPED_FBOS
+ 		if (!is_rendering_display) {
+-			uint32_t y = region.gl_y > 0 ? region.gl_y : 0;
+-			sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, region.x, y, region.x + region.w - 1, y + region.h - 1);
+-		} else
++			int y = region.gl_y > 0 ? region.gl_y : 0;
++			clip_y_min = y;
++			clip_y_max = y + region.h - 1;
++		}
+ #endif
+-			sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, region.x, region.y, region.x + region.w - 1, region.y + region.h - 1);
++		ISAAC_FBO_REGION_CLAMP_CLIP(clip_x_min, clip_y_min, clip_x_max, clip_y_max);
++		sceGxmSetRegionClip(gxm_context, SCE_GXM_REGION_CLIP_OUTSIDE, clip_x_min, clip_y_min, clip_x_max, clip_y_max);
+ 	}
+ #endif
+ 

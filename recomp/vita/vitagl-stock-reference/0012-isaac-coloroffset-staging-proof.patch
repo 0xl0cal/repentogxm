@@ -1,0 +1,168 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 76c2716..c7ebee3 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -62,6 +62,12 @@
+ #define ISAAC_COLOROFFSET_FS_PROBE_CACHE_CAPACITY 4u
+ static void isaac_coloroffset_fs_probe_note_exact_source(const shader *s);
+ #endif
++#if !defined(HAVE_ISAAC_COLOROFFSET_STAGING_PROOF) || HAVE_ISAAC_COLOROFFSET_STAGING_PROOF != 1 || HAVE_ISAAC_COLOROFFSET_FS_PROBE != 3
++#error "Isaac ColorOffset staging proof requires its opt-in flag and neutral mode 3"
++#endif
++#define ISAAC_COLOROFFSET_STAGING_MEMCPY vgl_fast_memcpy
++#include "isaac_coloroffset_staging.h"
++#undef ISAAC_COLOROFFSET_STAGING_MEMCPY
+ _Static_assert(VERTEX_ATTRIBS_NUM == ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES,
+ 	"Isaac GPU draw policy attribute ceiling drifted");
+ _Static_assert(sizeof(SceGxmVertexAttribute) ==
+@@ -1022,7 +1028,8 @@ static void isaac_coloroffset_release_fragment_cache(program *p) {
+ }
+ 
+ static SceGxmFragmentProgram *isaac_coloroffset_select_opaque_fragment(
+-		program *p, texture *tex, const SceGxmVertexAttribute *attributes,
++		program *p, GLboolean fragment_exact, texture *tex,
++		const SceGxmVertexAttribute *attributes,
+ 		const SceGxmVertexStream *streams, const void *vertices,
+ 		uint32_t vertex_bytes, const void *indices, uint32_t index_bytes,
+ 		GLboolean single_stream, GLboolean staged,
+@@ -1036,7 +1043,7 @@ static SceGxmFragmentProgram *isaac_coloroffset_select_opaque_fragment(
+ 	uint32_t width, height, index;
+ 	SceGxmFragmentProgram *fragment;
+ 
+-	if (!isaac_coloroffset_fragment_program_is_exact(p))
++	if (!fragment_exact)
+ 		return NULL;
+ 	ISAAC_COLOROFFSET_COUNT(exact_draw_requests);
+ 	if (!p->isaac_coloroffset_link_vertex_exact ||
+@@ -1500,27 +1507,27 @@ static void isaac_coloroffset_fs_probe_link(program *p) {
+ }
+ 
+ #if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 3
+-/* Inspect the complete bounded staging range already copied by vitaGL.
+- * Checking every vertex through max(index)+1 is conservative: it also
+- * rejects a nonneutral unused vertex, but can never admit a nonneutral
+- * referenced one.  VBOs, instancing, base-vertex and unknown layouts stay
+- * on the stock path.  No guest pointer is dereferenced here. */
+-static GLboolean isaac_coloroffset_neutral_draw_is_eligible(
+-		program *p, texture *tex, const SceGxmVertexAttribute *attributes,
+-		const SceGxmVertexStream *streams, const void *vertices,
+-		uint32_t vertex_bytes, GLboolean single_stream, GLboolean staged,
+-		GLsizei count, uint32_t top_idx, uint32_t base_idx,
++/* Called only at the existing packed client-array copy boundary, after
++ * handle_packed_attrib has resolved the same descriptors used by the draw.
++ * The immutable program check is shared with the opaque selector.  The copy
++ * helper proves all vertices; actual staging/coalescing are checked below
++ * before binding.  VBOs and unknown layouts retain the original path. */
++static GLboolean isaac_coloroffset_neutral_metadata_is_eligible(
++		program *p, GLboolean fragment_exact, texture *tex,
++		const SceGxmVertexAttribute *attributes,
++		const SceGxmVertexStream *streams,
++		GLsizei count, uint32_t base_idx,
+ 		SceGxmIndexSource index_type) {
+ 	isaac_coloroffset_attribute_key keys[ISAAC_COLOROFFSET_ATTRIBUTE_COUNT];
+ 	uint16_t strides[ISAAC_COLOROFFSET_ATTRIBUTE_COUNT];
+ 	uint32_t index;
+ 	SceGxmTextureFormat format;
+-	if (!isaac_coloroffset_fragment_program_is_exact(p) ||
++	if (!fragment_exact ||
+ 			!p->isaac_coloroffset_link_vertex_exact ||
+ 			p->attr_num != ISAAC_COLOROFFSET_ATTRIBUTE_COUNT ||
+ 			p->max_frag_texunit_idx != 1u || p->max_vert_texunit_idx != 0u ||
+ 			!p->frag_texunits[0] || p->frag_texunits[0]->type != UNIFORM_SAMPLER ||
+-			!single_stream || !staged || !attributes || !streams ||
++			!attributes || !streams ||
+ 			count <= 0 || base_idx != 0u || is_fbo_float ||
+ 			index_type != SCE_GXM_INDEX_SOURCE_INDEX_16BIT ||
+ 			!tex || tex->status != TEX_VALID || !tex->data)
+@@ -1544,9 +1551,7 @@ static GLboolean isaac_coloroffset_neutral_draw_is_eligible(
+ 		strides[index] = streams[index].stride;
+ 	}
+ 	return isaac_coloroffset_layout_is_exact(keys, strides, p->attr_num,
+-		cur_vao->vertex_attrib_state, SCE_GXM_ATTRIBUTE_FORMAT_F32) &&
+-		isaac_coloroffset_contiguous_vertices_are_neutral(vertices,
+-			vertex_bytes, top_idx, ISAAC_COLOROFFSET_VERTEX_STRIDE);
++		cur_vao->vertex_attrib_state, SCE_GXM_ATTRIBUTE_FORMAT_F32);
+ }
+ #endif
+ 
+@@ -2496,6 +2501,12 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ #ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
+ 	texture *isaac_coloroffset_texture = NULL;
+ 	SceGxmIndexSource isaac_coloroffset_original_index_type = index_type;
++	/* No guest shader mutation occurs inside a native draw.  Share this one
++	 * lifecycle/reflection check; never retain the result between draws. */
++	const GLboolean isaac_coloroffset_fragment_exact =
++		isaac_coloroffset_fragment_program_is_exact(p);
++	enum isaac_coloroffset_staging_result isaac_neutral_staging =
++		ISAAC_COLOROFFSET_STAGING_UNKNOWN;
+ #endif
+ 
+ 	// Check if a blend info rebuild is required and upload fragment program
+@@ -2699,20 +2710,34 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 				handle_packed_vbo_attrib();
+ 			}
+ 		} else {
++			/* disable_draw_attrib may set streams[0].stride to zero below;
++			 * retain the exact allocation/copy size of the original path. */
++			const uint32_t isaac_copy_stride = streams[0].stride;
++			/* Resolve metadata before copying so only the known neutral
++			 * layout takes the cached-chunk path.  These macros do not read
++			 * client bytes or consume ptrs[0]. */
++			for (int i = 0; i < p->attr_num; i++) {
++				uint8_t attr_idx = p->attr_map[i];
++				attributes[i].regIndex = p->attr[attr_idx].regIndex;
++				handle_packed_attrib();
++			}
+ #ifdef SAFER_DRAW_SPEEDHACK
+-			if (top_idx * streams[0].stride > SAFE_DRAW_SIZE_THRESHOLD) {
++			if (top_idx * isaac_copy_stride > SAFE_DRAW_SIZE_THRESHOLD) {
+ 				ptrs[0] = (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]];
+ 			} else
+ #endif
+ 			{
+-				ISAAC_NOTE_VERTEX_COPY(top_idx, streams[0].stride);
+-				ptrs[0] = gpu_alloc_mapped_temp(top_idx * streams[0].stride);
+-				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * streams[0].stride);
+-			}
+-			for (int i = 0; i < p->attr_num; i++) {
+-				uint8_t attr_idx = p->attr_map[i];
+-				attributes[i].regIndex = p->attr[attr_idx].regIndex;
+-				handle_packed_attrib();
++				ISAAC_NOTE_VERTEX_COPY(top_idx, isaac_copy_stride);
++				ptrs[0] = gpu_alloc_mapped_temp(top_idx * isaac_copy_stride);
++				if (isaac_coloroffset_neutral_metadata_is_eligible(
++						p, isaac_coloroffset_fragment_exact,
++						isaac_coloroffset_texture, attributes, streams,
++						count, base_idx, isaac_coloroffset_original_index_type))
++					isaac_neutral_staging = isaac_coloroffset_copy_and_prove_neutral(
++						ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]],
++						(size_t)top_idx * isaac_copy_stride, top_idx, isaac_copy_stride);
++				if (isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_UNKNOWN)
++					vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * isaac_copy_stride);
+ 			}
+ 		}	
+ 	} else {
+@@ -2780,7 +2805,8 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 			isaac_staged = GL_TRUE;
+ 		}
+ 		isaac_opaque_fragment = isaac_coloroffset_select_opaque_fragment(
+-			p, isaac_coloroffset_texture, attributes, streams,
++			p, isaac_coloroffset_fragment_exact, isaac_coloroffset_texture,
++			attributes, streams,
+ 			isaac_vertices, isaac_vertex_bytes, idx_buf,
+ 			(uint32_t)count * sizeof(uint16_t), isaac_single_stream,
+ 			isaac_staged, count, top_idx, base_idx,
+@@ -2788,11 +2814,8 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ #ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
+ 		{
+ #if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 3
+-			if (isaac_coloroffset_neutral_draw_is_eligible(
+-					p, isaac_coloroffset_texture, attributes, streams,
+-					isaac_vertices, isaac_vertex_bytes, isaac_single_stream,
+-					isaac_staged, count, top_idx, base_idx,
+-					isaac_coloroffset_original_index_type))
++			if (isaac_staged && isaac_single_stream &&
++					isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_NEUTRAL)
+ #endif
+ 			{
+ 				SceGxmFragmentProgram *isaac_probe_fragment =

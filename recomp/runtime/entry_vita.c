@@ -14,6 +14,9 @@
 #include "host_vita_fls.h"
 #include "host_vita_fios_cache.h"
 #include "host_vita_heap.h"
+#if defined(ISAAC_VITA_IMAGE_RETAIN)
+#include "host_vita_image_retain.h"
+#endif
 #include "host_vita_memory.h"
 #include "host_vita_post_com.h"
 #include "host_vita_startup.h"
@@ -25,6 +28,12 @@
 #include "vita_boot_imports.h"
 #if defined(ISAAC_VITA_LOG_ASYNC)
 #include "host_vita_log_async.h"
+#endif
+#if defined(ISAAC_VITA_HEAP_CENSUS)
+/* Only the census hook is used here; this owner is deliberately outside the
+ * ISAAC_VITA_PHASE_PROFILE define scope (the hook is declared under the
+ * census define). */
+#include "kage_vita_phase_profile.h"
 #endif
 #ifdef ISAAC_VITA_TEXTURE_ALIGN8_POLICY
 #include "kage_vita_texture_memory.h"
@@ -401,7 +410,37 @@ int isaac_vita_run_first_fault(const char *pe_path)
                 request_readable = 1;
             }
         }
-#ifdef __vita__
+#if defined(ISAAC_VITA_HEAP_CENSUS) && defined(__vita__)
+        {
+            /* ISAAC_VITA_HEAP_CENSUS: top= (newlib top chunk, keepcost) and
+             * led= (live ledger entries; the fixed ledger's live limit is
+             * 393216 and a reserve failure ends in this same bad_alloc) join
+             * the frozen fields.  mallinfo is skipped when the overflow
+             * domain is terminal: newlib may be inconsistent after a router
+             * fault.  The out-of-cadence ph120.mem why=badalloc record
+             * follows; both precede the telemetry's final record at done:. */
+            isaac_vita_guest_heap_census_locked census;
+            struct mallinfo heap;
+            int terminal = isaac_vita_guest_heap_terminal();
+
+            memset(&heap, 0, sizeof heap);
+            if (!terminal)
+                heap = mallinfo();
+            (void)isaac_vita_guest_heap_census_window_locked_get(&census);
+            isaac_vita_log(
+                "bad_alloc diagnostic: request=%s%u owner=%s0x%08x arena=%u "
+                "allocated=%u free=%u chunks=%u top=%u led=%u term=%u",
+                request_readable ? "" : "unreadable/",
+                (unsigned)failed_request,
+                owner_readable ? "" : "unreadable/",
+                (unsigned)owner_return_rva, (unsigned)heap.arena,
+                (unsigned)heap.uordblks, (unsigned)heap.fordblks,
+                (unsigned)heap.ordblks, (unsigned)heap.keepcost,
+                (unsigned)census.ledger_live_count,
+                (unsigned)(terminal || census.terminal));
+            kage_vita_phase_profile_heap_census_final("badalloc");
+        }
+#elif defined(__vita__)
         {
             struct mallinfo heap = mallinfo();
             isaac_vita_log(
@@ -464,6 +503,13 @@ done:
      * keep that failure just as observable as a GXM reserve failure. */
     kage_vita_io_profile_report("entry-tail");
 #endif
+#if defined(ISAAC_VITA_HEAP_CENSUS)
+    /* ISAAC_VITA_HEAP_CENSUS: the last ph120.mem (why=exit) before the
+     * overflow telemetry's final record.  The async logger is still alive
+     * here (its flush is below); the hook is a no-op when the profile never
+     * started and skips mallinfo when the heap is terminal. */
+    kage_vita_phase_profile_heap_census_final("exit");
+#endif
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     isaac_vita_guest_heap_telemetry_log_final();
 #endif
@@ -491,6 +537,13 @@ done:
         }
         isaac_vita_audio_log_final();
     }
+#endif
+#if defined(ISAAC_VITA_IMAGE_RETAIN)
+    /* Final receipt, then stop the release observer from retaining while the
+     * guest tears the ImageManager down; records are abandoned (the guest's
+     * own Clear path unregisters everything).  No guest work here. */
+    isaac_vita_image_retain_report("teardown");
+    isaac_vita_image_retain_disarm();
 #endif
     /* Pending save images must reach the card before the FILE cache and the
      * FIOS buffers go away; the drain blocks only while a job is in flight. */

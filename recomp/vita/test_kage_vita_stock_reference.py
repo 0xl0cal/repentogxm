@@ -32,7 +32,15 @@ def main() -> int:
     vita = Path(__file__).resolve().parent
     runtime = vita.parent / "runtime"
     with tempfile.TemporaryDirectory(prefix="isaac-stock-vitagl-") as value:
-        for mode in ("off", "on"):
+        # off/on: display raster 720 OFF/ON.  fbo-rt: the
+        # ISAAC_VITA_STOCK_FBO_RT_SCENES=8 knob (0007 hook called once per
+        # initialize with 8, banner prints the returned value); fbo-rt-720 the
+        # same on the 720 raster.  fbo-vr-observe/fbo-vr-on: the
+        # ISAAC_VITA_STOCK_FBO_VALID_REGION=1/2 knob on top of rt-scenes=8
+        # (0009 mode hook called once with 0/1, banner prints
+        # fbo-valid-region=observe/on).
+        for mode in ("off", "on", "fbo-rt", "fbo-rt-720",
+                     "fbo-vr-observe", "fbo-vr-on"):
             executable = Path(value) / (
                 f"stock-vitagl-oracle-{mode}.exe" if os.name == "nt" else
                 f"stock-vitagl-oracle-{mode}"
@@ -46,10 +54,16 @@ def main() -> int:
                 str(runtime / "kage_vita_stock_reference_oracle.c"),
                 "-o", str(executable),
             ]
-            if mode == "on":
+            if mode in ("on", "fbo-rt-720"):
                 command.insert(
                     7, "-DISAAC_VITA_DISPLAY_RASTER_720=1"
                 )
+            if mode in ("fbo-rt", "fbo-rt-720", "fbo-vr-observe", "fbo-vr-on"):
+                command.insert(7, "-DISAAC_VITA_STOCK_FBO_RT_SCENES=8")
+            if mode == "fbo-vr-observe":
+                command.insert(7, "-DISAAC_VITA_STOCK_FBO_VALID_REGION=1")
+            elif mode == "fbo-vr-on":
+                command.insert(7, "-DISAAC_VITA_STOCK_FBO_VALID_REGION=2")
             subprocess.run(command, check=True)
             completed = subprocess.run(
                 [str(executable)], check=True, text=True,
@@ -57,11 +71,18 @@ def main() -> int:
             )
             expected = (
                 "Stock vitaGL host oracle: PASS "
-                "(720x408 init; 720x405 viewport; 960x540 logical)"
-                if mode == "on" else
+                "(720x408 init; 720x405 viewport; 960x540 logical"
+                if mode in ("on", "fbo-rt-720") else
                 "Stock vitaGL host oracle: PASS "
-                "(960x544 init; display raster OFF)"
+                "(960x544 init; display raster OFF"
             )
+            if mode in ("fbo-rt", "fbo-rt-720", "fbo-vr-observe", "fbo-vr-on"):
+                expected += "; fbo rt-scenes=8"
+            if mode == "fbo-vr-observe":
+                expected += "; fbo valid-region=observe"
+            elif mode == "fbo-vr-on":
+                expected += "; fbo valid-region=on"
+            expected += ")"
             if expected not in completed.stdout:
                 raise AssertionError(
                     "stock vitaGL oracle returned unexpected output: "

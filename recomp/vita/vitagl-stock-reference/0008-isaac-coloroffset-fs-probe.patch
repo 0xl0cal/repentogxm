@@ -1,0 +1,599 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index d9bdd27..a53a838 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -50,6 +50,18 @@
+ #include "isaac_coloroffset_gpu_policy.h"
+ #define ISAAC_COLOROFFSET_FRAGMENT_CACHE_CAPACITY 4u
+ #endif
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++#ifndef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
++#error "Isaac ColorOffset FS probe requires the exact ColorOffset bundle"
++#endif
++#if HAVE_ISAAC_COLOROFFSET_FS_PROBE < 1 || HAVE_ISAAC_COLOROFFSET_FS_PROBE > 3
++#error "Isaac ColorOffset FS mode must be 1 (TRIVIAL), 2 (NODISCARD) or 3 (NEUTRAL)"
++#endif
++/* Modes 1/2 are diagnostic-only.  Mode 3 preserves the color lanes and is
++ * selected only after every vertex proves pixelation/clip are inactive. */
++#define ISAAC_COLOROFFSET_FS_PROBE_CACHE_CAPACITY 4u
++static void isaac_coloroffset_fs_probe_note_exact_source(const shader *s);
++#endif
+ _Static_assert(VERTEX_ATTRIBS_NUM == ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES,
+ 	"Isaac GPU draw policy attribute ceiling drifted");
+ _Static_assert(sizeof(SceGxmVertexAttribute) ==
+@@ -319,6 +331,10 @@ typedef struct isaac_vertex_program_cache_entry
+ typedef struct isaac_coloroffset_fragment_cache_entry
+ 	isaac_coloroffset_fragment_cache_entry;
+ #endif
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++typedef struct isaac_coloroffset_fs_probe_cache_entry
++	isaac_coloroffset_fs_probe_cache_entry;
++#endif
+ 
+ #ifdef STRICT_UNIFORMS_COMPLIANCE
+ typedef union {
+@@ -435,6 +451,16 @@ typedef struct {
+ 	uint32_t isaac_coloroffset_link_vertex_generation;
+ 	uint8_t isaac_coloroffset_link_vertex_exact;
+ #endif
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++	isaac_coloroffset_fs_probe_cache_entry *isaac_coloroffset_fs_probe_cache;
++	uint8_t isaac_coloroffset_fs_probe_cache_count;
++	uint8_t isaac_coloroffset_fs_probe_state;
++	SceGxmShaderPatcherId isaac_coloroffset_fs_probe_id;
++	const SceGxmProgram *isaac_coloroffset_fs_probe_program;
++	SceGxmShaderPatcherId isaac_coloroffset_fs_probe_link_fragment_id;
++	const SceGxmProgram *isaac_coloroffset_fs_probe_link_vertex_program;
++	uint32_t isaac_coloroffset_fs_probe_link_source_generation;
++#endif
+ } program;
+ 
+ // Internal shaders and array
+@@ -764,6 +790,9 @@ void vglIsaacMarkColorOffsetShader(
+ 	}
+ 	isaac_coloroffset_source_exact[index] = 1;
+ 	ISAAC_COLOROFFSET_COUNT(source_selected);
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++	isaac_coloroffset_fs_probe_note_exact_source(s);
++#endif
+ }
+ 
+ static void isaac_coloroffset_note_compile(shader *s) {
+@@ -1125,6 +1154,474 @@ void vglGetIsaacColorOffsetStats(vglIsaacColorOffsetStats *stats) {
+ static char *shark_log = NULL;
+ #endif
+ 
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++/* Fragment-shader variants for the exact ColorOffset program.
++ *
++ * When glLinkProgram links the exact ColorOffset pair (0003 record_link
++ * proved source, binary and vertex layout), a second fragment program is
++ * compiled from a variant source and registered next to the stock one:
++ *   mode 1 (TRIVIAL):   fragColor = Color0 * texture(Texture0, TexCoord0)
++ *                       -- no colorize/offset/pixelate lanes, no discard;
++ *   mode 2 (NODISCARD): authenticated stock source minus clip, runtime-derived;
++ *   mode 3 (NEUTRAL): retained color lanes, inactive clip/pixelate removed,
++ *                       selected only after the all-vertices neutral proof.
++ * Exact draws then bind the probe fragment program instead of the stock one
++ * (and instead of the 0003 opaque variant).  The stock shader object, its
++ * reflection, the program's uniform upload and the 0003 link record are not
++ * touched: the probe fails closed to the stock fragment program whenever the
++ * compiler is offline, the compile fails, the compiled program does not have
++ * exactly the stock interface (one sampler Texture0 at resource index 0, the
++ * stock default uniform buffer size) or the patcher rejects it. */
++struct isaac_coloroffset_fs_probe_cache_entry {
++	isaac_coloroffset_fs_probe_cache_entry *next;
++	uint32_t source_blend_raw;
++	uint8_t output_format;
++	uint8_t multisample_mode;
++	SceGxmFragmentProgram *fragment_program;
++};
++
++/* Consumer-declared ABI (kage_vita_phase_profile.c mirrors this struct so
++ * vitaGL.h stays byte-identical); all fields are uint32_t counters. */
++typedef struct vglIsaacColorOffsetFsProbeStats {
++	uint32_t abi_version;
++	uint32_t mode;
++	uint32_t link_attempts;
++	uint32_t link_ready;
++	uint32_t fail_source;
++	uint32_t fail_compiler;
++	uint32_t fail_compile;
++	uint32_t fail_check;
++	uint32_t fail_register;
++	uint32_t last_program;
++	uint32_t gxp_size;
++	uint32_t gxp_fnv1a;
++	uint32_t source_size;
++	uint32_t source_fnv1a;
++	uint32_t draw_requests;
++	uint32_t draws_bound;
++	uint32_t draws_opaque_overridden;
++	uint32_t fail_cache;
++	uint32_t fail_create;
++	uint32_t cache_creates;
++	uint32_t cache_releases;
++} vglIsaacColorOffsetFsProbeStats;
++
++enum {
++	ISAAC_COLOROFFSET_FS_PROBE_STATE_NONE = 0,
++	ISAAC_COLOROFFSET_FS_PROBE_STATE_FAILED = 1,
++	ISAAC_COLOROFFSET_FS_PROBE_STATE_READY = 2
++};
++
++/* Receipts of the runtime NODISCARD derivation on the authenticated stock
++ * source (size 2052, FNV-1a 0x2b3ccf4a): the clip statement byte span and
++ * the derived source. */
++#define ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET 903u
++#define ISAAC_COLOROFFSET_FS_PROBE_DISCARD_SIZE 73u
++#define ISAAC_COLOROFFSET_FS_PROBE_DISCARD_FNV1A 0xeed28c60u
++#define ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_SIZE 1979u
++#define ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_FNV1A 0xfc8c5c9bu
++
++/* The translator keeps its pair state in these globals (utils/glsl_utils.c);
++ * the probe brackets them so the game's own shader pairs never see a change. */
++extern binds_map glsl_bindings_map;
++
++/* Same declaration structure as the stock source so the GLSL translator takes
++ * the same path; only the two varyings the probe reads are declared. */
++static const char isaac_coloroffset_fs_probe_trivial_source[] =
++	"#ifdef GL_ES\n"
++	"precision highp float;\n"
++	"#endif\n"
++	"\n"
++	"#if __VERSION__ >= 140\n"
++	"\n"
++	"in vec4 Color0;\n"
++	"in vec2 TexCoord0;\n"
++	"out vec4 fragColor;\n"
++	"\n"
++	"#else\n"
++	"\n"
++	"varying vec4 Color0;\n"
++	"varying vec2 TexCoord0;\n"
++	"#define fragColor gl_FragColor\n"
++	"#define texture texture2D\n"
++	"\n"
++	"#endif\n"
++	"\n"
++	"uniform sampler2D Texture0;\n"
++	"\n"
++	"void main(void)\n"
++	"{\n"
++	"\tfragColor = Color0 * texture(Texture0, TexCoord0);\n"
++	"}\n";
++#if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 3
++/* Same Color/Colorize/Offset expressions and luminance coefficients as the
++ * authenticated stock FS.  Do not use the diagnostic TRIVIAL shader here. */
++static const char isaac_coloroffset_fs_neutral_source[] =
++	"#ifdef GL_ES\nprecision highp float;\n#endif\n"
++	"#if __VERSION__ >= 140\n"
++	"in vec4 Color0;\nin vec2 TexCoord0;\n"
++	"in vec4 ColorizeOut;\nin vec3 ColorOffsetOut;\n"
++	"out vec4 fragColor;\n#else\n"
++	"varying vec4 Color0;\nvarying vec2 TexCoord0;\n"
++	"varying vec4 ColorizeOut;\nvarying vec3 ColorOffsetOut;\n"
++	"#define fragColor gl_FragColor\n#define texture texture2D\n#endif\n"
++	"uniform sampler2D Texture0;\n"
++	"const vec3 _lum = vec3(0.212671, 0.715160, 0.072169);\n"
++	"void main(void) {\n"
++	" vec4 Color = Color0 * texture(Texture0, TexCoord0);\n"
++	" vec3 Colorized = mix(Color.rgb, dot(Color.rgb, _lum) * ColorizeOut.rgb, ColorizeOut.a);\n"
++	" fragColor = vec4(Colorized + ColorOffsetOut * Color.a, Color.a);\n"
++	"}\n";
++#endif
++static char *isaac_coloroffset_fs_probe_nodiscard_source;
++static vglIsaacColorOffsetFsProbeStats isaac_coloroffset_fs_probe_stats = {
++	.abi_version = 1,
++	.mode = HAVE_ISAAC_COLOROFFSET_FS_PROBE,
++};
++#define ISAAC_COLOROFFSET_FS_PROBE_COUNT(field) \
++	(isaac_coloroffset_fs_probe_stats.field++)
++
++static void isaac_coloroffset_fs_probe_note_exact_source(const shader *s) {
++#if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 2
++	char *derived;
++	uint32_t tail;
++	if (isaac_coloroffset_fs_probe_nodiscard_source || !s || !s->source ||
++			s->size != ISAAC_COLOROFFSET_SOURCE_SIZE ||
++			ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET +
++				ISAAC_COLOROFFSET_FS_PROBE_DISCARD_SIZE > s->size ||
++			isaac_coloroffset_fnv1a(
++				s->source + ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET,
++				ISAAC_COLOROFFSET_FS_PROBE_DISCARD_SIZE) !=
++				ISAAC_COLOROFFSET_FS_PROBE_DISCARD_FNV1A)
++		return;
++	tail = s->size - ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET -
++		ISAAC_COLOROFFSET_FS_PROBE_DISCARD_SIZE;
++	if (ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET + tail !=
++			ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_SIZE)
++		return;
++	derived = (char *)vglMalloc(ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_SIZE + 1u);
++	if (!derived)
++		return;
++	vgl_fast_memcpy(derived, s->source,
++		ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET);
++	vgl_fast_memcpy(derived + ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET,
++		s->source + ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET +
++			ISAAC_COLOROFFSET_FS_PROBE_DISCARD_SIZE,
++		tail);
++	derived[ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_SIZE] = 0;
++	if (isaac_coloroffset_fnv1a(derived,
++			ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_SIZE) !=
++			ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_FNV1A) {
++		vgl_free(derived);
++		return;
++	}
++	isaac_coloroffset_fs_probe_nodiscard_source = derived;
++#else
++	(void)s;
++#endif
++}
++
++static void isaac_coloroffset_fs_probe_release(program *p) {
++	isaac_coloroffset_fs_probe_cache_entry *entry =
++		p->isaac_coloroffset_fs_probe_cache;
++	while (entry) {
++		isaac_coloroffset_fs_probe_cache_entry *next = entry->next;
++		sceGxmShaderPatcherReleaseFragmentProgram(
++			gxm_shader_patcher, entry->fragment_program);
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(cache_releases);
++		vgl_free(entry);
++		entry = next;
++	}
++	p->isaac_coloroffset_fs_probe_cache = NULL;
++	p->isaac_coloroffset_fs_probe_cache_count = 0;
++	if (p->isaac_coloroffset_fs_probe_program) {
++		sceGxmShaderPatcherUnregisterProgram(
++			gxm_shader_patcher, p->isaac_coloroffset_fs_probe_id);
++		vgl_free((void *)p->isaac_coloroffset_fs_probe_program);
++		p->isaac_coloroffset_fs_probe_program = NULL;
++	}
++	p->isaac_coloroffset_fs_probe_id = NULL;
++	p->isaac_coloroffset_fs_probe_state = ISAAC_COLOROFFSET_FS_PROBE_STATE_NONE;
++	p->isaac_coloroffset_fs_probe_link_fragment_id = NULL;
++	p->isaac_coloroffset_fs_probe_link_vertex_program = NULL;
++	p->isaac_coloroffset_fs_probe_link_source_generation = 0;
++}
++
++static GLboolean isaac_coloroffset_fs_probe_program_is_exact(
++		const SceGxmProgram *candidate, uint32_t size,
++		const shader *stock_fragment) {
++	const SceGxmProgramParameter *texture0;
++	/* 0x9c is the complete SceGxmProgram header, not a source fingerprint
++	 * length.  Valid simple GXPs are smaller than 512 bytes. */
++	if (!candidate || size < 0x9cu || sceGxmProgramCheck(candidate) != 0 ||
++			sceGxmProgramGetType(candidate) != SCE_GXM_FRAGMENT_PROGRAM ||
++			sceGxmProgramGetSize(candidate) > size ||
++			sceGxmProgramGetParameterCount(candidate) != 1u ||
++			sceGxmProgramGetDefaultUniformBufferSize(candidate) !=
++				stock_fragment->unif_buf_size)
++		return GL_FALSE;
++	texture0 = sceGxmProgramFindParameterByName(candidate, "Texture0");
++	return texture0 &&
++		sceGxmProgramParameterGetCategory(texture0) ==
++			SCE_GXM_PARAMETER_CATEGORY_SAMPLER &&
++		sceGxmProgramParameterGetResourceIndex(texture0) == 0u &&
++		sceGxmProgramParameterGetArraySize(texture0) == 1u;
++}
++
++/* Runs at the end of glLinkProgram, after isaac_coloroffset_record_link. */
++static void isaac_coloroffset_fs_probe_link(program *p) {
++	shader probe;
++	const char *variant;
++	uint32_t variant_size;
++	const SceGxmProgram *compiled;
++	SceGxmProgram *copy = NULL;
++	GLenum saved_sema_mode;
++	GLboolean saved_first_shader;
++	binds_map saved_bindings;
++	GLboolean exact;
++	int result;
++
++	if (!p)
++		return;
++	exact = p->isaac_coloroffset_link_vertex_exact && p->fshader &&
++		p->fshader->prog && p->vshader && p->vshader->prog;
++	if (p->isaac_coloroffset_fs_probe_state !=
++			ISAAC_COLOROFFSET_FS_PROBE_STATE_NONE) {
++		if (exact &&
++				p->isaac_coloroffset_fs_probe_state ==
++					ISAAC_COLOROFFSET_FS_PROBE_STATE_READY &&
++				p->isaac_coloroffset_fs_probe_link_fragment_id ==
++					p->fshader->id &&
++				p->isaac_coloroffset_fs_probe_link_vertex_program ==
++					p->vshader->prog &&
++				p->isaac_coloroffset_fs_probe_link_source_generation ==
++					p->isaac_coloroffset_link_source_generation)
++			return;
++		/* Re-link of a program that already carried a probe: drop it the way
++		 * glDeleteProgram does (vitaGL does not support re-linking anyway). */
++		sceGxmFinish(gxm_context);
++		isaac_coloroffset_fs_probe_release(p);
++	}
++	if (!exact)
++		return;
++	ISAAC_COLOROFFSET_FS_PROBE_COUNT(link_attempts);
++	isaac_coloroffset_fs_probe_stats.last_program = (uint32_t)(p - progs) + 1u;
++	p->isaac_coloroffset_fs_probe_state = ISAAC_COLOROFFSET_FS_PROBE_STATE_FAILED;
++	p->isaac_coloroffset_fs_probe_link_fragment_id = p->fshader->id;
++	p->isaac_coloroffset_fs_probe_link_vertex_program = p->vshader->prog;
++	p->isaac_coloroffset_fs_probe_link_source_generation =
++		p->isaac_coloroffset_link_source_generation;
++#if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 1
++	variant = isaac_coloroffset_fs_probe_trivial_source;
++	variant_size = (uint32_t)(sizeof(isaac_coloroffset_fs_probe_trivial_source) - 1u);
++#elif HAVE_ISAAC_COLOROFFSET_FS_PROBE == 3
++	variant = isaac_coloroffset_fs_neutral_source;
++	variant_size = (uint32_t)(sizeof(isaac_coloroffset_fs_neutral_source) - 1u);
++#else
++	variant = isaac_coloroffset_fs_probe_nodiscard_source;
++	variant_size = ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_SIZE;
++#endif
++	if (!variant) {
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_source);
++		return;
++	}
++	isaac_coloroffset_fs_probe_stats.source_size = variant_size;
++	isaac_coloroffset_fs_probe_stats.source_fnv1a =
++		isaac_coloroffset_fnv1a(variant, variant_size);
++	if (!is_shark_online && !start_shader_compiler()) {
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_compiler);
++		return;
++	}
++	vgl_memset(&probe, 0, sizeof(probe));
++	probe.type = GL_FRAGMENT_SHADER;
++	probe.valid = GL_TRUE;
++	probe.is_glsl = GL_TRUE;
++	probe.size = variant_size;
++	probe.source = (char *)vglMalloc(variant_size + 1u);
++	if (!probe.source) {
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_source);
++		return;
++	}
++	vgl_fast_memcpy(probe.source, variant, variant_size);
++	probe.source[variant_size] = 0;
++	/* Same pair translation as glLinkProgram: the exact vertex shader is
++	 * already compiled, so its semantics seed the bindings and only the
++	 * probe source is translated.  The translator globals are restored so
++	 * the game's later shader pairs start from the state they would have
++	 * had without the probe. */
++	saved_sema_mode = glsl_sema_mode;
++	saved_first_shader = glsl_is_first_shader;
++	saved_bindings = glsl_bindings_map;
++	glsl_sema_mode = VGL_MODE_SHADER_PAIR;
++	glsl_translator_set_process(p->vshader, &probe);
++	glsl_sema_mode = saved_sema_mode;
++	glsl_is_first_shader = saved_first_shader;
++	glsl_bindings_map = saved_bindings;
++	compiled = shark_compile_shader_extended((const char *)probe.source,
++		&probe.size, SHARK_FRAGMENT_SHADER, compiler_opts, compiler_fastmath,
++		compiler_fastprecision, compiler_fastint);
++	vgl_free(probe.source);
++	if (compiled && probe.size) {
++		copy = (SceGxmProgram *)vglMalloc(probe.size);
++		if (copy)
++			vgl_fast_memcpy((void *)copy, (const void *)compiled, probe.size);
++	}
++	shark_clear_output();
++#ifdef HAVE_SHARK_LOG
++	if (shark_log) {
++		vgl_free(shark_log);
++		shark_log = NULL;
++	}
++#endif
++	if (!copy) {
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_compile);
++		return;
++	}
++	if (!isaac_coloroffset_fs_probe_program_is_exact(copy, probe.size,
++			p->fshader)) {
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_check);
++		vgl_free(copy);
++		return;
++	}
++	result = sceGxmShaderPatcherRegisterProgram(
++		gxm_shader_patcher, copy, &p->isaac_coloroffset_fs_probe_id);
++	if (result) {
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_register);
++		p->isaac_coloroffset_fs_probe_id = NULL;
++		vgl_free(copy);
++		return;
++	}
++	p->isaac_coloroffset_fs_probe_program = copy;
++	p->isaac_coloroffset_fs_probe_state = ISAAC_COLOROFFSET_FS_PROBE_STATE_READY;
++	isaac_coloroffset_fs_probe_stats.gxp_size = probe.size;
++	isaac_coloroffset_fs_probe_stats.gxp_fnv1a =
++		isaac_coloroffset_fnv1a(copy, probe.size);
++	ISAAC_COLOROFFSET_FS_PROBE_COUNT(link_ready);
++}
++
++#if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 3
++/* Inspect the complete bounded staging range already copied by vitaGL.
++ * Checking every vertex through max(index)+1 is conservative: it also
++ * rejects a nonneutral unused vertex, but can never admit a nonneutral
++ * referenced one.  VBOs, instancing, base-vertex and unknown layouts stay
++ * on the stock path.  No guest pointer is dereferenced here. */
++static GLboolean isaac_coloroffset_neutral_draw_is_eligible(
++		program *p, texture *tex, const SceGxmVertexAttribute *attributes,
++		const SceGxmVertexStream *streams, const void *vertices,
++		uint32_t vertex_bytes, GLboolean single_stream, GLboolean staged,
++		GLsizei count, uint32_t top_idx, uint32_t base_idx,
++		SceGxmIndexSource index_type) {
++	isaac_coloroffset_attribute_key keys[ISAAC_COLOROFFSET_ATTRIBUTE_COUNT];
++	uint16_t strides[ISAAC_COLOROFFSET_ATTRIBUTE_COUNT];
++	uint32_t index;
++	SceGxmTextureFormat format;
++	if (!isaac_coloroffset_fragment_program_is_exact(p) ||
++			!p->isaac_coloroffset_link_vertex_exact ||
++			p->attr_num != ISAAC_COLOROFFSET_ATTRIBUTE_COUNT ||
++			p->max_frag_texunit_idx != 1u || p->max_vert_texunit_idx != 0u ||
++			!p->frag_texunits[0] || p->frag_texunits[0]->type != UNIFORM_SAMPLER ||
++			!single_stream || !staged || !attributes || !streams ||
++			count <= 0 || base_idx != 0u || is_fbo_float ||
++			index_type != SCE_GXM_INDEX_SOURCE_INDEX_16BIT ||
++			!tex || tex->status != TEX_VALID || !tex->data)
++		return GL_FALSE;
++	/* Known normalized color textures keep shader arithmetic finite.  P8
++	 * is included for exact-palette uploads; floating/integer samplers fall
++	 * back, regardless of their current apparent color values. */
++	format = vglGetTexFormat(&tex->gxm_tex);
++	if (format != SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR &&
++			format != SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR &&
++			format != SCE_GXM_TEXTURE_FORMAT_P8_ABGR)
++		return GL_FALSE;
++	for (index = 0u; index < ISAAC_COLOROFFSET_ATTRIBUTE_COUNT; ++index) {
++		if (p->attr_map[index] != index)
++			return GL_FALSE;
++		keys[index].stream_index = attributes[index].streamIndex;
++		keys[index].offset = attributes[index].offset;
++		keys[index].format = attributes[index].format;
++		keys[index].component_count = attributes[index].componentCount;
++		keys[index].reg_index = attributes[index].regIndex;
++		strides[index] = streams[index].stride;
++	}
++	return isaac_coloroffset_layout_is_exact(keys, strides, p->attr_num,
++		cur_vao->vertex_attrib_state, SCE_GXM_ATTRIBUTE_FORMAT_F32) &&
++		isaac_coloroffset_contiguous_vertices_are_neutral(vertices,
++			vertex_bytes, top_idx, ISAAC_COLOROFFSET_VERTEX_STRIDE);
++}
++#endif
++
++/* Draw-time selection for the exact program; NULL keeps the fragment program
++ * the stock path (or the 0003 opaque variant) already bound. */
++static SceGxmFragmentProgram *isaac_coloroffset_fs_probe_select(
++		program *p, GLboolean opaque_selected) {
++	isaac_coloroffset_fs_probe_cache_entry *entry;
++	uint8_t output_format = is_fbo_float ?
++		SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 :
++		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4;
++	int32_t index;
++	int result;
++	if (p->isaac_coloroffset_fs_probe_state !=
++				ISAAC_COLOROFFSET_FS_PROBE_STATE_READY ||
++			p->status != PROG_LINKED || !p->fshader || !p->vshader ||
++			p->isaac_coloroffset_fs_probe_link_fragment_id != p->fshader->id ||
++			p->isaac_coloroffset_fs_probe_link_vertex_program !=
++				p->vshader->prog)
++		return NULL;
++	index = isaac_coloroffset_shader_index(p->fshader);
++	if (index < 0 || isaac_coloroffset_source_generation[index] !=
++			p->isaac_coloroffset_fs_probe_link_source_generation)
++		return NULL;
++	ISAAC_COLOROFFSET_FS_PROBE_COUNT(draw_requests);
++	if (opaque_selected)
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(draws_opaque_overridden);
++	entry = p->isaac_coloroffset_fs_probe_cache;
++	while (entry) {
++		if (entry->source_blend_raw == blend_info.raw &&
++				entry->output_format == output_format &&
++				entry->multisample_mode == (uint8_t)msaa_mode)
++			break;
++		entry = entry->next;
++	}
++	if (!entry) {
++		if (p->isaac_coloroffset_fs_probe_cache_count >=
++				ISAAC_COLOROFFSET_FS_PROBE_CACHE_CAPACITY) {
++			ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_cache);
++			return NULL;
++		}
++		entry = vglMalloc(sizeof(*entry));
++		if (!entry) {
++			ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_cache);
++			return NULL;
++		}
++		/* Same blend, output format and multisample mode as the stock
++		 * fragment program the draw would have used (setup_frag_program). */
++		result = sceGxmShaderPatcherCreateFragmentProgram(
++			gxm_shader_patcher, p->isaac_coloroffset_fs_probe_id,
++			(SceGxmOutputRegisterFormat)output_format, msaa_mode,
++			&blend_info.info, p->vshader->prog, &entry->fragment_program);
++		if (result) {
++			vgl_free(entry);
++			ISAAC_COLOROFFSET_FS_PROBE_COUNT(fail_create);
++			return NULL;
++		}
++		entry->source_blend_raw = blend_info.raw;
++		entry->output_format = output_format;
++		entry->multisample_mode = (uint8_t)msaa_mode;
++		entry->next = p->isaac_coloroffset_fs_probe_cache;
++		p->isaac_coloroffset_fs_probe_cache = entry;
++		p->isaac_coloroffset_fs_probe_cache_count++;
++		ISAAC_COLOROFFSET_FS_PROBE_COUNT(cache_creates);
++	}
++	ISAAC_COLOROFFSET_FS_PROBE_COUNT(draws_bound);
++	return entry->fragment_program;
++}
++
++void vglGetIsaacColorOffsetFsProbeStats(vglIsaacColorOffsetFsProbeStats *stats) {
++	if (stats)
++		*stats = isaac_coloroffset_fs_probe_stats;
++}
++#endif
++
+ #ifdef STRICT_UNIFORMS_COMPLIANCE
+ static inline __attribute__((always_inline)) uniform *get_uniform_from_ptr(GLint ptr, uint32_t *offset) {
+ 	uniform_location u;
+@@ -2211,6 +2708,24 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 			(uint32_t)count * sizeof(uint16_t), isaac_single_stream,
+ 			isaac_staged, count, top_idx, base_idx,
+ 			isaac_coloroffset_original_index_type);
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++		{
++#if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 3
++			if (isaac_coloroffset_neutral_draw_is_eligible(
++					p, isaac_coloroffset_texture, attributes, streams,
++					isaac_vertices, isaac_vertex_bytes, isaac_single_stream,
++					isaac_staged, count, top_idx, base_idx,
++					isaac_coloroffset_original_index_type))
++#endif
++			{
++				SceGxmFragmentProgram *isaac_probe_fragment =
++					isaac_coloroffset_fs_probe_select(
++						p, isaac_opaque_fragment ? GL_TRUE : GL_FALSE);
++				if (isaac_probe_fragment)
++					isaac_opaque_fragment = isaac_probe_fragment;
++			}
++		}
++#endif
+ 		if (isaac_opaque_fragment)
+ 			sceGxmSetFragmentProgram(gxm_context, isaac_opaque_fragment);
+ 	}
+@@ -2781,6 +3296,17 @@ GLuint glCreateProgram(void) {
+ 			progs[i].isaac_coloroffset_link_source_generation = 0;
+ 			progs[i].isaac_coloroffset_link_vertex_generation = 0;
+ 			progs[i].isaac_coloroffset_link_vertex_exact = 0;
++#endif
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++			progs[i].isaac_coloroffset_fs_probe_cache = NULL;
++			progs[i].isaac_coloroffset_fs_probe_cache_count = 0;
++			progs[i].isaac_coloroffset_fs_probe_state =
++				ISAAC_COLOROFFSET_FS_PROBE_STATE_NONE;
++			progs[i].isaac_coloroffset_fs_probe_id = NULL;
++			progs[i].isaac_coloroffset_fs_probe_program = NULL;
++			progs[i].isaac_coloroffset_fs_probe_link_fragment_id = NULL;
++			progs[i].isaac_coloroffset_fs_probe_link_vertex_program = NULL;
++			progs[i].isaac_coloroffset_fs_probe_link_source_generation = 0;
+ #endif
+ 			for (j = 0; j < VERTEX_ATTRIBS_NUM; j++) {
+ 				progs[i].attr[j].regIndex = 0xDEAD;
+@@ -2878,6 +3404,9 @@ void glDeleteProgram(GLuint prog) {
+ #endif
+ #ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
+ 		isaac_coloroffset_release_fragment_cache(p);
++#endif
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++		isaac_coloroffset_fs_probe_release(p);
+ #endif
+ 		if (p->vert_uniforms) {
+ 			vgl_free(p->vert_uniforms);
+@@ -3312,6 +3841,9 @@ void glLinkProgram(GLuint progr) {
+ #ifdef HAVE_ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS
+ 	isaac_coloroffset_record_link(p);
+ #endif
++#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++	isaac_coloroffset_fs_probe_link(p);
++#endif
+ }
+ 
+ void glUseProgram(GLuint prog) {

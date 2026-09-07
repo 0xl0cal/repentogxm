@@ -463,7 +463,7 @@ static void direct(const char *label, CPU *c, uint32_t token,
            (int)(s_backend_calls - before), g_host_dynamic_calls);
 }
 
-/* ---- the KAGE per-draw shapes (research-gl-shim-path.md finding 1) ---- */
+/* ---- the KAGE per-draw shapes (as observed in the shim call traces) ---- */
 
 static const char *const s_attribute_names[7] = {
     "aPosition", "aTexCoord", "aColor", "aColorOffset", "aRenderData",

@@ -1,0 +1,15 @@
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1393,7 +1393,11 @@ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(frame
+ 				fb->depthbuffer_ptr = NULL;
+ 				fb->depthbuffer_state &= ~DEPTHBUFFER_READY;
+ 			}
++			/* Same-object resize changes the cached, attachment-clipped box.
++			 * Rebuild after BeginScene, not inside this attachment helper. */
++			if (fb == in_use_framebuffer && scissor_test_state)
++				dirty_scissor_state = GL_TRUE;
+ 		}
+ 
+ 		// Increasing texture reference counter
+ 		fb->tex = tex;

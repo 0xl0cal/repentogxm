@@ -1,0 +1,24 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -1648,6 +1648,7 @@
+ 
+ #include "isaac_coloroffset_plain_vitagl.h"
+ #include "isaac_coloroffset_plain_vertex_pair.h"
++#include "isaac_coloroffset_transform_uniform.h"
+ 
+ #ifdef STRICT_UNIFORMS_COMPLIANCE
+ static inline __attribute__((always_inline)) uniform *get_uniform_from_ptr(GLint ptr, uint32_t *offset) {
+@@ -2908,6 +2909,12 @@ inline void glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+ 	int offs = 0;
+ 	uniform *u = (uniform *)get_uniform_from_ptr(location, &offs);
+ 
++	/* No extra source read for already-dirty or unsupported writes. */
++	if (!dirty_shader_vert_unifs && count == 1 && !transpose && offs == 0 &&
++			isaac_coloroffset_transform_unchanged(u, value)) {
++		return;
++	}
++
+ 	// Setting passed value to desired uniform
+ 	if (transpose) {
+ 		float *tmp = gpu_alloc_mapped_temp(count * 16 * sizeof(float));

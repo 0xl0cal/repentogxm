@@ -1,0 +1,168 @@
+diff --git a/source/gxm.c b/source/gxm.c
+index 7d861ff..2029557 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -24,19 +24,43 @@
+ #include "shared.h"
+ 
+ #ifdef HAVE_ISAAC_GL_TIME_PROFILE
+-/* Isaac GL time profile (0005-isaac-scene-timer.patch).  Process-clock
+- * microseconds spent inside the two GXM scene calls.  sceGxmBeginScene blocks
+- * while the render target's previous job is still in flight, so its bracket
+- * is the GPU back-pressure the CPU sees on a draw-target switch, a clear or
+- * the display scene after a present; sceGxmEndScene is the command-list
+- * flush.  Two clock reads per scene edge, nothing else.  The phase profiler
+- * takes and zeroes the sums once per 120-loop window through
+- * vglIsaacSceneTimes on the vitaGL owner thread; the hook is deliberately
+- * absent from vitaGL.h so that header's whole-file hash stays stable. */
++/* Isaac GL time profile (0005-isaac-scene-timer.patch and
++ * 0006-isaac-scene-split.patch).  Process-clock microseconds spent inside
++ * the two GXM scene calls.  Measured on the device (prof-v12 ph120.gt:
++ * c == e, bm <= 0.1 ms): the CPU blocks inside sceGxmEndScene, while
++ * sceGxmBeginScene returns in <= 100 us and is bookkeeping.  Hypothesised
++ * cause, unconfirmed until the FBO_RT_SCENES=8 vs 1 A/B: a render target
++ * created with scenesPerFrame = 1 has one scene slot, so ending scene k on
++ * it would wait until scene k-1 on the same target has finished on the GPU.
++ * Either way the EndScene bracket is the GPU back-pressure the CPU sees on
++ * a draw-target switch, a clear or a present; two clock reads per edge.
++ *
++ * 0006 splits the EndScene sum by the framebuffer whose scene is being ended
++ * (old_framebuffer still names it at both scene_end() call sites:
++ * scene_reset advances it only after BeginScene, and vglSwapBuffers ends the
++ * display scene with it NULL), by the ordinal of the offscreen scene end
++ * since the last vglSwapBuffers (1st, 2nd, 3rd, 4th and later), counts
++ * EndScenes longer than ISAAC_SCENE_SLOW_US and the longest one, and counts
++ * offscreen render targets and depth buffers created plus
++ * sceGxmCreateRenderTarget failures (silent under SKIP_ERROR_HANDLING
++ * otherwise).  The phase profiler takes and zeroes the sums once per
++ * 120-loop window through vglIsaacSceneTimes and vglIsaacSceneWaits on the
++ * vitaGL owner thread; both hooks are deliberately absent from vitaGL.h so
++ * that header's whole-file hash stays stable. */
+ static uint32_t isaac_scene_begin_us = 0;
+ static uint32_t isaac_scene_begin_max_us = 0;
+ static uint32_t isaac_scene_end_us = 0;
+ static uint32_t isaac_scene_count = 0;
++static uint32_t isaac_scene_end_fbo_us = 0; // EndScene us of offscreen (framebuffer object) scenes
++static uint32_t isaac_scene_end_display_us = 0; // EndScene us of display scenes
++static uint32_t isaac_scene_end_max_us = 0; // Longest single EndScene
++static uint32_t isaac_scene_end_slow = 0; // EndScenes longer than ISAAC_SCENE_SLOW_US
++static uint32_t isaac_scene_end_ordinal_us[4] = { 0, 0, 0, 0 }; // Offscreen EndScene us by ordinal since the last swap: 1st, 2nd, 3rd, later
++static uint32_t isaac_scene_fbo_ordinal = 0; // Offscreen EndScenes since the last vglSwapBuffers
++static uint32_t isaac_rt_created = 0; // Offscreen render targets created (every setup_render_target attempt)
++static uint32_t isaac_rt_failed = 0; // sceGxmCreateRenderTarget failures (any render target)
++static uint32_t isaac_depth_created = 0; // Offscreen depth/stencil buffers created
++#define ISAAC_SCENE_SLOW_US 500u
+ #define ISAAC_SCENE_TIME_BEGIN() uint64_t isaac_scene_t0 = sceKernelGetProcessTimeWide()
+ #define ISAAC_SCENE_TIME_END_BEGIN_SCENE() \
+ 	do { \
+@@ -47,7 +71,34 @@ static uint32_t isaac_scene_count = 0;
+ 		isaac_scene_count++; \
+ 	} while (0)
+ #define ISAAC_SCENE_TIME_END_END_SCENE() \
+-	isaac_scene_end_us += (uint32_t)(sceKernelGetProcessTimeWide() - isaac_scene_t0)
++	do { \
++		uint32_t isaac_scene_dt = (uint32_t)(sceKernelGetProcessTimeWide() - isaac_scene_t0); \
++		isaac_scene_end_us += isaac_scene_dt; \
++		if (old_framebuffer) { \
++			isaac_scene_end_fbo_us += isaac_scene_dt; \
++			isaac_scene_end_ordinal_us[isaac_scene_fbo_ordinal < 3 ? isaac_scene_fbo_ordinal : 3] += isaac_scene_dt; \
++			isaac_scene_fbo_ordinal++; \
++		} else { \
++			isaac_scene_end_display_us += isaac_scene_dt; \
++		} \
++		if (isaac_scene_dt > isaac_scene_end_max_us) \
++			isaac_scene_end_max_us = isaac_scene_dt; \
++		if (isaac_scene_dt > ISAAC_SCENE_SLOW_US) \
++			isaac_scene_end_slow++; \
++	} while (0)
++#define ISAAC_SCENE_TIME_SWAP() (isaac_scene_fbo_ordinal = 0)
++#define ISAAC_SCENE_TIME_RT_CREATED(rt, r) \
++	do { \
++		if ((rt) != &gxm_render_target) \
++			isaac_rt_created++; \
++		if (r) \
++			isaac_rt_failed++; \
++	} while (0)
++#define ISAAC_SCENE_TIME_DEPTH_CREATED(surface) \
++	do { \
++		if ((surface) != &gxm_depth_stencil_surface) \
++			isaac_depth_created++; \
++	} while (0)
+ void vglIsaacSceneTimes(uint32_t *begin_us, uint32_t *end_us, uint32_t *count, uint32_t *begin_max_us) {
+ 	if (begin_us)
+ 		*begin_us = isaac_scene_begin_us;
+@@ -62,10 +113,47 @@ void vglIsaacSceneTimes(uint32_t *begin_us, uint32_t *end_us, uint32_t *count, u
+ 	isaac_scene_end_us = 0;
+ 	isaac_scene_count = 0;
+ }
++// Take-and-zero like vglIsaacSceneTimes; ordinal_us receives four values (1st, 2nd, 3rd, later offscreen EndScene since the last swap)
++void vglIsaacSceneWaits(uint32_t *fbo_us, uint32_t *display_us, uint32_t *max_us, uint32_t *slow, uint32_t *ordinal_us, uint32_t *rt_created, uint32_t *rt_failed, uint32_t *depth_created) {
++	if (fbo_us)
++		*fbo_us = isaac_scene_end_fbo_us;
++	if (display_us)
++		*display_us = isaac_scene_end_display_us;
++	if (max_us)
++		*max_us = isaac_scene_end_max_us;
++	if (slow)
++		*slow = isaac_scene_end_slow;
++	if (ordinal_us) {
++		ordinal_us[0] = isaac_scene_end_ordinal_us[0];
++		ordinal_us[1] = isaac_scene_end_ordinal_us[1];
++		ordinal_us[2] = isaac_scene_end_ordinal_us[2];
++		ordinal_us[3] = isaac_scene_end_ordinal_us[3];
++	}
++	if (rt_created)
++		*rt_created = isaac_rt_created;
++	if (rt_failed)
++		*rt_failed = isaac_rt_failed;
++	if (depth_created)
++		*depth_created = isaac_depth_created;
++	isaac_scene_end_fbo_us = 0;
++	isaac_scene_end_display_us = 0;
++	isaac_scene_end_max_us = 0;
++	isaac_scene_end_slow = 0;
++	isaac_scene_end_ordinal_us[0] = 0;
++	isaac_scene_end_ordinal_us[1] = 0;
++	isaac_scene_end_ordinal_us[2] = 0;
++	isaac_scene_end_ordinal_us[3] = 0;
++	isaac_rt_created = 0;
++	isaac_rt_failed = 0;
++	isaac_depth_created = 0;
++}
+ #else
+ #define ISAAC_SCENE_TIME_BEGIN() ((void)0)
+ #define ISAAC_SCENE_TIME_END_BEGIN_SCENE() ((void)0)
+ #define ISAAC_SCENE_TIME_END_END_SCENE() ((void)0)
++#define ISAAC_SCENE_TIME_SWAP() ((void)0)
++#define ISAAC_SCENE_TIME_RT_CREATED(rt, r) ((void)0)
++#define ISAAC_SCENE_TIME_DEPTH_CREATED(surface) ((void)0)
+ #endif
+ 
+ #define MAX_SCENES_PER_FRAME 8 // Maximum amount of scenes per frame allowed by sceGxm per render target
+@@ -202,7 +290,9 @@ static inline __attribute__((always_inline)) int setup_render_target(SceGxmRende
+ 	renderTargetParams.scenesPerFrame = refs;
+ 	renderTargetParams.multisampleMode = msaa_mode;
+ 	renderTargetParams.driverMemBlock = -1;
+-	return sceGxmCreateRenderTarget(&renderTargetParams, rt);
++	int r = sceGxmCreateRenderTarget(&renderTargetParams, rt);
++	ISAAC_SCENE_TIME_RT_CREATED(rt, r);
++	return r;
+ }
+ 
+ #ifdef HAVE_SHARED_RENDERTARGETS
+@@ -563,6 +653,7 @@ void init_depth_stencil_buffer(uint32_t w, uint32_t h, SceGxmDepthStencilSurface
+ 	sceGxmDepthStencilSurfaceSetForceLoadMode(surface, SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
+ 	sceGxmDepthStencilSurfaceSetForceStoreMode(surface, SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED);
+ #endif
++	ISAAC_SCENE_TIME_DEPTH_CREATED(surface);
+ }
+ 
+ void init_display_depth_stencil_surfaces(void) {
+@@ -865,6 +956,7 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 
+ 	if (!needs_scene_reset)
+ 		scene_end();
++	ISAAC_SCENE_TIME_SWAP();
+ 
+ 	if (vgl_has_cdlg_support && has_commondialog) {
+ 		// Performing commondialog update

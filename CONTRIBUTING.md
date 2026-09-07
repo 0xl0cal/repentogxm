@@ -5,8 +5,8 @@ and mixed contributions are all acceptable. What matters is whether the change
 is understandable, attributable, scoped to the actual goal and backed by the
 mechanism it claims to preserve.
 
-The repository is still under private provenance review. Discuss licensing and
-publication before accepting outside contributions.
+Provenance is recorded in [THIRD_PARTY.md](THIRD_PARTY.md) and checked by
+`tools/release_audit.py`; discuss licensing before bringing in third-party code.
 
 ## Never commit
 
@@ -23,8 +23,8 @@ Do not bypass the ignore rules with a blind `git add -f` or `git add -A`.
 ## Code changes
 
 1. Start from a clean branch and inspect `git status --short --ignored`.
-2. Search existing journals, source and upstream prior art before inventing a
-   replacement.
+2. Search the existing source, tests and upstream prior art before inventing
+   a replacement.
 3. Keep a frozen native fast path guarded and preserve the original translated
    fallback for every unproved input.
 4. Run the focused oracle that actually exercises the changed mechanism.

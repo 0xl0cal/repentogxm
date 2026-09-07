@@ -11,8 +11,12 @@
 #include "kage_vita_loading.h"
 #include "kage_vita_io_profile.h"
 #include "kage_vita_stall_probe.h"
+#include "gl_vita_backend.h"
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
 #include "host_vita_crt.h"
+#endif
+#if defined(ISAAC_VITA_IMAGE_RETAIN)
+#include "host_vita_image_retain.h"
 #endif
 
 #include <stddef.h>
@@ -554,6 +558,7 @@ static void kage_loading_swap(uint32_t completed_calls)
     (void)completed_calls;
     KAGE_VITA_STALL_TRACE_SYNC(
         KAGE_VITA_STALL_SYNC_LOADING_SWAP_ENTER, completed_calls);
+    gl_vita_backend_attrib_sync();
     vglSwapBuffers(GL_FALSE);
     KAGE_VITA_STALL_TRACE_SYNC(
         KAGE_VITA_STALL_SYNC_LOADING_SWAP_RETURN, completed_calls);
@@ -772,6 +777,13 @@ void kage_vita_loading_finish(void)
     kage_vita_io_profile_report("loading-complete");
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     isaac_vita_crt_seek_shadow_report("loading-complete");
+#endif
+#if defined(ISAAC_VITA_IMAGE_RETAIN)
+    /* Arm sprite-sheet retention only once the loading thread is done, so boot
+     * mount/validation is never retained; then print the receipt.  Idempotent
+     * across every loading-complete. */
+    isaac_vita_image_retain_arm();
+    isaac_vita_image_retain_report("loading-complete");
 #endif
 }
 

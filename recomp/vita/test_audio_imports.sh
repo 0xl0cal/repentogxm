@@ -56,6 +56,21 @@ host_oracle_flags="$host_flags -Wno-error=maybe-uninitialized"
     -o "$work/vita-audio-host-oracle"
 "$work/vita-audio-host-oracle"
 
+# Static sample scopes use the same actual OpenAL adapters; the existing ABI
+# fixture supplies original-loader and clock mocks, not a second WAV decoder.
+"$host_cc" $host_oracle_flags \
+    -DISAAC_VITA_AUDIO_ORACLE=1 -DISAAC_VITA_STATIC_SFX_PROFILE=1 \
+    -DGUEST_IMAGE_BASE=0x27000000u \
+    -I"$root/vita/audio_oracle_include" \
+    -I"$root/runtime" -I"$root/vita" \
+    "$root/runtime/host_vita_audio.c" \
+    "$root/runtime/host_vita_static_sfx_profile.c" \
+    "$root/runtime/guest_stack_legacy_oracle_stub.c" \
+    "$root/runtime/vita_audio_import_oracle.c" \
+    -Wl,--gc-sections \
+    -o "$work/vita-audio-static-sfx-host-oracle"
+"$work/vita-audio-static-sfx-host-oracle"
+
 # Execute both pre-OpenAL initialization edges with a deterministic pool stub.
 # The ordinary oracle above deliberately keeps the pool router out so it also
 # remains the exact audio-OFF/A-B regression fixture.

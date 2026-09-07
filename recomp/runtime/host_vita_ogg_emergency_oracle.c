@@ -58,6 +58,20 @@ static unsigned s_native_calloc_calls;
 static int s_fail_native_calloc;
 static const char *s_routing_import_name;
 static int s_routing_import_handled;
+/* The heap router's weak observer (host_vita_heap.c: isaac_nv_guest_buffer_
+ * freed).  In production host_vita_native_vorbis.c retires a stream mirror
+ * when the game frees its stb_vorbis_alloc buffer; the slot's free path
+ * returns HANDLED before vita_heap_guest_free_impl, so vita_heap_free must
+ * tell it itself.  Strong here so heap_routing_oracle can prove exactly one
+ * call per slot free and none for rejected frees. */
+static unsigned s_observer_calls;
+static uintptr_t s_observer_last;
+
+void isaac_nv_guest_buffer_freed(void *pointer)
+{
+    ++s_observer_calls;
+    s_observer_last = (uintptr_t)pointer;
+}
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -154,11 +168,13 @@ static int direct_module_oracle(void)
     CHECK(isaac_vita_ogg_emergency_oracle_reset() == 0);
     clear_memblock_counters();
 
+#ifndef ISAAC_VITA_OGG_QUEUE_EMERGENCY
     CHECK(isaac_vita_ogg_emergency_malloc(
               ISAAC_VITA_OGG_QUEUE_ALLOCATION_RETURN_RVA,
               ISAAC_VITA_OGG_OPEN_BACKING_BYTES,
               0x74000000U, 0x74400000U, &decision) ==
           ISAAC_VITA_OGG_EMERGENCY_NOT_HANDLED);
+#endif
     CHECK(isaac_vita_ogg_emergency_malloc(
               ISAAC_VITA_OGG_QUEUE_DECODER_RETURN_RVA,
               ISAAC_VITA_OGG_OPEN_BACKING_BYTES,
@@ -450,7 +466,9 @@ static int heap_routing_oracle(void)
           s_memblock_alloc_calls == 0U);
 
     static const uint32_t excluded_owners[] = {
+#ifndef ISAAC_VITA_OGG_QUEUE_EMERGENCY
         ISAAC_VITA_OGG_QUEUE_ALLOCATION_RETURN_RVA,
+#endif
         ISAAC_VITA_OGG_QUEUE_DECODER_RETURN_RVA,
         ISAAC_VITA_OGG_THIRD_SIZE_OWNER_RVA
     };
@@ -489,14 +507,26 @@ static int heap_routing_oracle(void)
           s_native_malloc_calls == native_before + 1U &&
           s_memblock_alloc_calls == alloc_before);
 
+    /* Vorbis observer contract of the slot path: a shrinking realloc keeps
+     * the slot live (no call), rejected frees tell nobody, the accepted slot
+     * free tells the seam exactly once with the slot base, and the stale
+     * second free is rejected before the observer.  realloc(slot, 0) keeps
+     * parity with the router's own realloc(ptr, 0), which frees without the
+     * observer (vita_heap_guest_realloc_impl). */
+    s_observer_calls = 0U;
+    s_observer_last = 0U;
     CHECK(call_realloc(&cpu, stack, pointer, 128U, &result));
     CHECK(!cpu.fault && result == pointer);
+    CHECK(s_observer_calls == 0U);
     CHECK(call_free(&cpu, stack, pointer + 4U));
     CHECK(cpu.fault && strstr(cpu.fault, "interior OGG emergency"));
+    CHECK(s_observer_calls == 0U);
     CHECK(call_free(&cpu, stack, pointer));
     CHECK(!cpu.fault && s_memblock_free_calls == 0U && s_memblock_live);
+    CHECK(s_observer_calls == 1U && s_observer_last == (uintptr_t)pointer);
     CHECK(call_free(&cpu, stack, pointer));
     CHECK(cpu.fault && strstr(cpu.fault, "double/stale free"));
+    CHECK(s_observer_calls == 1U);
 
     CHECK(call_malloc(
         &cpu, stack, ISAAC_VITA_OGG_OPEN_BACKING_BYTES,
@@ -505,6 +535,37 @@ static int heap_routing_oracle(void)
     CHECK(!cpu.fault && result == pointer && s_memblock_alloc_calls == 1U);
     CHECK(call_realloc(&cpu, stack, pointer, 0U, &result));
     CHECK(!cpu.fault && result == 0U);
+    CHECK(s_observer_calls == 1U);
+
+#ifdef ISAAC_VITA_OGG_QUEUE_EMERGENCY
+    /* The measured Exit failure belongs to Queue, not Open. Reuse the idle
+     * backing, never grow the reserve or lend it to two live owners. */
+    CHECK(call_malloc(
+        &cpu, stack, ISAAC_VITA_OGG_OPEN_BACKING_BYTES,
+        ISAAC_VITA_OGG_QUEUE_ALLOCATION_RETURN_RVA,
+        ISAAC_VITA_HEAP_WRAPPER_MALLOC_RETURN_RVA, &result));
+    CHECK(!cpu.fault && result == pointer && s_memblock_alloc_calls == 1U);
+    CHECK(call_malloc(
+        &cpu, stack, ISAAC_VITA_OGG_OPEN_BACKING_BYTES,
+        ISAAC_VITA_OGG_QUEUE_ALLOCATION_RETURN_RVA,
+        ISAAC_VITA_HEAP_WRAPPER_MALLOC_RETURN_RVA, &result));
+    CHECK(!cpu.fault && result == 0U && s_memblock_alloc_calls == 1U);
+    CHECK(call_malloc(
+        &cpu, stack, ISAAC_VITA_OGG_OPEN_BACKING_BYTES,
+        ISAAC_VITA_OGG_OPEN_ALLOCATION_RETURN_RVA,
+        ISAAC_VITA_HEAP_WRAPPER_MALLOC_RETURN_RVA, &result));
+    CHECK(!cpu.fault && result == 0U && s_memblock_alloc_calls == 1U);
+    CHECK(call_free(&cpu, stack, pointer));
+    CHECK(!cpu.fault && s_observer_calls == 2U &&
+          s_observer_last == (uintptr_t)pointer);
+    CHECK(call_malloc(
+        &cpu, stack, ISAAC_VITA_OGG_OPEN_BACKING_BYTES,
+        ISAAC_VITA_OGG_OPEN_ALLOCATION_RETURN_RVA,
+        ISAAC_VITA_HEAP_WRAPPER_MALLOC_RETURN_RVA, &result));
+    CHECK(!cpu.fault && result == pointer && s_memblock_alloc_calls == 1U);
+    CHECK(call_free(&cpu, stack, pointer));
+    CHECK(!cpu.fault && s_observer_calls == 3U);
+#endif
 
     CHECK(isaac_vita_ogg_emergency_oracle_reset() == 0 &&
           !s_memblock_live && s_memblock_free_calls == 1U);

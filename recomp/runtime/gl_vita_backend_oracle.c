@@ -205,6 +205,52 @@ static GLenum s_native_attrib_type;
 static GLboolean s_native_attrib_normalized;
 static GLsizei s_native_attrib_stride;
 static const void *s_native_attrib_pointer;
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+static uint16_t s_native_attrib_mask, s_native_attrib_observed;
+static uint16_t s_native_canonical_attrib_observed;
+static unsigned s_native_attrib_invalid_mutation;
+#endif
+#if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+/* Ordered fake-vitaGL call trace for the direct-state comparison (attribute
+ * toggles and pointers, draws and program binds, with their arguments). */
+static char s_direct_trace[1u << 15];
+static size_t s_direct_trace_len;
+static int s_direct_trace_overflow;
+static void oracle_direct_trace(const char *format, ...)
+{
+    va_list args;
+    int n;
+
+    va_start(args, format);
+    n = vsnprintf(s_direct_trace + s_direct_trace_len,
+                  sizeof s_direct_trace - s_direct_trace_len, format, args);
+    va_end(args);
+    if (n < 0 || (size_t)n >= sizeof s_direct_trace - s_direct_trace_len) {
+        s_direct_trace_overflow = 1;
+        return;
+    }
+    s_direct_trace_len += (size_t)n;
+}
+# define ORACLE_DIRECT_TRACE(...) oracle_direct_trace(__VA_ARGS__)
+/* Foreign table members for the decline checks: must never be reached. */
+static unsigned oracle_backend_fake_calls;
+static void oracle_backend_fake_toggle(guest_gl_uint index)
+{
+    (void)index;
+    ++oracle_backend_fake_calls;
+}
+static guest_gl_int oracle_backend_fake_location(guest_gl_uint program,
+                                                 guest_gl_addr name)
+{
+    (void)program;
+    (void)name;
+    ++oracle_backend_fake_calls;
+    return -1;
+}
+#else
+# define ORACLE_DIRECT_TRACE(...) ((void)0)
+#endif
 static unsigned s_native_get_integer_calls;
 static GLuint s_native_next_program = 7u;
 static GLint s_native_link_status;
@@ -510,6 +556,7 @@ void oracle_glUseProgram(GLuint program)
 {
     ++s_native_use_program_calls;
     s_native_last_program = program;
+    ORACLE_DIRECT_TRACE("u%u;", (unsigned)program);
     if (!s_native_reject_use_program)
         s_native_current_program = program;
 }
@@ -522,6 +569,10 @@ void oracle_glClearDepth(GLdouble depth)
 
 void oracle_glClear(GLbitfield mask)
 {
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    s_native_attrib_observed = s_native_attrib_mask;
+#endif
     ++s_native_clear_calls;
     s_native_clear_mask = mask;
 }
@@ -711,22 +762,47 @@ void oracle_glDepthFunc(GLenum function)
 
 void oracle_glEnableVertexAttribArray(GLuint index)
 {
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    s_native_attrib_observed = s_native_attrib_mask;
+    if (index < 16u)
+        s_native_attrib_mask |= (uint16_t)(1u << index);
+    else if (s_native_attrib_invalid_mutation)
+        s_native_attrib_mask ^= 1u; /* Explicit hostile model, no undefined shift. */
+#endif
     ++s_native_enable_attrib_calls;
     s_native_attrib_index = index;
+    ORACLE_DIRECT_TRACE("E%u;", (unsigned)index);
 }
 
 void oracle_glDisableVertexAttribArray(GLuint index)
 {
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    s_native_attrib_observed = s_native_attrib_mask;
+    if (index < 16u)
+        s_native_attrib_mask &= (uint16_t)~(1u << index);
+    else if (s_native_attrib_invalid_mutation)
+        s_native_attrib_mask ^= 1u;
+#endif
     ++s_native_disable_attrib_calls;
     s_native_attrib_index = index;
+    ORACLE_DIRECT_TRACE("D%u;", (unsigned)index);
 }
 
 void oracle_glVertexAttribPointer(
     GLuint index, GLint size, GLenum type, GLboolean normalized,
     GLsizei stride, const void *pointer)
 {
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    s_native_attrib_observed = s_native_attrib_mask;
+#endif
     ++s_native_attrib_pointer_calls;
     s_native_attrib_index = index;
+    ORACLE_DIRECT_TRACE("P%u,%d,%x,%u,%d,%lx;", (unsigned)index, (int)size,
+                        (unsigned)type, (unsigned)normalized, (int)stride,
+                        (unsigned long)(uintptr_t)pointer);
     s_native_attrib_size = size;
     s_native_attrib_type = type;
     s_native_attrib_normalized = normalized;
@@ -736,6 +812,10 @@ void oracle_glVertexAttribPointer(
 
 void oracle_glGetIntegerv(GLenum name, GLint *value)
 {
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    s_native_attrib_observed = s_native_attrib_mask;
+#endif
     ++s_native_get_integer_calls;
     if (!value)
         return;
@@ -787,8 +867,14 @@ void oracle_glDeleteFramebuffers(
 void oracle_glDrawElements(
     GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    s_native_attrib_observed = s_native_attrib_mask;
+#endif
     ++s_native_draw_elements_calls;
     s_native_draw_mode = mode;
+    ORACLE_DIRECT_TRACE("d%x,%d,%x,%lx;", (unsigned)mode, (int)count,
+                        (unsigned)type, (unsigned long)(uintptr_t)indices);
     s_native_draw_count = count;
     s_native_draw_type = type;
     s_native_draw_indices = indices;
@@ -796,6 +882,11 @@ void oracle_glDrawElements(
 
 GLboolean vglIsaacDrawCanonicalQuads(GLsizei count)
 {
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    s_native_attrib_observed = s_native_attrib_mask;
+    s_native_canonical_attrib_observed = s_native_attrib_mask;
+#endif
     ++s_native_canonical_quad_calls;
     s_native_canonical_quad_count = count;
     return s_native_canonical_quad_result;
@@ -1346,6 +1437,113 @@ static int oracle_test_fxray_off_passthrough(CPU *cpu, uint32_t stack_top)
     CHECK(s_native_tex_image_internal_format == (GLint)ORACLE_GL_RGBA);
     CHECK(s_native_tex_image_format == ORACLE_GL_RGBA);
     CHECK((uintptr_t)s_native_tex_image_pixels == 1u);
+    return 0;
+}
+#endif
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+/* ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO (coalesce-memo mode): the
+ * generation word the replay memo is keyed on is bumped by exactly the
+ * mutators that invalidate the shim location cache, by every backend
+ * install/uninstall (never rewound), and by nothing else on the draw path;
+ * VERIFY routes a memo/wrapper disagreement into ph120.a loc(...,m). */
+/* Registry tokens of gl_surface_generated.inc not used elsewhere here. */
+#define ORACLE_TOKEN_GET_ATTRIB 0x7e307ce3u
+#define ORACLE_TOKEN_ATTACH_SHADER 0x7ec5ca07u
+#define ORACLE_TOKEN_COMPILE_SHADER 0x7edbdc55u
+#define ORACLE_TOKEN_CREATE_SHADER 0x7e8e2dffu
+#define ORACLE_TOKEN_DELETE_SHADER 0x7e226ffeu
+#define ORACLE_TOKEN_SHADER_SOURCE 0x7ea2cbd7u
+
+static int oracle_test_location_memo_generation(CPU *cpu, uint32_t stack_top)
+{
+    static const char attrib_name[] = "aPosition";
+    static const char source_text[] = "void main() {}";
+    const char *sources[1] = { source_text };
+    uint32_t arguments[4];
+    uint32_t generation;
+    uint32_t program, shader;
+
+    gl_vita_backend_uninstall();
+    CHECK(gl_vita_backend_install());
+    generation = g_isaac_vita_gl_location_generation;
+    CHECK(generation != 0u);
+
+    /* Pure queries and the draw-path program bind leave the word alone. */
+    arguments[0] = 7u;
+    arguments[1] = (uint32_t)(uintptr_t)attrib_name;
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_GET_ATTRIB, arguments, 2u));
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_GET_UNIFORM, arguments, 2u));
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_USE_PROGRAM, arguments, 1u));
+    CHECK(g_isaac_vita_gl_location_generation == generation);
+
+    /* Every program/shader-state mutator bumps it exactly once, before
+     * the native call (the wrapper order is pinned by the source). */
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_CREATE_PROGRAM, arguments, 0u));
+    program = cpu->eax;
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+    arguments[0] = 0x8b31u;
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_CREATE_SHADER, arguments, 1u));
+    shader = cpu->eax;
+    CHECK(g_isaac_vita_gl_location_generation == generation);
+    arguments[0] = shader;
+    arguments[1] = 1u;
+    arguments[2] = (uint32_t)(uintptr_t)sources;
+    arguments[3] = 0u;
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_SHADER_SOURCE, arguments, 4u));
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_COMPILE_SHADER, arguments, 1u));
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+    arguments[0] = program;
+    arguments[1] = shader;
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_ATTACH_SHADER, arguments, 2u));
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_LINK_PROGRAM, arguments, 1u));
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+    arguments[0] = shader;
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_DELETE_SHADER, arguments, 1u));
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+    arguments[0] = program;
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_DELETE_PROGRAM, arguments, 1u));
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+    /* Name recycling: delete + create is two bumps. */
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_CREATE_PROGRAM, arguments, 0u));
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+    arguments[0] = cpu->eax;
+    CHECK(oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_DELETE_PROGRAM, arguments, 1u));
+    CHECK(g_isaac_vita_gl_location_generation == ++generation);
+
+    /* Install/uninstall reset the shim cache; the memo word only moves
+     * forward, so an entry filled before either is stale after. */
+    gl_vita_backend_uninstall();
+    CHECK(g_isaac_vita_gl_location_generation > generation);
+    generation = g_isaac_vita_gl_location_generation;
+    CHECK(gl_vita_backend_install());
+    CHECK(g_isaac_vita_gl_location_generation > generation);
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY) && \
+    defined(ISAAC_VITA_PHASE_PROFILE)
+    {
+        uint32_t before =
+            g_isaac_vita_gl_phase_profile_counters.location_cache_mismatch;
+        isaac_vita_gl_location_memo_note_mismatch();
+        CHECK(g_isaac_vita_gl_phase_profile_counters.location_cache_mismatch ==
+              before + 1u);
+    }
+#endif
     return 0;
 }
 #endif
@@ -2294,6 +2492,9 @@ static int oracle_fbo_clear_color(
         cpu, stack_top, ORACLE_TOKEN_CLEAR_COLOR, arguments, 4u);
 }
 
+#if !defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
+/* Only the plain elision test folds owed depths; the depth-drop build must
+ * stay -Wunused-function clean under -Werror. */
 static int oracle_fbo_clear_depth(
     CPU *cpu, uint32_t stack_top, double depth)
 {
@@ -2306,6 +2507,7 @@ static int oracle_fbo_clear_depth(
     return oracle_dispatch(
         cpu, stack_top, ORACLE_TOKEN_CLEAR_DEPTH, arguments, 2u);
 }
+#endif
 
 static int oracle_fbo_attach(
     CPU *cpu, uint32_t stack_top, uint32_t target, uint32_t texture)
@@ -2320,6 +2522,24 @@ static int oracle_fbo_attach(
     return oracle_dispatch(
         cpu, stack_top, ORACLE_TOKEN_FRAMEBUFFER_TEXTURE, arguments, 5u);
 }
+
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
+/* Every argument spelled out: detaches, other levels and texture targets. */
+static int oracle_fbo_attach_full(
+    CPU *cpu, uint32_t stack_top, uint32_t target, uint32_t attachment,
+    uint32_t texture_target, uint32_t texture, uint32_t level)
+{
+    uint32_t arguments[5];
+
+    arguments[0] = target;
+    arguments[1] = attachment;
+    arguments[2] = texture_target;
+    arguments[3] = texture;
+    arguments[4] = level;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_FRAMEBUFFER_TEXTURE, arguments, 5u);
+}
+#endif
 
 static int oracle_fbo_draw(CPU *cpu, uint32_t stack_top)
 {
@@ -2397,6 +2617,9 @@ static int oracle_fbo_read_pixels(CPU *cpu, uint32_t stack_top)
         cpu, stack_top, ORACLE_TOKEN_READ_PIXELS, arguments, 7u);
 }
 
+#if !defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
+/* Colour renderbuffers only matter to the colour-note path of the plain
+ * elision test. */
 static int oracle_fbo_attach_renderbuffer(
     CPU *cpu, uint32_t stack_top, uint32_t attachment, uint32_t renderbuffer)
 {
@@ -2410,10 +2633,13 @@ static int oracle_fbo_attach_renderbuffer(
         cpu, stack_top, ORACLE_TOKEN_FRAMEBUFFER_RENDERBUFFER, arguments, 4u);
 }
 #endif
+#endif
 
-#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION) && \
+    !defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
 /* Exact clear elision on offscreen targets: colour no-ops are absorbed,
- * depth/stencil clears are owed to the first draw of the same GXM scene. */
+ * depth/stencil clears are owed to the first draw of the same GXM scene.
+ * (The depth-drop sub-mode changes the colour path; its own test follows.) */
 static int oracle_test_fbo_clear_elision(CPU *cpu, uint32_t stack_top)
 {
     static uint8_t pixels[16 * 16 * 4];
@@ -2651,6 +2877,183 @@ static int oracle_test_fbo_clear_elision(CPU *cpu, uint32_t stack_top)
 }
 #endif
 
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
+/* Depth-drop sub-mode: colour clears are always native (colour notes never
+ * consulted); an owed depth/stencil clear is replayed before a draw or an
+ * unmodelled call, dropped at a tracked COLOR_ATTACHMENT0 re-attach of the
+ * owing framebuffer (a), or dropped when stock vitaGL ends the owing scene
+ * (d).  The closure x == r + a + d holds when no owed clear is folded. */
+static int oracle_test_fbo_clear_elision_depth_drop(
+    CPU *cpu, uint32_t stack_top)
+{
+    static uint8_t pixels[16 * 16 * 4];
+    const uint32_t read_framebuffer = 0x00008ca8u;
+    const uint32_t cube_positive_x = 0x00008515u;
+    uint32_t name;
+    unsigned native_before;
+    unsigned guest_before;
+    unsigned attach_calls;
+    unsigned bind_calls;
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    uint32_t replayed_before = g_isaac_vita_gl_phase_profile_counters.clear_replayed;
+    uint32_t suppressed_before = g_isaac_vita_gl_phase_profile_counters.clear_suppressed;
+    uint32_t attach_before = g_isaac_vita_gl_phase_profile_counters.clear_dropped_attach;
+    uint32_t scene_before = g_isaac_vita_gl_phase_profile_counters.clear_dropped_scene;
+    uint32_t poison_before = g_isaac_vita_gl_phase_profile_counters.fbo_elision_poison;
+#endif
+
+    gl_vita_backend_uninstall();
+    CHECK(gl_vita_backend_install());
+    native_before = s_native_clear_calls;
+    guest_before = s_fbo_guest_clear_calls;
+
+    /* Colour requests are native even when the texture holds the colour. */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_attach(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 5u));
+    CHECK(oracle_fbo_clear_color(cpu, stack_top, 0.1f, 0.2f, 0.3f, 1.0f));
+    CHECK(oracle_fbo_clear(cpu, stack_top,
+        ORACLE_GL_COLOR_BUFFER_BIT | ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(s_native_clear_calls == native_before + 1u);
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_COLOR_BUFFER_BIT));
+    CHECK(s_native_clear_calls == native_before + 2u);
+    CHECK(s_native_clear_mask == ORACLE_GL_COLOR_BUFFER_BIT);
+    CHECK(oracle_fbo_clear(cpu, stack_top,
+        ORACLE_GL_COLOR_BUFFER_BIT | ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(s_native_clear_calls == native_before + 3u);
+    /* A depth-only request is owed and replayed by the first draw. */
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(s_native_clear_calls == native_before + 3u);
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(s_native_clear_calls == native_before + 4u);
+    CHECK(s_native_clear_mask == ORACLE_GL_DEPTH_BUFFER_BIT);
+    /* The owing framebuffer re-attaching a level-0 2D texture drops the owed
+     * clear (vitaGL ends that scene at the next clear or draw). */
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    attach_calls = s_native_framebuffer_texture_calls;
+    CHECK(oracle_fbo_attach(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 6u));
+    CHECK(s_native_clear_calls == native_before + 4u);
+    CHECK(s_native_framebuffer_texture_calls == attach_calls + 1u);
+    CHECK(oracle_fbo_clear(cpu, stack_top,
+        ORACLE_GL_COLOR_BUFFER_BIT | ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(s_native_clear_calls == native_before + 5u);
+    /* An attach on another framebuffer replays (with the native rebind). */
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 8u));
+    CHECK(s_native_clear_calls == native_before + 5u);
+    CHECK(oracle_fbo_attach(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 5u));
+    CHECK(s_native_clear_calls == native_before + 6u);
+    CHECK(s_native_clear_mask == ORACLE_GL_DEPTH_BUFFER_BIT);
+    /* A detach (texture 0) does not dirty the scene in vitaGL: replay. */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_fbo_attach_full(cpu, stack_top, ORACLE_GL_FRAMEBUFFER,
+        ORACLE_GL_COLOR_ATTACHMENT0, ORACLE_GL_TEXTURE_2D, 0u, 0u));
+    CHECK(s_native_clear_calls == native_before + 7u);
+    CHECK(oracle_fbo_attach(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 5u));
+    /* Untracked attachments (other level, other texture target) and the read
+     * framebuffer target fail closed to the replay. */
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_fbo_attach_full(cpu, stack_top, ORACLE_GL_FRAMEBUFFER,
+        ORACLE_GL_COLOR_ATTACHMENT0, ORACLE_GL_TEXTURE_2D, 6u, 1u));
+    CHECK(s_native_clear_calls == native_before + 8u);
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_fbo_attach_full(cpu, stack_top, ORACLE_GL_FRAMEBUFFER,
+        ORACLE_GL_COLOR_ATTACHMENT0, cube_positive_x, 6u, 0u));
+    CHECK(s_native_clear_calls == native_before + 9u);
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_fbo_attach_full(cpu, stack_top, read_framebuffer,
+        ORACLE_GL_COLOR_ATTACHMENT0, ORACLE_GL_TEXTURE_2D, 6u, 0u));
+    CHECK(s_native_clear_calls == native_before + 10u);
+    /* Scene-ending drops: a clear on another framebuffer, the present, the
+     * deletion of the owing framebuffer. */
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 8u));
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_COLOR_BUFFER_BIT));
+    CHECK(s_native_clear_calls == native_before + 11u);
+    CHECK(s_native_clear_mask == ORACLE_GL_COLOR_BUFFER_BIT);
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    gl_vita_backend_fbo_present();
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(s_native_clear_calls == native_before + 11u);
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    name = 7u;
+    CHECK(oracle_delete_framebuffer(cpu, stack_top, &name));
+    name = 7u;
+    CHECK(oracle_fbo_gen(cpu, stack_top, &name));
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_attach(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 5u));
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(s_native_clear_calls == native_before + 11u);
+    /* The unmodelled settlements replay the owed depth clear exactly as the
+     * plain elision does: glReadPixels, a texture upload, a texture deletion,
+     * and the readback of a target bound away from (natively rebound around
+     * the quad). */
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_native_clear_calls == native_before + 12u);
+    CHECK(s_native_clear_mask == ORACLE_GL_DEPTH_BUFFER_BIT);
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_bind_texture(cpu, stack_top, 42u));
+    CHECK(oracle_tex_sub_image(cpu, stack_top, 16, 16, pixels));
+    CHECK(s_native_clear_calls == native_before + 13u);
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    name = 42u;
+    CHECK(oracle_fbo_delete_texture(cpu, stack_top, &name));
+    CHECK(s_native_clear_calls == native_before + 14u);
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 8u));
+    bind_calls = s_native_bind_framebuffer_calls;
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_native_clear_calls == native_before + 15u);
+    CHECK(s_native_bind_framebuffer_calls == bind_calls + 2u);
+    CHECK(s_native_bind_framebuffer_name == 8u);
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(s_native_clear_calls == native_before + 15u);
+    /* A scissor enable settles the owed clear and poisons the policy for
+     * good: every later clear is native. */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(s_native_clear_calls == native_before + 15u);
+    CHECK(oracle_fbo_enable(cpu, stack_top, ORACLE_GL_SCISSOR_TEST));
+    CHECK(s_native_clear_calls == native_before + 16u);
+    CHECK(s_native_clear_mask == ORACLE_GL_DEPTH_BUFFER_BIT);
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_DEPTH_BUFFER_BIT));
+    CHECK(s_native_clear_calls == native_before + 17u);
+    CHECK(s_fbo_guest_clear_calls == guest_before + 21u);
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    {
+        uint32_t replayed =
+            g_isaac_vita_gl_phase_profile_counters.clear_replayed -
+            replayed_before;
+        uint32_t suppressed =
+            g_isaac_vita_gl_phase_profile_counters.clear_suppressed -
+            suppressed_before;
+        uint32_t dropped_attach =
+            g_isaac_vita_gl_phase_profile_counters.clear_dropped_attach -
+            attach_before;
+        uint32_t dropped_scene =
+            g_isaac_vita_gl_phase_profile_counters.clear_dropped_scene -
+            scene_before;
+
+        CHECK(replayed == 11u);
+        CHECK(dropped_attach == 1u);
+        CHECK(dropped_scene == 3u);
+        CHECK(suppressed == 15u);
+        CHECK(g_isaac_vita_gl_phase_profile_counters.fbo_elision_poison ==
+              poison_before + 1u);
+        /* ph120.e closures: x == r + a + d (no folds here) and native clears
+         * == guest clears - x + r. */
+        CHECK(suppressed == replayed + dropped_attach + dropped_scene);
+        CHECK(suppressed ==
+              (s_fbo_guest_clear_calls - guest_before) -
+              (s_native_clear_calls - native_before) + replayed);
+    }
+#endif
+    return 0;
+}
+#endif
+
 #if defined(ISAAC_VITA_FBO_RASTER_SCALE)
 /* Reduced raster for NULL-defined screen-sized colour targets (test builds
  * define NUM/DEN = 1/2). */
@@ -2744,6 +3147,1276 @@ static int oracle_test_fbo_raster_scale(CPU *cpu, uint32_t stack_top)
     CHECK(g_isaac_vita_gl_phase_profile_counters.fbo_raster_viewports >= 4u);
     CHECK(g_isaac_vita_gl_phase_profile_counters.fbo_raster_respecified == 1u);
 #endif
+    return 0;
+}
+#endif
+
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+#include "gl_vita_backend_test_vitagl_undef.h"
+#include "../vita/host_tests/vita_attrib_owner_mock.inc"
+
+static int oracle_test_attrib_coalescing(CPU *cpu, uint32_t stack_top)
+{
+    const guest_gl_backend *backend;
+    unsigned enabled_before, disabled_before, index;
+    uint32_t faults = 0, draw[4] = {ORACLE_GL_TRIANGLES, 6u, ORACLE_GL_UNSIGNED_SHORT, 0x1000u};
+    GLint queried = 0;
+    char name[] = "Position";
+    gl_vita_backend_uninstall();
+    s_native_attrib_mask = 0x8000u; /* Native state is NOT reset on install. */
+    CHECK(gl_vita_backend_install());
+    backend = guest_gl_installed_backend();
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    memset(&g_isaac_vita_gl_phase_profile_counters, 0,
+           sizeof g_isaac_vita_gl_phase_profile_counters);
+#endif
+    enabled_before = s_native_enable_attrib_calls;
+    disabled_before = s_native_disable_attrib_calls;
+    backend->glEnableVertexAttribArray(0u); /* Unknown -> synchronous learning. */
+    CHECK(s_native_enable_attrib_calls == enabled_before + 1u);
+    CHECK(s_native_attrib_mask == 0x8001u);
+    backend->glDisableVertexAttribArray(0u);
+    CHECK(gl_vita_backend_attrib_pending() == 1u && s_native_attrib_mask == 0x8001u);
+    backend->glVertexAttribPointer(0u, 2, ORACLE_GL_FLOAT, 0u, 8, 1u);
+    (void)backend->glGetAttribLocation(0u, (guest_gl_addr)(uintptr_t)name);
+    CHECK(gl_vita_backend_attrib_pending() == 1u); /* Neither consumes mask. */
+    backend->glEnableVertexAttribArray(0u);
+    CHECK(!gl_vita_backend_attrib_pending());
+    CHECK(s_native_disable_attrib_calls == disabled_before);
+    CHECK(s_native_enable_attrib_calls == enabled_before + 1u);
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    CHECK(g_isaac_vita_gl_phase_profile_counters.attrib_toggle == 1u);
+    CHECK(g_isaac_vita_gl_phase_profile_counters.attrib_deferred == 2u);
+    CHECK(g_isaac_vita_gl_phase_profile_counters.attrib_cancelled == 2u);
+#endif
+    backend->glDisableVertexAttribArray(0u);
+    backend->glDrawElements(0u, 0, 0u, 1u); /* Invalid/zero ordinary draw still flushes. */
+    CHECK(s_native_attrib_observed == 0x8000u && !gl_vita_backend_attrib_pending());
+    backend->glEnableVertexAttribArray(0u);
+    s_native_canonical_quad_result = 1u;
+    CHECK(oracle_dispatch_with_return(cpu, stack_top, ORACLE_TOKEN_DRAW_ELEMENTS,
+                                      draw, 4u, 0x0056039du));
+    CHECK(s_native_attrib_observed == 0x8001u);
+#if defined(ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY)
+    CHECK(s_native_canonical_attrib_observed == 0x8001u);
+#endif
+    backend->glDisableVertexAttribArray(0u);
+    s_native_canonical_quad_result = 0u;
+    CHECK(oracle_dispatch_with_return(cpu, stack_top, ORACLE_TOKEN_DRAW_ELEMENTS,
+                                      draw, 4u, 0x0056039du));
+    CHECK(s_native_attrib_observed == 0x8000u);
+#if defined(ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY)
+    CHECK(s_native_canonical_attrib_observed == 0x8000u);
+#endif
+    backend->glEnableVertexAttribArray(0u);
+    s_native_attrib_invalid_mutation = 1u;
+    backend->glDisableVertexAttribArray(32u);
+    CHECK(s_native_attrib_observed == 0x8001u); /* Earlier enable reached native first. */
+    CHECK(s_native_attrib_mask == 0x8000u && !gl_vita_backend_attrib_pending());
+    s_native_attrib_invalid_mutation = 0u;
+    enabled_before = s_native_enable_attrib_calls;
+    backend->glEnableVertexAttribArray(0u);
+    CHECK(s_native_enable_attrib_calls == enabled_before + 1u); /* Poison retrains. */
+    backend->glDisableVertexAttribArray(0u);
+    backend->glVertexAttribPointer(16u, 2, ORACLE_GL_FLOAT, 0u, 8, 1u);
+    CHECK(s_native_attrib_observed == 0x8000u && !gl_vita_backend_attrib_pending());
+    backend->glEnableVertexAttribArray(0u);
+    CHECK(!gl_vita_backend_attrib_pending()); /* Invalid pointer also poisoned. */
+    backend->glDisableVertexAttribArray(0u);
+    backend->glGetIntegerv(0x8869u, (guest_gl_addr)(uintptr_t)&queried);
+    CHECK(s_native_attrib_observed == 0x8000u && !gl_vita_backend_attrib_pending());
+    backend->glEnableVertexAttribArray(0u);
+    backend->glClear(0u);
+    CHECK(s_native_attrib_observed == 0x8001u && !gl_vita_backend_attrib_pending());
+
+    /* Actual freshly extracted owners; no typed uninstall beforehand and no
+     * FBO_CLEAR_ELISION dependency. Native swaps observe the real policy mask. */
+    backend->glDisableVertexAttribArray(0u);
+    s_active = 1;
+    attrib_owner_kage_vita_backend_deactivate();
+    CHECK(!s_active && s_native_attrib_mask == 0x8000u && !gl_vita_backend_attrib_pending());
+    backend->glEnableVertexAttribArray(0u);
+    s_attrib_owner_expected = 0x8001u;
+    attrib_owner_kage_loading_swap(0u);
+    backend->glDisableVertexAttribArray(0u);
+    s_attrib_owner_expected = 0x8000u;
+    CHECK(attrib_owner_continue_overlay_begin(1u, 2u, &faults));
+    backend->glEnableVertexAttribArray(0u);
+    s_attrib_owner_expected = 0x8001u;
+    attrib_owner_continue_overlay_stage(1u, 3u);
+    CHECK(s_attrib_owner_swaps == 3u && !s_attrib_owner_bad && !faults);
+
+    backend->glDisableVertexAttribArray(0u);
+    gl_vita_backend_attrib_external_begin();
+    CHECK(s_native_attrib_mask == 0x8000u && !gl_vita_backend_attrib_pending());
+    s_native_attrib_mask |= 1u; /* Explicit untracked native owner mutation. */
+    backend->glDisableVertexAttribArray(0u);
+    CHECK(s_native_attrib_mask == 0x8000u); /* Unknown bit cannot stale-hit. */
+    backend->glEnableVertexAttribArray(0u);
+    CHECK(gl_vita_backend_attrib_pending() == 1u);
+    CHECK(gl_vita_backend_install()); /* Retained-context reinstall flushes first. */
+    CHECK(s_native_attrib_mask == 0x8001u && !gl_vita_backend_attrib_pending());
+    backend = guest_gl_installed_backend();
+    backend->glDisableVertexAttribArray(0u); /* Fresh unknown state, immediate. */
+    CHECK(s_native_attrib_mask == 0x8000u);
+    backend->glEnableVertexAttribArray(0u);
+    gl_vita_backend_uninstall();
+    CHECK(s_native_attrib_mask == 0x8001u && !gl_vita_backend_attrib_pending());
+    CHECK(gl_vita_backend_install());
+    backend = guest_gl_installed_backend();
+    /* All 16 bits, reverse setter order, and readback as a consumer. No read
+     * of client pointer contents is needed for either coalescing or flushing. */
+    for (index = 0u; index < 16u; ++index)
+        backend->glEnableVertexAttribArray(index);
+    for (index = 16u; index != 0u; --index)
+        backend->glDisableVertexAttribArray(index - 1u);
+    CHECK(s_native_attrib_mask == 0xffffu && gl_vita_backend_attrib_pending() == 16u);
+    backend->glReadPixels(0, 0, 0, 0, ORACLE_GL_RGBA, ORACLE_GL_UNSIGNED_BYTE, 0u);
+    CHECK(s_native_attrib_mask == 0u && !gl_vita_backend_attrib_pending());
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    {
+        IsaacVitaGlPhaseProfileCounters first, second;
+        uint32_t p0 = gl_vita_backend_attrib_pending(), p1, p2;
+        first = g_isaac_vita_gl_phase_profile_counters;
+        backend->glEnableVertexAttribArray(0u); /* Pending crosses the window. */
+        p1 = gl_vita_backend_attrib_pending();
+        second = g_isaac_vita_gl_phase_profile_counters;
+        CHECK(p0 == 0u && p1 == 1u);
+        CHECK(second.attrib_toggle == first.attrib_toggle);
+        CHECK(second.attrib_deferred - first.attrib_deferred == 1u);
+        CHECK(second.attrib_cancelled == first.attrib_cancelled);
+        backend->glDisableVertexAttribArray(0u); /* Cancels prior-window request. */
+        p2 = gl_vita_backend_attrib_pending();
+        CHECK(p2 == 0u);
+        CHECK(g_isaac_vita_gl_phase_profile_counters.attrib_toggle == second.attrib_toggle);
+        CHECK(g_isaac_vita_gl_phase_profile_counters.attrib_deferred - second.attrib_deferred == 1u);
+        CHECK(g_isaac_vita_gl_phase_profile_counters.attrib_cancelled - second.attrib_cancelled == 2u);
+        /* Window two has one request: native 0 + cancellations 2 + pending -1. */
+        CHECK(0 + 2 + (int)p2 - (int)p1 == 1);
+    }
+#endif
+    puts("attribute coalescing: actual masks, invalid ordering, owner swaps/reset PASS");
+    return 0;
+}
+#endif
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+/* Member access by name below (the coalescing test above undefines the fake
+ * native names only under its own option). */
+#include "gl_vita_backend_test_vitagl_undef.h"
+/* ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE (*-direct modes): the batch entry
+ * points must leave the backend exactly where the per-call wrapper sequence
+ * the Shader::EnableAttribs/DisableAttribs replays issue today leaves it.
+ * The same scripted replay inputs are driven through both paths from a
+ * fresh install and the vitaGL call trace (every fake native attribute /
+ * draw / program call with its arguments, in order), the typed-state shadow
+ * bytes, the coalescer's pending count, the fake native mask and every
+ * phase counter must compare equal.  Scripts: enable then draw;
+ * enable/disable/enable; disable without a prior enable; changed pointers
+ * between draws; program switch between draws; glUseProgram/glDrawElements
+ * interleaved with the replays; a -1 location (index 0xffffffff, the invalid
+ * native path with its sync + poison); a negative stride (invalid pointer
+ * path); a repeated location inside one replay (toggle hit path); 16
+ * attributes.  Each script runs with locations supplied (the replay's memo
+ * hit) and with names looked up by the batch (memo miss / memo OFF /
+ * VERIFY).  Declines (count 17, component 0 or 5, NULL locations/tokens, a
+ * table whose members are not this backend's wrappers) return 0 and leave
+ * trace, state and counters untouched. */
+typedef struct direct_spec {
+    uint32_t program;
+    uint32_t count;
+    guest_gl_int locations[16];
+    uint8_t components[16];
+    guest_gl_sizei stride;
+    guest_gl_addr base;
+} direct_spec;
+
+typedef struct direct_op {
+    char kind;          /* 'E' enable replay, 'D' disable replay, 'd' draw, 'u' use program */
+    uint32_t spec;      /* index into s_direct_specs (E/D) or the program (u) */
+} direct_op;
+
+static const direct_spec s_direct_specs[] = {
+    /* 0: the frozen ColorOffset shape: 7 attributes, stride 48 */
+    { 7u, 7u, { 0, 1, 2, 3, 4, 5, 6 }, { 2u, 2u, 4u, 4u, 3u, 1u, 3u }, 48, 0x98800000u },
+    /* 1: same shape, next ring slot */
+    { 7u, 7u, { 0, 1, 2, 3, 4, 5, 6 }, { 2u, 2u, 4u, 4u, 3u, 1u, 3u }, 48, 0x98800000u + 0x2400u },
+    /* 2: another program, 3 attributes at other locations */
+    { 9u, 3u, { 4, 0, 9 }, { 3u, 2u, 1u }, 24, 0x98900000u },
+    /* 3: a -1 location among valid ones */
+    { 7u, 4u, { 0, (guest_gl_int)0xffffffff, 2, 3 }, { 2u, 2u, 4u, 4u }, 48, 0x98800000u },
+    /* 4: negative stride */
+    { 7u, 2u, { 0, 1 }, { 2u, 2u }, -16, 0x98800000u },
+    /* 5: repeated location inside one replay */
+    { 7u, 3u, { 5, 5, 1 }, { 1u, 4u, 2u }, 32, 0x98a00000u },
+    /* 6: all sixteen attributes */
+    { 11u, 16u, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+      { 1u, 2u, 3u, 4u, 1u, 2u, 3u, 4u, 1u, 2u, 3u, 4u, 1u, 2u, 3u, 4u }, 160, 0x98b00000u },
+};
+
+static const direct_op s_direct_script[] = {
+    { 'u', 7u }, { 'E', 0u }, { 'd', 0u }, { 'D', 0u },          /* enable, draw, disable */
+    { 'E', 1u }, { 'd', 0u }, { 'D', 1u },                       /* changed pointers */
+    { 'E', 0u }, { 'D', 0u }, { 'E', 0u }, { 'd', 0u }, { 'D', 0u }, /* enable/disable/enable */
+    { 'D', 2u },                                                 /* disable without enable */
+    { 'u', 9u }, { 'E', 2u }, { 'd', 0u }, { 'D', 2u },          /* program switch */
+    { 'u', 7u }, { 'E', 3u }, { 'd', 0u }, { 'D', 3u },          /* -1 location */
+    { 'E', 4u }, { 'd', 0u }, { 'D', 4u },                       /* negative stride */
+    { 'E', 5u }, { 'u', 11u }, { 'd', 0u }, { 'D', 5u },         /* repeat + program mid-frame */
+    { 'E', 6u }, { 'd', 0u }, { 'D', 6u },                       /* sixteen */
+    { 'E', 0u }, { 'E', 1u }, { 'd', 0u }, { 'd', 0u }, { 'D', 1u }, { 'D', 0u },
+};
+
+static const char *const s_direct_names[16] = {
+    "aPosition", "aTexCoord", "aColor", "aColorOffset", "aRenderData",
+    "aScale", "aExtra0", "aExtra1", "aExtra2", "aExtra3", "aExtra4",
+    "aExtra5", "aExtra6", "aExtra7", "aExtra8", "aExtra9"
+};
+
+typedef struct direct_snapshot {
+    char trace[sizeof s_direct_trace];
+    unsigned char typed[1024];   /* >= sizeof s_gl_typed_state */
+    size_t typed_bytes;
+    uint32_t pending;
+    uint16_t mask;
+    guest_gl_int locations[64][16];
+    uint32_t replays;
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    IsaacVitaGlPhaseProfileCounters counters;
+#endif
+} direct_snapshot;
+
+static direct_snapshot s_direct_percall, s_direct_batch;
+
+static void direct_reset_backend(void)
+{
+    gl_vita_backend_uninstall();
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    s_native_attrib_mask = 0x8000u;
+#endif
+    s_direct_trace_len = 0u;
+    s_direct_trace[0] = '\0';
+    s_direct_trace_overflow = 0;
+}
+
+/* One run of the script.  direct = 0: the replay's per-call wrapper sequence
+ * (lookup, enable, pointer per attribute / lookup, disable); direct = 1: the
+ * batch.  by_name: the batch (and the per-call lookups) resolve names. */
+static int direct_run(int direct, int by_name, direct_snapshot *out)
+{
+    const guest_gl_backend *backend;
+    IsaacVitaAttribReplayTokens tokens = { 0x7e000001u, 0x7e000002u,
+                                           0x7e000003u, 0u };
+    size_t op;
+
+    memset(out, 0, sizeof *out);
+    direct_reset_backend();
+    CHECK(gl_vita_backend_install());
+    backend = guest_gl_installed_backend();
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    memset(&g_isaac_vita_gl_phase_profile_counters, 0,
+           sizeof g_isaac_vita_gl_phase_profile_counters);
+#endif
+    for (op = 0u; op < sizeof s_direct_script / sizeof s_direct_script[0];
+            ++op) {
+        const direct_op *o = &s_direct_script[op];
+        const direct_spec *spec = &s_direct_specs[o->spec];
+        guest_gl_addr names[16];
+        guest_gl_int locations[16];
+        uint32_t i;
+
+        for (i = 0u; i < 16u; ++i) {
+            names[i] = (guest_gl_addr)(uintptr_t)s_direct_names[i];
+            locations[i] = spec->locations[i];
+        }
+        switch (o->kind) {
+        case 'u':
+            backend->glUseProgram(o->spec);
+            break;
+        case 'd':
+            backend->glDrawElements(ORACLE_GL_TRIANGLES, 6,
+                                    ORACLE_GL_UNSIGNED_SHORT, 0x1000u);
+            break;
+        case 'E':
+            CHECK(out->replays < 64u);
+            if (direct) {
+                CHECK(gl_vita_backend_attribs_replay_enable(
+                    backend, spec->program, spec->count,
+                    by_name ? names : NULL, locations, spec->components,
+                    spec->stride, spec->base, &tokens) == 1);
+            } else {
+                guest_gl_addr base = spec->base;
+                for (i = 0u; i < spec->count; ++i) {
+                    if (by_name)
+                        locations[i] = backend->glGetAttribLocation(
+                            spec->program, names[i]);
+                    backend->glEnableVertexAttribArray(
+                        (guest_gl_uint)locations[i]);
+                    backend->glVertexAttribPointer(
+                        (guest_gl_uint)locations[i],
+                        (guest_gl_int)spec->components[i], ORACLE_GL_FLOAT,
+                        0u, spec->stride, base);
+                    base += (guest_gl_addr)spec->components[i] * 4u;
+                }
+            }
+            memcpy(out->locations[out->replays++], locations,
+                   sizeof locations);
+            break;
+        case 'D':
+            CHECK(out->replays < 64u);
+            if (direct) {
+                CHECK(gl_vita_backend_attribs_replay_disable(
+                    backend, spec->program, spec->count,
+                    by_name ? names : NULL, locations, &tokens) == 1);
+            } else {
+                for (i = 0u; i < spec->count; ++i) {
+                    if (by_name)
+                        locations[i] = backend->glGetAttribLocation(
+                            spec->program, names[i]);
+                    backend->glDisableVertexAttribArray(
+                        (guest_gl_uint)locations[i]);
+                }
+            }
+            memcpy(out->locations[out->replays++], locations,
+                   sizeof locations);
+            break;
+        default:
+            CHECK(0);
+        }
+    }
+    CHECK(!s_direct_trace_overflow);
+    memcpy(out->trace, s_direct_trace, sizeof out->trace);
+    out->typed_bytes = gl_vita_backend_oracle_typed_state(
+        out->typed, sizeof out->typed);
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    out->pending = gl_vita_backend_attrib_pending();
+    out->mask = s_native_attrib_mask;
+#endif
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+    out->counters = g_isaac_vita_gl_phase_profile_counters;
+#endif
+    return 0;
+}
+
+static int direct_snapshots_equal(const direct_snapshot *a,
+                                  const direct_snapshot *b)
+{
+    return strcmp(a->trace, b->trace) == 0 &&
+        a->typed_bytes == b->typed_bytes &&
+        memcmp(a->typed, b->typed, a->typed_bytes) == 0 &&
+        a->pending == b->pending && a->mask == b->mask &&
+        a->replays == b->replays &&
+        memcmp(a->locations, b->locations, sizeof a->locations) == 0
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+        && memcmp(&a->counters, &b->counters, sizeof a->counters) == 0
+#endif
+        ;
+}
+
+static int oracle_test_attrib_direct_state(void)
+{
+    int by_name;
+    unsigned draws = 0u, pointers = 0u;
+    const char *p;
+
+    for (by_name = 0; by_name < 2; ++by_name) {
+        CHECK(direct_run(0, by_name, &s_direct_percall) == 0);
+        CHECK(direct_run(1, by_name, &s_direct_batch) == 0);
+        if (!direct_snapshots_equal(&s_direct_percall, &s_direct_batch)) {
+            fprintf(stderr, "direct-state mismatch (by_name=%d)\n--- per-call\n%s\n--- batch\n%s\n",
+                    by_name, s_direct_percall.trace, s_direct_batch.trace);
+            CHECK(0);
+        }
+        /* The script did reach vitaGL: its ten draws and the pointer writes
+         * (70 without a typed-state pointer hit) appear in the trace. */
+        draws = 0u;
+        pointers = 0u;
+        for (p = s_direct_batch.trace; *p; ++p) {
+            if (strncmp(p, "d4,6,1403,", 10u) == 0) ++draws;
+            if (*p == 'P') ++pointers;
+        }
+        CHECK(draws == 10u && pointers >= 40u && pointers <= 70u);
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+        CHECK(s_direct_batch.typed_bytes > 0u);
+#endif
+    }
+
+    /* Declines: nothing happens. */
+    {
+        const guest_gl_backend *backend;
+        guest_gl_backend foreign;
+        IsaacVitaAttribReplayTokens tokens = { 1u, 2u, 3u, 0u };
+        guest_gl_int locations[17] = { 0 };
+        uint8_t components[17] = { 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u,
+                                   1u, 1u, 1u, 1u, 1u, 1u, 1u };
+        uint8_t bad_components[2] = { 0u, 5u };
+        direct_snapshot before, after;
+
+        CHECK(direct_run(1, 0, &before) == 0);
+        backend = guest_gl_installed_backend();
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            backend, 7u, 17u, NULL, locations, components, 16, 0x1000u,
+            &tokens) == 0);
+        CHECK(gl_vita_backend_attribs_replay_disable(
+            backend, 7u, 17u, NULL, locations, &tokens) == 0);
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            backend, 7u, 2u, NULL, locations, bad_components, 16, 0x1000u,
+            &tokens) == 0);
+        bad_components[0] = 1u;
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            backend, 7u, 2u, NULL, locations, bad_components, 16, 0x1000u,
+            &tokens) == 0);
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            backend, 7u, 2u, NULL, NULL, components, 16, 0x1000u,
+            &tokens) == 0);
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            backend, 7u, 2u, NULL, locations, NULL, 16, 0x1000u,
+            &tokens) == 0);
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            backend, 7u, 2u, NULL, locations, components, 16, 0x1000u,
+            NULL) == 0);
+        CHECK(gl_vita_backend_attribs_replay_disable(
+            backend, 7u, 2u, NULL, NULL, &tokens) == 0);
+        CHECK(gl_vita_backend_attribs_replay_disable(
+            backend, 7u, 2u, NULL, locations, NULL) == 0);
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            NULL, 7u, 2u, NULL, locations, components, 16, 0x1000u,
+            &tokens) == 0);
+        /* A table whose members are not this backend's wrappers (the
+         * replay oracle's recording backend, a partial bring-up table). */
+        foreign = *backend;
+        foreign.glVertexAttribPointer = NULL;
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            &foreign, 7u, 2u, NULL, locations, components, 16, 0x1000u,
+            &tokens) == 0);
+        foreign = *backend;
+        foreign.glEnableVertexAttribArray = oracle_backend_fake_toggle;
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            &foreign, 7u, 2u, NULL, locations, components, 16, 0x1000u,
+            &tokens) == 0);
+        foreign = *backend;
+        foreign.glDisableVertexAttribArray = oracle_backend_fake_toggle;
+        CHECK(gl_vita_backend_attribs_replay_disable(
+            &foreign, 7u, 2u, NULL, locations, &tokens) == 0);
+        foreign = *backend;
+        foreign.glGetAttribLocation = oracle_backend_fake_location;
+        CHECK(gl_vita_backend_attribs_replay_disable(
+            &foreign, 7u, 2u, NULL, locations, &tokens) == 0);
+        CHECK(gl_vita_backend_attribs_replay_enable(
+            &foreign, 7u, 2u, NULL, locations, components, 16, 0x1000u,
+            &tokens) == 0);
+        /* Untouched: trace, typed state, pending, counters. */
+        memcpy(after.trace, s_direct_trace, sizeof after.trace);
+        after.typed_bytes = gl_vita_backend_oracle_typed_state(
+            after.typed, sizeof after.typed);
+        after.pending = before.pending;
+        after.mask = before.mask;
+        after.replays = before.replays;
+        memcpy(after.locations, before.locations, sizeof after.locations);
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+        after.pending = gl_vita_backend_attrib_pending();
+        after.mask = s_native_attrib_mask;
+#endif
+#if defined(ISAAC_VITA_PHASE_PROFILE)
+        after.counters = g_isaac_vita_gl_phase_profile_counters;
+#endif
+        CHECK(direct_snapshots_equal(&before, &after));
+        CHECK(oracle_backend_fake_calls == 0u);
+    }
+    gl_vita_backend_uninstall();
+    puts("attribute direct state: per-call and batch traces/state/counters equal; declines untouched PASS");
+    return 0;
+}
+#endif
+
+#if defined(ISAAC_VITA_GL_FILL_CENSUS)
+/* GL fill census (ISAAC_VITA_GL_FILL_CENSUS): the shim projects every guest
+ * draw through its Position/Transform/viewport shadows.  Synthetic quads in
+ * pixel space through an orthographic Transform pin the kilo-pixel
+ * arithmetic (full screen 960x540 = 506 kpx, half off-screen 253, rotated
+ * 100x100 square 10, NaN vertex -> bad, 5x-wide quad -> big), every
+ * eligibility miss, the program/blend classes, the viewport shadow across
+ * typed-cache hits, the pass ordinal model (attach/readpixels/delete/present
+ * boundaries, attachment size via the level-0 glTexImage2D table) and, under
+ * the DUMP define, the one-frame draw list emitted only from take-window. */
+#define ORACLE_FILL_TOKEN_GET_ATTRIB 0x7e307ce3u
+#define ORACLE_FILL_TOKEN_CLEAR 0x7e194b2bu
+#define ORACLE_FILL_TOKEN_ENABLE 0x7ed43cfdu
+#define ORACLE_FILL_TOKEN_READ_PIXELS 0x7e038504u
+#define ORACLE_FILL_GL_BLEND 0x00000be2u
+#define ORACLE_FILL_GL_ZERO 0u
+#define ORACLE_FILL_GL_LINES 0x00000001u
+#define ORACLE_FILL_GL_SHORT 0x00001402u
+#define ORACLE_FILL_GL_UNSIGNED_INT 0x00001405u
+#define ORACLE_FILL_GL_COLOR_ATTACHMENT0 0x00008ce0u
+#define ORACLE_FILL_GL_COLOR_BUFFER_BIT 0x00004000u
+#define ORACLE_FILL_GL_DEPTH_BUFFER_BIT 0x00000100u
+#define ORACLE_FILL_CANONICAL_RVA 0x0056039du
+#define ORACLE_FILL_STRIDE 88u
+#define ORACLE_FILL_FLOATS_PER_VERTEX (ORACLE_FILL_STRIDE / 4u)
+
+static float s_fill_vertices[4u * ORACLE_FILL_FLOATS_PER_VERTEX];
+static const uint16_t s_fill_indices[6] = { 0u, 2u, 1u, 1u, 2u, 3u };
+static const uint32_t s_fill_indices32[6] = { 0u, 2u, 1u, 1u, 2u, 3u };
+static float s_fill_transform[16];
+
+#if defined(ISAAC_VITA_GL_FILL_CENSUS_DUMP) && \
+    !defined(ISAAC_VITA_FXRAY_ALPHA_MASK) && \
+    !defined(ISAAC_VITA_FBO_RASTER_SCALE)
+#define ORACLE_FILL_LOG_CAPACITY 16u
+static unsigned s_fill_log_calls;
+static size_t s_fill_log_max_length;
+static char s_fill_logs[ORACLE_FILL_LOG_CAPACITY][512];
+
+void isaac_vita_log(const char *format, ...)
+{
+    va_list arguments;
+    char line[1024];
+    int length;
+
+    va_start(arguments, format);
+    length = vsnprintf(line, sizeof line, format, arguments);
+    va_end(arguments);
+    line[sizeof line - 1u] = '\0';
+    if (length > 0 && (size_t)length > s_fill_log_max_length)
+        s_fill_log_max_length = (size_t)length;
+    if (s_fill_log_calls < ORACLE_FILL_LOG_CAPACITY) {
+        /* Bounded copy (not snprintf "%s": gcc -Wformat-truncation
+         * objects to the 1024 -> 512 byte narrowing). */
+        char *slot = s_fill_logs[s_fill_log_calls];
+        size_t copy = strlen(line);
+
+        if (copy > sizeof s_fill_logs[0] - 1u)
+            copy = sizeof s_fill_logs[0] - 1u;
+        memcpy(slot, line, copy);
+        slot[copy] = '\0';
+    }
+    ++s_fill_log_calls;
+}
+#endif
+
+/* Four vertices of an axis-aligned quad in pixel space at float offset 0 of
+ * each 88-byte vertex, in the canonical (0,2,1)(1,2,3) winding order. */
+static void oracle_fill_quad(float x0, float y0, float x1, float y1)
+{
+    memset(s_fill_vertices, 0, sizeof s_fill_vertices);
+    s_fill_vertices[0u * ORACLE_FILL_FLOATS_PER_VERTEX] = x0;
+    s_fill_vertices[0u * ORACLE_FILL_FLOATS_PER_VERTEX + 1u] = y0;
+    s_fill_vertices[1u * ORACLE_FILL_FLOATS_PER_VERTEX] = x1;
+    s_fill_vertices[1u * ORACLE_FILL_FLOATS_PER_VERTEX + 1u] = y0;
+    s_fill_vertices[2u * ORACLE_FILL_FLOATS_PER_VERTEX] = x0;
+    s_fill_vertices[2u * ORACLE_FILL_FLOATS_PER_VERTEX + 1u] = y1;
+    s_fill_vertices[3u * ORACLE_FILL_FLOATS_PER_VERTEX] = x1;
+    s_fill_vertices[3u * ORACLE_FILL_FLOATS_PER_VERTEX + 1u] = y1;
+}
+
+/* Pixel-space orthographic Transform (column major, y down), as the guest's
+ * 2D sprite pipeline: x' = 2x/w - 1, y' = 1 - 2y/h. */
+static void oracle_fill_ortho(float width, float height)
+{
+    memset(s_fill_transform, 0, sizeof s_fill_transform);
+    s_fill_transform[0] = 2.0f / width;
+    s_fill_transform[5] = -2.0f / height;
+    s_fill_transform[10] = 1.0f;
+    s_fill_transform[12] = -1.0f;
+    s_fill_transform[13] = 1.0f;
+    s_fill_transform[15] = 1.0f;
+}
+
+static int oracle_fill_use_program(
+    CPU *cpu, uint32_t stack_top, uint32_t program)
+{
+    uint32_t arguments[1];
+
+    arguments[0] = program;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_USE_PROGRAM, arguments, 1u);
+}
+
+static int oracle_fill_attrib_location(
+    CPU *cpu, uint32_t stack_top, uint32_t program, const char *name)
+{
+    uint32_t arguments[2];
+
+    arguments[0] = program;
+    arguments[1] = (uint32_t)(uintptr_t)name;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_FILL_TOKEN_GET_ATTRIB, arguments, 2u);
+}
+
+static int oracle_fill_uniform_location(
+    CPU *cpu, uint32_t stack_top, uint32_t program, const char *name)
+{
+    uint32_t arguments[2];
+
+    arguments[0] = program;
+    arguments[1] = (uint32_t)(uintptr_t)name;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_GET_UNIFORM, arguments, 2u);
+}
+
+static int oracle_fill_uniform_matrix(
+    CPU *cpu, uint32_t stack_top, int32_t location, uint32_t transpose)
+{
+    uint32_t arguments[4];
+
+    arguments[0] = (uint32_t)location;
+    arguments[1] = 1u;
+    arguments[2] = transpose;
+    arguments[3] = (uint32_t)(uintptr_t)s_fill_transform;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_UNIFORM_MATRIX4FV, arguments, 4u);
+}
+
+static int oracle_fill_attrib_pointer(
+    CPU *cpu, uint32_t stack_top, uint32_t index, uint32_t size,
+    uint32_t type, uint32_t stride, uint32_t pointer)
+{
+    uint32_t arguments[6];
+
+    arguments[0] = index;
+    arguments[1] = size;
+    arguments[2] = type;
+    arguments[3] = 0u;
+    arguments[4] = stride;
+    arguments[5] = pointer;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_ATTRIB_POINTER, arguments, 6u);
+}
+
+static int oracle_fill_attrib_toggle(
+    CPU *cpu, uint32_t stack_top, uint32_t index, int enabled)
+{
+    uint32_t arguments[1];
+
+    arguments[0] = index;
+    return oracle_dispatch(
+        cpu, stack_top,
+        enabled ? ORACLE_TOKEN_ENABLE_ATTRIB : ORACLE_TOKEN_DISABLE_ATTRIB,
+        arguments, 1u);
+}
+
+static int oracle_fill_blend(
+    CPU *cpu, uint32_t stack_top, uint32_t source, uint32_t destination)
+{
+    uint32_t arguments[4];
+
+    arguments[0] = source;
+    arguments[1] = destination;
+    arguments[2] = source;
+    arguments[3] = destination;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_BLEND_SEPARATE, arguments, 4u);
+}
+
+static int oracle_fill_enable(CPU *cpu, uint32_t stack_top, uint32_t cap)
+{
+    uint32_t arguments[1];
+
+    arguments[0] = cap;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_FILL_TOKEN_ENABLE, arguments, 1u);
+}
+
+static int oracle_fill_draw(
+    CPU *cpu, uint32_t stack_top, uint32_t mode, uint32_t count,
+    uint32_t type, uint32_t indices, uint32_t return_word)
+{
+    uint32_t arguments[4];
+
+    arguments[0] = mode;
+    arguments[1] = count;
+    arguments[2] = type;
+    arguments[3] = indices;
+    return oracle_dispatch_with_return(
+        cpu, stack_top, ORACLE_TOKEN_DRAW_ELEMENTS, arguments, 4u,
+        return_word);
+}
+
+/* The ordinary guest quad: six GL_UNSIGNED_SHORT indices read from memory. */
+static int oracle_fill_draw_quad(CPU *cpu, uint32_t stack_top)
+{
+    return oracle_fill_draw(
+        cpu, stack_top, ORACLE_GL_TRIANGLES, 6u, ORACLE_GL_UNSIGNED_SHORT,
+        (uint32_t)(uintptr_t)s_fill_indices, 0xaabbccddu);
+}
+
+static int oracle_fill_clear(CPU *cpu, uint32_t stack_top, uint32_t mask)
+{
+    uint32_t arguments[1];
+
+    arguments[0] = mask;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_FILL_TOKEN_CLEAR, arguments, 1u);
+}
+
+static int oracle_fill_bind_framebuffer(
+    CPU *cpu, uint32_t stack_top, uint32_t framebuffer)
+{
+    return oracle_bind_framebuffer(
+        cpu, stack_top, ORACLE_GL_FRAMEBUFFER, framebuffer);
+}
+
+static int oracle_fill_attach(
+    CPU *cpu, uint32_t stack_top, uint32_t texture)
+{
+    uint32_t arguments[5];
+
+    arguments[0] = ORACLE_GL_FRAMEBUFFER;
+    arguments[1] = ORACLE_FILL_GL_COLOR_ATTACHMENT0;
+    arguments[2] = ORACLE_GL_TEXTURE_2D;
+    arguments[3] = texture;
+    arguments[4] = 0u;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_FRAMEBUFFER_TEXTURE, arguments, 5u);
+}
+
+static int oracle_fill_bind_texture(
+    CPU *cpu, uint32_t stack_top, uint32_t texture)
+{
+    uint32_t arguments[2];
+
+    arguments[0] = ORACLE_GL_TEXTURE_2D;
+    arguments[1] = texture;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_BIND_TEXTURE, arguments, 2u);
+}
+
+static int oracle_fill_tex_image(
+    CPU *cpu, uint32_t stack_top, uint32_t width, uint32_t height)
+{
+    uint32_t arguments[9];
+
+    arguments[0] = ORACLE_GL_TEXTURE_2D;
+    arguments[1] = 0u;
+    arguments[2] = ORACLE_GL_RGBA;
+    arguments[3] = width;
+    arguments[4] = height;
+    arguments[5] = 0u;
+    arguments[6] = ORACLE_GL_RGBA;
+    arguments[7] = ORACLE_GL_UNSIGNED_BYTE;
+    arguments[8] = 0u;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_TEX_IMAGE, arguments, 9u);
+}
+
+static int oracle_fill_read_pixels(CPU *cpu, uint32_t stack_top)
+{
+    static uint8_t pixels[4];
+    uint32_t arguments[7];
+
+    arguments[0] = 0u;
+    arguments[1] = 0u;
+    arguments[2] = 1u;
+    arguments[3] = 1u;
+    arguments[4] = ORACLE_GL_RGBA;
+    arguments[5] = ORACLE_GL_UNSIGNED_BYTE;
+    arguments[6] = (uint32_t)(uintptr_t)pixels;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_FILL_TOKEN_READ_PIXELS, arguments, 7u);
+}
+
+static int oracle_fill_delete_framebuffer(
+    CPU *cpu, uint32_t stack_top, uint32_t *name)
+{
+    uint32_t arguments[2];
+
+    arguments[0] = 1u;
+    arguments[1] = (uint32_t)(uintptr_t)name;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_DELETE_FRAMEBUFFERS, arguments, 2u);
+}
+
+/* Draw, take the window and check the common single-draw shape. */
+static int oracle_fill_single(
+    CPU *cpu, uint32_t stack_top, IsaacVitaGlFillCensus *census)
+{
+    if (!oracle_fill_draw_quad(cpu, stack_top))
+        return 0;
+    gl_vita_backend_fill_census_take_window(census, 0u, 0u);
+    return census->draws == 1u && census->pass_draws[4] == 1u;
+}
+
+static int oracle_test_fill_census(CPU *cpu, uint32_t stack_top)
+{
+    IsaacVitaGlFillCensus census;
+    uint32_t framebuffer_name = 7u;
+    uint32_t vertices = (uint32_t)(uintptr_t)s_fill_vertices;
+    union {
+        uint32_t bits;
+        float value;
+    } quiet_nan;
+
+    quiet_nan.bits = 0x7fc00000u;
+    gl_vita_backend_uninstall();
+    CHECK(gl_vita_backend_install());
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 0u && census.kpx_clipped == 0u);
+
+    /* Program 7 carries the coloroffset layout (PixelationAmount queried),
+     * program 8 is plain.  The facade answers 0 for every attribute name
+     * and s_native_uniform_location for Transform. */
+    CHECK(oracle_fill_use_program(cpu, stack_top, 7u));
+    CHECK(oracle_fill_attrib_location(cpu, stack_top, 7u, "Position"));
+    CHECK(oracle_fill_attrib_location(
+        cpu, stack_top, 7u, "PixelationAmount"));
+    CHECK(oracle_fill_attrib_location(cpu, stack_top, 7u, "TexCoord"));
+    CHECK(oracle_fill_uniform_location(cpu, stack_top, 7u, "Transform"));
+    CHECK(oracle_fill_uniform_location(cpu, stack_top, 7u, "Texture0"));
+    CHECK(oracle_fill_attrib_location(cpu, stack_top, 8u, "Position"));
+    CHECK(oracle_fill_uniform_location(cpu, stack_top, 8u, "Transform"));
+    oracle_fill_quad(0.0f, 0.0f, 960.0f, 540.0f);
+    CHECK(oracle_fill_attrib_pointer(
+        cpu, stack_top, 0u, 3u, ORACLE_GL_FLOAT, ORACLE_FILL_STRIDE,
+        vertices));
+    CHECK(oracle_fill_attrib_toggle(cpu, stack_top, 0u, 1));
+
+    /* No glViewport yet: counted, not measured. */
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.triangles == 2u && census.miss == 1u &&
+          census.kpx_clipped == 0u && census.kpx_unclipped == 0u);
+    CHECK(census.viewport_width == 0u && census.viewport_changes == 0u);
+
+    /* Viewport known, Transform still unknown: counted, not measured. */
+    CHECK(oracle_set_viewport(cpu, stack_top, 0, 0, 960, 540));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.triangles == 2u && census.miss == 1u &&
+          census.kpx_clipped == 0u);
+    CHECK(census.viewport_width == 960u && census.viewport_height == 540u &&
+          census.viewport_changes == 1u);
+
+    /* Full-screen quad through the orthographic Transform: 960*540/1024 =
+     * 506.25 -> 506 kpx, no anomaly, program class e, blend class d. */
+    oracle_fill_ortho(960.0f, 540.0f);
+    CHECK(oracle_fill_uniform_matrix(
+        cpu, stack_top, s_native_uniform_location, 0u));
+    CHECK(oracle_fill_enable(cpu, stack_top, ORACLE_FILL_GL_BLEND));
+    CHECK(oracle_fill_blend(
+        cpu, stack_top, ORACLE_GL_SRC_ALPHA, ORACLE_GL_ONE_MINUS_SRC_ALPHA));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.triangles == 2u && census.miss == 0u);
+    CHECK(census.kpx_unclipped == 506u && census.kpx_clipped == 506u &&
+          census.max_draw_kpx == 506u);
+    CHECK(census.big == 0u && census.bad == 0u && census.synthesized == 0u &&
+          census.projective == 0u);
+    CHECK(census.prog_kpx[0] == 506u && census.prog_kpx[1] == 0u);
+    CHECK(census.blend_kpx[0] == 0u && census.blend_kpx[1] == 506u &&
+          census.blend_kpx[2] == 0u);
+    CHECK(census.pass_kpx[4] == 506u && census.pass_clears[4] == 0u);
+    CHECK(census.kpx_clear == 0u && census.viewport_changes == 0u);
+    /* 32x32 tiles of each triangle's clipped box (the whole viewport):
+     * 30..31 columns by 17 rows, twice (float edges decide the last column). */
+    CHECK(census.tiles >= 2u * 30u * 17u && census.tiles <= 2u * 31u * 17u);
+
+    /* Redundant state (typed-cache hits, redundancy-cache paths): the
+     * shadows already hold these values, the draw measures the same. */
+    CHECK(oracle_fill_attrib_pointer(
+        cpu, stack_top, 0u, 3u, ORACLE_GL_FLOAT, ORACLE_FILL_STRIDE,
+        vertices));
+    CHECK(oracle_fill_attrib_toggle(cpu, stack_top, 0u, 1));
+    CHECK(oracle_set_viewport(cpu, stack_top, 0, 0, 960, 540));
+    CHECK(oracle_fill_uniform_matrix(
+        cpu, stack_top, s_native_uniform_location, 0u));
+    CHECK(oracle_fill_blend(
+        cpu, stack_top, ORACLE_GL_SRC_ALPHA, ORACLE_GL_ONE_MINUS_SRC_ALPHA));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.kpx_clipped == 506u && census.miss == 0u &&
+          census.viewport_changes == 0u);
+
+    /* Transposed upload of the transposed matrix is the same Transform. */
+    {
+        float transposed[16];
+        uint32_t row;
+        uint32_t column;
+
+        for (row = 0u; row < 4u; ++row)
+            for (column = 0u; column < 4u; ++column)
+                transposed[row * 4u + column] =
+                    s_fill_transform[column * 4u + row];
+        memcpy(s_fill_transform, transposed, sizeof transposed);
+        CHECK(oracle_fill_uniform_matrix(
+            cpu, stack_top, s_native_uniform_location, 1u));
+        CHECK(oracle_fill_single(cpu, stack_top, &census));
+        CHECK(census.kpx_clipped == 506u && census.miss == 0u);
+        oracle_fill_ortho(960.0f, 540.0f);
+        CHECK(oracle_fill_uniform_matrix(
+            cpu, stack_top, s_native_uniform_location, 0u));
+    }
+
+    /* 32-bit indices are read as well. */
+    CHECK(oracle_fill_draw(
+        cpu, stack_top, ORACLE_GL_TRIANGLES, 6u, ORACLE_FILL_GL_UNSIGNED_INT,
+        (uint32_t)(uintptr_t)s_fill_indices32, 0xaabbccddu));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 1u && census.kpx_clipped == 506u &&
+          census.miss == 0u);
+
+#if defined(ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY)
+    /* Canonical zero-copy draw: the index array is never read; the census
+     * synthesizes base+{0,2,1,1,2,3} and measures the same quad. */
+    s_native_canonical_quad_result = 1u;
+    CHECK(oracle_fill_draw(
+        cpu, stack_top, ORACLE_GL_TRIANGLES, 6u, ORACLE_GL_UNSIGNED_SHORT,
+        0x1000u, ORACLE_FILL_CANONICAL_RVA));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 1u && census.synthesized == 1u &&
+          census.kpx_clipped == 506u && census.miss == 0u);
+#endif
+
+    /* Half off-screen to the right: unclipped 506, clipped 253. */
+    oracle_fill_quad(480.0f, 0.0f, 1440.0f, 540.0f);
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.kpx_unclipped == 506u && census.kpx_clipped == 253u &&
+          census.max_draw_kpx == 253u && census.big == 0u);
+
+    /* Entirely off-screen: unclipped 506, clipped 0, no tiles. */
+    oracle_fill_quad(1000.0f, 0.0f, 1960.0f, 540.0f);
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.kpx_unclipped == 506u && census.kpx_clipped == 0u &&
+          census.tiles == 0u && census.max_draw_kpx == 0u);
+
+    /* Rotated 100x100 square (diamond): area 9800 -> 10 kpx either way. */
+    memset(s_fill_vertices, 0, sizeof s_fill_vertices);
+    s_fill_vertices[0u * ORACLE_FILL_FLOATS_PER_VERTEX] = 480.0f;
+    s_fill_vertices[0u * ORACLE_FILL_FLOATS_PER_VERTEX + 1u] = 200.0f;
+    s_fill_vertices[1u * ORACLE_FILL_FLOATS_PER_VERTEX] = 550.0f;
+    s_fill_vertices[1u * ORACLE_FILL_FLOATS_PER_VERTEX + 1u] = 270.0f;
+    s_fill_vertices[2u * ORACLE_FILL_FLOATS_PER_VERTEX] = 410.0f;
+    s_fill_vertices[2u * ORACLE_FILL_FLOATS_PER_VERTEX + 1u] = 270.0f;
+    s_fill_vertices[3u * ORACLE_FILL_FLOATS_PER_VERTEX] = 480.0f;
+    s_fill_vertices[3u * ORACLE_FILL_FLOATS_PER_VERTEX + 1u] = 340.0f;
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.kpx_unclipped == 10u && census.kpx_clipped == 10u);
+
+    /* Five viewports wide: big on both triangles, unclipped 2531, clipped
+     * back to the viewport's 506. */
+    oracle_fill_quad(0.0f, 0.0f, 4800.0f, 540.0f);
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.big == 2u && census.kpx_unclipped == 2531u &&
+          census.kpx_clipped == 506u && census.bad == 0u);
+
+    /* NaN vertex 0: its triangle is bad, the other half still measures. */
+    oracle_fill_quad(0.0f, 0.0f, 960.0f, 540.0f);
+    s_fill_vertices[0] = quiet_nan.value;
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.bad == 1u && census.kpx_clipped == 253u &&
+          census.triangles == 2u && census.miss == 0u);
+    oracle_fill_quad(0.0f, 0.0f, 960.0f, 540.0f);
+
+    /* Blend classes: additive (dst ONE) and other (dst ZERO). */
+    CHECK(oracle_fill_blend(cpu, stack_top, ORACLE_GL_ONE, ORACLE_GL_ONE));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.blend_kpx[0] == 506u && census.blend_kpx[1] == 0u &&
+          census.blend_kpx[2] == 0u);
+    CHECK(oracle_fill_blend(cpu, stack_top, ORACLE_GL_ONE, ORACLE_FILL_GL_ZERO));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.blend_kpx[0] == 0u && census.blend_kpx[1] == 0u &&
+          census.blend_kpx[2] == 506u);
+
+    /* Program class o: program 8 with its own Transform upload. */
+    CHECK(oracle_fill_use_program(cpu, stack_top, 8u));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.miss == 1u && census.kpx_clipped == 0u);
+    CHECK(oracle_fill_uniform_matrix(
+        cpu, stack_top, s_native_uniform_location, 0u));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.prog_kpx[0] == 0u && census.prog_kpx[1] == 506u &&
+          census.kpx_clipped == 506u);
+
+    /* Viewport shadow: a quarter viewport scales the same quad to
+     * 480*270/1024 = 126.56 -> 127 kpx and counts one change. */
+    CHECK(oracle_set_viewport(cpu, stack_top, 0, 0, 480, 270));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.kpx_clipped == 127u && census.viewport_width == 480u &&
+          census.viewport_height == 270u && census.viewport_changes == 1u);
+    /* A negative size is a GL error and leaves the shadow alone. */
+    CHECK(oracle_set_viewport(cpu, stack_top, 0, 0, -1, 270));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.kpx_clipped == 127u && census.viewport_changes == 0u);
+    CHECK(oracle_set_viewport(cpu, stack_top, 0, 0, 960, 540));
+
+    /* Projective Transform (m15 = 2 halves every coordinate about the
+     * centre): the full quad covers 480x270 -> 127 kpx, proj counted. */
+    s_fill_transform[15] = 2.0f;
+    CHECK(oracle_fill_uniform_matrix(
+        cpu, stack_top, s_native_uniform_location, 0u));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.projective == 1u && census.kpx_clipped == 127u &&
+          census.viewport_changes == 1u);
+    oracle_fill_ortho(960.0f, 540.0f);
+    CHECK(oracle_fill_uniform_matrix(
+        cpu, stack_top, s_native_uniform_location, 0u));
+
+    /* Eligibility misses: disabled attribute, size 4, GL_SHORT, a stride
+     * that is not a multiple of 4, GL_LINES, count % 3, a null index array.
+     * Each is one draw; only triangle lists add to tri. */
+    CHECK(oracle_fill_attrib_toggle(cpu, stack_top, 0u, 0));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.miss == 1u && census.triangles == 2u &&
+          census.kpx_clipped == 0u);
+    CHECK(oracle_fill_attrib_toggle(cpu, stack_top, 0u, 1));
+    CHECK(oracle_fill_attrib_pointer(
+        cpu, stack_top, 0u, 4u, ORACLE_GL_FLOAT, ORACLE_FILL_STRIDE,
+        vertices));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.miss == 1u && census.kpx_clipped == 0u);
+    CHECK(oracle_fill_attrib_pointer(
+        cpu, stack_top, 0u, 3u, ORACLE_FILL_GL_SHORT, ORACLE_FILL_STRIDE,
+        vertices));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.miss == 1u && census.kpx_clipped == 0u);
+    CHECK(oracle_fill_attrib_pointer(
+        cpu, stack_top, 0u, 3u, ORACLE_GL_FLOAT, 6u, vertices));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.miss == 1u && census.kpx_clipped == 0u);
+    CHECK(oracle_fill_attrib_pointer(
+        cpu, stack_top, 0u, 3u, ORACLE_GL_FLOAT, ORACLE_FILL_STRIDE,
+        vertices));
+    CHECK(oracle_fill_draw(
+        cpu, stack_top, ORACLE_FILL_GL_LINES, 6u, ORACLE_GL_UNSIGNED_SHORT,
+        (uint32_t)(uintptr_t)s_fill_indices, 0xaabbccddu));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 1u && census.triangles == 0u &&
+          census.miss == 1u);
+    CHECK(oracle_fill_draw(
+        cpu, stack_top, ORACLE_GL_TRIANGLES, 5u, ORACLE_GL_UNSIGNED_SHORT,
+        (uint32_t)(uintptr_t)s_fill_indices, 0xaabbccddu));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 1u && census.triangles == 0u &&
+          census.miss == 1u);
+    CHECK(oracle_fill_draw(
+        cpu, stack_top, ORACLE_GL_TRIANGLES, 6u, ORACLE_GL_UNSIGNED_SHORT,
+        0u, 0xaabbccddu));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 1u && census.triangles == 2u &&
+          census.miss == 1u);
+    /* Back to a measured draw after the miss run. */
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.miss == 0u && census.kpx_clipped == 506u);
+
+    /* Pass ordinal model: offscreen passes 0..3+ since present, split by a
+     * colour attach to the bound pass framebuffer, glReadPixels and delete;
+     * display draws in the fifth bucket; the attachment size follows the
+     * level-0 glTexImage2D of the attached texture. */
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 7u));
+    CHECK(oracle_fill_bind_texture(cpu, stack_top, 5u));
+    CHECK(oracle_fill_tex_image(cpu, stack_top, 512u, 512u));
+    CHECK(oracle_fill_attach(cpu, stack_top, 5u));
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_COLOR_BUFFER_BIT));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_bind_texture(cpu, stack_top, 6u));
+    CHECK(oracle_fill_tex_image(cpu, stack_top, 1024u, 1024u));
+    CHECK(oracle_fill_attach(cpu, stack_top, 6u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_read_pixels(cpu, stack_top));
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_COLOR_BUFFER_BIT));
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 0u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 7u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_delete_framebuffer(cpu, stack_top, &framebuffer_name));
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 0u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 9u));
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_COLOR_BUFFER_BIT));
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 7u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 7u && census.triangles == 14u &&
+          census.miss == 0u);
+    CHECK(census.kpx_clipped == 7u * 506u && census.max_draw_kpx == 506u);
+    CHECK(census.pass_draws[0] == 2u && census.pass_draws[1] == 1u &&
+          census.pass_draws[2] == 0u && census.pass_draws[3] == 2u &&
+          census.pass_draws[4] == 2u);
+    CHECK(census.pass_kpx[0] == 1012u && census.pass_kpx[1] == 506u &&
+          census.pass_kpx[2] == 0u && census.pass_kpx[3] == 1012u &&
+          census.pass_kpx[4] == 1012u);
+    CHECK(census.pass_clears[0] == 1u && census.pass_clears[1] == 0u &&
+          census.pass_clears[2] == 1u && census.pass_clears[3] == 1u &&
+          census.pass_clears[4] == 0u);
+    /* 512*512/1024 + 1024*1024/1024; framebuffer 9 has no known target:
+     * 0 kpx and one clear_unknown so the shortfall is visible. */
+    CHECK(census.kpx_clear == 256u + 1024u);
+    CHECK(census.clear_unknown == 1u);
+    CHECK(census.attachment_width == 1024u &&
+          census.attachment_height == 1024u);
+
+    /* A display clear is the 960x544 surface: 510 kpx (not the viewport). */
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 0u));
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_COLOR_BUFFER_BIT));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.kpx_clear == 510u && census.pass_clears[4] == 1u &&
+          census.draws == 0u && census.clear_unknown == 0u);
+
+    /* Clears the elision absorbs never reach vitaGL and are not counted:
+     * a depth-only clear on a tabled framebuffer is owed, the colour clear
+     * that follows is native.  Without the elision both are native. */
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 7u));
+    CHECK(oracle_fill_attach(cpu, stack_top, 6u));
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_COLOR_BUFFER_BIT));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    CHECK(census.pass_clears[0] == 1u && census.kpx_clear == 1024u);
+#else
+    CHECK(census.pass_clears[0] == 2u && census.kpx_clear == 2048u);
+#endif
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 0u));
+
+    /* An owed depth clear the elision materializes natively after the guest
+     * bound away (a glTexImage2D forces it, gl_vita_fbo_owed_materialize
+     * rebinds for the quad) is counted on the owing framebuffer, inside its
+     * still-open pass, never on the bound one; without the elision the same
+     * clear is native at once.  Either way: pass 0 = one draw + one clear of
+     * the 1024x1024 attachment, disp = the display draw alone. */
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 7u));
+    CHECK(oracle_fill_attach(cpu, stack_top, 6u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 0u));
+    CHECK(oracle_fill_bind_texture(cpu, stack_top, 5u));
+    CHECK(oracle_fill_tex_image(cpu, stack_top, 512u, 512u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 2u && census.kpx_clear == 1024u &&
+          census.clear_unknown == 0u);
+    CHECK(census.pass_draws[0] == 1u && census.pass_clears[0] == 1u &&
+          census.pass_kpx[0] == 506u);
+    CHECK(census.pass_draws[1] == 0u && census.pass_clears[1] == 0u);
+    CHECK(census.pass_draws[4] == 1u && census.pass_clears[4] == 0u);
+
+    /* An owed clear the elision drops at the scene end (a draw on another
+     * framebuffer) never reaches vitaGL and is not counted (ph120.e 'd');
+     * without the elision it is a native clear like any other. */
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 7u));
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_DEPTH_BUFFER_BIT));
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 0u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    CHECK(census.pass_clears[0] == 0u && census.kpx_clear == 0u);
+#else
+    CHECK(census.pass_clears[0] == 1u && census.kpx_clear == 1024u);
+#endif
+    CHECK(census.pass_draws[4] == 1u && census.draws == 1u);
+
+    /* glReadPixels splits a pass only when it reads the pass framebuffer
+     * (vitaGL framebuffers.c:674, in_use == active_read): a read through
+     * another binding leaves the open pass intact. */
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 7u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 0u));
+    CHECK(oracle_fill_read_pixels(cpu, stack_top));
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 7u));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_read_pixels(cpu, stack_top));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    gl_vita_backend_fill_census_take_window(&census, 0u, 0u);
+    CHECK(census.draws == 3u && census.pass_draws[0] == 2u &&
+          census.pass_draws[1] == 1u && census.pass_draws[4] == 0u);
+    CHECK(oracle_fill_bind_framebuffer(cpu, stack_top, 0u));
+
+#if defined(ISAAC_VITA_GL_FILL_CENSUS_DUMP)
+    /* Boot receipt values (kage_vita_backend.c banner line). */
+    {
+        uint32_t dump_render_p50_us = 1u;
+        uint32_t dump_min_window = 1u;
+        uint32_t dump_window = 1u;
+        uint32_t dump_frames = 1u;
+
+        CHECK(gl_vita_backend_fill_census_dump_config(
+                  &dump_render_p50_us, &dump_min_window, &dump_window,
+                  &dump_frames) == 1u);
+        CHECK(dump_render_p50_us == 60000u && dump_min_window == 30u &&
+              dump_window == 0u && dump_frames == 2u);
+    }
+#endif
+
+#if defined(ISAAC_VITA_GL_FILL_CENSUS_DUMP) && \
+    !defined(ISAAC_VITA_FXRAY_ALPHA_MASK) && \
+    !defined(ISAAC_VITA_FBO_RASTER_SCALE)
+    /* One-frame draw dump: armed by take-window (window >= 30 and render
+     * p50 >= 60000 us), captured between the next two presents, emitted by
+     * the following take-window through isaac_vita_log, at most two frames
+     * per launch.  No wrapper logs. */
+    s_fill_log_calls = 0u;
+    s_fill_log_max_length = 0u;
+    CHECK(oracle_fill_bind_texture(cpu, stack_top, 0u));
+    CHECK(oracle_fill_blend(cpu, stack_top, ORACLE_GL_ONE, ORACLE_GL_ONE));
+    gl_vita_backend_fill_census_take_window(&census, 10u, 70000u);
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    gl_vita_backend_fill_census_present();
+    gl_vita_backend_fill_census_take_window(&census, 40u, 1000u);
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    gl_vita_backend_fill_census_present();
+    gl_vita_backend_fill_census_take_window(&census, 40u, 70000u);
+    CHECK(s_fill_log_calls == 0u);
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_clear(cpu, stack_top, ORACLE_FILL_GL_COLOR_BUFFER_BIT));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_attrib_toggle(cpu, stack_top, 0u, 0));
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    CHECK(oracle_fill_attrib_toggle(cpu, stack_top, 0u, 1));
+    CHECK(s_fill_log_calls == 0u);
+    gl_vita_backend_fill_census_present();
+    CHECK(s_fill_log_calls == 0u);
+    gl_vita_backend_fill_census_take_window(&census, 41u, 70000u);
+    CHECK(s_fill_log_calls == 4u);
+    CHECK(strcmp(s_fill_logs[0],
+                 "KAGE VITA FILL DUMP f=1 i=0 C ord=4 fb=0 mask=4000 "
+                 "att=960x544") == 0);
+    CHECK(strstr(s_fill_logs[1],
+                 "KAGE VITA FILL DUMP f=1 i=1 D ord=4 fb=0 prog=8 "
+                 "tex=0/0x0 bl=1,1,1 tri=2 kpx=506 box=") != NULL);
+    CHECK(strstr(s_fill_logs[1], " vp=0,0,960,540 syn=0 skip=0 rva=")
+          != NULL);
+    CHECK(strstr(s_fill_logs[2],
+                 "KAGE VITA FILL DUMP f=1 i=2 D ord=4 fb=0 prog=8 "
+                 "tex=0/0x0 bl=1,1,1 tri=2 kpx=0 box=0,0,0,0 "
+                 "vp=0,0,960,540 syn=0 skip=5 rva=") != NULL);
+    CHECK(strcmp(s_fill_logs[3],
+                 "KAGE VITA FILL DUMP f=1 end n=3 trunc=0") == 0);
+    CHECK(s_fill_log_max_length > 0u && s_fill_log_max_length < 384u);
+    /* Second frame allowed, third refused. */
+    gl_vita_backend_fill_census_take_window(&census, 42u, 70000u);
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    gl_vita_backend_fill_census_present();
+    gl_vita_backend_fill_census_take_window(&census, 43u, 70000u);
+    CHECK(s_fill_log_calls == 6u);
+    CHECK(strcmp(s_fill_logs[5],
+                 "KAGE VITA FILL DUMP f=2 end n=1 trunc=0") == 0);
+    gl_vita_backend_fill_census_present();
+    CHECK(oracle_fill_draw_quad(cpu, stack_top));
+    gl_vita_backend_fill_census_present();
+    gl_vita_backend_fill_census_take_window(&census, 44u, 70000u);
+    CHECK(s_fill_log_calls == 6u);
+#endif
+
+    /* Uninstall drops every shadow and table. */
+    gl_vita_backend_uninstall();
+    CHECK(gl_vita_backend_install());
+    CHECK(oracle_fill_use_program(cpu, stack_top, 8u));
+    CHECK(oracle_set_viewport(cpu, stack_top, 0, 0, 960, 540));
+    CHECK(oracle_fill_attrib_toggle(cpu, stack_top, 0u, 1));
+    CHECK(oracle_fill_attrib_pointer(
+        cpu, stack_top, 0u, 3u, ORACLE_GL_FLOAT, ORACLE_FILL_STRIDE,
+        vertices));
+    CHECK(oracle_fill_single(cpu, stack_top, &census));
+    CHECK(census.miss == 1u && census.kpx_clipped == 0u);
     return 0;
 }
 #endif
@@ -3234,6 +4907,9 @@ int main(void)
 #if defined(ISAAC_VITA_GL_REDUNDANCY_CACHE)
     CHECK(oracle_test_gl_redundancy(&cpu, stack_top) == 0);
 #endif
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+    CHECK(oracle_test_location_memo_generation(&cpu, stack_top) == 0);
+#endif
 #if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
     CHECK(oracle_test_gl_typed_state(&cpu, stack_top) == 0);
 #endif
@@ -3245,13 +4921,50 @@ int main(void)
 #else
     CHECK(oracle_test_fxray_off_passthrough(&cpu, stack_top) == 0);
 #endif
-#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
+    CHECK(oracle_test_fbo_clear_elision_depth_drop(&cpu, stack_top) == 0);
+#elif defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     CHECK(oracle_test_fbo_clear_elision(&cpu, stack_top) == 0);
 #endif
 #if defined(ISAAC_VITA_FBO_RASTER_SCALE)
     CHECK(oracle_test_fbo_raster_scale(&cpu, stack_top) == 0);
 #endif
+#if defined(ISAAC_VITA_GL_FILL_CENSUS)
+    CHECK(oracle_test_fill_census(&cpu, stack_top) == 0);
+#endif
 
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    CHECK(oracle_test_attrib_coalescing(&cpu, stack_top) == 0);
+#endif
+#if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+    CHECK(oracle_test_attrib_direct_state() == 0);
+#endif
+#if defined(ISAAC_VITA_GL_WRAPPER_TIME)
+    /* ph120.gd draw split (coalesce-wrapper-time mode): the gl part is the
+     * gt draw bracket's own two reads, so us and calls match exactly; every
+     * wrapper body passed ENTER once and BODY_DONE once (no canonical quad
+     * path in this mode, so no fallback re-entry); the monotonic stub clock
+     * never reverses.  Direct backend->glDrawElements calls (no bridge run)
+     * still charge disp from the last bridge entry read and skip the tail,
+     * so only the shared-read identities are pinned here. */
+    CHECK(g_isaac_vita_gl_wrapper_time.draw[ISAAC_VITA_GL_DRAW_SPLIT_BODY]
+              .total_us == g_isaac_vita_gl_time_profile.draw.total_us);
+    CHECK(g_isaac_vita_gl_wrapper_time.draw[ISAAC_VITA_GL_DRAW_SPLIT_BODY]
+              .calls == g_isaac_vita_gl_time_profile.draw.calls);
+    CHECK(g_isaac_vita_gl_wrapper_time.draw[ISAAC_VITA_GL_DRAW_SPLIT_BODY]
+              .calls > 0u);
+    CHECK(g_isaac_vita_gl_wrapper_time.draw[ISAAC_VITA_GL_DRAW_SPLIT_DISPATCH]
+              .calls ==
+          g_isaac_vita_gl_wrapper_time.draw[ISAAC_VITA_GL_DRAW_SPLIT_BODY]
+              .calls);
+    CHECK(g_isaac_vita_gl_wrapper_time.draw[ISAAC_VITA_GL_DRAW_SPLIT_TAIL]
+              .calls <=
+          g_isaac_vita_gl_wrapper_time.draw[ISAAC_VITA_GL_DRAW_SPLIT_BODY]
+              .calls);
+    CHECK(g_isaac_vita_gl_wrapper_time.draw_canonical == 0u);
+    CHECK(g_isaac_vita_gl_wrapper_time.bad_clock == 0u);
+#endif
     gl_vita_backend_uninstall();
     CHECK(!gl_vita_backend_installed());
     CHECK(gl_vita_backend_resolved_count() == 0u);

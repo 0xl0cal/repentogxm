@@ -661,6 +661,28 @@ for compiler_index in 0 1; do
         -Wl,--wrap=isaac_vita_heap_overflow_mspace_snapshot_get \
         -Wl,--gc-sections -o "$work/router-oracle-$tag"
     "$work/router-oracle-$tag" > "$work/router-oracle-$tag.log"
+    "$work/router-oracle-$tag" --terminal-observer
+    # Same real router/state-machine fixture, with only the terminal observer
+    # changed. The oracle checks false/latched/reset states, lock acquisitions
+    # and a concurrent observer while the normal init path publishes terminal.
+    "$resolved" "${host_flags[@]}" "${host_defines[@]}" \
+        -DISAAC_VITA_HEAP_TERMINAL_FASTPATH=1 "${host_interpose[@]}" \
+        -I"$fake_include" -I"$root/runtime" \
+        -c "$root/runtime/host_vita_heap.c" \
+        -o "$work/heap-router-terminal-$tag.o"
+    "$resolved" "${host_flags[@]}" "${host_defines[@]}" \
+        -DISAAC_VITA_HEAP_TERMINAL_FASTPATH=1 -pthread \
+        -I"$fake_include" -I"$root/runtime" \
+        -c "$root/runtime/host_vita_heap_overflow_router_oracle.c" \
+        -o "$work/router-terminal-oracle-$tag.o"
+    "$resolved" -fsanitize=address,undefined -fno-omit-frame-pointer \
+        -no-pie -pthread \
+        "$work/heap-router-terminal-$tag.o" "$work/overflow-mspace-$tag.o" \
+        "$work/room-entry-slab-$tag.o" "$work/room-entry-external-$tag.o" \
+        "$work/heap-ledger-$tag.o" "$work/router-terminal-oracle-$tag.o" \
+        -Wl,--wrap=isaac_vita_heap_overflow_mspace_snapshot_get \
+        -Wl,--gc-sections -o "$work/router-terminal-oracle-$tag"
+    "$work/router-terminal-oracle-$tag" --terminal-observer
     "$work/router-oracle-$tag" --room-commit-terminal \
         > "$work/router-room-terminal-$tag.log"
     "$work/router-oracle-$tag" --room-invariant-terminal \

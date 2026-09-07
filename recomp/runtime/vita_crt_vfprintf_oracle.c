@@ -6,6 +6,7 @@
 #include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "guest.h"
@@ -26,11 +27,27 @@ static void oracle_after_first_pass(CPU *cpu, uint32_t token,
 #define fwrite oracle_fwrite
 #define fflush oracle_fflush
 #define fclose oracle_fclose
+#if defined(ISAAC_VITA_CRT_ATOF_SMALLINT_TEST)
+static double oracle_strtod(const char *text, char **end);
+#define strtod oracle_strtod
+#endif
 #include "host_vita_crt.c"
+#if defined(ISAAC_VITA_CRT_ATOF_SMALLINT_TEST)
+#undef strtod
+#endif
 #undef fclose
 #undef fflush
 #undef fwrite
 #undef ISAAC_VITA_CRT_VFPRINTF_AFTER_FIRST_PASS
+
+/* Keep Windows' RPC macros out of the production CRT/musl inclusion. */
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS_TEST)
+# if defined(_WIN32)
+#  include <windows.h>
+# else
+#  include <sys/mman.h>
+# endif
+#endif
 
 enum {
     ORACLE_TOKEN = 0x7f123456U,
@@ -1043,6 +1060,245 @@ static int run_oracle(void)
 #undef CHECK
 }
 
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS_TEST)
+static unsigned s_room_calls, s_room_callback_bad;
+static CPU *s_room_cpu;
+static uint32_t s_room_expected_esp, s_room_expected_buffer, s_room_expected_length;
+static const char s_room_expected[] = "Room -2147483648.-1(Start)\n";
+static char s_room_name[] = "Start";
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
+void kage_vita_phase_profile_room_log(uint32_t first, uint32_t second)
+{
+    ++s_room_calls;
+    if (first != UINT32_C(0x80000000) || second != UINT32_MAX ||
+        !s_room_cpu || s_room_cpu->esp != s_room_expected_esp ||
+        s_room_cpu->eax != s_room_expected_length ||
+        memcmp((void *)(uintptr_t)s_room_expected_buffer, s_room_expected,
+               sizeof s_room_expected) != 0)
+        ++s_room_callback_bad;
+    errno = EDOM; /* the CRT observer must preserve the caller's errno */
+}
+#endif
+
+static void *oracle_room_map(uint32_t address)
+{
+#if defined(_WIN32)
+    return VirtualAlloc((void *)(uintptr_t)address, 65536u,
+                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void *p = mmap((void *)(uintptr_t)address, 65536u, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+#endif
+}
+
+static int oracle_room_log(void)
+{
+    unsigned mode;
+    void *format_map = oracle_room_map(UINT32_C(0x98740000));
+    void *buffer_map = oracle_room_map(UINT32_C(0x98800000));
+#define ROOM_CHECK(x) do { if (!(x)) { fprintf(stderr, "Room CRT check failed line %d mode %u\n", __LINE__, mode); return __LINE__; } } while (0)
+    mode = 0u;
+    ROOM_CHECK(format_map == (void *)(uintptr_t)UINT32_C(0x98740000) &&
+               buffer_map == (void *)(uintptr_t)UINT32_C(0x98800000));
+    for (mode = 0u; mode < 13u; ++mode) {
+        CPU cpu, expected;
+        uint32_t esp = pointer32(&s_guest_stack[16]);
+        uint32_t frame = pointer32(&s_guest_stack[80]);
+        uint32_t args = frame + 16u;
+        uint32_t buffer = ISAAC_VITA_CRT_ROOM_LOG_BUFFER_VA + 9u;
+        uint32_t count = ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END - buffer;
+        uint32_t format = ISAAC_VITA_CRT_ROOM_LOG_FORMAT_VA;
+        uint32_t length = sizeof s_room_expected - 1u;
+        unsigned calls = s_room_calls;
+        memset(&cpu, 0, sizeof cpu);
+        memset(s_guest_stack, 0xcc, sizeof s_guest_stack);
+        memset(buffer_map, 0xa5, 65536u);
+        memcpy((void *)(uintptr_t)format, ISAAC_VITA_CRT_ROOM_LOG_FORMAT,
+               sizeof ISAAC_VITA_CRT_ROOM_LOG_FORMAT);
+        st32(frame + 4u, ISAAC_VITA_CRT_ROOM_LOG_ORIGIN_RETURN_RVA);
+        st32(frame + 8u, 0u); st32(frame + 12u, format);
+        st32(args, UINT32_C(0x80000000)); st32(args + 4u, UINT32_MAX);
+        st32(args + 8u, pointer32(s_room_name));
+        st32(esp, ISAAC_VITA_CRT_VSPRINTF_TIMER_RETURN_RVA);
+        st32(esp + 4u, 2u); st32(esp + 8u, 0u);
+        if (mode == 1u) st32(frame + 4u, 0x003b1112u);
+        if (mode == 2u) st32(esp, 0x0055e45bu);
+        if (mode == 3u) st32(frame + 8u, 1u);
+        if (mode == 4u) st32(frame + 12u, format + 1u);
+        if (mode == 5u) { --count; } /* complete but not exact owner capacity */
+        if (mode == 6u) { buffer = ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END - 4u; count = 4u; }
+        if (mode == 7u) { st8(format + sizeof ISAAC_VITA_CRT_ROOM_LOG_FORMAT - 2u, '!'); }
+        if (mode == 8u) { st8(format + sizeof ISAAC_VITA_CRT_ROOM_LOG_FORMAT - 1u, 'X'); st8(format + sizeof ISAAC_VITA_CRT_ROOM_LOG_FORMAT, 0u); ++length; }
+        if (mode == 9u) { memcpy((void *)(uintptr_t)(format + 64u), (void *)(uintptr_t)format, sizeof ISAAC_VITA_CRT_ROOM_LOG_FORMAT); format += 64u; st32(frame + 12u, format); }
+        if (mode == 10u) { memcpy(s_arguments, (void *)(uintptr_t)args, 12u); args = pointer32(s_arguments); }
+        if (mode == 11u) { st32(esp + 4u, 0u); }
+        if (mode == 12u) { buffer = ISAAC_VITA_CRT_ROOM_LOG_BUFFER_VA - 32u; count = 32u; }
+        st32(esp + 12u, buffer); st32(esp + 16u, count);
+        st32(esp + 20u, format); st32(esp + 24u, 0u); st32(esp + 28u, args);
+        cpu.esp = esp; cpu.ebp = frame; cpu.eax = 0x5aa55aa5u;
+        cpu.stack_owner = &cpu; cpu.stack_floor = pointer32(s_guest_stack);
+        cpu.stack_ceiling = pointer32(s_guest_stack + 128);
+        cpu.stack_low_water = cpu.stack_ceiling;
+        expected = cpu; expected.esp += 4u; expected.eax = length;
+        /* vita_crt_arg checks ESP+4 first; the existing gpop_at validates
+         * its range but does not call guest_stack_note_low on the RET word. */
+        expected.stack_low_water = esp + 4u;
+        s_room_cpu = &cpu; s_room_expected_esp = esp;
+        s_room_expected_buffer = buffer; s_room_expected_length = length;
+        errno = EACCES; g_isaac_vita_crt_errno = ORACLE_GUEST_ERRNO_SENTINEL;
+        vita_crt_stdio_common_vsprintf(&cpu);
+        ROOM_CHECK(memcmp(&cpu, &expected, sizeof cpu) == 0 && errno == EACCES &&
+                   g_isaac_vita_crt_errno == ORACLE_GUEST_ERRNO_SENTINEL);
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
+        ROOM_CHECK(s_room_calls == calls + (mode == 0u));
+#else
+        ROOM_CHECK(s_room_calls == calls);
+#endif
+        ROOM_CHECK(!s_room_callback_bad);
+        if (mode == 0u) ROOM_CHECK(memcmp((void *)(uintptr_t)buffer, s_room_expected, sizeof s_room_expected) == 0);
+    }
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
+    /* Guard-only hostile ranges: no formatter execution is claimed for these
+     * invalid synthetic frames. The actual helper must skip without touching
+     * CPU state, reading unbound memory, or calling the recorder. */
+    for (mode = 0u; mode < 8u; ++mode) {
+        CPU cpu, before;
+        uint32_t frame = pointer32(&s_guest_stack[80]);
+        uint32_t buffer = ISAAC_VITA_CRT_ROOM_LOG_BUFFER_VA;
+        uint32_t count = ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END - buffer;
+        unsigned calls = s_room_calls;
+        memset(&cpu, 0, sizeof cpu);
+        cpu.esp = pointer32(&s_guest_stack[16]); cpu.ebp = frame;
+        cpu.stack_owner = &cpu; cpu.stack_floor = pointer32(s_guest_stack);
+        cpu.stack_ceiling = pointer32(s_guest_stack + 128); cpu.stack_low_water = cpu.stack_ceiling;
+        st32(cpu.esp, ISAAC_VITA_CRT_VSPRINTF_TIMER_RETURN_RVA);
+        if (mode == 0u) cpu.stack_owner = NULL;
+        if (mode == 1u) cpu.esp = UINT32_MAX;
+        if (mode == 2u) cpu.ebp = UINT32_MAX - 8u;
+        if (mode == 3u) cpu.ebp = cpu.stack_ceiling - 8u;
+        if (mode == 4u) count = UINT32_MAX;
+        if (mode == 5u) buffer = UINT32_MAX;
+        if (mode == 6u || mode == 7u) {
+            cpu.stack_floor = buffer; cpu.stack_ceiling = ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END;
+            cpu.stack_low_water = cpu.stack_ceiling;
+            cpu.esp = buffer + 64u; cpu.ebp = buffer + 128u;
+            st32(cpu.esp, ISAAC_VITA_CRT_VSPRINTF_TIMER_RETURN_RVA);
+            if (mode == 7u) { buffer += 128u; count -= 128u; }
+        }
+        before = cpu; errno = EACCES;
+        vita_crt_room_log_completed(&cpu, buffer, count, ISAAC_VITA_CRT_ROOM_LOG_FORMAT_VA, cpu.ebp + 16u, 1u, 1);
+        ROOM_CHECK(memcmp(&cpu, &before, sizeof cpu) == 0 && errno == EACCES && s_room_calls == calls);
+    }
+#endif
+#if defined(_WIN32)
+    ROOM_CHECK(VirtualFree(format_map, 0u, MEM_RELEASE));
+    ROOM_CHECK(VirtualFree(buffer_map, 0u, MEM_RELEASE));
+#else
+    ROOM_CHECK(munmap(format_map, 65536u) == 0);
+    ROOM_CHECK(munmap(buffer_map, 65536u) == 0);
+#endif
+    puts("Room CRT actual vsprintf seam: PASS (complete CPU/errno, exact chain/format, full output, fail-open ranges)");
+    return 0;
+#undef ROOM_CHECK
+}
+#endif
+
+#if defined(ISAAC_VITA_CRT_ATOF_SMALLINT_TEST)
+static unsigned s_strtod_calls;
+static double oracle_strtod(const char *text, char **end)
+{
+    ++s_strtod_calls;
+    return strtod(text, end);
+}
+
+static int oracle_atof_smallint(void)
+{
+    static const struct { const char *text; unsigned accepted; } cases[] = {
+        { "0", 1 }, { "-0", 1 }, { "000000000", 1 }, { "-000000000", 1 },
+        { "1", 1 }, { "-1", 1 }, { "100", 1 }, { "255", 1 },
+        { "9", 1 }, { "10", 1 }, { "99", 1 }, { "999", 1 },
+        { "1000", 1 }, { "9999", 1 }, { "10000", 1 }, { "99999", 1 },
+        { "100000", 1 }, { "999999", 1 }, { "1000000", 1 },
+        { "9999999", 1 }, { "10000000", 1 }, { "99999999", 1 },
+        { "100000000", 1 }, { "-100000000", 1 },
+        { "999999999", 1 }, { "-999999999", 1 }, { "012345678", 1 },
+        { "", 0 }, { "-", 0 }, { "+", 0 }, { "+1", 0 }, { "--1", 0 },
+        { "1000000000", 0 }, { "0000000000", 0 }, { "-1000000000", 0 },
+        { "123x", 0 }, { "1 ", 0 }, { " 1", 0 }, { "\t1", 0 },
+        { "1e0", 0 }, { "-0e1", 0 }, { "1e", 0 }, { "1.0", 0 },
+        { "1,5", 0 }, { "0x10", 0 }, { "inf", 0 }, { "-inf", 0 },
+        { "nan", 0 }, { "1e309", 0 }, { "1e-999", 0 },
+        { "2147483647", 0 }, { "-2147483648", 0 },
+        { "\xff", 0 }, { "1\xff", 0 }
+    };
+    unsigned i;
+    uint32_t esp;
+    CPU cpu, expected;
+    unsigned checks = 0u;
+#define ATOF_CHECK(x) do { ++checks; if (!(x)) { \
+    fprintf(stderr, "atof check failed line=%d case=%u\n", __LINE__, i); return 210; } } while (0)
+    for (i = 0u; i < sizeof cases / sizeof cases[0]; ++i) {
+        double reference;
+        unsigned expected_calls = 1u;
+        strcpy(s_long_source, cases[i].text);
+        reference = strtod(s_long_source, NULL);
+        esp = oracle_prepare_call(&cpu, ORACLE_TOKEN, s_empty_format, s_arguments);
+        st32(esp + 4u, pointer32(s_long_source));
+        cpu.st_top = 5u;
+        cpu.st[4] = 7.0; cpu.st[5] = -11.0;
+        expected = cpu;
+        expected.stack_owner = &expected;
+        (void)vita_crt_arg(&expected, 0u); /* unchanged guarded argument read */
+        fpush(&expected, reference);
+        vita_crt_cdecl_return(&expected);
+        expected.stack_owner = &cpu;
+#if defined(ISAAC_VITA_CRT_ATOF_SMALLINT) && ISAAC_VITA_CRT_ATOF_SMALLINT
+        expected_calls -= cases[i].accepted;
+#endif
+        s_strtod_calls = 0u;
+        errno = EACCES; g_isaac_vita_crt_errno = ORACLE_GUEST_ERRNO_SENTINEL;
+        vita_crt_atof(&cpu);
+        ATOF_CHECK(memcmp(&cpu, &expected, sizeof cpu) == 0);
+        ATOF_CHECK(s_strtod_calls == expected_calls && errno == EACCES &&
+                   g_isaac_vita_crt_errno == ORACLE_GUEST_ERRNO_SENTINEL);
+        ATOF_CHECK(strcmp(s_long_source, cases[i].text) == 0 &&
+                   ld32(esp) == ORACLE_RETURN && ld32(esp + 4u) == pointer32(s_long_source));
+    }
+    /* A valid 4095-byte snapshot falls back; 4096 non-NUL bytes must fault
+     * BEFORE any fast-path/parser work, leaving stack/x87 unchanged. */
+    for (i = 0u; i < 3u; ++i) {
+        memset(s_long_source, '0', 4096u); s_long_source[i == 0u ? 4095u : 4096u] = 0;
+        esp = oracle_prepare_call(&cpu, ORACLE_TOKEN, s_empty_format, s_arguments);
+        st32(esp + 4u, i == 2u ? 0u : pointer32(s_long_source));
+        cpu.st_top = 6u; cpu.st[6] = -3.0;
+        expected = cpu;
+        if (i == 0u) {
+            expected.stack_owner = &expected;
+            (void)vita_crt_arg(&expected, 0u);
+            fpush(&expected, 0.0); vita_crt_cdecl_return(&expected);
+            expected.stack_owner = &cpu;
+        }
+        s_strtod_calls = 0u;
+        errno = EACCES; g_isaac_vita_crt_errno = ORACLE_GUEST_ERRNO_SENTINEL;
+        vita_crt_atof(&cpu);
+        if (i == 0u) {
+            ATOF_CHECK(memcmp(&cpu, &expected, sizeof cpu) == 0 && s_strtod_calls == 1u);
+        } else {
+            ATOF_CHECK(cpu.fault && cpu.esp == expected.esp && cpu.st_top == expected.st_top &&
+                       memcmp(cpu.st, expected.st, sizeof cpu.st) == 0 && s_strtod_calls == 0u);
+            ATOF_CHECK(strcmp(cpu.fault, i == 2u ? "atof received a null guest pointer" :
+                             "atof input is unreadable or exceeds 4095 bytes") == 0);
+        }
+        ATOF_CHECK(errno == EACCES && g_isaac_vita_crt_errno == ORACLE_GUEST_ERRNO_SENTINEL);
+    }
+    printf("atof actual CRT boundary: PASS checks=%u cases=%u (full CPU/errno, fallback calls, snapshot limits)\n",
+           checks, (unsigned)(sizeof cases / sizeof cases[0]) + 3u);
+    return 0;
+#undef ATOF_CHECK
+}
+#endif
+
 int main(void)
 {
     int result = run_oracle();
@@ -1050,6 +1306,14 @@ int main(void)
 #if defined(ISAAC_VITA_GAME_LOG_BATCH)
     if (!result)
         result = oracle_log_batch();
+#endif
+#if defined(ISAAC_VITA_ROOM_LOG_MARKERS_TEST)
+    if (!result)
+        result = oracle_room_log();
+#endif
+#if defined(ISAAC_VITA_CRT_ATOF_SMALLINT_TEST)
+    if (!result)
+        result = oracle_atof_smallint();
 #endif
     return result;
 }

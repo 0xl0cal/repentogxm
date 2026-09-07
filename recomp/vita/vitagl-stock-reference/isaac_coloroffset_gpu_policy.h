@@ -174,6 +174,60 @@ static inline int isaac_coloroffset_contiguous_vertices_are_opaque(
 	return 1;
 }
 
+/* The neutral FS preserves Color/Colorize/Offset.  Unlike the opaque
+ * composite policy, it is usable by alpha-blended sprite batches.  Values
+ * are checked as IEEE bits so fast-math cannot optimize away NaN rejection.
+ * The exact paired VS copies these lanes unchanged. */
+static inline int isaac_coloroffset_vertex_is_neutral(
+		const uint8_t *vertex, size_t available) {
+	uint32_t offset, bits;
+	if (!vertex || available < ISAAC_COLOROFFSET_VERTEX_STRIDE)
+		return 0;
+	for (offset = 0u; offset < ISAAC_COLOROFFSET_VERTEX_STRIDE; offset += 4u) {
+		bits = isaac_coloroffset_load_u32(vertex + offset) & 0x7fffffffu;
+		if (bits >= 0x7f800000u)
+			return 0; /* Inf and NaN, including unused lanes. */
+	}
+	/* Keep intermediate color arithmetic bounded, including its discarded
+	 * quantization expression in the stock shader.  Tints and offsets are
+	 * still retained, not required to be zero/default. */
+	for (offset = 12u; offset < 64u; offset += 4u) {
+		if (offset == 28u || offset == 32u)
+			continue; /* UVs, not color lanes. */
+		if ((isaac_coloroffset_load_u32(vertex + offset) & 0x7fffffffu) >
+				0x41800000u) /* abs(value) <= 16.0f */
+			return 0;
+	}
+	/* Pixelation is neutral at +/-0, NOT at 1.  Clip.xy == 0 and Clip.z
+	 * <= 0 makes dot(fragment.xy, Clip.xy) < Clip.z false everywhere. */
+	if ((isaac_coloroffset_load_u32(vertex + 72u) & 0x7fffffffu) != 0u ||
+			(isaac_coloroffset_load_u32(vertex + 76u) & 0x7fffffffu) != 0u ||
+			(isaac_coloroffset_load_u32(vertex + 80u) & 0x7fffffffu) != 0u)
+		return 0;
+	bits = isaac_coloroffset_load_u32(vertex + 84u);
+	return (bits & 0x80000000u) != 0u || bits == 0u;
+}
+
+static inline int isaac_coloroffset_contiguous_vertices_are_neutral(
+		const void *vertices, size_t vertex_bytes, uint32_t vertex_count,
+		uint32_t stride) {
+	const uint8_t *bytes = (const uint8_t *)vertices;
+	uint32_t index;
+	/* Bound draw-time CPU work.  Larger/unknown buffers keep the stock FS. */
+	if (!bytes || stride != ISAAC_COLOROFFSET_VERTEX_STRIDE ||
+			vertex_count == 0u || vertex_count > 4096u ||
+			vertex_count > SIZE_MAX / stride ||
+			vertex_bytes != (size_t)vertex_count * stride)
+		return 0;
+	for (index = 0u; index < vertex_count; ++index) {
+		size_t offset = (size_t)index * stride;
+		if (!isaac_coloroffset_vertex_is_neutral(
+				bytes + offset, vertex_bytes - offset))
+			return 0;
+	}
+	return 1;
+}
+
 /* General indexed form used by the hostile-range oracle.  Production uses
  * the contiguous form only after vitaGL itself has found max(index)+1 and
  * copied that complete range into its bounded mapped staging allocation. */

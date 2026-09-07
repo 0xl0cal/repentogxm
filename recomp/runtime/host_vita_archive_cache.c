@@ -334,3 +334,15 @@ int isaac_vita_archive_cache_drop(void)
 {
     return archive_cache_drop_idle();
 }
+
+FILE *isaac_vita_archive_cache_reopen_native(const char *native_path,
+                                             const char *mode)
+{
+    if (!native_path || !mode) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (s_idle.stream)
+        archive_cache_evict_before_open();
+    return archive_native_fopen(native_path, mode);
+}

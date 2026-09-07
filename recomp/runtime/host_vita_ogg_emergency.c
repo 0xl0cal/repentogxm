@@ -1,8 +1,9 @@
 /* One retained emergency USER_RW slot for the exact OGG Open allocation which
  * terminated the measured post-death run after newlib fragmentation.  This is
- * intentionally not a general audio pool: Queue is unbounded, two other
- * frozen sites request the same size, and the PE proves no global stream-count
- * bound. */
+ * intentionally not a general audio pool: the PE proves no global stream-count
+ * bound. The opt-in Queue policy admits its exact allocation owner to the SAME
+ * single slot after native malloc failure. A live slot still falls through to
+ * the original allocation failure; no backing is shared by two live streams. */
 #include <limits.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -207,8 +208,13 @@ int isaac_vita_ogg_emergency_malloc(
     int reserve_result;
 
     ogg_emergency_clear_decision(decision);
-    if (owner_return_rva !=
-            ISAAC_VITA_OGG_OPEN_ALLOCATION_RETURN_RVA ||
+    if ((owner_return_rva !=
+            ISAAC_VITA_OGG_OPEN_ALLOCATION_RETURN_RVA
+#ifdef ISAAC_VITA_OGG_QUEUE_EMERGENCY
+         && owner_return_rva !=
+            ISAAC_VITA_OGG_QUEUE_ALLOCATION_RETURN_RVA
+#endif
+        ) ||
         size != ISAAC_VITA_OGG_OPEN_BACKING_BYTES)
         return ISAAC_VITA_OGG_EMERGENCY_NOT_HANDLED;
     if (!decision)
@@ -376,6 +382,19 @@ int isaac_vita_ogg_emergency_realloc(
     ogg_emergency_unlock();
     return ISAAC_VITA_OGG_EMERGENCY_HANDLED;
 }
+
+#ifdef ISAAC_VITA_HEAP_CENSUS
+uint32_t isaac_vita_ogg_emergency_live_count(void)
+{
+    uint32_t live;
+
+    if (!ogg_emergency_try_lock())
+        return UINT32_MAX;
+    live = s_state.live;
+    ogg_emergency_unlock();
+    return live;
+}
+#endif
 
 #ifdef ISAAC_VITA_OGG_EMERGENCY_ORACLE
 int isaac_vita_ogg_emergency_oracle_snapshot(

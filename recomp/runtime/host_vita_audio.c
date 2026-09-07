@@ -15,6 +15,9 @@
 
 #include "host_vita_audio.h"
 #include "host_vita_import_id.h"
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+#include "host_vita_static_sfx_profile.h"
+#endif
 #if defined(ISAAC_VITA_AUDIO_REFILL_HOOKS)
 /* Stream refill pacing/receipts.  Off in every oracle and in ordinary
  * production builds; see host_vita_audio_refill.h for the measured rationale. */
@@ -708,8 +711,14 @@ static void vita_audio_source_stop(CPU *__restrict c)
 
 static void vita_audio_gen_buffers(CPU *__restrict c)
 {
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+    uint64_t start_us = isaac_vita_static_sfx_profile_native_begin(c);
+#endif
     alGenBuffers((ALsizei)vita_audio_arg(c, 0U),
                  (ALuint *)vita_audio_pointer_arg(c, 1U));
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+    isaac_vita_static_sfx_profile_create_end(c, start_us);
+#endif
     vita_audio_cdecl_return(c);
 }
 
@@ -844,6 +853,9 @@ static void vita_audio_gen_sources(CPU *__restrict c)
 static void vita_audio_get_error(CPU *__restrict c)
 {
     c->eax = (uint32_t)alGetError();
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+    isaac_vita_static_sfx_profile_error(c, c->eax);
+#endif
     vita_audio_cdecl_return(c);
 }
 
@@ -892,9 +904,15 @@ static void vita_audio_buffer_data(CPU *__restrict c)
     ALsizei size = (ALsizei)vita_audio_arg(c, 3U);
     ALsizei frequency = (ALsizei)vita_audio_arg(c, 4U);
 
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+    uint64_t start_us = isaac_vita_static_sfx_profile_native_begin(c);
+#endif
     alBufferData((ALuint)vita_audio_arg(c, 0U), format,
                  (const ALvoid *)vita_audio_pointer_arg(c, 2U),
                  size, frequency);
+#if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
+    isaac_vita_static_sfx_profile_upload_end(c, start_us, size);
+#endif
 #if defined(ISAAC_VITA_AUDIO_REFILL_HOOKS)
     isaac_vita_audio_refill_note_buffer_data(
         ld32(guest_stack_address(c, c->esp, 4U, 0U)),

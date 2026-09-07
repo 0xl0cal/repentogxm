@@ -17,6 +17,9 @@
 #include "host_vita_texel_scratch.h"
 #include "kage_vita_texture_memory.h"
 #include "platform.h"
+#if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE)
+#include "host_vita_png_premultiply.h"
+#endif
 
 #if !defined(ISAAC_VITA_TEXEL_SCRATCH_ORACLE) && UINTPTR_MAX != UINT32_MAX
 #error texel scratch requires a 32-bit identity-mapped Vita address space
@@ -34,6 +37,10 @@ typedef struct texel_scratch_state {
     uint32_t freed_count;
     uint32_t busy_fallback_count;
     uint32_t oversize_fallback_count;
+#if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE) || \
+    defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION) || defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH)
+    uint32_t owner_return_rva;
+#endif
 } texel_scratch_state;
 
 _Static_assert(KAGE_VITA_TEXEL_PNG_LOADER_RETURN ==
@@ -310,6 +317,10 @@ int isaac_vita_texel_scratch_malloc(
     }
     s_state.live = 1U;
     s_state.live_size = size;
+#if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE) || \
+    defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION) || defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH)
+    s_state.owner_return_rva = owner_return_rva;
+#endif
     if (size > s_state.high_water)
         s_state.high_water = size;
     ++s_state.acquired_count;
@@ -359,6 +370,10 @@ int isaac_vita_texel_scratch_free(
 
     s_state.live = 0U;
     s_state.live_size = 0U;
+#if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE) || \
+    defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION) || defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH)
+    s_state.owner_return_rva = 0U;
+#endif
     ++s_state.freed_count;
     if (s_state.freed_count == 1U ||
         (s_state.freed_count & 255U) == 0U) {
@@ -374,6 +389,84 @@ int isaac_vita_texel_scratch_free(
     texel_scratch_unlock();
     return ISAAC_VITA_TEXEL_SCRATCH_HANDLED;
 }
+
+#if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE)
+int isaac_vita_texel_scratch_png_premultiply(
+    const IsaacVitaPngPremultiply *p)
+{
+    uint64_t end;
+    int result = 0;
+    if (!p || !p->base || !p->table || !p->width || !p->rows ||
+        p->stride < (uint64_t)p->width * 4u ||
+        (uint64_t)p->base + p->bytes > UINT32_MAX ||
+        (uintptr_t)p->table > UINTPTR_MAX - 65536u ||
+        ((uint64_t)p->base < (uint64_t)(uintptr_t)p->table + 65536u &&
+         (uint64_t)(uintptr_t)p->table < (uint64_t)p->base + p->bytes))
+        return 0;
+    end = (uint64_t)(p->rows - 1u) * p->stride + (uint64_t)p->width * 4u;
+    if (end > p->bytes || !texel_scratch_try_lock())
+        return 0;
+    if (!s_state.poisoned && s_state.live &&
+        s_state.owner_return_rva == KAGE_VITA_TEXEL_PNG_LOADER_RETURN &&
+        s_state.live_size == p->bytes &&
+        atomic_load_explicit(&s_published_base, memory_order_relaxed) == p->base) {
+        isaac_vita_png_premultiply_rows(p);
+        result = 1;
+    }
+    texel_scratch_unlock();
+    return result;
+}
+#endif
+
+#if defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION)
+int isaac_vita_texel_scratch_png_exact(uint32_t base, uint32_t bytes)
+{
+    int result;
+    if (!base || !bytes || !texel_scratch_try_lock())
+        return 0;
+    result = !s_state.poisoned && s_state.live &&
+        s_state.owner_return_rva == KAGE_VITA_TEXEL_PNG_LOADER_RETURN &&
+        s_state.live_size == bytes &&
+        atomic_load_explicit(&s_published_base, memory_order_relaxed) == base;
+    texel_scratch_unlock();
+    return result;
+}
+#endif
+
+#if defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH)
+int isaac_vita_texel_scratch_png_middle_rows(uint32_t base, uint32_t stride,
+    uint32_t rowbytes, uint32_t height, const uint8_t *filtered_rows)
+{
+    uint64_t end;
+    int result = 0;
+    if (!base || !filtered_rows || !rowbytes || height < 3u ||
+        stride < rowbytes)
+        return 0;
+    end = (uint64_t)(height - 1u) * stride + rowbytes;
+    if ((uint64_t)base + end > UINT32_MAX || !texel_scratch_try_lock())
+        return 0;
+    if (!s_state.poisoned && s_state.live &&
+        s_state.owner_return_rva == KAGE_VITA_TEXEL_PNG_LOADER_RETURN &&
+        end <= s_state.live_size &&
+        atomic_load_explicit(&s_published_base, memory_order_relaxed) == base &&
+        !((uintptr_t)filtered_rows < (uint64_t)base + end &&
+          base < (uint64_t)(uintptr_t)filtered_rows +
+              (uint64_t)height * (rowbytes + 1u))) {
+        uint8_t *destination = (uint8_t *)(uintptr_t)base + stride;
+        const uint8_t *source = filtered_rows + rowbytes + 2u;
+        const uint8_t *stop = (uint8_t *)(uintptr_t)base +
+            (size_t)(height - 1u) * stride;
+        while (destination != stop) {
+            memcpy(destination, source, rowbytes);
+            destination += stride;
+            source += rowbytes + 1u;
+        }
+        result = 1;
+    }
+    texel_scratch_unlock();
+    return result;
+}
+#endif
 
 int isaac_vita_texel_scratch_realloc(
     void *pointer, size_t size,
@@ -429,6 +522,18 @@ int isaac_vita_texel_scratch_realloc(
 }
 
 #ifdef ISAAC_VITA_TEXEL_SCRATCH_ORACLE
+#if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE) || \
+    defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION)
+int isaac_vita_texel_scratch_oracle_hold_lock(void)
+{
+    return texel_scratch_try_lock();
+}
+
+void isaac_vita_texel_scratch_oracle_drop_lock(void)
+{
+    texel_scratch_unlock();
+}
+#endif
 int isaac_vita_texel_scratch_oracle_snapshot(
     isaac_vita_texel_scratch_snapshot *snapshot)
 {

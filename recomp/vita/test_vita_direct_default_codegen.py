@@ -10,6 +10,10 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
 import tempfile
 
 import vita_direct_default_codegen as codegen
@@ -358,6 +362,141 @@ def frozen_corpus_tests(source: Path, root: Path) -> None:
         raise AssertionError("frozen corpus switch back lost direct-default bytes")
 
 
+def cmake_owner_scan_tests(root: Path) -> None:
+    """Run production selection/scans with missing and hostile stale outputs."""
+    from test_kage_vita_png_decode_profile import compiler
+
+    vita = Path(__file__).resolve().parent
+    production = (vita / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    def section(begin: str, end: str) -> str:
+        start = production.index(begin)
+        return production[start:production.index(end, start)]
+
+    prepare = section("  # Feature-owner discovery must inspect", "  set(ISAAC_VITA_RUNTIME_SOURCES")
+    scans = section("  if(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH)\n    # gen_all.py pins", "  if(ISAAC_VITA_LIGHT_SURFACE_RASTER_416 OR")
+    scans += section("      if(ISAAC_VITA_DEEP_PROFILE)\n        set(ISAAC_DEEP_GENERATED_OWNERS", "      if(ISAAC_VITA_NATIVE_RESOURCE_PROFILE)")
+    finalize = section("  # Finalize the compiled generated list", "  target_include_directories(isaac_first_arm_fault PRIVATE\n    \"${ISAAC_GENERATED_DIR}\")")
+    derivation = section("  if(ISAAC_VITA_DIRECT_DEFAULT)\n    # The derived unit's identity", "  if(ISAAC_VITA_LUA)\n    list(APPEND ISAAC_VITA_RAW_ALLOCATOR_LUA_ARGS")
+    cmake, ninja, cc = shutil.which("cmake"), shutil.which("ninja"), compiler()
+    if ninja is None and os.name == "nt":
+        # Same installed-tool fallback as the existing PNG CMake oracle.
+        candidate = (Path(os.environ.get("ProgramFiles", r"C:\Program Files")) /
+                     "Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe")
+        if candidate.is_file():
+            ninja = str(candidate)
+    if not cmake or not ninja:
+        raise RuntimeError("cmake/ninja are required for direct-default owner tests")
+    toolchain = [f"-DCMAKE_C_COMPILER={Path(cc).as_posix()}",
+                 f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}"]
+    if os.name == "nt":
+        toolchain += [f"-DCMAKE_RC_COMPILER={Path(cc).with_name('llvm-rc.exe').as_posix()}",
+                      f"-DCMAKE_AR={Path(cc).with_name('llvm-ar.exe').as_posix()}",
+                      "-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY"]
+    root.mkdir()
+    canonical = root / codegen.SOURCE_NAME
+    # Co-locate the three real selectors in the replaced owner. The fixture
+    # exercises discovery/property transport, not the separately tested hash gate.
+    canonical.write_text(
+        "void sub_005aeb00(CPU *__restrict c)\n{\n"
+        "  isaac_vita_archive_miniz_guest_try(c);\n}\n"
+        "void sub_0059c690(CPU *__restrict c)\n{\n"
+        "  isaac_vita_wav_buffered_rewind_try(c);\n"
+        + "  KAGE_VITA_DEEP_SCOPE(KVD_ROOM_SWITCH);\n" * 16
+        + "".join(f"  KAGE_VITA_DEEP_SCOPE({name});\n" for name in (
+            "KVD_ANM2_LOAD", "KVD_ANM2_GRAPHICS", "KVD_ROOM_STATE_RESET", "KVD_ROOM_SNAPSHOT"))
+        + "}\n", encoding="utf-8")
+    (root / "unrelated.c").write_text("int unrelated;\n", encoding="utf-8")
+    (root / "manifest.json").write_text("{}\n", encoding="utf-8")
+    for name in set(re.findall(r'\$\{ISAAC_RUNTIME\}/([^"/]+\.c)', scans)):
+        (root / name).write_text("/* runtime placeholder */\n", encoding="utf-8")
+    for name in ("owner-include", "derived-include"):
+        (root / name).mkdir()
+    for name in ("owner.dep", "derived.dep"):
+        (root / name).write_text("fixture\n", encoding="utf-8")
+    (root / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\nproject(direct_owner C)\n"
+        "set(CMAKE_EXPORT_COMPILE_COMMANDS ON)\n"
+        f'include("{(vita / "generated_definitions.cmake").as_posix()}")\n'
+        "function(isaac_validate_strict_absolute_path path label)\n"
+        "  if(NOT IS_ABSOLUTE \"${path}\")\nmessage(FATAL_ERROR \"${label}\")\nendif()\nendfunction()\n"
+        "set(ISAAC_RUNTIME \"${CMAKE_CURRENT_SOURCE_DIR}\")\n"
+        "set(ISAAC_GENERATED_DIR \"${CMAKE_CURRENT_SOURCE_DIR}\")\n"
+        f'set(Python3_EXECUTABLE "{Path(sys.executable).as_posix()}")\n'
+        "set(ISAAC_VITA_RUNTIME_SOURCES)\n"
+        "set(ISAAC_GENERATED_C \"${ISAAC_RUNTIME}/unrelated.c\" \"${ISAAC_RUNTIME}/guest_0144.c\")\n"
+        "set(ISAAC_GENERATED_C_COUNT 2)\n"
+        "set(ISAAC_VITA_DIRECT_DEFAULT_CANONICAL_SOURCE \"${ISAAC_RUNTIME}/guest_0144.c\")\n"
+        f"set(ISAAC_VITA_DIRECT_DEFAULT_SOURCE_SIZE {codegen.SOURCE_SIZE})\n"
+        f"set(ISAAC_VITA_DIRECT_DEFAULT_MANIFEST_SIZE {codegen.SOURCE_SIZE})\n"
+        f"set(ISAAC_VITA_DIRECT_DEFAULT_SOURCE_SHA {codegen.SOURCE_SHA256})\n"
+        f"set(ISAAC_VITA_DIRECT_DEFAULT_MANIFEST_SHA {codegen.SOURCE_SHA256})\n"
+        + prepare
+        + f'set(ISAAC_VITA_DIRECT_DEFAULT_CODEGEN "{(vita / "vita_direct_default_codegen.py").as_posix()}")\n'
+        + "set(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH ON)\nset(ISAAC_VITA_WAV_BUFFERED_REWIND ON)\nset(ISAAC_VITA_DEEP_PROFILE ON)\n"
+        + scans
+        + "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_CANONICAL_SOURCE}\" APPEND PROPERTY COMPILE_DEFINITIONS OWNER_ONLY=1 SHARED=1)\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_CANONICAL_SOURCE}\" PROPERTY COMPILE_OPTIONS -DOWNER_OPTION=1)\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_CANONICAL_SOURCE}\" PROPERTY COMPILE_FLAGS \"-DOWNER_FLAGS=1\")\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_CANONICAL_SOURCE}\" PROPERTY INCLUDE_DIRECTORIES \"${ISAAC_RUNTIME}/owner-include\")\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_CANONICAL_SOURCE}\" PROPERTY OBJECT_DEPENDS \"${ISAAC_RUNTIME}/owner.dep\")\n"
+        "if(ISAAC_VITA_DIRECT_DEFAULT)\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_OUTPUT}\" PROPERTY COMPILE_DEFINITIONS DERIVED_ONLY=1 SHARED=1)\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_OUTPUT}\" PROPERTY COMPILE_OPTIONS -DDERIVED_OPTION=1)\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_OUTPUT}\" PROPERTY COMPILE_FLAGS \"-DDERIVED_FLAGS=1\")\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_OUTPUT}\" PROPERTY INCLUDE_DIRECTORIES \"${ISAAC_RUNTIME}/derived-include\")\n"
+        "set_property(SOURCE \"${ISAAC_VITA_DIRECT_DEFAULT_OUTPUT}\" PROPERTY OBJECT_DEPENDS \"${ISAAC_RUNTIME}/derived.dep\")\nendif()\n"
+        "add_library(isaac_first_arm_fault OBJECT)\n"
+        + finalize + derivation
+        + "list(GET ISAAC_GENERATED_C 1 compiled_owner)\n"
+        "get_property(owner_definitions SOURCE \"${compiled_owner}\" PROPERTY COMPILE_DEFINITIONS)\n"
+        "get_property(owner_dependencies SOURCE \"${compiled_owner}\" PROPERTY OBJECT_DEPENDS)\n"
+        "file(WRITE \"${CMAKE_BINARY_DIR}/owner-properties.txt\" \"${ISAAC_GENERATED_C}\\n${owner_definitions}\\n${owner_dependencies}\\n\")\n",
+        encoding="utf-8")
+    for enabled, stale in ((False, False), (True, False), (True, True)):
+        build = root / f"build-{int(enabled)}-{int(stale)}"
+        output = build.joinpath(*codegen.OVERRIDE_PARENT, codegen.SOURCE_NAME)
+        hostile = b"void sub_0059c690(CPU *__restrict c)\nvoid sub_0059c690(CPU *__restrict c)\n"
+        if stale:
+            output.parent.mkdir(parents=True)
+            output.write_bytes(hostile)
+        completed = subprocess.run([cmake, "-S", str(root), "-B", str(build), "-G", "Ninja",
+                                    *toolchain, f"-DISAAC_VITA_DIRECT_DEFAULT={'ON' if enabled else 'OFF'}",
+                                    f"-DISAAC_VITA_RENDER_SURFACE_NATIVE={'ON' if stale else 'OFF'}"],
+                                   capture_output=True, text=True)
+        if completed.returncode:
+            raise AssertionError(f"owner configure failed: {completed.stdout}\n{completed.stderr}")
+        if output.exists() != stale or (stale and output.read_bytes() != hostile):
+            raise AssertionError("configure materialized or rewrote the derived source")
+        lines = (build / "owner-properties.txt").read_text().splitlines()
+        expected_owner = output if enabled else canonical
+        if [Path(path) for path in lines[0].split(";")] != [root / "unrelated.c", expected_owner]:
+            raise AssertionError(f"compiled source replacement changed order/count: {lines[0]}")
+        definitions = lines[1].split(";")
+        if definitions.count("SHARED=1") != 1:
+            raise AssertionError("shared source definition was duplicated")
+        dependencies = {Path(path) for path in lines[2].split(";")}
+        if dependencies != {root / "owner.dep"} | ({root / "derived.dep"} if enabled else set()):
+            raise AssertionError("source OBJECT_DEPENDS did not survive substitution")
+        commands = json.loads((build / "compile_commands.json").read_text())
+        owners = [item for item in commands if Path(item["file"]) == expected_owner]
+        if len(owners) != 1:
+            raise AssertionError("compiled derived owner is missing or duplicated")
+        rendered = owners[0]["command"]
+        for token in ("ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH=1", "ISAAC_VITA_WAV_BUFFERED_REWIND=1",
+                      "ISAAC_VITA_DEEP_PROFILE=1", "OWNER_ONLY=1", "OWNER_OPTION=1",
+                      "OWNER_FLAGS=1", "owner-include"):
+            if token not in rendered:
+                raise AssertionError(f"compiled owner lost {token}: {rendered}")
+        for token in ("DERIVED_ONLY=1", "DERIVED_OPTION=1", "DERIVED_FLAGS=1", "derived-include"):
+            if (token in rendered) != enabled:
+                raise AssertionError(f"explicit derived setting changed: {token}")
+        unrelated = next(item["command"] for item in commands if Path(item["file"]).name == "unrelated.c")
+        if any(token in unrelated for token in ("ISAAC_VITA_DEEP_PROFILE=1", "OWNER_ONLY=1", "DERIVED_ONLY=1")):
+            raise AssertionError("owner definition escaped to the unrelated generated unit")
+    print("Direct-default CMake canonical scans: OFF/missing/stale; compiled owner properties PASS")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -372,6 +511,7 @@ def main() -> int:
     ) as value:
         root = Path(value)
         writer_tests(root, source)
+        cmake_owner_scan_tests(root / "cmake")
         if args.source is not None:
             frozen_corpus_tests(args.source, root / "frozen")
     print(

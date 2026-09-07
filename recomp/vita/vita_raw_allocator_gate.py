@@ -69,6 +69,15 @@ KAGE_MUTEX_SEAM_ROOTS = (
     ("void sub_00562ec0(CPU *__restrict c)",
      "KAGE Mutex::Unlock native critical-section seam"),
 )
+KAGE_REFCOUNT_SEAM_CACHE_KEY = "ISAAC_VITA_KAGE_REFCOUNT_SEAM"
+KAGE_REFCOUNT_SEAM_ROOTS = (
+    ("void sub_00007af0(CPU *__restrict c)",
+     "KAGE ReferenceCount::Release native seam"),
+    ("void sub_00007b50(CPU *__restrict c)",
+     "KAGE ReferenceCount::AddRef native seam"),
+    ("void sub_00007b70(CPU *__restrict c)",
+     "KAGE ReferenceCount weak-lock native seam"),
+)
 FLOOR_THUNK_FASTPATH_CACHE_KEY = "ISAAC_VITA_FLOOR_THUNK_FASTPATH"
 TEXTURE_CHURN_PROFILE_CACHE_KEY = "ISAAC_VITA_TEXTURE_CHURN_PROFILE"
 AUDIO_STREAM_RECEIPT_CACHE_KEY = "ISAAC_VITA_AUDIO_STREAM_RECEIPT"
@@ -619,6 +628,7 @@ def expected_sources(
         cache, MEMSET_THUNK_FASTPATH_CACHE_KEY
     )
     kage_mutex_seam = _feature(cache, KAGE_MUTEX_SEAM_CACHE_KEY)
+    kage_refcount_seam = _feature(cache, KAGE_REFCOUNT_SEAM_CACHE_KEY)
     floor_thunk_fastpath = _feature(
         cache, FLOOR_THUNK_FASTPATH_CACHE_KEY
     )
@@ -750,6 +760,23 @@ def expected_sources(
                 "ISAAC_VITA_SYNC_INLINE_FASTPATH=ON"
             )
         runtime.add("host_vita_kage_mutex_seam.c")
+    if kage_refcount_seam:
+        if not kage_mutex_seam:
+            raise GateError(
+                f"{KAGE_REFCOUNT_SEAM_CACHE_KEY} requires "
+                f"{KAGE_MUTEX_SEAM_CACHE_KEY}=ON"
+            )
+        # The seam TU is exact for the GUEST_FLAGS_LOCAL=1 corpus only and
+        # CMake fails the configure otherwise; a real cache carries both
+        # keys, so they are re-checked when present (synthetic caches may
+        # omit them).
+        for key in ("ISAAC_VITA_TRANSLATED_CPU",
+                    "ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL"):
+            if key in cache and not _feature(cache, key):
+                raise GateError(
+                    f"{KAGE_REFCOUNT_SEAM_CACHE_KEY} requires {key}=ON"
+                )
+        runtime.add("host_vita_kage_refcount_seam.c")
     if floor_thunk_fastpath:
         runtime.add("host_vita_floor_thunk_direct.c")
     if texture_churn_profile and not _feature(
@@ -1977,6 +2004,82 @@ def verify_kage_mutex_seam_compile_scope(
     if actual != expected:
         raise GateError(
             "KAGE mutex seam compile-definition scope changed: "
+            f"missing={sorted(expected - actual)}, "
+            f"extra={sorted(actual - expected)}"
+        )
+
+
+def verify_kage_refcount_seam_compile_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+) -> None:
+    """ISAAC_VITA_KAGE_REFCOUNT_SEAM=1 reaches exactly the one generated owner
+    of the three frozen ReferenceCount helpers and the seam helper TU; each
+    root is defined once and carries exactly one seam line in that owner."""
+    active = _feature(cache, KAGE_REFCOUNT_SEAM_CACHE_KEY)
+    expected: set[str] = set()
+    actual: set[str] = set()
+    owners: set[str] = set()
+    root_counts = [0] * len(KAGE_REFCOUNT_SEAM_ROOTS)
+    seam_counts = [0] * len(KAGE_REFCOUNT_SEAM_ROOTS)
+
+    for record in records.values():
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        source = record.get("source")
+        if (not isinstance(definitions, dict) or
+                not isinstance(undefinitions, list) or
+                not isinstance(source, Path)):
+            raise GateError("compile record is missing source definitions")
+        if KAGE_REFCOUNT_SEAM_CACHE_KEY in undefinitions:
+            raise GateError(
+                f"KAGE refcount seam policy undefined by {source}")
+        values = definitions.get(KAGE_REFCOUNT_SEAM_CACHE_KEY, [])
+        if values:
+            if values != ["1"]:
+                raise GateError(
+                    f"{source.name} has non-canonical KAGE refcount seam "
+                    f"definition: {values}"
+                )
+            actual.add(source.name)
+        if active and source.name.startswith("guest_") and \
+                source.suffix == ".c":
+            try:
+                text = source.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise GateError(
+                    f"cannot inspect KAGE refcount generated owner "
+                    f"{source}: {exc}"
+                ) from exc
+            owner = False
+            for index, (root, marker) in enumerate(KAGE_REFCOUNT_SEAM_ROOTS):
+                roots = text.count(root)
+                seams = text.count(marker)
+                if roots != seams or roots > 1:
+                    raise GateError(
+                        "KAGE refcount owner has a missing or duplicate "
+                        f"seam: {source.name} roots={roots} seams={seams}"
+                    )
+                root_counts[index] += roots
+                seam_counts[index] += seams
+                owner = owner or roots > 0
+            if owner:
+                expected.add(source.name)
+                owners.add(source.name)
+
+    if active:
+        expected.add("host_vita_kage_refcount_seam.c")
+        if root_counts != [1] * len(KAGE_REFCOUNT_SEAM_ROOTS) or \
+                seam_counts != [1] * len(KAGE_REFCOUNT_SEAM_ROOTS) or \
+                len(owners) != 1:
+            raise GateError(
+                "KAGE refcount generated owner/seam census changed: "
+                f"roots={root_counts}, seams={seam_counts}, "
+                f"owners={sorted(owners)}"
+            )
+    if actual != expected:
+        raise GateError(
+            "KAGE refcount seam compile-definition scope changed: "
             f"missing={sorted(expected - actual)}, "
             f"extra={sorted(actual - expected)}"
         )
@@ -3621,6 +3724,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     verify_save_reader_direct_edges_compile_scope(records, cache)
     verify_memset_thunk_fastpath_compile_scope(records, cache)
     verify_kage_mutex_seam_compile_scope(records, cache)
+    verify_kage_refcount_seam_compile_scope(records, cache)
     verify_floor_thunk_fastpath_compile_scope(records, cache)
     verify_exit_menu_profile_compile_scope(records, cache)
     verify_png_decode_profile_compile_scope(records, cache)

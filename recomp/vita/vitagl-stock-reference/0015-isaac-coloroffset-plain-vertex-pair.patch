@@ -1,0 +1,104 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index cad96f3..af058eb 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -72,6 +72,10 @@ static void isaac_coloroffset_fs_probe_note_exact_source(const shader *s);
+ #error "Isaac ColorOffset plain specialization requires its opt-in flag"
+ #endif
+ typedef struct isaac_coloroffset_plain_state isaac_coloroffset_plain_state;
++typedef struct isaac_coloroffset_plain_vertex_pair isaac_coloroffset_plain_vertex_pair;
++#if !defined(HAVE_ISAAC_COLOROFFSET_PLAIN_VERTEX_PAIR) || HAVE_ISAAC_COLOROFFSET_PLAIN_VERTEX_PAIR != 1
++#error "Isaac plain vertex pair requires its opt-in flag"
++#endif
+ _Static_assert(VERTEX_ATTRIBS_NUM == ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES,
+ 	"Isaac GPU draw policy attribute ceiling drifted");
+ _Static_assert(sizeof(SceGxmVertexAttribute) ==
+@@ -482,6 +486,7 @@ typedef struct {
+ 	uint32_t isaac_coloroffset_fs_probe_link_source_generation;
+ #endif
+ 	isaac_coloroffset_plain_state *isaac_coloroffset_plain;
++	isaac_coloroffset_plain_vertex_pair *isaac_plain_vertex_pair;
+ } program;
+ 
+ // Internal shaders and array
+@@ -1643,6 +1648,7 @@ void vglGetIsaacColorOffsetFsProbeStats(vglIsaacColorOffsetFsProbeStats *stats)
+ #endif
+ 
+ #include "isaac_coloroffset_plain_vitagl.h"
++#include "isaac_coloroffset_plain_vertex_pair.h"
+ 
+ #ifdef STRICT_UNIFORMS_COMPLIANCE
+ static inline __attribute__((always_inline)) uniform *get_uniform_from_ptr(GLint ptr, uint32_t *offset) {
+@@ -2502,6 +2508,8 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean
+ }
+ 
+ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, SceGxmIndexSource index_type) {
++	SceGxmVertexProgram *isaac_pair_vertex = NULL;
++	static GLboolean isaac_pair_was_bound = GL_FALSE;
+ #ifdef HAVE_PROFILING
+ 	uint32_t draw_start = sceKernelGetProcessTimeLow();
+ #endif
+@@ -2837,8 +2845,11 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ #endif
+ 			{
+ 				SceGxmFragmentProgram *isaac_probe_fragment = NULL;
+-				if (isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_PLAIN)
+-					isaac_probe_fragment = isaac_coloroffset_plain_select(p);
++				if (isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_PLAIN) {
++					isaac_probe_fragment = isaac_plain_vertex_pair_select(p, &isaac_pair_vertex);
++					if (!isaac_probe_fragment)
++						isaac_probe_fragment = isaac_coloroffset_plain_select(p);
++				}
+ 				if (isaac_probe_fragment) {
+ 					/* Preserve the existing neutral-family request/bound
+ 					 * counters; plain(q,b,f) identifies its exact subset. */
+@@ -2864,6 +2875,9 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ #endif
+ 
+ 	// Uploading new vertex program
++	if (isaac_pair_vertex) {
++		sceGxmSetVertexProgram(gxm_context, isaac_pair_vertex);
++	} else {
+ #ifdef HAVE_ISAAC_GPU_DRAW_OPTIMIZATIONS
+ 	isaac_patch_vertex_program_cached(
+ 		p, p->vshader->id, draw_attributes, p->attr_num,
+@@ -2873,6 +2887,13 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 		p->attr_num, streams, p->attr_num, &p->vprog);
+ #endif
+ 	sceGxmSetVertexProgram(gxm_context, p->vprog);
++	}
++	/* Both VS programs have the same validated 64-byte Transform ABI.
++	 * Rebind, rather than allocate/reupload, when crossing the private path.
++	 * A dirty upload below already installs its new buffer. */
++	if ((isaac_pair_vertex || isaac_pair_was_bound) && !dirty_shader_vert_unifs)
++		vglRestoreVertexUniformBuffer();
++	isaac_pair_was_bound = isaac_pair_vertex ? GL_TRUE : GL_FALSE;
+ 
+ 	// Uploading both fragment and vertex uniforms data
+ 	upload_uniforms();
+@@ -3473,6 +3494,7 @@ GLuint glCreateProgram(void) {
+ 			progs[i].isaac_coloroffset_fs_probe_link_source_generation = 0;
+ #endif
+ 			progs[i].isaac_coloroffset_plain = NULL;
++			progs[i].isaac_plain_vertex_pair = NULL;
+ 			for (j = 0; j < VERTEX_ATTRIBS_NUM; j++) {
+ 				progs[i].attr[j].regIndex = 0xDEAD;
+ 			}
+@@ -3571,6 +3593,7 @@ void glDeleteProgram(GLuint prog) {
+ 		isaac_coloroffset_release_fragment_cache(p);
+ #endif
+ #ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++		isaac_plain_vertex_pair_release(p);
+ 		isaac_coloroffset_plain_release(p);
+ 		isaac_coloroffset_fs_probe_release(p);
+ #endif
+@@ -4043,7 +4066,9 @@ void glLinkProgram(GLuint progr) {
+ 	isaac_coloroffset_record_link(p);
+ #endif
+ #ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++	isaac_plain_vertex_pair_before_link(p);
+ 	isaac_coloroffset_fs_probe_link(p);
+ 	isaac_coloroffset_plain_link(p);
++	isaac_plain_vertex_pair_link(p);
+ #endif
+ }

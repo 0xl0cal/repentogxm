@@ -24,6 +24,17 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+# if !defined(ISAAC_VITA_FULLSPEED_SCHEDULER) || !defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+#  error "full-head advance requires fullspeed cadence and pre-Game service samples"
+# endif
+# define KAGE_VITA_HEAD_ADVANCE 1
+/* Experimental model parameter, NOT a hardware-calibrated optimum. This
+ * advances preparation of a full head only; published render deadlines and
+ * the Game floor are not advanced. Keep smaller than one wrapper period. */
+# define KAGE_VITA_HEAD_ADVANCE_UNITS (4500u * 3u)
+#endif
+
 #ifndef ISAAC_VITA_FULLSPEED_SCHEDULER_BUILD_ID
 # define ISAAC_VITA_FULLSPEED_SCHEDULER_BUILD_ID "cadence30:unstamped"
 #endif
@@ -60,6 +71,15 @@ static uint32_t s_have_game_due;
 static uint64_t s_update_begin_us;
 static uint64_t s_last_update_units;
 static uint32_t s_have_last_update;
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+static uint64_t s_tick_head_us;
+static uint64_t s_pre_game_units;
+static uint32_t s_pre_game_manager;
+static uint32_t s_pre_game_game;
+static uint32_t s_pre_game_counter;
+/* 1: sampled on this full tick; 2: its immediately following non-full tick. */
+static uint32_t s_pre_game_age;
+#endif
 static uint64_t s_render_entry_us;
 static uint64_t s_last_render_units;
 static uint32_t s_have_last_render;
@@ -75,6 +95,64 @@ static uint32_t s_game_update_return_site;
 static uint32_t s_consecutive_full_render_skips;
 static uint32_t s_logged;
 static uint32_t s_disable_logged;
+
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+static uint64_t s_head_advance_credit_units;
+static uint64_t s_head_realign_credit_units;
+static uint64_t s_head_realign_restore_units;
+static uint32_t s_head_expected_manager;
+static uint32_t s_head_expected_game;
+static uint32_t s_head_expected_counter;
+static uint32_t s_head_expected_frame;
+
+static void kage_vita_fullspeed_clear_head_advance(void)
+{
+    s_head_advance_credit_units = 0u;
+    s_head_realign_credit_units = 0u;
+    s_head_realign_restore_units = 0u;
+    s_head_expected_manager = 0u;
+    s_head_expected_game = 0u;
+    s_head_expected_counter = 0u;
+    s_head_expected_frame = 0u;
+}
+
+static uint64_t kage_vita_fullspeed_head_target(uint64_t now_units)
+{
+    uint64_t target;
+
+    /* Predict only from the completed, immediately preceding non-full tick
+     * and its preceding advancing Game sample. Current identity is validated
+     * at Manager entry; a prediction refusal must not invent a guest fault. */
+    if (!s_runtime_enabled || !s_initialized || !s_have_last_due ||
+            now_units >= s_next_due_units || !s_have_game_due ||
+            s_next_game_due_units <= now_units || s_pre_game_age != 2u ||
+            s_pre_game_units > KAGE_VITA_HEAD_ADVANCE_UNITS ||
+            KAGE_VITA_HEAD_ADVANCE_UNITS >= KAGE_VITA_FULLSPEED_TICK_UNITS ||
+            s_next_due_units <= KAGE_VITA_HEAD_ADVANCE_UNITS ||
+            !(s_manager_counter_before & 1u) ||
+            s_manager_counter_before == UINT32_MAX ||
+            s_pre_game_counter == UINT32_MAX ||
+            s_pre_game_counter + 1u != s_manager_counter_before ||
+            !s_game_pointer || s_pre_game_manager != s_manager_pointer ||
+            s_pre_game_game != s_game_pointer ||
+            s_game_frame_before != s_game_frame_after ||
+            !s_have_last_update || !s_have_last_render ||
+            s_last_update_units > UINT64_MAX - s_last_render_units ||
+            s_last_update_units + s_last_render_units >=
+                KAGE_VITA_FULLSPEED_GAME_TICK_UNITS ||
+            (s_tick_flags & (KAGE_VITA_TICK_MANAGER_COUNTER_REBASE |
+                             KAGE_VITA_TICK_GAME_POINTER_PUBLISH)))
+        return s_next_due_units;
+    target = s_next_due_units - KAGE_VITA_HEAD_ADVANCE_UNITS;
+    if (target <= s_last_due_units)
+        return s_next_due_units;
+    s_head_expected_manager = s_manager_pointer;
+    s_head_expected_game = s_game_pointer;
+    s_head_expected_counter = s_manager_counter_before + 1u;
+    s_head_expected_frame = s_game_frame_after;
+    return target;
+}
+#endif
 
 static void kage_vita_fullspeed_add_u32(
     uint32_t *value, uint64_t increment)
@@ -118,6 +196,10 @@ static int kage_vita_fullspeed_zero_frame_site(uint32_t site)
 
 static void kage_vita_fullspeed_disable(void)
 {
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    kage_vita_fullspeed_clear_head_advance();
+    s_pre_game_age = 0u;
+#endif
     if (s_runtime_enabled) {
         s_runtime_enabled = 0u;
         s_render_decision = 1u;
@@ -314,6 +396,28 @@ static void kage_vita_fullspeed_pace_game_update(void)
         kage_vita_fullspeed_disable();
         return;
     }
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    /* The original floor may recover a clock retreat by waiting. Do not let
+     * that successful wait make credit from the old head clock epoch live
+     * again; use this existing pre-floor clock read, not another sample. */
+    if (now_us < s_tick_head_us || now_us < s_last_clock_us)
+        kage_vita_fullspeed_clear_head_advance();
+#endif
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+    /* Reuse the two existing clock reads.  The head timestamp is AFTER its
+     * wait; this one is BEFORE the Game floor wait.  Thus this sample includes
+     * input/service/Manager prologue, but neither sleep nor Game::Update. */
+    s_pre_game_age = 0u;
+    if (now_us >= s_tick_head_us &&
+            kage_vita_fullspeed_clock_units(
+                now_us - s_tick_head_us, &s_pre_game_units) &&
+            s_pre_game_units < KAGE_VITA_FULLSPEED_GAME_TICK_UNITS) {
+        s_pre_game_manager = s_manager_pointer;
+        s_pre_game_game = s_game_pointer;
+        s_pre_game_counter = s_manager_counter_before;
+        s_pre_game_age = 1u;
+    }
+#endif
     uint64_t floor_anchor_units;
     uint64_t floor_wait_units = 0u;
     uint32_t waited_for_floor = 0u;
@@ -349,9 +453,15 @@ static void kage_vita_fullspeed_pace_game_update(void)
 #endif
         if (wait_result == 0)
             return;
-        if (wait_result == 2)
+        if (wait_result == 2) {
             s_have_game_due = 0u;
-        else if (wait_result == 1) {
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+            kage_vita_fullspeed_clear_head_advance();
+#endif
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+            s_pre_game_age = 0u;
+#endif
+        } else if (wait_result == 1) {
             waited_for_floor = 1u;
             if (now_units > before_units)
                 floor_wait_units = now_units - before_units;
@@ -432,12 +542,32 @@ static void kage_vita_fullspeed_pace_game_update(void)
                   KAGE_VITA_FULLSPEED_GAME_TICK_UNITS)) &&
             floor_wait_units > 0u &&
             s_next_due_units <= UINT64_MAX - floor_wait_units)
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    {
+        uint64_t credit = s_head_advance_credit_units;
+        if (s_tick_flags & (KAGE_VITA_TICK_MANAGER_COUNTER_REBASE |
+                            KAGE_VITA_TICK_GAME_POINTER_PUBLISH))
+            credit = 0u;
+        if (credit > floor_wait_units)
+            credit = floor_wait_units;
+        /* The original overflow guard covers restore as well as the smaller
+         * adjusted deadline. Retain all recovery not caused by early service.
+         * A zero-frame return below restores the original forward shift. */
+        s_head_realign_restore_units = s_next_due_units + floor_wait_units;
+        s_head_realign_credit_units = credit;
+        s_next_due_units = s_head_realign_restore_units - credit;
+    }
+#else
         s_next_due_units += floor_wait_units;
+#endif
     s_last_clock_us = now_us;
 }
 
 static void kage_vita_fullspeed_scheduler_clear(uint32_t runtime_enabled)
 {
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    kage_vita_fullspeed_clear_head_advance();
+#endif
     s_next_due_units = 0u;
     s_current_due_units = 0u;
     s_last_due_units = 0u;
@@ -452,6 +582,14 @@ static void kage_vita_fullspeed_scheduler_clear(uint32_t runtime_enabled)
     s_update_begin_us = 0u;
     s_last_update_units = 0u;
     s_have_last_update = 0u;
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+    s_tick_head_us = 0u;
+    s_pre_game_units = 0u;
+    s_pre_game_manager = 0u;
+    s_pre_game_game = 0u;
+    s_pre_game_counter = 0u;
+    s_pre_game_age = 0u;
+#endif
     s_render_entry_us = 0u;
     s_last_render_units = 0u;
     s_have_last_render = 0u;
@@ -484,12 +622,21 @@ void kage_vita_fullspeed_scheduler_deactivate(void)
 
 void kage_vita_fullspeed_scheduler_note_loop_head(void)
 {
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    kage_vita_fullspeed_clear_head_advance();
+#endif
     uint64_t now_us = isaac_vita_get_process_time();
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+    uint32_t pre_game_clock_ok = now_us >= s_last_clock_us;
+#endif
     uint64_t now_units;
     uint64_t due_ticks = 1u;
     uint64_t dropped = 0u;
     uint64_t debt_units = 0u;
     int wait_result;
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    uint64_t head_target;
+#endif
 
     kage_vita_fullspeed_finish_previous_tick();
     if (!kage_vita_fullspeed_clock_units(now_us, &now_units)) {
@@ -506,20 +653,51 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
         s_have_last_due = 0u;
     }
 
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    head_target = pre_game_clock_ok ?
+        kage_vita_fullspeed_head_target(now_units) : s_next_due_units;
+    if (s_runtime_enabled && now_units < head_target) {
+        wait_result = kage_vita_fullspeed_wait_until(
+            head_target, &now_us, &now_units);
+#else
     if (s_runtime_enabled && now_units < s_next_due_units) {
         wait_result = kage_vita_fullspeed_wait_until(
             s_next_due_units, &now_us, &now_units);
+#endif
         if (wait_result == 2) {
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+            kage_vita_fullspeed_clear_head_advance();
+#endif
             s_next_due_units = now_units;
             s_have_last_due = 0u;
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+            pre_game_clock_ok = 0u;
+#endif
         }
     }
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    if (s_runtime_enabled && s_head_expected_manager &&
+            now_units < s_next_due_units) {
+        s_head_advance_credit_units = s_next_due_units - now_units;
+        /* wait_until never accepts a clock before its requested target. */
+        if (s_head_advance_credit_units > KAGE_VITA_HEAD_ADVANCE_UNITS)
+            kage_vita_fullspeed_disable();
+    }
+#endif
 
     if (s_runtime_enabled) {
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+        if (now_units < s_next_due_units && !s_head_advance_credit_units) {
+#else
         if (now_units < s_next_due_units) {
+#endif
             kage_vita_fullspeed_disable();
         } else {
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+            due_ticks = now_units < s_next_due_units ? 1u :
+#else
             due_ticks =
+#endif
                 (now_units - s_next_due_units) /
                 KAGE_VITA_FULLSPEED_TICK_UNITS + 1u;
             if (due_ticks > KAGE_VITA_FULLSPEED_MAX_DUE_TICKS) {
@@ -541,7 +719,12 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
                 kage_vita_fullspeed_disable();
             } else {
                 s_next_due_units += KAGE_VITA_FULLSPEED_TICK_UNITS;
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+                debt_units = now_units < s_current_due_units ? 0u :
+                    now_units - s_current_due_units;
+#else
                 debt_units = now_units - s_current_due_units;
+#endif
                 if (s_have_last_due &&
                         s_current_due_units <= s_last_due_units)
                     kage_vita_fullspeed_sequence_failure();
@@ -559,6 +742,15 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
     }
 
     s_last_clock_us = now_us;
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+    if (s_runtime_enabled && pre_game_clock_ok &&
+            now_us >= s_tick_head_us &&
+            s_pre_game_age == 1u)
+        s_pre_game_age = 2u;
+    else
+        s_pre_game_age = 0u;
+    s_tick_head_us = now_us;
+#endif
     s_tick_flags = 0u;
     s_render_decision = 1u;
     s_manager_pointer = 0u;
@@ -576,7 +768,14 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
             "KAGE VITA CADENCE30: bid=%.32s tick_units=%u "
             "game_tick_units=%u max_catchup=%u stale_catchup=%u "
             "max_full_skip=%u "
-            "parity=4a264 frame=1a30dc",
+            "parity=4a264 frame=1a30dc"
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+            " reserve=pre-game"
+#endif
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+            " head-advance=4500us-experimental"
+#endif
+            ,
             ISAAC_VITA_FULLSPEED_SCHEDULER_BUILD_ID,
             (unsigned)KAGE_VITA_FULLSPEED_TICK_UNITS,
             (unsigned)KAGE_VITA_FULLSPEED_GAME_TICK_UNITS,
@@ -620,6 +819,19 @@ void kage_vita_fullspeed_scheduler_note_manager_entry(
     s_game_pointer = game_pointer;
     s_game_frame_before = game_frame;
     s_game_frame_after = game_frame;
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    if (s_head_expected_manager &&
+            (manager_pointer != s_head_expected_manager ||
+             game_pointer != s_head_expected_game ||
+             manager_counter != s_head_expected_counter ||
+             game_frame != s_head_expected_frame)) {
+        /* The service may already have run early once during a transition.
+         * Never promote a prediction miss into a new cadence violation. The
+         * existing rebase/publication/sequence checks remain authoritative. */
+        kage_vita_fullspeed_clear_head_advance();
+        s_pre_game_age = 0u;
+    }
+#endif
 }
 
 void kage_vita_fullspeed_scheduler_note_manager_counter_rebase(
@@ -655,6 +867,10 @@ void kage_vita_fullspeed_scheduler_note_manager_counter_rebase(
     }
 
     s_manager_counter_before = new_manager_counter;
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    kage_vita_fullspeed_clear_head_advance();
+    s_pre_game_age = 0u;
+#endif
     kage_vita_fullspeed_add_u32(
         &s_counters.manager_counter_rebases, 1u);
 }
@@ -693,6 +909,10 @@ void kage_vita_fullspeed_scheduler_note_game_pointer_publish(
     }
 
     s_game_pointer = new_game_pointer;
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    kage_vita_fullspeed_clear_head_advance();
+    s_pre_game_age = 0u;
+#endif
     kage_vita_fullspeed_add_u32(&s_counters.game_pointer_rebinds, 1u);
 }
 
@@ -738,6 +958,9 @@ void kage_vita_fullspeed_scheduler_note_game_update_early_return(
 void kage_vita_fullspeed_scheduler_note_game_update_end(
     uint32_t game_pointer, uint32_t game_frame)
 {
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    uint32_t return_clock_ok = 0u;
+#endif
     if (!kage_vita_fullspeed_note_flag_once(KAGE_VITA_TICK_GAME_END))
         return;
     {
@@ -752,9 +975,19 @@ void kage_vita_fullspeed_scheduler_note_game_update_end(
                     end_us - s_update_begin_us, &elapsed_units)) {
             s_last_update_units = elapsed_units;
             s_have_last_update = 1u;
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+            return_clock_ok = end_us <= UINT64_MAX / 3u &&
+                end_us >= s_last_clock_us;
+#endif
         }
     }
     s_game_frame_after = game_frame;
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+    /* Pause/Exit zero-frame returns are valid, but must not seed gameplay's
+     * next-start prediction.  Pointer/counter identity is checked at use. */
+    if (game_frame != s_game_frame_before + 1u)
+        s_pre_game_age = 0u;
+#endif
     s_counters.game_update_last_return_site = s_game_update_return_site;
     s_counters.game_update_last_frame_before = s_game_frame_before;
     s_counters.game_update_last_frame_after = game_frame;
@@ -780,6 +1013,25 @@ void kage_vita_fullspeed_scheduler_note_game_update_end(
             &s_counters.game_frame_violations, 1u);
         kage_vita_fullspeed_disable();
     }
+#if defined(KAGE_VITA_HEAD_ADVANCE)
+    if (s_head_realign_credit_units) {
+        if (!return_clock_ok) {
+            kage_vita_fullspeed_add_u32(&s_counters.clock_resets, 1u);
+            kage_vita_fullspeed_disable();
+        } else if (game_frame != s_game_frame_before + 1u) {
+            /* This is a valid paused/Exit return (invalid returns already
+             * disabled above). Restore exactly the old forward realignment;
+             * the early head must not grant credit to future paused ticks. */
+            if (s_head_realign_credit_units <= s_head_realign_restore_units &&
+                    s_next_due_units == s_head_realign_restore_units -
+                        s_head_realign_credit_units)
+                s_next_due_units = s_head_realign_restore_units;
+            else
+                kage_vita_fullspeed_sequence_failure();
+        }
+    }
+    kage_vita_fullspeed_clear_head_advance();
+#endif
 }
 
 int kage_vita_fullspeed_scheduler_plan_render(
@@ -888,9 +1140,24 @@ int kage_vita_fullspeed_scheduler_plan_render(
             kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
             return 0;
         }
+        uint64_t next_start_reserve_units = s_last_update_units;
+#if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+        /* The floor is the next Game::Update START, not its completion.
+         * Reserve the work before that start, not the update body after it.
+         * Use only the preceding advancing full tick of this same Manager /
+         * Game epoch.  Unknown, stale or oversized samples keep stock policy.
+         * Like last Render, this is a prediction, not a bound on future work. */
+        if (s_pre_game_age == 2u &&
+                s_pre_game_manager == manager_pointer &&
+                s_pre_game_game == game_pointer &&
+                s_manager_counter_before == s_pre_game_counter + 1u)
+            next_start_reserve_units = s_pre_game_units;
+#endif
         /* Admit the interpolated frame only if, at the measured cost of the
          * last Render, it finishes before the next Game::Update floor with
-         * room for that update.  Otherwise the frame is paid for by delaying
+         * the selected next-start reserve left over (stock uses the update
+         * body; the opt-in above uses pre-Game service).  Otherwise the frame
+         * is paid for by delaying
          * the simulation: Bundle32 rooms with a 20-ms render presented 46 per
          * 120 ticks at 27 UPS, alternating a full render, an interpolated
          * render that ran past the floor, a late update and a skipped full
@@ -904,10 +1171,10 @@ int kage_vita_fullspeed_scheduler_plan_render(
          * 30 FPS with 60 non-full skips per window against 43 FPS before. */
         if (s_have_game_due && s_have_last_render && s_have_last_update &&
                 s_next_game_due_units > now_units &&
-                s_last_render_units <= UINT64_MAX - s_last_update_units &&
+                s_last_render_units <= UINT64_MAX - next_start_reserve_units &&
                 now_units <= UINT64_MAX -
-                    (s_last_render_units + s_last_update_units) &&
-                now_units + s_last_render_units + s_last_update_units >
+                    (s_last_render_units + next_start_reserve_units) &&
+                now_units + s_last_render_units + next_start_reserve_units >
                     s_next_game_due_units) {
             s_render_decision = 0u;
             kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);

@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(ISAAC_VITA_HEAP_TERMINAL_FASTPATH) && ISAAC_VITA_HEAP_TERMINAL_FASTPATH
+#include <pthread.h>
+#include <stdatomic.h>
+#endif
 
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/sysmem.h>
@@ -1579,6 +1583,67 @@ static int test_drain_only_statuses(void)
     return 0;
 }
 
+static int check_terminal_observer(int expected)
+{
+    isaac_vita_guest_heap_test_probe_stats before, after;
+    unsigned i;
+
+    CHECK(isaac_vita_guest_heap_test_probe_stats_snapshot(&before));
+    for (i = 0U; i < 64U; ++i)
+        CHECK(isaac_vita_guest_heap_terminal() == expected);
+    CHECK(isaac_vita_guest_heap_test_probe_stats_snapshot(&after));
+    /* The second snapshot itself still acquires the allocator lock. */
+#if defined(ISAAC_VITA_HEAP_TERMINAL_FASTPATH) && ISAAC_VITA_HEAP_TERMINAL_FASTPATH
+    CHECK(after.lock_acquisitions == before.lock_acquisitions + 1U);
+#else
+    CHECK(after.lock_acquisitions == before.lock_acquisitions + 65U);
+#endif
+    return 0;
+}
+
+#if defined(ISAAC_VITA_HEAP_TERMINAL_FASTPATH) && ISAAC_VITA_HEAP_TERMINAL_FASTPATH
+static atomic_int s_terminal_reader_started;
+static atomic_int s_terminal_writer_done;
+
+static void *terminal_reader(void *unused)
+{
+    int seen_terminal = 0;
+    (void)unused;
+    atomic_store_explicit(&s_terminal_reader_started, 1, memory_order_release);
+    do {
+        int terminal = isaac_vita_guest_heap_terminal();
+        if (seen_terminal && !terminal)
+            return (void *)(uintptr_t)1U;
+        seen_terminal |= terminal;
+    } while (!atomic_load_explicit(&s_terminal_writer_done, memory_order_acquire));
+    return isaac_vita_guest_heap_terminal() ? NULL : (void *)(uintptr_t)1U;
+}
+
+static int test_terminal_observer_thread(void)
+{
+    pthread_t reader;
+    void *reader_result = (void *)(uintptr_t)1U;
+
+    CHECK(oracle_init());
+    CHECK(check_terminal_observer(0) == 0);
+    atomic_store_explicit(&s_terminal_reader_started, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_terminal_writer_done, 0, memory_order_relaxed);
+    CHECK(pthread_create(&reader, NULL, terminal_reader, NULL) == 0);
+    while (!atomic_load_explicit(&s_terminal_reader_started, memory_order_acquire)) {
+    }
+    /* Reinitialization is a real production terminal setter. Only the writer
+     * touches the fake allocator; the concurrent reader observes the latch. */
+    CHECK(!oracle_init());
+    atomic_store_explicit(&s_terminal_writer_done, 1, memory_order_release);
+    CHECK(pthread_join(reader, &reader_result) == 0 && !reader_result);
+    CHECK(check_terminal_observer(1) == 0);
+    /* Test-only reset is deliberately after the observer has joined. */
+    CHECK(oracle_reset());
+    CHECK(check_terminal_observer(0) == 0);
+    return 0;
+}
+#endif
+
 static int test_ready_raw_terminal_latch(void)
 {
     isaac_vita_guest_heap_test_result result;
@@ -1588,6 +1653,7 @@ static int test_ready_raw_terminal_latch(void)
     size_t mspace_free_calls;
 
     CHECK(oracle_init());
+    CHECK(check_terminal_observer(0) == 0);
     pointer = isaac_vita_guest_heap_test_malloc_ex(64U, &result, NULL);
     CHECK(pointer && result == ISAAC_VITA_GUEST_HEAP_TEST_OK &&
           !isaac_vita_heap_overflow_mspace_contains(pointer));
@@ -1602,6 +1668,7 @@ static int test_ready_raw_terminal_latch(void)
           isaac_vita_guest_heap_owns(pointer) &&
           s_native_free_calls == native_free_calls &&
           s_mspace_free_calls == mspace_free_calls);
+    CHECK(check_terminal_observer(1) == 0);
     CHECK(isaac_vita_heap_overflow_mspace_snapshot_get(&snapshot) &&
           snapshot.state == ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY);
     CHECK(isaac_vita_guest_heap_test_restore_empty());
@@ -1611,6 +1678,7 @@ static int test_ready_raw_terminal_latch(void)
           isaac_vita_guest_heap_terminal());
     CHECK(oracle_reset());
     CHECK(!isaac_vita_guest_heap_terminal());
+    CHECK(check_terminal_observer(0) == 0);
     return 0;
 }
 
@@ -2475,6 +2543,16 @@ static int test_room_cold_invariant_terminal_mode(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--terminal-observer") == 0) {
+        CHECK(test_ranges_and_setup() == 0);
+        CHECK(test_ready_raw_terminal_latch() == 0);
+#if defined(ISAAC_VITA_HEAP_TERMINAL_FASTPATH) && ISAAC_VITA_HEAP_TERMINAL_FASTPATH
+        CHECK(test_terminal_observer_thread() == 0);
+#endif
+        CHECK(s_bad_api_calls == 0U && oracle_live_memblocks() == 0U);
+        puts("Vita heap terminal observer oracle: PASS");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--room-commit-terminal") == 0) {
         CHECK(test_room_commit_terminal_mode() == 0);
         CHECK(s_bad_api_calls == 0U);

@@ -16,6 +16,7 @@
 #endif
 
 #include "host_vita_heap.h"
+#include "kage_vita_deep_profile.h"
 #include "host_vita_import_id.h"
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
 #include "guest_pe.h"
@@ -282,7 +283,25 @@ enum vita_heap_init_state {
 };
 
 static int s_heap_init_state;
+#if defined(ISAAC_VITA_HEAP_TERMINAL_FASTPATH) && ISAAC_VITA_HEAP_TERMINAL_FASTPATH
+/* Production only moves 0 -> 1, under s_ledger_lock. The sole reset is the
+ * quiescent host-test reset below. This observer does not grant heap ownership:
+ * allocation/domain/telemetry operations still acquire s_ledger_lock and check
+ * their own state. Publishing terminal early can only reject a caller; no
+ * unlocked reader consumes the mutable ledger or terminal telemetry fields.
+ * Keep locked reads relaxed, not implicit seq_cst atomic lvalue accesses. */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "heap terminal observer requires lock-free atomic int");
+static atomic_int s_heap_terminal;
+#define VITA_HEAP_TERMINAL_LOCKED() \
+    atomic_load_explicit(&s_heap_terminal, memory_order_relaxed)
+#define VITA_HEAP_TERMINAL_STORE_LOCKED(value) \
+    atomic_store_explicit(&s_heap_terminal, (value), memory_order_release)
+#else
 static int s_heap_terminal;
+#define VITA_HEAP_TERMINAL_LOCKED() (s_heap_terminal)
+#define VITA_HEAP_TERMINAL_STORE_LOCKED(value) (s_heap_terminal = (value))
+#endif
 
 enum vita_heap_telemetry_edge {
     VITA_HEAP_TELEMETRY_EDGE_FIRST_USE = 1U << 0,
@@ -1039,7 +1058,7 @@ static void vita_heap_floor_lifetime_snapshot_locked(
     else
         valid = 0U;
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
-    snapshot->terminal = s_heap_terminal ? 1U : 0U;
+    snapshot->terminal = VITA_HEAP_TERMINAL_LOCKED() ? 1U : 0U;
 #endif
     snapshot->counter_saturated =
         s_floor_lifetime.counter_saturated;
@@ -1737,7 +1756,7 @@ static void vita_heap_telemetry_snapshot_locked(
         snapshot->mspace_state =
             (uint32_t)ISAAC_VITA_HEAP_OVERFLOW_MSPACE_FAILED;
     }
-    snapshot->terminal = s_heap_terminal ? 1U : 0U;
+    snapshot->terminal = VITA_HEAP_TERMINAL_LOCKED() ? 1U : 0U;
     snapshot->accounting_valid =
         s_heap_telemetry.active && s_heap_telemetry.accounting_valid && raw_ok
             ? 1U : 0U;
@@ -1801,7 +1820,7 @@ static void vita_heap_telemetry_emit(const vita_heap_telemetry_event *event)
 {
     uint32_t edge;
 
-    if (!event)
+    if (!event || !event->edges)
         return;
     for (edge = 1U; edge <= VITA_HEAP_TELEMETRY_EDGE_FINAL; edge <<= 1U) {
         const isaac_vita_guest_heap_telemetry_snapshot *s;
@@ -1985,9 +2004,9 @@ static void vita_heap_router_result_set(
      * durable latch for callers of the public pointer-only API, including
      * terminal ledger invariants which leave the raw mspace itself READY. */
     if (result == VITA_HEAP_ROUTER_TERMINAL) {
-        int first_terminal = !s_heap_terminal;
+        int first_terminal = !VITA_HEAP_TERMINAL_LOCKED();
 
-        s_heap_terminal = 1;
+        VITA_HEAP_TERMINAL_STORE_LOCKED(1);
         if (first_terminal) {
             vita_heap_telemetry_claim_locked(
                 event, VITA_HEAP_TELEMETRY_EDGE_TERMINAL);
@@ -2066,9 +2085,9 @@ static int vita_heap_initialize_locked(
 #endif
 
     if (s_heap_init_state != VITA_HEAP_INIT_UNINITIALIZED ||
-        s_heap_terminal) {
+        VITA_HEAP_TERMINAL_LOCKED()) {
         s_heap_init_state = VITA_HEAP_INIT_FAILED;
-        s_heap_terminal = 1;
+        VITA_HEAP_TERMINAL_STORE_LOCKED(1);
         return 0;
     }
     if (heap_bytes != VITA_HEAP_REQUIRED_NEWLIB_BYTES ||
@@ -2076,7 +2095,7 @@ static int vita_heap_initialize_locked(
             link_end, heap_bytes, stack_floor, stack_ceiling, &ranges) ||
         s_ledger_count || s_heap_lease_count) {
         s_heap_init_state = VITA_HEAP_INIT_FAILED;
-        s_heap_terminal = 1;
+        VITA_HEAP_TERMINAL_STORE_LOCKED(1);
         return 0;
     }
 #if defined(__vita__)
@@ -2099,7 +2118,7 @@ static int vita_heap_initialize_locked(
                 VITA_HEAP_LEDGER_FIXED_USABLE_BYTES, &ledger_request) ||
             ledger_request != VITA_HEAP_LEDGER_FIXED_REQUEST_BYTES) {
             s_heap_init_state = VITA_HEAP_INIT_FAILED;
-            s_heap_terminal = 1;
+            VITA_HEAP_TERMINAL_STORE_LOCKED(1);
             return 0;
         }
     }
@@ -2111,7 +2130,7 @@ static int vita_heap_initialize_locked(
     if (s_ledger_capacity != VITA_HEAP_LEDGER_FIXED_CAPACITY &&
         !vita_heap_ledger_rehash(VITA_HEAP_LEDGER_FIXED_CAPACITY)) {
         s_heap_init_state = VITA_HEAP_INIT_FAILED;
-        s_heap_terminal = 1;
+        VITA_HEAP_TERMINAL_STORE_LOCKED(1);
         return 0;
     }
     s_ledger_fixed_capacity = 1;
@@ -2126,7 +2145,7 @@ static int vita_heap_initialize_locked(
         snapshot.internal_live_count ||
         snapshot.internal_requested_bytes) {
         s_heap_init_state = VITA_HEAP_INIT_FAILED;
-        s_heap_terminal = 1;
+        VITA_HEAP_TERMINAL_STORE_LOCKED(1);
         return 0;
     }
 #ifdef ISAAC_VITA_ROOM_ENTRY_HYBRID
@@ -2134,7 +2153,7 @@ static int vita_heap_initialize_locked(
     raw_request.end = snapshot.end;
     if (!isaac_vita_room_entry_external_init(&ranges, &raw_request)) {
         s_heap_init_state = VITA_HEAP_INIT_FAILED;
-        s_heap_terminal = 1;
+        VITA_HEAP_TERMINAL_STORE_LOCKED(1);
         return 0;
     }
 #endif
@@ -2144,7 +2163,7 @@ static int vita_heap_initialize_locked(
     vita_heap_telemetry_validate_locked();
     if (!s_heap_telemetry.accounting_valid) {
         s_heap_init_state = VITA_HEAP_INIT_FAILED;
-        s_heap_terminal = 1;
+        VITA_HEAP_TERMINAL_STORE_LOCKED(1);
         return 0;
     }
     s_heap_init_state = VITA_HEAP_INIT_READY;
@@ -2189,7 +2208,7 @@ static int vita_heap_new_allocation_ready_locked(void)
      * router branch sets the durable terminal latch before unlocking.  The
      * latch is therefore the exact hot-path readiness cache; polling a raw
      * snapshot here would tax even allocations satisfied by newlib. */
-    return !s_heap_terminal &&
+    return !VITA_HEAP_TERMINAL_LOCKED() &&
         s_heap_init_state == VITA_HEAP_INIT_READY;
 }
 
@@ -2644,7 +2663,7 @@ static void *vita_heap_guest_realloc_impl(void *pointer, size_t size,
 
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (!old_is_overflow) {
-        if (s_heap_terminal) {
+        if (VITA_HEAP_TERMINAL_LOCKED()) {
             vita_heap_router_result_set(
                 router_result, VITA_HEAP_ROUTER_TERMINAL, &telemetry);
             vita_heap_unlock_with_telemetry(&telemetry);
@@ -2661,7 +2680,7 @@ static void *vita_heap_guest_realloc_impl(void *pointer, size_t size,
          * after the durable terminal latch has fired. */
         if ((overflow_state != ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY &&
              overflow_state != ISAAC_VITA_HEAP_OVERFLOW_MSPACE_DRAIN_ONLY) ||
-            (s_heap_terminal &&
+            (VITA_HEAP_TERMINAL_LOCKED() &&
              overflow_state != ISAAC_VITA_HEAP_OVERFLOW_MSPACE_DRAIN_ONLY)) {
             vita_heap_router_result_set(
                 router_result, VITA_HEAP_ROUTER_TERMINAL, &telemetry);
@@ -3044,7 +3063,7 @@ static isaac_vita_room_entry_slab_result vita_heap_room_slab_realloc_route(
         vita_heap_telemetry_event_init(
             &heap_event, VITA_HEAP_TELEMETRY_OP_REALLOC, size);
         vita_heap_lock();
-        if (s_heap_terminal) {
+        if (VITA_HEAP_TERMINAL_LOCKED()) {
             vita_heap_router_result cleanup_result;
 
             finish_ok = isaac_vita_room_entry_slab_realloc_cancel_locked(
@@ -3205,12 +3224,16 @@ int isaac_vita_guest_heap_owns(const void *pointer)
 int isaac_vita_guest_heap_terminal(void)
 {
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
+#if defined(ISAAC_VITA_HEAP_TERMINAL_FASTPATH) && ISAAC_VITA_HEAP_TERMINAL_FASTPATH
+    return atomic_load_explicit(&s_heap_terminal, memory_order_acquire);
+#else
     int result;
 
     vita_heap_lock();
     result = s_heap_terminal;
     vita_heap_unlock();
     return result;
+#endif
 #else
     return 0;
 #endif
@@ -3253,6 +3276,105 @@ void isaac_vita_guest_heap_telemetry_log_final(void)
 #ifdef ISAAC_VITA_ROOM_ENTRY_SLAB
     isaac_vita_room_entry_slab_log_event(&slab_event);
 #endif
+}
+#endif
+
+#ifdef ISAAC_VITA_HEAP_CENSUS
+/* ph120.mem (kage_vita_phase_profile.c) and the bad_alloc death line
+ * (entry_vita.c).  One lock section, scalar copies only: no mallinfo, no
+ * allocation, no logging under the lock.  The OGG slot count is read after
+ * unlocking from the slot module's own lock. */
+int isaac_vita_guest_heap_census_window_locked_get(
+    isaac_vita_guest_heap_census_locked *out)
+{
+    if (!out)
+        return 0;
+    memset(out, 0, sizeof *out);
+#ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
+    out->heap_total_bytes = VITA_HEAP_REQUIRED_NEWLIB_BYTES;
+#else
+    /* CMake requires the overflow router for the census; a host oracle
+     * compiled without it still gets the 81 MiB contract (CMake
+     * ISAAC_VITA_HEAP_MB, platform.c _newlib_heap_size_user). */
+    out->heap_total_bytes = 0x05100000U;
+#endif
+    out->valid = 1U;
+    vita_heap_lock();
+#if SIZE_MAX > UINT32_MAX
+    if (s_ledger_count > UINT32_MAX) {
+        out->ledger_live_count = UINT32_MAX;
+        out->valid = 0U;
+    }
+    else
+#endif
+        out->ledger_live_count = (uint32_t)s_ledger_count;
+#ifdef ISAAC_VITA_HEAP_RANGE_LEASE
+    /* Exact live requested bytes: the floor-lifetime module keeps the total
+     * on every ledger insert/remove.  mi(u) - led(b) - slab(b) is the only
+     * handle on host newlib residents the ledger can never attribute. */
+    out->ledger_live_requested_bytes =
+        s_floor_lifetime.total_requested_bytes;
+    if (!s_floor_lifetime.accounting_valid ||
+        s_floor_lifetime.counter_saturated ||
+        s_floor_lifetime.total_count != out->ledger_live_count)
+        out->valid = 0U;
+#endif
+#ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
+    {
+        isaac_vita_heap_overflow_mspace_snapshot raw;
+
+        if (s_heap_init_state != VITA_HEAP_INIT_READY)
+            out->valid = 0U;
+        out->terminal = VITA_HEAP_TERMINAL_LOCKED() ? 1U : 0U;
+        out->overflow_live_count = s_heap_telemetry.owned_live_count;
+        out->overflow_live_requested_bytes =
+            s_heap_telemetry.owned_requested_bytes;
+        out->overflow_native_failures = s_heap_telemetry.native_failures;
+        out->overflow_pool_failures = s_heap_telemetry.pool_failures;
+        if (!s_heap_telemetry.active ||
+            !s_heap_telemetry.accounting_valid ||
+            s_heap_telemetry.counter_saturated)
+            out->valid = 0U;
+        if (isaac_vita_heap_overflow_mspace_snapshot_get(&raw) &&
+            raw.capacity_bytes <= UINT32_MAX &&
+            raw.internal_requested_bytes <= UINT32_MAX) {
+            out->overflow_capacity_bytes = (uint32_t)raw.capacity_bytes;
+            out->overflow_internal_requested_bytes =
+                (uint32_t)raw.internal_requested_bytes;
+            if (raw.state != ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY ||
+                !raw.has_mspace)
+                out->valid = 0U;
+        }
+        else {
+            out->valid = 0U;
+        }
+    }
+#endif
+#ifdef ISAAC_VITA_ROOM_ENTRY_SLAB
+    {
+        isaac_vita_room_entry_slab_fast_snapshot room;
+
+        out->slab_page_bytes = ISAAC_VITA_ROOM_ENTRY_SLAB_PAGE_BYTES;
+        if (isaac_vita_room_entry_slab_fast_snapshot_locked(&room)) {
+            out->slab_pages = room.pages;
+            out->slab_live_slots = room.live_slots;
+            if (room.terminal)
+                out->terminal = 1U;
+            if (room.counter_saturated)
+                out->valid = 0U;
+        }
+        else {
+            out->slab_pages = UINT32_MAX;
+            out->slab_live_slots = UINT32_MAX;
+            out->valid = 0U;
+        }
+    }
+#endif
+    vita_heap_unlock();
+#ifdef ISAAC_VITA_OGG_EMERGENCY
+    out->ogg_slot_live = isaac_vita_ogg_emergency_live_count();
+#endif
+    return out->valid != 0U;
 }
 #endif
 
@@ -3497,7 +3619,7 @@ static void vita_stage_memory_snapshot_locked(
             s_heap_telemetry.owned_requested_bytes;
         snapshot->counter_saturated |=
             s_heap_telemetry.counter_saturated;
-        snapshot->terminal |= s_heap_terminal ? 1U : 0U;
+        snapshot->terminal |= VITA_HEAP_TERMINAL_LOCKED() ? 1U : 0U;
         if (!s_heap_telemetry.active ||
             !s_heap_telemetry.accounting_valid || !raw_ok) {
             snapshot->valid = 0U;
@@ -4110,7 +4232,16 @@ static void vita_heap_room_slab_unlock(
 #ifdef ISAAC_VITA_HEAP_RANGE_LEASE
 #if defined(ISAAC_VITA_PNG_NATIVE_UNFILTER) || \
     defined(ISAAC_VITA_PNG_INFLATE_FLUSH_FASTPATH) || \
-    defined(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH)
+    defined(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH) || \
+    defined(ISAAC_VITA_WAV_BUFFERED_REWIND) || \
+    defined(ISAAC_VITA_ARCHIVE_XOR_FASTPATH) || \
+    defined(ISAAC_VITA_LIGHT_SURFACE_RASTER_416) || \
+    (defined(ISAAC_VITA_RENDER_SURFACE_RASTER_432) && \
+     ISAAC_VITA_RENDER_SURFACE_RASTER_432) || \
+    defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE) || \
+    defined(ISAAC_VITA_ROOM_GRID_INIT_NATIVE) || \
+    defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH) || \
+    defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION)
 static size_t vita_heap_free_lease_slot(void)
 {
     size_t index;
@@ -4829,7 +4960,7 @@ int isaac_vita_guest_heap_test_storage_reset(void)
 #endif
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     s_heap_init_state = VITA_HEAP_INIT_UNINITIALIZED;
-    s_heap_terminal = 0;
+    VITA_HEAP_TERMINAL_STORE_LOCKED(0);
     s_heap_test_fail_raw_free = 0U;
     memset(&s_heap_telemetry, 0, sizeof s_heap_telemetry);
 #endif
@@ -5158,6 +5289,7 @@ static void vita_heap_callnewh(CPU *__restrict c)
 
 static void vita_heap_free(CPU *__restrict c)
 {
+    KAGE_VITA_DEEP_SCOPE(KVD_HEAP_FREE);
     uint32_t pointer = vita_heap_arg(c, 0U);
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (isaac_vita_guest_heap_terminal()) {
@@ -5176,6 +5308,17 @@ static void vita_heap_free(CPU *__restrict c)
             return;
         }
         if (emergency_result == ISAAC_VITA_OGG_EMERGENCY_HANDLED) {
+            /* The slot returns before the generic free path below, which is
+             * the only place the native vorbis seam is told that a guest
+             * buffer died (isaac_nv_guest_buffer_freed).  A stream whose
+             * stb_vorbis_alloc buffer came from the slot would otherwise
+             * never retire with reason=freed.  Exactly once per slot free;
+             * the seam matches by address, so the memblock address is fine.
+             * (test_ogg_emergency.sh: heap_routing_oracle asserts once.) */
+#if defined(__GNUC__)
+            if (isaac_nv_guest_buffer_freed)
+                isaac_nv_guest_buffer_freed((void *)(uintptr_t)pointer);
+#endif
             vita_heap_cdecl_return(c);
             return;
         }
@@ -5261,6 +5404,8 @@ static void vita_heap_free(CPU *__restrict c)
 
 static void vita_heap_calloc(CPU *__restrict c)
 {
+    KAGE_VITA_DEEP_SCOPE_BYTES(KVD_HEAP_ALLOC,
+        (uint64_t)vita_heap_arg(c, 0U) * vita_heap_arg(c, 1U));
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     vita_heap_router_result router_result;
     size_t count = (size_t)vita_heap_arg(c, 0U);
@@ -5290,6 +5435,7 @@ static void vita_heap_calloc(CPU *__restrict c)
 
 static void vita_heap_malloc(CPU *__restrict c)
 {
+    KAGE_VITA_DEEP_SCOPE_BYTES(KVD_HEAP_ALLOC, vita_heap_arg(c, 0U));
 #if defined(ISAAC_VITA_ANM2_SCRATCH) || \
     defined(ISAAC_VITA_TEXEL_OOM_DIAGNOSTIC) || \
     defined(ISAAC_VITA_TEXEL_SCRATCH) || \
@@ -5508,6 +5654,7 @@ static void vita_heap_set_new_mode(CPU *__restrict c)
 
 static void vita_heap_realloc(CPU *__restrict c)
 {
+    KAGE_VITA_DEEP_SCOPE_BYTES(KVD_HEAP_ALLOC, vita_heap_arg(c, 1U));
     uint32_t pointer = vita_heap_arg(c, 0U);
     size_t size = (size_t)vita_heap_arg(c, 1U);
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE

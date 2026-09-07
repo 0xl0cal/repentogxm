@@ -28,8 +28,13 @@ void isaac_vita_lua_gc_profile_note_callback(uint32_t target);
 uint32_t isaac_vita_lua_gc_profile_depth(void);
 void isaac_vita_lua_gc_profile_unwind(uint32_t depth);
 
+#endif
+
+#if defined(ISAAC_VITA_LUA_GC_PROFILE) || defined(ISAAC_VITA_HEAP_CENSUS)
 /* host_vita_lua.c: private-arena live/peak KiB and guest-heap fallbacks;
- * zeros when ISAAC_VITA_LUA_ARENA_MB is 0. */
+ * zeros when ISAAC_VITA_LUA_ARENA_MB is 0.  Also the lua(l,pk,fb) source of
+ * the ph120.mem heap receipt (ISAAC_VITA_HEAP_CENSUS), which declares the
+ * prototype itself because this header needs the Lua include path. */
 void isaac_vita_lua_arena_stats(uint32_t *live_kb, uint32_t *peak_kb,
                                 uint32_t *fallbacks);
 #endif

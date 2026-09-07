@@ -79,6 +79,23 @@ static uint32_t model_hash(const char *name)
     return hash;
 }
 
+/* Copy the production bucket functions only to choose deliberate collisions;
+ * returned locations are still checked against the independent model. */
+static uint32_t address_slot(const char *name, uint32_t program, uint32_t kind)
+{
+    uint32_t address = (uint32_t)(uintptr_t)name;
+    return (address ^ (address >> 6) ^ (address >> 12) ^ program ^ kind) & 63u;
+}
+
+static uint32_t content_slot(const char *name, uint32_t program, uint32_t kind)
+{
+    uint32_t hash = 2166136261u ^ (program * 0x9e3779b9u);
+    hash = (hash ^ kind) * 16777619u;
+    while (*name)
+        hash = (hash ^ (unsigned char)*name++) * 16777619u;
+    return (hash ^ (hash >> 16)) & 255u;
+}
+
 static GLint model_attrib(GLuint program, const char *name)
 {
     const model_program *p;
@@ -385,13 +402,14 @@ int main(void)
     static char high_name[8] = { 'a', (char)0x80, 'b', 0, 0, 0, 0, 0 };
     static char control_name[8] = { 'a', '\t', 'b', 0, 0, 0, 0, 0 };
     static char many_names[300][12];
+    static char mutable_name[80] = "aMutableOriginal";
     uint32_t arguments[2];
     CPU cpu;
     GLint value;
     unsigned before;
     unsigned q_before;
     uint32_t p1, p2, p3;
-    unsigned i;
+    unsigned i, j, collision_a, collision_b;
 
     memset(&cpu, 0, sizeof cpu);
     s_stack_top = (uint32_t)(uintptr_t)&s_stack[96];
@@ -517,6 +535,73 @@ int main(void)
     CHECK(check_pair(&cpu, p3, long_name));
     CHECK(check_pair(&cpu, p3, long_name));
     CHECK(natives_total() == before + expected_natives(4u, 2u));
+
+    /* Cache an address, then change its bytes without changing the pointer.
+     * Shortening must stop at the new NUL; extending must check the old NUL. */
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    mutable_name[3] = '\0';
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    strcpy(mutable_name, "aMutableExtended");
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    mutable_name[1] = (char)0x80;
+    before = natives_total();
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    CHECK(natives_total() == before + 4u); /* never cache invalid bytes */
+    mutable_name[1] = 'M';
+    before = natives_total();
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    CHECK(natives_total() == before + expected_natives(2u, 0u));
+    strcpy(mutable_name, "aMutableOriginal");
+    CHECK(check_pair(&cpu, p3, mutable_name));
+    CHECK(check_pair(&cpu, p3, mutable_name));
+
+    /* Two addresses collide in the 64-entry hints, but not in the content
+     * memo. Evicting the hint must still find the original content hit. */
+    for (i = 1u; i < 300u; ++i) {
+        if (address_slot(many_names[0], p3, 1u) ==
+                address_slot(many_names[i], p3, 1u) &&
+                content_slot(many_names[0], p3, 1u) !=
+                content_slot(many_names[i], p3, 1u))
+            break;
+    }
+    CHECK(i < 300u);
+    before = natives_total();
+    for (j = 0u; j < 4u; ++j) {
+        const char *name = many_names[(j & 1u) ? i : 0u];
+        CHECK(query(&cpu, TOKEN_ATTRIB, p3, name, &value));
+        CHECK(value == model_attrib(p3, name));
+    }
+    CHECK(natives_total() == before + expected_natives(4u, 2u));
+
+    /* Overwrite a content slot while the old address hint survives. Same
+     * program/kind/generation is insufficient: the current bytes must match. */
+    collision_a = collision_b = 300u;
+    for (i = 0u; i < 300u && collision_a == 300u; ++i) {
+        for (j = i + 1u; j < 300u; ++j) {
+            if (content_slot(many_names[i], p3, 2u) ==
+                    content_slot(many_names[j], p3, 2u) &&
+                    address_slot(many_names[i], p3, 2u) !=
+                    address_slot(many_names[j], p3, 2u) &&
+                    model_uniform(p3, many_names[i]) !=
+                    model_uniform(p3, many_names[j])) {
+                collision_a = i;
+                collision_b = j;
+                break;
+            }
+        }
+    }
+    CHECK(collision_a < 300u && collision_b < 300u);
+    before = natives_total();
+    for (i = 0u; i < 3u; ++i) {
+        const char *name = many_names[i == 1u ? collision_b : collision_a];
+        CHECK(query(&cpu, TOKEN_UNIFORM, p3, name, &value));
+        CHECK(value == model_uniform(p3, name));
+    }
+    CHECK(natives_total() == before + 3u);
 
     /* More distinct names than the table holds: values stay exact. */
     for (i = 0u; i < 300u; ++i)

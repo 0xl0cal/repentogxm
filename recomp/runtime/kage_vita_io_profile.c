@@ -1,4 +1,361 @@
 #include "kage_vita_io_profile.h"
+#include "kage_vita_deep_profile.h"
+
+#if defined(ISAAC_VITA_IO_WINDOW_PROFILE)
+
+#include <errno.h>
+#include <string.h>
+#if defined(ISAAC_VITA_IO_PROFILE_ORACLE)
+typedef int SceUID;
+typedef int SceMode;
+typedef int64_t SceOff;
+extern uint64_t sceKernelGetProcessTimeWide(void);
+#else
+#include <psp2/io/fcntl.h>
+#include <psp2/kernel/processmgr.h>
+#endif
+
+/* Signatures copied from vita-headers psp2/io/fcntl.h and common/types.h:
+ * SceMode/SceUID/SceSSize are int, SceSize unsigned int, SceOff int64_t. */
+extern SceUID __real_sceIoOpen(const char *, int, SceMode);
+extern int __real_sceIoClose(SceUID);
+extern int __real_sceIoRead(SceUID, void *, unsigned int);
+extern int __real_sceIoPread(SceUID, void *, unsigned int, SceOff);
+extern long __real_sceIoLseek32(SceUID, long, int);
+extern SceOff __real_sceIoLseek(SceUID, SceOff, int);
+extern int __real_sceIoWrite(SceUID, const void *, unsigned int);
+extern int __real_sceIoPwrite(SceUID, const void *, unsigned int, SceOff);
+extern int __real_sceIoSync(const char *, unsigned int);
+extern int __real_sceIoSyncByFd(SceUID, int);
+
+static uint32_t s_window_lock;
+static uint32_t s_window_take_misses;
+static uint32_t s_window_record_drops;
+static uint32_t s_window_map_drops;
+static uint32_t s_window_map_dirty;
+static kage_vita_io_window_snapshot s_window;
+static struct {
+    int32_t descriptor;
+    uint32_t file_class; /* zero is an unused/unknown slot */
+} s_window_files[64];
+
+static uint64_t window_now(void)
+{
+    int saved_errno = errno;
+    uint64_t now = sceKernelGetProcessTimeWide();
+    errno = saved_errno;
+    return now;
+}
+
+static int window_try_lock(void)
+{
+    return !__atomic_exchange_n(&s_window_lock, 1U, __ATOMIC_ACQUIRE);
+}
+
+static void window_unlock(void)
+{
+    __atomic_store_n(&s_window_lock, 0U, __ATOMIC_RELEASE);
+}
+
+static void window_add32(uint32_t *value, uint32_t add)
+{
+    *value = add > UINT32_MAX - *value ? UINT32_MAX : *value + add;
+}
+
+/* Lock-free loss counters have no preempted owner to wait for. */
+static void window_loss(uint32_t *value)
+{
+    uint32_t previous = __atomic_load_n(value, __ATOMIC_RELAXED);
+    while (previous != UINT32_MAX &&
+           !__atomic_compare_exchange_n(value, &previous, previous + 1U,
+               1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+}
+
+static void window_map_recover_locked(void)
+{
+    if (__atomic_exchange_n(&s_window_map_dirty, 0U, __ATOMIC_ACQ_REL))
+        memset(s_window_files, 0, sizeof s_window_files);
+}
+
+static void window_add64(uint64_t *value, uint64_t add)
+{
+    *value = add > UINT64_MAX - *value ? UINT64_MAX : *value + add;
+}
+
+static uint32_t window_slot(SceUID descriptor)
+{
+    uint32_t value = (uint32_t)descriptor;
+    return (value ^ (value >> 6) ^ (value >> 12)) & 63U;
+}
+
+static uint32_t window_class(SceUID descriptor, int closing)
+{
+    uint32_t slot = window_slot(descriptor);
+    uint32_t result = KAGE_IO_UNKNOWN;
+    if (!window_try_lock()) {
+        window_loss(&s_window_map_drops);
+        if (closing)
+            __atomic_store_n(&s_window_map_dirty, 1U, __ATOMIC_RELEASE);
+        return KAGE_IO_UNKNOWN;
+    }
+    window_map_recover_locked();
+    if (s_window_files[slot].file_class &&
+        s_window_files[slot].descriptor == descriptor) {
+        result = s_window_files[slot].file_class;
+        /* Remove before the native close, so a newly reused fd cannot be
+         * erased afterwards.  A failed close loses attribution, not I/O. */
+        if (closing)
+            s_window_files[slot].file_class = KAGE_IO_UNKNOWN;
+    }
+    window_unlock();
+    return result;
+}
+
+static uint32_t window_path_class(const char *path)
+{
+    char name[1024];
+    const char *extension;
+    unsigned length;
+    /* Called only after successful native Open.  Early NUL, bounded copy;
+     * unsuccessful/NULL/overlong names never acquire an invented class. */
+    if (!path)
+        return KAGE_IO_UNKNOWN;
+    for (length = 0U; length < sizeof name; ++length) {
+        unsigned char ch = (unsigned char)path[length];
+        if (ch >= 'A' && ch <= 'Z')
+            ch = (unsigned char)(ch + ('a' - 'A'));
+        name[length] = (char)(ch == '\\' ? '/' : ch);
+        if (!ch)
+            break;
+    }
+    if (length == sizeof name)
+        return KAGE_IO_UNKNOWN;
+    extension = strrchr(name, '.');
+    if (extension && !strcmp(extension, ".a"))
+        return KAGE_IO_ARCHIVE;
+    if (strstr(name, "/shader") ||
+        (extension && !strcmp(extension, ".gxp")))
+        return KAGE_IO_SHADER;
+    if (strstr(name, "/documents/") ||
+        (extension && !strcmp(extension, ".dat")))
+        return KAGE_IO_SAVE;
+    if (extension && (!strcmp(extension, ".ini") ||
+                      !strcmp(extension, ".cfg")))
+        return KAGE_IO_CONFIG;
+    if ((extension && !strcmp(extension, ".log")) ||
+        (length >= 7U && !strcmp(name + length - 7U, "log.txt") &&
+         (length == 7U || name[length - 8U] == '/')))
+        return KAGE_IO_LOG;
+    if (strstr(name, "/resources/") || strstr(name, "/mods/"))
+        return KAGE_IO_RESOURCE;
+    return KAGE_IO_OTHER;
+}
+
+static void window_opened(SceUID descriptor, uint32_t file_class)
+{
+    uint32_t slot = window_slot(descriptor);
+    if (!window_try_lock()) {
+        window_loss(&s_window_map_drops);
+        __atomic_store_n(&s_window_map_dirty, 1U, __ATOMIC_RELEASE);
+        return;
+    }
+    window_map_recover_locked();
+    if (s_window_files[slot].file_class &&
+        s_window_files[slot].descriptor != descriptor)
+        window_add32(&s_window.map_collisions, 1U);
+    s_window_files[slot].descriptor = descriptor;
+    s_window_files[slot].file_class = file_class;
+    window_unlock();
+}
+
+static void window_record(uint32_t op, uint32_t file_class,
+                          uint32_t requested, int64_t result,
+                          uint64_t begin, uint64_t end)
+{
+#if defined(ISAAC_VITA_DEEP_PROFILE)
+    /* Reuse the physical call's clocks. The recorder rejects foreign threads
+     * so background music and log writes cannot become Update self time. */
+    kage_vita_deep_io(op, file_class, requested, result, begin, end);
+#endif
+    uint64_t elapsed = end >= begin ? end - begin : 0U;
+    kage_vita_io_window_operation *entry;
+    if (!window_try_lock()) {
+        window_loss(&s_window_record_drops);
+        return;
+    }
+    entry = &s_window.op[op];
+    window_add32(&entry->calls, 1U);
+    if (result < 0)
+        window_add32(&entry->errors, 1U);
+    if (end < begin)
+        window_add32(&s_window.clock_reversals, 1U);
+    if (file_class == KAGE_IO_UNKNOWN)
+        window_add32(&s_window.unknown_calls, 1U);
+    window_add64(&entry->requested_bytes, requested);
+    if ((op == KAGE_IO_READ || op == KAGE_IO_PREAD ||
+         op == KAGE_IO_WRITE || op == KAGE_IO_PWRITE) && result > 0)
+        window_add64(&entry->returned_bytes, (uint64_t)result);
+    window_add64(&entry->time_us, elapsed);
+    window_add64(&s_window.class_us[file_class], elapsed);
+    if (elapsed > s_window.max_us) {
+        s_window.max_us = elapsed;
+        s_window.max_op = op;
+        s_window.max_class = file_class;
+        s_window.max_requested_bytes = requested;
+        s_window.max_error = result < 0 ? (int32_t)result : 0;
+    }
+    window_unlock();
+}
+
+void kage_vita_io_window_take(kage_vita_io_window_snapshot *out)
+{
+    if (!out)
+        return;
+    if (!window_try_lock()) {
+        window_loss(&s_window_take_misses);
+        memset(out, 0, sizeof *out);
+        out->abi_version = KAGE_VITA_IO_WINDOW_ABI;
+        return;
+    }
+    *out = s_window;
+    out->abi_version = KAGE_VITA_IO_WINDOW_ABI;
+    out->snapshot_valid = 1U;
+    out->take_misses = __atomic_exchange_n(
+        &s_window_take_misses, 0U, __ATOMIC_ACQ_REL);
+    out->record_drops = __atomic_exchange_n(
+        &s_window_record_drops, 0U, __ATOMIC_ACQ_REL);
+    out->map_drops = __atomic_exchange_n(
+        &s_window_map_drops, 0U, __ATOMIC_ACQ_REL);
+    memset(&s_window, 0, sizeof s_window);
+    window_unlock();
+}
+
+SceUID __wrap_sceIoOpen(const char *path, int flags, SceMode mode)
+{
+    uint64_t begin = window_now();
+    SceUID result = __real_sceIoOpen(path, flags, mode);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    uint32_t file_class = result >= 0 ? window_path_class(path) : KAGE_IO_UNKNOWN;
+    if (result >= 0)
+        window_opened(result, file_class);
+    window_record(KAGE_IO_OPEN, file_class, 0U, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+int __wrap_sceIoClose(SceUID descriptor)
+{
+    uint32_t file_class = window_class(descriptor, 1);
+    uint64_t begin = window_now();
+    int result = __real_sceIoClose(descriptor);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    window_record(KAGE_IO_CLOSE, file_class, 0U, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+int __wrap_sceIoRead(SceUID descriptor, void *buffer, unsigned int size)
+{
+    uint32_t file_class = window_class(descriptor, 0);
+    uint64_t begin = window_now();
+    int result = __real_sceIoRead(descriptor, buffer, size);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    window_record(KAGE_IO_READ, file_class, size, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+int __wrap_sceIoPread(SceUID descriptor, void *buffer, unsigned int size,
+                     SceOff offset)
+{
+    uint32_t file_class = window_class(descriptor, 0);
+    uint64_t begin = window_now();
+    int result = __real_sceIoPread(descriptor, buffer, size, offset);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    window_record(KAGE_IO_PREAD, file_class, size, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+long __wrap_sceIoLseek32(SceUID descriptor, long offset, int origin)
+{
+    uint32_t file_class = window_class(descriptor, 0);
+    uint64_t begin = window_now();
+    long result = __real_sceIoLseek32(descriptor, offset, origin);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    window_record(KAGE_IO_SEEK32, file_class, 0U, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+SceOff __wrap_sceIoLseek(SceUID descriptor, SceOff offset, int origin)
+{
+    uint32_t file_class = window_class(descriptor, 0);
+    uint64_t begin = window_now();
+    SceOff result = __real_sceIoLseek(descriptor, offset, origin);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    window_record(KAGE_IO_SEEK64, file_class, 0U, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+int __wrap_sceIoWrite(SceUID descriptor, const void *buffer, unsigned int size)
+{
+    uint32_t file_class = window_class(descriptor, 0);
+    uint64_t begin = window_now();
+    int result = __real_sceIoWrite(descriptor, buffer, size);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    window_record(KAGE_IO_WRITE, file_class, size, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+int __wrap_sceIoPwrite(SceUID descriptor, const void *buffer, unsigned int size,
+                      SceOff offset)
+{
+    uint32_t file_class = window_class(descriptor, 0);
+    uint64_t begin = window_now();
+    int result = __real_sceIoPwrite(descriptor, buffer, size, offset);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    window_record(KAGE_IO_PWRITE, file_class, size, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+int __wrap_sceIoSync(const char *device, unsigned int flags)
+{
+    uint64_t begin = window_now();
+    int result = __real_sceIoSync(device, flags);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    /* A mount-wide operation cannot truthfully inherit one file's class.
+     * Do not dereference DEVICE: the native call owns its validation. */
+    window_record(KAGE_IO_SYNC, KAGE_IO_UNKNOWN, 0U, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+int __wrap_sceIoSyncByFd(SceUID descriptor, int flags)
+{
+    uint32_t file_class = window_class(descriptor, 0);
+    uint64_t begin = window_now();
+    int result = __real_sceIoSyncByFd(descriptor, flags);
+    int saved_errno = errno;
+    uint64_t end = window_now();
+    window_record(KAGE_IO_SYNC_BY_FD, file_class, 0U, result, begin, end);
+    errno = saved_errno;
+    return result;
+}
+
+#else /* existing startup-only profiler, unchanged */
 
 #include <errno.h>
 #include <stdarg.h>
@@ -620,3 +977,4 @@ void kage_vita_io_profile_report(const char *reason)
     }
 #endif
 }
+#endif /* ISAAC_VITA_IO_WINDOW_PROFILE */

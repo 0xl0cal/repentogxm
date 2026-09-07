@@ -14,6 +14,33 @@
 
 #include "gl_bridge.h"
 
+#if defined(ISAAC_VITA_GL_WRAPPER_TIME)
+/* ---- ISAAC_VITA_GL_WRAPPER_TIME (wf/cpu-render-20260906) begin ----------
+ * Wrapper entry/return clock around every adapter run (guest_gl_run_owned);
+ * bucket per registry entry, classified once at backend install by the
+ * frozen name (gl_vita_backend.h legend).  The clock is the one ph120.gt
+ * uses (sceKernelGetProcessTimeWide), so w minus gt is subtractable. */
+# if !defined(ISAAC_VITA_GL_SHIM_FASTDISPATCH)
+#  error ISAAC_VITA_GL_WRAPPER_TIME needs the entry-indexed fast dispatch (ISAAC_VITA_GL_SHIM_FASTDISPATCH)
+# endif
+# include "gl_vita_backend.h"
+# if defined(__vita__)
+#  include <psp2/kernel/processmgr.h>
+# else
+uint64_t sceKernelGetProcessTimeWide(void);
+# endif
+IsaacVitaGlWrapperTimeProfile g_isaac_vita_gl_wrapper_time;
+uint64_t g_isaac_vita_gl_wrapper_entry_at;
+uint64_t g_isaac_vita_gl_draw_body_ended_at;
+static uint8_t s_guest_gl_wrapper_bucket[GUEST_GL_SURFACE_COUNT];
+static uint8_t s_guest_gl_uniform_kind[GUEST_GL_SURFACE_COUNT];
+static inline uint64_t guest_gl_wrapper_time_now(void)
+{
+    return sceKernelGetProcessTimeWide();
+}
+/* ---- ISAAC_VITA_GL_WRAPPER_TIME end ------------------------------------ */
+#endif
+
 typedef void (*guest_gl_adapter_fn)(CPU *__restrict);
 
 typedef struct guest_gl_entry {
@@ -337,6 +364,21 @@ void guest_gl_install_backend(const guest_gl_backend *backend)
         s_guest_gl_backend = *backend;
     else
         memset(&s_guest_gl_backend, 0, sizeof s_guest_gl_backend);
+#if defined(ISAAC_VITA_GL_WRAPPER_TIME)
+    /* Entry index -> bucket, from the frozen names; install-time only. */
+    if (backend) {
+        size_t i;
+
+        for (i = 0u; i < GUEST_GL_SURFACE_COUNT; ++i) {
+            s_guest_gl_wrapper_bucket[i] =
+                isaac_vita_gl_wrapper_bucket_for_name(
+                    s_guest_gl_entries[i].name);
+            s_guest_gl_uniform_kind[i] =
+                isaac_vita_gl_uniform_kind_for_name(
+                    s_guest_gl_entries[i].name);
+        }
+    }
+#endif
 #if defined(ISAAC_VITA_GL_SHIM_FASTDISPATCH)
     /* A backend teardown is the only legitimate owner change: the next
      * dispatching CPU re-pins.  Nothing else ever clears the pin. */
@@ -487,7 +529,40 @@ static inline int guest_gl_run_owned(
         s_guest_gl_owner_cpu = c;
     }
     s_guest_gl_active_state = (uintptr_t)c;
+#if defined(ISAAC_VITA_GL_WRAPPER_TIME)
+    {
+        /* One clock read before the adapter, one after: argument decode,
+         * the typed wrapper (with its gt bracket inside) and the stdcall
+         * retirement are the wrapper cost the guest sampler sees as `ext`. */
+        uint64_t wrapper_started_at = guest_gl_wrapper_time_now();
+        uint64_t wrapper_ended_at;
+        size_t index = (size_t)(entry - s_guest_gl_entries);
+
+        /* The draw wrapper charges its ph120.gd `disp` from this read. */
+        g_isaac_vita_gl_wrapper_entry_at = wrapper_started_at;
+        entry->adapter(c);
+        wrapper_ended_at = guest_gl_wrapper_time_now();
+        isaac_vita_gl_wrapper_time_add(
+            &g_isaac_vita_gl_wrapper_time.wrapper[
+                s_guest_gl_wrapper_bucket[index]],
+            wrapper_started_at, wrapper_ended_at);
+        /* Same two reads, finer keys: the draw tail (gt END read -> here)
+         * and the ph120.gu uniform entry point; no further clock. */
+        if (s_guest_gl_wrapper_bucket[index] == ISAAC_VITA_GL_WRAPPER_DRAW)
+            isaac_vita_gl_wrapper_time_add(
+                &g_isaac_vita_gl_wrapper_time.draw[
+                    ISAAC_VITA_GL_DRAW_SPLIT_TAIL],
+                g_isaac_vita_gl_draw_body_ended_at, wrapper_ended_at);
+        else if (s_guest_gl_uniform_kind[index] !=
+                 ISAAC_VITA_GL_UNIFORM_NONE)
+            isaac_vita_gl_wrapper_time_add(
+                &g_isaac_vita_gl_wrapper_time.uniform[
+                    s_guest_gl_uniform_kind[index]],
+                wrapper_started_at, wrapper_ended_at);
+    }
+#else
     entry->adapter(c);
+#endif
     active = s_guest_gl_active_state;
     if (active == (uintptr_t)c || active == GUEST_GL_ACTIVE_FAULTED) {
         /* Production guest_fault never returns.  Recording oracles may

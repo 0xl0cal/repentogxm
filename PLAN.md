@@ -1,8 +1,8 @@
 # Project plan
 
-Updated 2026-09-04. This file lists the goal, the open problems in priority
-order, the performance rules and the definition of done. Build ids and hashes
-live in [STATUS.md](STATUS.md); this file names none.
+Updated 2026-09-07. Goal, open problems in priority order, performance rules
+and the definition of done. Build ids, hashes and per-build numbers live in
+[STATUS.md](STATUS.md).
 
 ## Goal
 
@@ -19,124 +19,98 @@ PS Vita:
 - Zero regressions: saves and mods that worked keep working.
 - Loading pauses short enough not to interrupt play.
 
-## Where things stand (device, 2026-09-04)
+## Where things stand
 
-- Game speed: 29.85-30.00 updates per second measured on device while the port
-  presents up to 60 frames per second. Done; kept as a rule below.
-- Menus, light and mid rooms with EID loaded, 960x544: median render time per
-  frame 10.2 ms (menu), 7.8 ms (light rooms), 11.5 ms (mid rooms)
-  (2026-09-04, STATUS.md performance table).
-- Caveat: the profiler counts 120 frames shown per 2-second window as
-  "60 FPS", and a morning session had 120 in every window, but that is not a
-  smooth 60 FPS. Counted over wall time, rooms ran at a median of 42-49 FPS in
-  a 7-minute session and menus at 59.6 in a 20-minute one: room-entry stalls
-  and hitches over 33 ms sit inside the windows (2026-09-04, STATUS.md).
-- Audio: OpenAL Soft, native Vorbis decoder on CPU 2. No buffer underruns, and
-  the native decoder never fell back to the translated one, in any 2026-09-04
-  session; a music source runs dry only inside load stalls.
-- Mods: EID loads (95 scripts) and draws descriptions; no EID errors were
-  logged in either full session. Lua must be compiled in (CMake
-  `ISAAC_VITA_LUA=ON`) whenever
-  a mod is enabled; a build without it crashes at startup.
-- Saves persist; a Continue run was completed; no faults in the 20-minute and
-  15-minute sessions. Longest session: 27 minutes, ended by priority 4.
+v0.1.1-alpha: menus 60 FPS, rooms with enemies 55-59 FPS, dense rooms 33-34
+FPS, game at 30 updates per second, EID working, audio on CPU 2 without
+underruns, saves and Continue working. Door transitions with resource loads
+stall about a second, Continue about 7 s. Longest session 27 minutes, ended
+by the heap (priority 5).
 
 ## Current priorities
 
-1. Dense rooms run at 35-37 FPS.
-   Problem: rooms with many entities render at 20-22 ms per frame.
-   Evidence (2026-09-04, STATUS.md known problem 1): 35,692 translated calls
-   and 7,790 mutex lock/unlock pairs per frame versus 10,867 and 700 in a
-   normal room; draw count, GL work and Lua unchanged. The pairs come from the
-   game's reference counting, which takes a mutex on every AddRef, Release and
-   weak-pointer lock.
-   Fix: a native replacement for those three helpers with identical behaviour.
-   Status: being implemented (design reviewed 2026-09-04); not on device.
-2. Laser rooms fall to 30 FPS, the worst room to 6-7 FPS.
-   Problem: Circle of Protection alone locks the game to 30 FPS; two Brimstone
-   monsters plus Circle of Protection plus Azazel's Brimstone gives 6-7 FPS.
-   Evidence (2026-09-04, STATUS.md known problem 2): for Circle of Protection
-   alone one profile found the CPU busy in render and a later one found it
-   waiting for the GPU. In the worst room, during a burst, the CPU spent 72 ms
-   per frame waiting for the GPU inside glClear and at the end of each GXM
-   scene (GXM is the Vita's graphics API; vitaGL splits every frame into
-   several scenes: 7 clears and 4 scenes per frame, one clear took 138 ms);
-   steady state in that room 12.7 ms per frame, a normal room 0.5 ms. Two
-   experiments failed: letting vitaGL split the display frame into 8 GXM
-   scenes instead of 1 changed nothing; skipping redundant clears of
-   off-screen framebuffers saved about 2 ms and left the bursts.
-   Fix: the wait is at the end of each offscreen render pass; vitaGL creates
-   the offscreen render target with one scene slot per frame, so pass k cannot
-   end until pass k-1 has finished on the GPU (frame time = CPU + GPU). Give
-   that render target 8 slots (vitaGL patch, build option) and time scene ends
-   per render target to confirm. The worst room also spends over 100 ms per
-   frame of GPU fill on the laser layers, which this does not fix.
-   Status: being implemented (design reviewed 2026-09-04); not on device.
-3. Loading stalls.
-   Problem: room entries stop the game for 0.9-1.7 s, floor changes for
-   1.5-4.3 s, run start and Continue for about 5.5 s (2026-09-04).
-   Evidence (profiler, 2026-09-04): 45-50 % of a room entry is PNG sprite-sheet
-   decode plus the archive reads under it (sprites are decoded and uploaded
-   again on every entry); 10 % is a full Lua garbage collection at level init.
-   Already replaced by native code or otherwise optimized when measured, so
-   not the cause: PNG row decode, zlib inflate, and the file-size seek loop of
-   floor loading (answered from a cache). The limit on that collection's work
-   per floor (CMake `ISAAC_VITA_LUA_GCCOLLECT_CLAMP`) is in the latest build,
-   unmeasured.
-   Fix: keep decoded sprites across room entries. Status: implemented on a
-   branch, not merged, not measured on device.
-4. Guest heap runs out in long sessions.
-   Problem: after 27 minutes of play, "Exit game" crashed.
-   Evidence (2026-09-04): a 307,200 byte allocation for a menu music stream
-   failed with 80.5 MiB of the game's 81 MiB heap in use and 505 KB free in 3,294
-   fragments. The same exit worked early in the session, so heap use grows
-   with play time. Saves were written before the crash.
-   Fix: log heap usage periodically during play, then find what grows.
-   Status: in progress.
-5. An open EID description breaks 60 FPS.
-   Problem: Lua costs about 2.7 ms per frame in rooms and 8-10 ms per frame
-   while an EID description box is on screen (profiler, 2026-09-04).
-   Fix: native replacements for the two hottest calls of the Lua bridge (the
-   layer that exposes game objects to Lua), `__index` and `getClass`, are in
-   the latest build with verification on; one false
-   verification alarm needs a comparator fix before verification is turned off.
-   Then time the EID callbacks themselves. Status: on device, unmeasured.
-6. Controls.
+1. Rooms below 60 FPS.
+   Cause: the CPU render phase, 9.9-15.9 ms median per frame: about 5.7 ms of
+   translated game code and 4.3 ms of native code called from it (vitaGL draw
+   bodies, scene switches, Lua callbacks and sprite attribute state each under
+   1 ms).
+   Done: neutral ColorOffset fragment path, laser ring shadow skip,
+   reference-count seam, host replay of the sprite quad builder
+   `Image::PushQuad` for every quad (room render median 11.7-13.1 ms down to
+   9.9-10.3 ms).
+   Next: re-attribute the room render phase on the current build, then the
+   remaining translated render work.
+2. Laser rooms fall to 30 FPS, the worst room found to 6-7 FPS.
+   Cause: the CPU waited for the GPU at the end of each offscreen render pass,
+   because vitaGL created the offscreen render target with one scene slot, so
+   pass k could not end until pass k-1 had finished on the GPU; plus over
+   100 ms per frame of GPU fill on the laser layers, which has no fix.
+   Done: the 8-slot render target (`ISAAC_VITA_STOCK_FBO_RT_SCENES`) and the
+   omission of the sampled/ring laser shadow pass
+   (`ISAAC_VITA_LASER_RING_SHADOW_SKIP`).
+   Next: measure a laser room on the current build.
+3. Loading stalls: door transitions with resource loads 0.9-1.1 s, Continue
+   about 7 s, floor changes 1.5-4.3 s.
+   Cause: the room state reset (`00520160`, 73 ms per call, 53 ms its own
+   work) and the room snapshot (`00314fc0`, 40 ms), sometimes on two
+   consecutive frames; PNG sprite-sheet decode plus the archive reads under it
+   (45-50 % of a room entry) and a full Lua garbage collection at level init
+   (10 %).
+   Done: the PNG fast paths and the per-floor GC clamp.
+   Next: the room state reset's own 53 ms. Sprite retention across rooms
+   (`ISAAC_VITA_IMAGE_RETAIN`) is in the tree, OFF, unmeasured.
+4. Crash after the PS button or a console lock: `ArchivedFile block header is
+   invalid`.
+   Cause: the Vita kernel invalidates the process's open `ux0:` file handles
+   across an app suspend; the next music-stream read failed and the archive
+   reader stopped the game.
+   Done: the CRT reopens the handle from its retained path at the same cursor
+   and redoes the read (`ISAAC_VITA_CRT_DESCRIPTOR_RECOVER`); verified on
+   device with the PS button at the main menu.
+   Next: the same check with a run open and after standby.
+5. Guest heap runs out in long sessions.
+   Cause: after 27 minutes a 307,200-byte allocation for the menu music
+   stream failed with 80.5 MiB of the 81 MiB heap in use and 505 KB free in
+   3,294 fragments; the same exit worked early in the session, so heap use
+   grows with play time. Saves were written before the crash.
+   Done: a one-slot emergency allocation for that stream queue
+   (`ISAAC_VITA_OGG_QUEUE_EMERGENCY`); not a fragmentation cure.
+   Next: log heap usage periodically during play, find what grows.
+6. An open EID description box breaks 60 FPS: Lua costs about 0.8 ms per frame
+   with the box closed and 8-10 ms with it open.
+   Done: native `__index` and `getClass` seams.
+   Next: fix the `__index` VERIFY comparator false alarm (STATUS.md problem 7),
+   then time the EID callbacks themselves.
+7. Controls.
    Today: L = bomb, R = active item, Select = drop (tap swaps pocket items, as
    the PC right trigger does), Start = pause, Start+L = pill/card, Start+R =
    map, hold Start = restart; touch zones over the active-item icon, minimap
-   and pocket icon (not re-verified on the 2026-09-04 builds). Full table:
-   recomp/vita/README.md.
-   Open: remapping UI, PS TV profiles, audit of two active items, Schoolbag
-   and characters whose pocket slot holds an active item. Status: not started.
-7. Mods beyond EID.
+   and pocket icon. Full table: recomp/vita/README.md.
+   Open: remapping UI, PS TV profiles, an audit of two active items, Schoolbag
+   and characters whose pocket slot holds an active item.
+8. Mods beyond EID.
    Open: callback/API compatibility report, dependency and load-order display,
    a recovery boot that disables the last enabled mod. A tiny test mod
-   (`tools/isaac_vita_sync.py --lua-sentinel`) exists; not yet run on device.
+   (`tools/isaac_vita_sync.py --lua-sentinel`) exists, not yet run on device.
    Rule: Workshop content comes from the user's own Steam installation; the
-   project will not download paid content or bypass Steam. Status: not started.
-8. Companion tools.
-   Present: one VPK and Title ID; a second button on the game's LiveArea page
-   opens the on-device
+   project will not download paid content or bypass Steam.
+9. Companion tools.
+   Present: a second button on the game's LiveArea page opens the on-device
    Manager (mod enable/disable via the game's own `disable.it` file, SHA-256
    checked save backup and restore, FTP on port 1337 rooted at the data
    directory); a PC command-line tool and a small Windows GUI around it. Host
-   tests pass (2026-09-04); Manager UI and transfers have not been used on
-   hardware.
-   Open: package the GUI as a Windows executable; test the Manager on a Vita;
-   a one-time FTP code (any password is accepted today). Status: built;
-   nothing tested on hardware; open items not started.
-9. Long-run correctness and lifecycle.
-   Untested: a run played end to end (several floors to an ending); Utero II
-   rendering (an earlier report of that floor rendering black has not been
-   re-tested); suspend/resume; the PS button;
-   language switching; update and rollback; PS TV. Status: not started.
-10. Releases.
-   Present: source on GitHub; the VPK is attached to GitHub Releases. The
-   game's resources are never published.
-   Licence: GPL-2.0-or-later. Open: keep THIRD_PARTY.md current and
-   `tools/release_audit.py --strict` at GO for every release. Status: done for
-   the source; the per-release steps are in RELEASE_CHECKLIST.md.
+   tests pass; nothing has been used on hardware.
+   Open: test the Manager on a Vita; package the GUI as a Windows executable;
+   a one-time FTP code (any password is accepted today).
+10. Long-run correctness and lifecycle.
+    Untested: a run played end to end; standby with a run open; language
+    switching; update and rollback; PS TV.
+11. Releases.
+    Source on GitHub; the v0.1.0-alpha and v0.1.1-alpha VPKs are attached to
+    GitHub Releases. The game's resources are never published. Licence
+    GPL-2.0-or-later. Keep THIRD_PARTY.md current and
+    `tools/release_audit.py --strict` at GO for every release; per-release
+    steps in release/README.md.
 
 ## Performance rules
 
@@ -151,8 +125,8 @@ PS Vita:
 - Fix a measured seconds-scale stall before any micro-optimization.
 - Never hide a stall by running the simulation faster than 30 updates/s.
 - Keep native 960x544 output. The 720x408 and 480x272 display options exist
-  and are not a fix. Skipping clears of off-screen framebuffers (CMake
-  `ISAAC_VITA_FBO_CLEAR_ELISION`) stays off: combined with framebuffer
+  and are not a fix. Skipping clears of off-screen framebuffers
+  (`ISAAC_VITA_FBO_CLEAR_ELISION`) stays off: combined with framebuffer
   down-scaling it lost shading layers on device; alone it saved about 2 ms and
   did not remove the laser-room bursts.
 - The menu is vsync-bound; menu savings buy no FPS. Rank work by room and

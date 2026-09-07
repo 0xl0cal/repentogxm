@@ -13,7 +13,9 @@
  * profile window.  The counters live at the typed GL boundary, so internal
  * setup/diagnostic GL calls are not misattributed to game rendering.  The
  * suppressed counters are requests deliberately stopped at that boundary;
- * add them to the matching driver-facing count to recover guest requests. */
+ * add them to the matching driver-facing count to recover guest requests.
+ * With ATTRIB_ENABLE_COALESCE, toggle requests additionally include cancelled
+ * requests and the change in pending count across the window (see below). */
 typedef struct IsaacVitaGlPhaseProfileCounters {
     uint32_t draw_elements;
     uint32_t clear;
@@ -80,9 +82,123 @@ typedef struct IsaacVitaGlPhaseProfileCounters {
     uint32_t uniform_location;
     uint32_t location_cache_hit;
     /* ISAAC_VITA_GL_LOCATION_CACHE_VERIFY only: hits whose cached answer
-     * differed from a shadow native query (must stay zero; zero otherwise). */
+     * differed from a shadow native query (must stay zero; zero otherwise).
+     * ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY counts its replay-memo /
+     * wrapper disagreements into the same field. */
     uint32_t location_cache_mismatch;
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
+    /* FBO_CLEAR_ELISION_DEPTH_DROP only (ph120.e clear a, d), appended so
+     * every other option keeps its offsets: owed depth/stencil clears dropped
+     * at a tracked colour attach of the owing framebuffer, and owed clears
+     * dropped because stock vitaGL ends the owing scene (clear or draw on
+     * another framebuffer, present, framebuffer deletion). */
+    uint32_t clear_dropped_attach;
+    uint32_t clear_dropped_scene;
+#endif
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+    /* Changed known-valid requests staged by the coalescer, including each
+     * cancelling request. cancelled counts BOTH requests of a cancelled pair.
+     * ph120.y coal(d,c,p0,p1) reports these deltas plus pending endpoint counts.
+     * Toggle requests = attrib_toggle + hit_attrib_toggle + cancelled + p1-p0.
+     * Deferred native emits = deferred-cancelled-(p1-p0). Do signed arithmetic;
+     * a pending request may originate in the preceding profile window.
+     * Actual emitted toggles alone increment attrib_toggle/typed_state_miss. */
+    uint32_t attrib_deferred;
+    uint32_t attrib_cancelled;
+#endif
 } IsaacVitaGlPhaseProfileCounters;
+
+#if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
+    ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
+/* Main/context-owner thread only. Synchronize before native consumers/queries,
+ * swap, and any reset while the context remains live. No allocation/new timer.
+ * External begin synchronizes THEN forgets attribute enable/pointer knowledge;
+ * call before any untracked native attribute/VAO mutation, never afterwards. */
+void gl_vita_backend_attrib_sync(void);
+void gl_vita_backend_attrib_external_begin(void);
+uint32_t gl_vita_backend_attrib_pending(void);
+#else
+#define gl_vita_backend_attrib_sync() ((void)0)
+#define gl_vita_backend_attrib_external_begin() ((void)0)
+#endif
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+/* ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO: the program-state generation the
+ * Shader::EnableAttribs/DisableAttribs replay memo is keyed on
+ * (host_vita_shader_attrib_fastpath.c).  Never zero, never rewound; bumped
+ * by gl_vita_location_cache_invalidate/_reset, i.e. by exactly the events
+ * that invalidate the shim location cache: glAttachShader, glCompileShader,
+ * glCreateProgram, glDeleteProgram, glDeleteShader, glLinkProgram,
+ * glShaderSource and every backend install/uninstall.  A memo entry filled
+ * under generation G is valid while the word still reads G. */
+extern uint32_t g_isaac_vita_gl_location_generation;
+# if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY)
+/* VERIFY only: a memo hit whose remembered location differed from the
+ * wrapper lookup the VERIFY variant still performs; counted into ph120.a
+ * loc(...,m) next to the shim cache's own VERIFY mismatches (must stay 0). */
+void isaac_vita_gl_location_memo_note_mismatch(void);
+# endif
+#endif
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+/* ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE: the Shader::EnableAttribs /
+ * DisableAttribs host replays (host_vita_shader_attrib_fastpath.c) hand the
+ * whole attribute set to the typed backend in one native call instead of
+ * calling the glGetAttribLocation / glEnableVertexAttribArray /
+ * glVertexAttribPointer (glDisableVertexAttribArray) wrappers once per
+ * attribute through the backend table.
+ *
+ * Contract.  For attribute i the batch performs, in this order, exactly the
+ * statements of vita_glGetAttribLocation(program, names[i]) (only when
+ * `names` is non-NULL; with NULL the caller supplies locations[i], as the
+ * replay's location memo does), vita_glEnableVertexAttribArray(loc) and
+ * vita_glVertexAttribPointer(loc, components[i], GL_FLOAT, 0, stride, base +
+ * 4 * (components[0] + ... + components[i-1])) - respectively
+ * vita_glDisableVertexAttribArray(loc) - so every vitaGL call, its
+ * arguments and order, every typed-state / coalescer / fill-census /
+ * location-cache write and every phase counter are those of the per-call
+ * sequence.  What it does not pay: the table-indirect call, the
+ * per-attribute sampler publish/restore pair is kept (tokens), and the
+ * pointer wrapper's per-call argument validation is hoisted (the batch
+ * checks components[i] in 1..4 once, GL_FLOAT is a constant of the frozen
+ * bodies, only `stride >= 0` and `loc < 16` remain per call).  locations[]
+ * receives every location the batch used (looked up or supplied), so the
+ * caller can retire EAX/[ebp+8] and fill its memo exactly as before.
+ * Returns 0 and changes nothing when the installed table's members are not
+ * this backend's wrappers, count exceeds 16, a component is outside 1..4 or
+ * neither names nor locations are given: the replay then takes its
+ * per-call path.  tokens: the 0x7e registry tokens the replay would publish
+ * to the guest sampler around each wrapper (get_location, toggle = enable
+ * or disable, pointer) and the enclosing value it restores; ignored when the
+ * backend is built without ISAAC_VITA_GUEST_SAMPLER. */
+typedef struct IsaacVitaAttribReplayTokens {
+    uint32_t get_location;
+    uint32_t toggle;
+    uint32_t pointer;
+    uint32_t enclosing;
+} IsaacVitaAttribReplayTokens;
+
+/* Plain stdint spellings of guest_gl_uint / guest_gl_addr / guest_gl_int /
+ * guest_gl_sizei (gl_bridge.h is included after this header). */
+struct guest_gl_backend;
+int gl_vita_backend_attribs_replay_enable(
+    const struct guest_gl_backend *backend, uint32_t program,
+    uint32_t count, const uint32_t *names, int32_t *locations,
+    const uint8_t *components, int32_t stride, uint32_t base,
+    const IsaacVitaAttribReplayTokens *tokens);
+int gl_vita_backend_attribs_replay_disable(
+    const struct guest_gl_backend *backend, uint32_t program,
+    uint32_t count, const uint32_t *names, int32_t *locations,
+    const IsaacVitaAttribReplayTokens *tokens);
+# if defined(ISAAC_GL_VITA_BACKEND_ORACLE)
+/* Oracle only: a byte copy of the typed state shadow (s_gl_typed_state) so
+ * the per-call and the direct-state runs can be compared field for field.
+ * Returns the number of bytes written (0 when `capacity` is too small or the
+ * typed state cache is not compiled). */
+size_t gl_vita_backend_oracle_typed_state(void *out, size_t capacity);
+# endif
+#endif
 
 /* Diagnostic-only texture lifecycle and upload-path census.  Gen timing
  * brackets native glGenTextures after its safe pre-read and before lifecycle
@@ -193,6 +309,253 @@ static inline void isaac_vita_gl_time_add(
 }
 #endif
 
+#if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB)
+/* ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB (wf/cpu-render-20260906): the sdk32
+ * scheme (isaac_sdk_sparse_profile.h) applied to the two Shader attribute
+ * replays of ISAAC_VITA_SHADER_ATTRIB_FASTPATH.  CMake hands the define to
+ * host_vita_shader_attrib_fastpath.c and kage_vita_phase_profile.c only when
+ * ISAAC_VITA_GL_TIME_SDK_SPARSE and the fast path are both ON.  Every 32nd
+ * Enable replay and every 32nd Disable replay - ordinal counted per kind
+ * over HANDLED replays, selected when (ordinal & 31) == residue, residue =
+ * window & 31 like the native sdk32 sites - reads sceKernelGetProcessTimeWide
+ * once at replay entry and once at HANDLED (the `ret 0xc` retirement, after
+ * the last wrapper or batch call), and adds the difference to its kind's
+ * bucket; the other 31 pay one load, one compare and one increment.  A
+ * rejected replay is never counted or timed (the translated body runs).
+ * enable_replays/disable_replays count every HANDLED replay of the window
+ * (count-0 replays included), so bucket.calls * 32 ~ replays.  Taken and
+ * zeroed by the phase profiler at the same loop head as the sdk32 rows
+ * (residue re-derived from the next window), printed as one ph120.gt
+ * mode=sdk32 scope=attrib row directly after scope=queue. */
+typedef struct IsaacVitaAttribReplaySparseBucket {
+    uint32_t calls;
+    uint32_t us;
+    uint32_t max_us;
+} IsaacVitaAttribReplaySparseBucket;
+
+typedef struct IsaacVitaAttribReplaySparse {
+    uint32_t residue;
+    uint32_t enable_replays;
+    uint32_t disable_replays;
+    uint32_t bad_clock;
+    IsaacVitaAttribReplaySparseBucket enable;
+    IsaacVitaAttribReplaySparseBucket disable;
+} IsaacVitaAttribReplaySparse;
+
+/* Take-and-zero (out == NULL discards); next_window selects the residue the
+ * following window samples with.  Defined in host_vita_shader_attrib_fastpath.c. */
+void isaac_vita_attrib_replay_sparse_take(
+    IsaacVitaAttribReplaySparse *out, uint32_t next_window);
+#endif
+
+#if defined(ISAAC_VITA_GL_WRAPPER_TIME)
+# include <string.h>
+# if !defined(ISAAC_VITA_GL_TIME_PROFILE)
+#  error "ISAAC_VITA_GL_WRAPPER_TIME requires ISAAC_VITA_GL_TIME_PROFILE"
+# endif
+# if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE) && ISAAC_VITA_GL_TIME_SDK_SPARSE
+#  error "ISAAC_VITA_GL_WRAPPER_TIME needs the broad ph120.gt buckets, not GL_TIME_SDK_SPARSE"
+# endif
+/* ISAAC_VITA_GL_WRAPPER_TIME (wf/cpu-render-20260906): wall time of every
+ * GL shim wrapper the guest reaches, from the moment gl_bridge.c hands the
+ * CPU to the generated adapter (guest_gl_run_owned) until the adapter
+ * returns, on the same sceKernelGetProcessTimeWide clock as ph120.gt and
+ * with the same bucket assignment, so wrapper minus gt body is the shim's
+ * own cost (argument decode, attribute coalescing, location cache, fill
+ * census, coloroffset staging, typed-state shadows).  Buckets, in record
+ * order w(d,c,b,t,s,p,a,u,o):
+ *   d glDrawElements; c glClear; b glBindFramebuffer + glFramebufferTexture2D;
+ *   t glTexImage2D + glTexSubImage2D; s the remaining gt `state` owners
+ *   (glUseProgram, glActiveTexture, glBindTexture, glBlendFuncSeparate,
+ *   glClearColor, glClearDepth, glCullFace, glDepthFunc, glEnable,
+ *   glGetAttribLocation, glGetUniformLocation, glTexParameteri, glViewport);
+ *   p the KAGE Present method (kage_vita_backend_present entry to return,
+ *   whose gt body is the vglSwapBuffers bracket); a glEnableVertexAttribArray
+ *   + glDisableVertexAttribArray + glVertexAttribPointer; u glUniform*;
+ *   o every other registry entry (shader/texture/framebuffer object
+ *   management, queries, glReadPixels) - none of these has a gt bracket
+ *   except through `state`, so a and u overhead is read against gt `s`
+ *   together with the s bucket.
+ * Slots k(en,di): the two host-native callees sub_0056d500 reaches through
+ * its vtable slots (the flush reaches eight indirect targets; only these two
+ * are replaced natively, see ISAAC_VITA_SHADER_ATTRIB_FASTPATH in
+ * vita/README.md): the ISAAC_VITA_SHADER_ATTRIB_FASTPATH replays of
+ * Shader::EnableAttribs / DisableAttribs, entry to `ret 0xc`, handled
+ * replays only (a rejected replay costs a few loads and the translated body
+ * then pays the wrapper buckets).  Their wrapper bodies bypass the adapters,
+ * so they appear in k, not in a; the gt `state` bucket still holds their
+ * vitaGL bodies.  Zero without the fast path.  Two 64-bit clock reads per
+ * wrapper when ON, nothing when OFF; take-and-zero per phase window. */
+enum {
+    ISAAC_VITA_GL_WRAPPER_DRAW = 0,
+    ISAAC_VITA_GL_WRAPPER_CLEAR = 1,
+    ISAAC_VITA_GL_WRAPPER_BIND_FB = 2,
+    ISAAC_VITA_GL_WRAPPER_TEX = 3,
+    ISAAC_VITA_GL_WRAPPER_STATE = 4,
+    ISAAC_VITA_GL_WRAPPER_PRESENT = 5,
+    ISAAC_VITA_GL_WRAPPER_ATTRIB = 6,
+    ISAAC_VITA_GL_WRAPPER_UNIFORM = 7,
+    ISAAC_VITA_GL_WRAPPER_OTHER = 8,
+    ISAAC_VITA_GL_WRAPPER_BUCKETS = 9
+};
+enum {
+    ISAAC_VITA_GL_WRAPPER_K_ATTRIB_ENABLE = 0,
+    ISAAC_VITA_GL_WRAPPER_K_ATTRIB_DISABLE = 1,
+    ISAAC_VITA_GL_WRAPPER_K_SLOTS = 2
+};
+
+/* ph120.gd: the glDrawElements wrapper's entry-to-return time split along
+ * vita_glDrawElements' own statement order (gl_vita_backend.c), record order
+ * d(disp,sync,cls,cen,fbo,gl,tail), one clock read per boundary:
+ *   disp gl_bridge entry read -> wrapper body start (adapter argument decode,
+ *        KAGE_VITA_DEEP_SCOPE enter);
+ *   sync gl_vita_backend_attrib_sync: the deferred Enable/DisableVertexAttrib-
+ *        Array toggles (ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) issued natively
+ *        before the draw, their gt `state` bodies included;
+ *   cls  kage_vita_world_seam_diag_note_draw + kage_vita_canonical_quad_
+ *        classify (ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY: return-RVA and
+ *        index-array shape check) + the first-frame probe counters;
+ *   cen  GL_VITA_PHASE_COUNT(draw_elements) + gl_vita_fusion_profile_draw +
+ *        gl_vita_fill_census_draw (ISAAC_VITA_GL_FILL_CENSUS projection);
+ *   fbo  gl_vita_fbo_note_draw (ISAAC_VITA_FBO_CLEAR_ELISION: owed clear
+ *        materialize incl. its native glClear, colour-note forget) up to the
+ *        gt draw bracket's BEGIN read; a canonical driver fallback re-opens
+ *        the body and its gap lands here too;
+ *   gl   the gt draw bracket itself (vglIsaacDrawCanonicalQuads or
+ *        glDrawElements): identical reads, so gd.gl == gt.d per window;
+ *   tail gt END read -> gl_bridge exit read (deep-scope leave, adapter
+ *        return, stdcall retirement).
+ * n(dr,cq,ea,da): draws (disp calls), canonical zero-copy quad hits, attribs
+ * replayed by the handled EnableAttribs / DisableAttribs replays.
+ * en(own,loc,gl) / di(own,loc,gl): the k(en,di) replay time split
+ * (host_vita_shader_attrib_fastpath.c): own = frame/object/token checks
+ * before the loop + register retirement after it; loc = per-attrib
+ * backend->glGetAttribLocation (the shim location memo); gl = per-attrib
+ * backend->glEnableVertexAttribArray + glVertexAttribPointer (enable) or
+ * glDisableVertexAttribArray (disable), typed wrappers and gt bodies
+ * included.  own + loc + gl == k us.
+ * ph120.gu u(m4,4f,2f,1i,o)=us,n/...: the u wrapper bucket by frozen entry
+ * name: glUniformMatrix4fv, glUniform4fv, glUniform2fv, glUniform1i, every
+ * other glUniform*; same two reads as w, no extra clock. */
+enum {
+    ISAAC_VITA_GL_DRAW_SPLIT_DISPATCH = 0,
+    ISAAC_VITA_GL_DRAW_SPLIT_SYNC = 1,
+    ISAAC_VITA_GL_DRAW_SPLIT_CLASSIFY = 2,
+    ISAAC_VITA_GL_DRAW_SPLIT_CENSUS = 3,
+    ISAAC_VITA_GL_DRAW_SPLIT_FBO = 4,
+    ISAAC_VITA_GL_DRAW_SPLIT_BODY = 5,
+    ISAAC_VITA_GL_DRAW_SPLIT_TAIL = 6,
+    ISAAC_VITA_GL_DRAW_SPLIT_BUCKETS = 7
+};
+enum {
+    ISAAC_VITA_GL_REPLAY_OWN = 0,
+    ISAAC_VITA_GL_REPLAY_LOC = 1,
+    ISAAC_VITA_GL_REPLAY_GL = 2,
+    ISAAC_VITA_GL_REPLAY_PARTS = 3
+};
+enum {
+    ISAAC_VITA_GL_UNIFORM_M4 = 0,
+    ISAAC_VITA_GL_UNIFORM_4F = 1,
+    ISAAC_VITA_GL_UNIFORM_2F = 2,
+    ISAAC_VITA_GL_UNIFORM_1I = 3,
+    ISAAC_VITA_GL_UNIFORM_OTHER = 4,
+    ISAAC_VITA_GL_UNIFORM_KINDS = 5,
+    ISAAC_VITA_GL_UNIFORM_NONE = 0xff
+};
+
+typedef struct IsaacVitaGlWrapperTimeProfile {
+    IsaacVitaGlTimeBucket wrapper[ISAAC_VITA_GL_WRAPPER_BUCKETS];
+    IsaacVitaGlTimeBucket slot[ISAAC_VITA_GL_WRAPPER_K_SLOTS];
+    IsaacVitaGlTimeBucket draw[ISAAC_VITA_GL_DRAW_SPLIT_BUCKETS];
+    uint32_t draw_canonical;
+    IsaacVitaGlTimeBucket replay[ISAAC_VITA_GL_WRAPPER_K_SLOTS]
+                                [ISAAC_VITA_GL_REPLAY_PARTS];
+    IsaacVitaGlTimeBucket uniform[ISAAC_VITA_GL_UNIFORM_KINDS];
+    uint32_t bad_clock;
+} IsaacVitaGlWrapperTimeProfile;
+
+/* gl_bridge.c owns the storage in production (the phase-profile oracle
+ * defines its own). */
+extern IsaacVitaGlWrapperTimeProfile g_isaac_vita_gl_wrapper_time;
+/* gl_bridge.c: the entry read of the adapter run in flight (the draw
+ * wrapper charges its `disp` from it) and the draw wrapper's last gt END
+ * read (gl_bridge charges `tail` up to its exit read).  Not part of the
+ * take-and-zero: cursors, not accumulators. */
+extern uint64_t g_isaac_vita_gl_wrapper_entry_at;
+extern uint64_t g_isaac_vita_gl_draw_body_ended_at;
+
+/* Same arithmetic as isaac_vita_gl_time_add; a reversed clock taints this
+ * record's own bad= instead of ph120.gt's. */
+static inline void isaac_vita_gl_wrapper_time_add(
+    IsaacVitaGlTimeBucket *bucket, uint64_t started_at, uint64_t ended_at)
+{
+    uint64_t elapsed;
+
+    if (ended_at < started_at) {
+        ++g_isaac_vita_gl_wrapper_time.bad_clock;
+        return;
+    }
+    elapsed = ended_at - started_at;
+    if (elapsed > UINT32_MAX)
+        elapsed = UINT32_MAX;
+    ++bucket->calls;
+    bucket->total_us += (uint32_t)elapsed;
+    if ((uint32_t)elapsed > bucket->max_us)
+        bucket->max_us = (uint32_t)elapsed;
+}
+
+/* Bucket of one frozen-registry entry by its exact name (the table above);
+ * unknown names are `o`.  Evaluated once per entry at backend install. */
+static inline uint8_t isaac_vita_gl_wrapper_bucket_for_name(const char *name)
+{
+    static const char *const k_state[] = {
+        "glUseProgram", "glActiveTexture", "glBindTexture",
+        "glBlendFuncSeparate", "glClearColor", "glClearDepth", "glCullFace",
+        "glDepthFunc", "glEnable", "glGetAttribLocation",
+        "glGetUniformLocation", "glTexParameteri", "glViewport",
+    };
+    size_t i;
+
+    if (!name)
+        return ISAAC_VITA_GL_WRAPPER_OTHER;
+    if (!strcmp(name, "glDrawElements"))
+        return ISAAC_VITA_GL_WRAPPER_DRAW;
+    if (!strcmp(name, "glClear"))
+        return ISAAC_VITA_GL_WRAPPER_CLEAR;
+    if (!strcmp(name, "glBindFramebuffer") ||
+            !strcmp(name, "glFramebufferTexture2D"))
+        return ISAAC_VITA_GL_WRAPPER_BIND_FB;
+    if (!strcmp(name, "glTexImage2D") || !strcmp(name, "glTexSubImage2D"))
+        return ISAAC_VITA_GL_WRAPPER_TEX;
+    if (!strcmp(name, "glEnableVertexAttribArray") ||
+            !strcmp(name, "glDisableVertexAttribArray") ||
+            !strcmp(name, "glVertexAttribPointer"))
+        return ISAAC_VITA_GL_WRAPPER_ATTRIB;
+    if (!strncmp(name, "glUniform", 9u))
+        return ISAAC_VITA_GL_WRAPPER_UNIFORM;
+    for (i = 0u; i < sizeof k_state / sizeof k_state[0]; ++i)
+        if (!strcmp(name, k_state[i]))
+            return ISAAC_VITA_GL_WRAPPER_STATE;
+    return ISAAC_VITA_GL_WRAPPER_OTHER;
+}
+
+/* ph120.gu kind of one registry entry (NONE for non-uniform entries). */
+static inline uint8_t isaac_vita_gl_uniform_kind_for_name(const char *name)
+{
+    if (!name || strncmp(name, "glUniform", 9u))
+        return ISAAC_VITA_GL_UNIFORM_NONE;
+    if (!strcmp(name, "glUniformMatrix4fv"))
+        return ISAAC_VITA_GL_UNIFORM_M4;
+    if (!strcmp(name, "glUniform4fv"))
+        return ISAAC_VITA_GL_UNIFORM_4F;
+    if (!strcmp(name, "glUniform2fv"))
+        return ISAAC_VITA_GL_UNIFORM_2F;
+    if (!strcmp(name, "glUniform1i"))
+        return ISAAC_VITA_GL_UNIFORM_1I;
+    return ISAAC_VITA_GL_UNIFORM_OTHER;
+}
+#endif
+
 /* Preserve current requested GL state but start a fresh adjacency/run census. */
 void gl_vita_backend_phase_profile_window_boundary(void);
 
@@ -209,6 +572,99 @@ void gl_vita_backend_fbo_present(void);
  * logical texture-name lifecycle needed to classify the next window. */
 void gl_vita_backend_texture_churn_profile_take_window(
     IsaacVitaTextureChurnProfile *profile);
+#endif
+
+#if defined(ISAAC_VITA_GL_FILL_CENSUS) || \
+    defined(ISAAC_KAGE_VITA_PHASE_PROFILE_ORACLE)
+/* GL fill census (ISAAC_VITA_GL_FILL_CENSUS): per phase window, the
+ * projected screen area every guest glDrawElements would rasterise, from
+ * the Position attribute + Transform matrix + viewport shadows of the typed
+ * shim.  Pure CPU bookkeeping, no GL query; kilo-pixels (1024 px) rounded
+ * per draw (a draw under 512 px counts 0, each draw carries at most 0.5 kpx
+ * of rounding; the class sums prog e+o == blend a+d+o == sum(pass kpx) ==
+ * kpx_clipped hold exactly).  Reported as ph120.fa (totals/classes) and
+ * ph120.fp (per pass ordinal, attachment, tiles).  Legend:
+ *   kpx_unclipped / kpx_clipped: triangle area before / after clipping its
+ *     bounding box to the viewport (area scaled by the box overlap ratio);
+ *   kpx_clear: area of every glClear vitaGL received: the level-0 size of
+ *     the colour texture attached to the target framebuffer, or the native
+ *     960x544 display surface for framebuffer 0 (not the viewport); owed
+ *     depth/stencil clears the FBO clear elision issues natively count on
+ *     the framebuffer that owed them;
+ *   clear_unknown: native clears whose attachment size the census did not
+ *     know (renderbuffer, texture defined before the census saw its level-0
+ *     glTexImage2D, or a name past GL_VITA_TEXTURE_CAPACITY): counted 0 kpx
+ *     in kpx_clear, so kpx_clear is a lower bound when this is non-zero;
+ *   max_draw_kpx: largest clipped single draw;
+ *   big: triangles whose bbox exceeds twice the viewport in either axis;
+ *   bad: triangles with a non-finite or |coordinate| > 65536 pixel vertex,
+ *     or a near-zero clip w;
+ *   synthesized: canonical zero-copy draws whose indices were synthesized
+ *     (base+{0,2,1,1,2,3} per quad) instead of read;
+ *   projective: draws whose Transform was not affine (m3/m7/m11 != 0 or
+ *     m15 != 1), measured through the full divide;
+ *   tiles: 32x32 pixel tiles covered by clipped triangle boxes (summed per
+ *     triangle, so overlapping triangles count twice);
+ *   viewport_changes: glViewport calls that changed the rectangle (not the
+ *     number of distinct viewports);
+ *   miss: draws counted in draws/triangles but not measured (no viewport,
+ *     unknown program, Position/Transform not resolved, attribute disabled,
+ *     non-float or size 1/4 attribute, misaligned pointer/stride, non
+ *     triangle-list mode, invalid index array);
+ *   prog_kpx: e = program whose attribute queries included
+ *     PixelationAmount (the coloroffset layout), o = every other program;
+ *   blend_kpx: a = blend enabled with dst ONE (additive, as ph120.f),
+ *     d = dst ONE_MINUS_SRC_ALPHA, o = other factors or blend disabled;
+ *   pass_*: [0..3] = offscreen pass ordinal since present (3 = 3+), [4] =
+ *     display (framebuffer 0), one pass = a run of draws/clears on the
+ *     same framebuffer, split by attach-to-bound, glReadPixels on the pass
+ *     framebuffer and delete (the vitaGL scene_reset predicate);
+ *   attachment_*: level-0 glTexImage2D size of the colour texture attached
+ *     to the last offscreen pass of the window. */
+typedef struct IsaacVitaGlFillCensus {
+    uint32_t draws;
+    uint32_t triangles;
+    uint32_t kpx_unclipped;
+    uint32_t kpx_clipped;
+    uint32_t kpx_clear;
+    uint32_t max_draw_kpx;
+    uint32_t big;
+    uint32_t bad;
+    uint32_t synthesized;
+    uint32_t projective;
+    uint32_t tiles;
+    uint32_t viewport_width;
+    uint32_t viewport_height;
+    uint32_t viewport_changes;
+    uint32_t miss;
+    uint32_t prog_kpx[2];
+    uint32_t blend_kpx[3];
+    uint32_t pass_draws[5];
+    uint32_t pass_kpx[5];
+    uint32_t pass_clears[5];
+    uint32_t attachment_width;
+    uint32_t attachment_height;
+    uint32_t clear_unknown;
+} IsaacVitaGlFillCensus;
+
+/* Copies and zeroes the completed-window census (take-and-zero; the
+ * viewport size is the current shadow, not a counter).  `window` and the
+ * window's render p50 arm the optional one-frame draw dump
+ * (ISAAC_VITA_GL_FILL_CENSUS_DUMP), whose lines are emitted from here with
+ * isaac_vita_log, never from a wrapper. */
+void gl_vita_backend_fill_census_take_window(
+    IsaacVitaGlFillCensus *census, uint32_t window,
+    uint32_t render_p50_us);
+/* Call at present, before the swap: resets the pass ordinal and moves the
+ * draw dump between armed -> capturing -> complete. */
+void gl_vita_backend_fill_census_present(void);
+/* Boot receipt for the kage_vita_backend.c banner: returns 1 and the dump
+ * thresholds (render p50 arm in microseconds, first eligible window, forced
+ * window, frames per launch) when ISAAC_VITA_GL_FILL_CENSUS_DUMP is compiled
+ * in, else 0 and zeros. */
+uint32_t gl_vita_backend_fill_census_dump_config(
+    uint32_t *render_p50_us, uint32_t *min_window, uint32_t *window,
+    uint32_t *frames);
 #endif
 
 #ifndef ISAAC_VITAGL_DISPLAY_SURFACE_STATUS_DEFINED

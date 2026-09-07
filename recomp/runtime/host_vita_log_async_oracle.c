@@ -72,6 +72,112 @@ static void printf_sink(const char *line, unsigned length)
                   ISAAC_VITA_LOG_ASYNC_SINK_PRINTF, line, length);
 }
 
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+/* Use the actual native append/recovery/splitting algorithm, replacing only
+ * the kernel operations. The ordinary stream oracle still sees one record. */
+static unsigned char s_file_bytes[ISAAC_VITA_LOG_ASYNC_FILE_BATCH_BYTES];
+static unsigned s_file_size, s_io_opens, s_io_writes, s_io_closes;
+static unsigned s_open_fail_mask, s_write_results_count;
+static int s_write_results[16], s_close_fail, s_active_fd;
+static unsigned s_batch_calls, s_batch_trace_count;
+static unsigned s_batch_trace[256];
+static int s_trace_batches;
+static int s_batch_enqueue_after_sink;
+
+static void batch_io_reset(void)
+{
+    s_file_size = s_io_opens = s_io_writes = s_io_closes = 0u;
+    s_open_fail_mask = s_write_results_count = 0u;
+    s_close_fail = 0;
+    s_active_fd = -1;
+}
+
+static int batch_open(void)
+{
+    unsigned call = s_io_opens++;
+    check(s_active_fd == -1, "batch: no descriptor overlap");
+    if (call < 32u && ((s_open_fail_mask >> call) & 1u))
+        return -1;
+    s_active_fd = (int)call + 10;
+    return s_active_fd;
+}
+
+static int batch_write(int fd, const char *data, unsigned length)
+{
+    unsigned call = s_io_writes++;
+    int result = call < s_write_results_count ? s_write_results[call] :
+        (int)length;
+    check(fd == s_active_fd, "batch: write owns descriptor");
+    if (result > (int)length)
+        result = (int)length;
+    if (result > 0) {
+        check(s_file_size + (unsigned)result <= sizeof s_file_bytes,
+              "batch: file capture bounded");
+        if (s_file_size + (unsigned)result > sizeof s_file_bytes)
+            exit(2);
+        memcpy(s_file_bytes + s_file_size, data, (unsigned)result);
+        s_file_size += (unsigned)result;
+    }
+    return result;
+}
+
+static int batch_close(int fd)
+{
+    check(fd == s_active_fd, "batch: close owns descriptor exactly once");
+    s_active_fd = -1;
+    ++s_io_closes;
+    return s_close_fail ? -1 : 0;
+}
+
+static void batch_debug(const char *line, unsigned length)
+{
+    check(line[length] == '\0', "batch: each debug record terminated");
+    file_sink(line, length);
+}
+
+#define ISAAC_LOG_BATCH_OPEN() batch_open()
+#define ISAAC_LOG_BATCH_WRITE(fd, data, size) batch_write(fd, data, size)
+#define ISAAC_LOG_BATCH_CLOSE(fd) batch_close(fd)
+#define ISAAC_LOG_BATCH_DEBUG(line, size) batch_debug(line, size)
+#include "host_vita_log_file_batch_private.h"
+#undef ISAAC_LOG_BATCH_OPEN
+#undef ISAAC_LOG_BATCH_WRITE
+#undef ISAAC_LOG_BATCH_CLOSE
+#undef ISAAC_LOG_BATCH_DEBUG
+
+static void file_batch_sink(char *payload, const uint16_t *lengths,
+                             unsigned records)
+{
+    static char original[ISAAC_VITA_LOG_ASYNC_FILE_BATCH_BYTES + 1u];
+    unsigned total = 0u;
+    unsigned i;
+    ++s_batch_calls;
+    if (s_trace_batches) {
+        check(s_batch_trace_count < 256u, "batch: bounded test trace");
+        s_batch_trace[s_batch_trace_count++] = records;
+    }
+    for (i = 0u; i < records; ++i)
+        total += lengths[i];
+    check(records > 0u && records <= ISAAC_VITA_LOG_ASYNC_FILE_BATCH_RECORDS,
+          "batch: record cap");
+    check(total <= ISAAC_VITA_LOG_ASYNC_FILE_BATCH_BYTES, "batch: byte cap");
+    memcpy(original, payload, total + 1u);
+    batch_io_reset();
+    isaac_vita_log_file_batch_emit(payload, lengths, records);
+    check(s_io_opens == 1u && s_io_writes == 1u && s_io_closes == 1u,
+          "batch: one successful file transaction");
+    check(s_file_size == total && memcmp(s_file_bytes, original, total) == 0,
+          "batch: exact durable payload including binary bytes");
+    check(memcmp(payload, original, total + 1u) == 0,
+          "batch: debug terminators restored");
+    if (s_batch_enqueue_after_sink) {
+        s_batch_enqueue_after_sink = 0;
+        check(isaac_vita_log_async_enqueue(0u, "later", 5u) == 1,
+              "batch: producer enqueue during sink");
+    }
+}
+#endif
+
 static void expect(unsigned tag, const char *line, unsigned length)
 {
     stream_append(s_expected, &s_expected_length, &s_expected_lines, tag,
@@ -527,6 +633,149 @@ static void hostile_mixed_fill(void)
     streams_reset();
 }
 
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+static void batch_boundaries(void)
+{
+    char line[ISAAC_VITA_LOG_ASYNC_LINE_MAX];
+    unsigned i;
+    uint32_t calls;
+    uint32_t dropped;
+    memset(line, 'B', sizeof line);
+    streams_reset();
+    s_trace_batches = 1;
+    s_batch_trace_count = 0u;
+    /* Eight-record cap, then a PRINTF barrier and the exact 4096-byte cap. */
+    for (i = 0u; i < 9u; ++i) {
+        check(isaac_vita_log_async_enqueue(0u, "x", 1u) == 1,
+              "batch: short queued");
+        expect(0u, "x", 1u);
+    }
+    check(isaac_vita_log_async_enqueue(1u, "P", 1u) == 1, "batch: barrier");
+    expect(1u, "P", 1u);
+    for (i = 0u; i < 5u; ++i) {
+        check(isaac_vita_log_async_enqueue(0u, line, sizeof line) == 1,
+              "batch: maximal queued");
+        expect(0u, line, sizeof line);
+    }
+    check(isaac_vita_log_async_oracle_service() == 15u, "batch: immediate drain");
+    check(streams_equal(), "batch: caps and PRINTF FIFO");
+    check(s_batch_trace_count == 4u && s_batch_trace[0] == 8u &&
+          s_batch_trace[1] == 1u && s_batch_trace[2] == 4u &&
+          s_batch_trace[3] == 1u, "batch: exact record/byte boundaries");
+    streams_reset();
+    s_batch_trace_count = 0u;
+    /* The drop-report check is after record 64, even within a FILE run. */
+    dropped = stats().dropped;
+    expect(1u, "P", 1u);
+    check(isaac_vita_log_async_enqueue(1u, "P", 1u) == 1, "batch: offset");
+    for (i = 0u; i < 66u; ++i) {
+        check(isaac_vita_log_async_enqueue(0u, "F", 1u) == 1, "batch: long run");
+        expect(0u, "F", 1u);
+        if (i == 62u) {
+            char report[64];
+            snprintf(report, sizeof report, "[kage-vita] log-async dropped=%u\n",
+                     (unsigned)(dropped + 1u));
+            expect_string(1u, report);
+        }
+    }
+    check(isaac_vita_log_async_enqueue(7u, "bad", 3u) == -1,
+          "batch: refused record before drain");
+    g_isaac_vita_log_async_oracle_now_us += ISAAC_VITA_LOG_ASYNC_DROP_REPORT_US;
+    isaac_vita_log_async_flush();
+    check(streams_equal(), "batch: flush exact FILE run");
+    check(s_batch_trace_count == 9u && s_batch_trace[7] == 7u &&
+          s_batch_trace[8] == 3u, "batch: never straddles drop-report boundary");
+    streams_reset();
+    s_batch_trace_count = 0u;
+    check(isaac_vita_log_async_enqueue(0u, "first", 5u) == 1,
+          "batch: one queued record does not wait");
+    expect(0u, "first", 5u);
+    expect(0u, "later", 5u);
+    s_batch_enqueue_after_sink = 1;
+    check(isaac_vita_log_async_oracle_service() == 2u,
+          "batch: enqueue during sink drained without delayed pending state");
+    check(streams_equal() && s_batch_trace_count == 2u &&
+          s_batch_trace[0] == 1u && s_batch_trace[1] == 1u,
+          "batch: only already queued records in each group");
+    streams_reset();
+    s_trace_batches = 0;
+    /* Exceptional no-lock fallback remains the original per-record sink. */
+    calls = s_batch_calls;
+    for (i = 0u; i < 3u; ++i) {
+        check(isaac_vita_log_async_enqueue(i & 1u, "F", 1u) == 1,
+              "batch: fallback queued");
+        expect(i & 1u, "F", 1u);
+    }
+    g_isaac_vita_log_async_oracle_sink_lock_fail = 1;
+    isaac_vita_log_async_flush();
+    g_isaac_vita_log_async_oracle_sink_lock_fail = 0;
+    check(s_batch_calls == calls && streams_equal(), "batch: original no-lock path");
+    streams_reset();
+}
+
+static void batch_failures(void)
+{
+    static const uint16_t lengths[] = {5u, 4u, 6u};
+    unsigned mode;
+    for (mode = 0u; mode < 12u; ++mode) {
+        char payload[] = "ABCDEfghiJKLMNO";
+        const char *expected_file = payload;
+        unsigned expected_size = 15u;
+        unsigned expected_opens = 1u, expected_writes = 1u, expected_closes = 1u;
+        unsigned i;
+        streams_reset();
+        batch_io_reset();
+        if (mode == 1u) { /* Every positive short write progresses. */
+            for (i = 0u; i < 8u; ++i) s_write_results[i] = 2;
+            s_write_results_count = 8u;
+            expected_writes = 8u;
+        } else if (mode == 2u || mode == 3u || mode == 8u ||
+                   mode == 10u || mode == 11u) {
+            int at_boundary = mode == 3u || mode == 11u;
+            s_write_results[0] = at_boundary ? 5 : 2;
+            s_write_results[1] = mode >= 10u ? 0 : -1;
+            s_write_results_count = 2u;
+            expected_opens = at_boundary ? 3u : 4u;
+            expected_writes = at_boundary ? 4u : 5u;
+            expected_closes = expected_opens;
+            if (mode == 8u) { /* A fallback suffix gets only one attempt. */
+                s_write_results[2] = 1;
+                s_write_results_count = 3u;
+                expected_file = "ABCfghiJKLMNO";
+                expected_size = 13u;
+            }
+        } else if (mode == 4u || mode == 5u) {
+            s_open_fail_mask = mode == 4u ? 1u : 0xffffffffu;
+            expected_opens = 4u;
+            expected_writes = expected_closes = mode == 4u ? 3u : 0u;
+            if (mode == 5u) expected_size = 0u;
+        } else if (mode == 6u || mode == 7u) {
+            s_write_results_count = mode == 6u ? 1u : 4u;
+            for (i = 0u; i < s_write_results_count; ++i)
+                s_write_results[i] = mode == 6u ? 0 : -1;
+            expected_opens = expected_writes = expected_closes = 4u;
+            if (mode == 7u) expected_size = 0u;
+        } else if (mode == 9u) {
+            s_close_fail = 1;
+        }
+        expect(0u, "ABCDE", 5u);
+        expect(0u, "fghi", 4u);
+        expect(0u, "JKLMNO", 6u);
+        isaac_vita_log_file_batch_emit(payload, lengths, 3u);
+        check(s_file_size == expected_size &&
+              memcmp(s_file_bytes, expected_file, expected_size) == 0,
+              "batch failure: accepted prefix never replayed");
+        check(s_io_opens == expected_opens && s_io_writes == expected_writes &&
+              s_io_closes == expected_closes && s_active_fd == -1,
+              "batch failure: bounded recovery and balanced close");
+        check(streams_equal(), "batch failure: every debug record exactly once");
+        check(memcmp(payload, "ABCDEfghiJKLMNO", sizeof payload) == 0,
+              "batch failure: payload restored");
+    }
+    streams_reset();
+}
+#endif
+
 int main(void)
 {
     static char big[ISAAC_VITA_LOG_ASYNC_LINE_MAX + 1u];
@@ -543,6 +792,9 @@ int main(void)
 
     g_isaac_vita_log_async_oracle_file_sink = file_sink;
     g_isaac_vita_log_async_oracle_printf_sink = printf_sink;
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+    g_isaac_vita_log_async_oracle_file_batch_sink = file_batch_sink;
+#endif
     g_isaac_vita_log_async_oracle_now_us = 5000000u;
 
     /* 1. Before start: enqueue refuses (caller writes synchronously) and the
@@ -720,6 +972,10 @@ int main(void)
     hostile_overload_report_position();
     hostile_printf_overflow();
     hostile_mixed_fill();
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+    batch_boundaries();
+    batch_failures();
+#endif
 
     /* Final totals: every accepted line reached a sink exactly once. */
     s = stats();

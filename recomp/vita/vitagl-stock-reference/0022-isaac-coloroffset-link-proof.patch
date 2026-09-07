@@ -1,0 +1,116 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 8bf715e..99a992f 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -470,6 +470,10 @@ typedef struct {
+ 	isaac_coloroffset_fragment_cache_entry *isaac_coloroffset_fragment_cache;
+ 	uint8_t isaac_coloroffset_fragment_cache_count;
+ 	SceGxmShaderPatcherId isaac_coloroffset_link_fragment_id;
++#ifdef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
++	/* Positive immutable sampler proof, valid only for this exact GXP. */
++	const SceGxmProgram *isaac_coloroffset_link_sampler_program;
++#endif
+ 	const SceGxmProgram *isaac_coloroffset_link_vertex_program;
+ 	uint32_t isaac_coloroffset_link_source_generation;
+ 	uint32_t isaac_coloroffset_link_vertex_generation;
+@@ -879,9 +883,26 @@ static GLboolean isaac_coloroffset_vertex_shader_is_exact(const shader *s) {
+ 		sceGxmProgramParameterGetContainerIndex(transform) == 14u;
+ }
+ 
++#ifdef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
++static GLboolean isaac_coloroffset_fragment_sampler_is_exact(
++		const SceGxmProgram *gxp) {
++	const SceGxmProgramParameter *texture0;
++	if (!gxp || sceGxmProgramGetParameterCount(gxp) != 1u)
++		return GL_FALSE;
++	texture0 = sceGxmProgramFindParameterByName(gxp, "Texture0");
++	return texture0 &&
++		sceGxmProgramParameterGetCategory(texture0) ==
++			SCE_GXM_PARAMETER_CATEGORY_SAMPLER &&
++		sceGxmProgramParameterGetResourceIndex(texture0) == 0u &&
++		sceGxmProgramParameterGetArraySize(texture0) == 1u;
++}
++#endif
++
+ static GLboolean isaac_coloroffset_fragment_program_is_exact(
+ 		const program *p) {
++#ifndef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
+ 	const SceGxmProgramParameter *texture0;
++#endif
+ 	int32_t shader_index;
+ 	int32_t vertex_index;
+ 	if (!p || p->status != PROG_LINKED || !p->fshader || !p->fshader->prog ||
+@@ -902,6 +923,11 @@ static GLboolean isaac_coloroffset_fragment_program_is_exact(
+ 			!isaac_coloroffset_source_generation[vertex_index] ||
+ 			p->isaac_coloroffset_link_vertex_generation !=
+ 				isaac_coloroffset_source_generation[vertex_index] ||
++#ifdef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
++			p->isaac_coloroffset_link_sampler_program != p->fshader->prog)
++		return GL_FALSE;
++	return GL_TRUE;
++#else
+ 			sceGxmProgramGetParameterCount(p->fshader->prog) != 1u)
+ 		return GL_FALSE;
+ 	texture0 = sceGxmProgramFindParameterByName(p->fshader->prog, "Texture0");
+@@ -910,12 +936,17 @@ static GLboolean isaac_coloroffset_fragment_program_is_exact(
+ 			SCE_GXM_PARAMETER_CATEGORY_SAMPLER &&
+ 		sceGxmProgramParameterGetResourceIndex(texture0) == 0u &&
+ 		sceGxmProgramParameterGetArraySize(texture0) == 1u;
++#endif
+ }
+ 
+ static void isaac_coloroffset_record_link(program *p) {
+ 	int32_t index = p ? isaac_coloroffset_shader_index(p->fshader) : -1;
+ 	int32_t vertex_index = p ?
+ 		isaac_coloroffset_shader_index(p->vshader) : -1;
++#ifdef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
++	if (p)
++		p->isaac_coloroffset_link_sampler_program = NULL;
++#endif
+ 	if (index >= 0 && vertex_index >= 0 && p->vshader && p->vshader->prog &&
+ 			isaac_coloroffset_source_generation[vertex_index] &&
+ 			isaac_coloroffset_fragment_shader_is_exact(p->fshader) &&
+@@ -932,6 +963,12 @@ static void isaac_coloroffset_record_link(program *p) {
+ 		p->isaac_coloroffset_link_vertex_generation =
+ 			isaac_coloroffset_source_generation[vertex_index];
+ 		p->isaac_coloroffset_link_vertex_exact = 1;
++#ifdef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
++		/* The owned GXP is immutable until a source/compile/binary mutation.
++		 * Every such path invalidates the existing draw-time generations. */
++		if (isaac_coloroffset_fragment_sampler_is_exact(p->fshader->prog))
++			p->isaac_coloroffset_link_sampler_program = p->fshader->prog;
++#endif
+ 	} else if (p) {
+ 		p->isaac_coloroffset_link_fragment_id = 0;
+ 		p->isaac_coloroffset_link_vertex_program = NULL;
+@@ -3499,6 +3536,9 @@ GLuint glCreateProgram(void) {
+ 			progs[i].isaac_coloroffset_fragment_cache = NULL;
+ 			progs[i].isaac_coloroffset_fragment_cache_count = 0;
+ 			progs[i].isaac_coloroffset_link_fragment_id = 0;
++#ifdef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
++			progs[i].isaac_coloroffset_link_sampler_program = NULL;
++#endif
+ 			progs[i].isaac_coloroffset_link_vertex_program = NULL;
+ 			progs[i].isaac_coloroffset_link_source_generation = 0;
+ 			progs[i].isaac_coloroffset_link_vertex_generation = 0;
+@@ -3601,6 +3641,9 @@ void glDeleteProgram(GLuint prog) {
+ 
+ 	// Grabbing passed program
+ 	program *p = &progs[prog - 1];
++#ifdef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
++	p->isaac_coloroffset_link_sampler_program = NULL;
++#endif
+ #ifdef HAVE_ISAAC_GXM_STATE_SHADOW
+ 	isaacGxmStateInvalidate(gxm_context);
+ #endif
+@@ -3741,6 +3784,10 @@ void glLinkProgram(GLuint progr) {
+ 
+ 	// Grabbing passed program
+ 	program *p = &progs[progr - 1];
++#ifdef HAVE_ISAAC_COLOROFFSET_LINK_PROOF
++	/* Invalidate before any early link failure, not only on link completion. */
++	p->isaac_coloroffset_link_sampler_program = NULL;
++#endif
+ #ifndef SKIP_ERROR_HANDLING
+ 	if (glsl_sema_mode == VGL_MODE_POSTPONED) {
+ 		if (!(p->fshader->prog || (p->fshader->is_glsl && p->fshader->source)) || !(p->vshader->prog || (p->vshader->is_glsl && p->vshader->source))) {

@@ -17,7 +17,9 @@ GPU_DRAW_PATCH_SHA256 = "a640d5f89487aa09ace46b5260c94126a6588c8ba0f1e99b4b1120b
 GPU_DRAW_POLICY_SHA256 = "9d4721994dc9c786e6cd78b64276f4fd5b18b0b03c7aed1f3c5732e81102731f"
 GXM_STATE_POLICY_SHA256 = "21aeacfbcb9b0a2999e40645ed4c6c664dfb401c2c447fabed364688e02b80f5"
 COLOROFFSET_PATCH_SHA256 = "e623e862fea045c6423113ac960e43d1144123eb9e93835a77a2067a8db48873"
-COLOROFFSET_POLICY_SHA256 = "edbc0fcca982ce35339ea97dad2a1bb656232c97401407f4beb1397ed52b3079"
+COLOROFFSET_POLICY_SHA256 = "dcc5e7d29f803cfc86b8cdc029281607806edb09da97c4f7d5101e0de73562e2"
+# 0008: diagnostic ColorOffset fragment-shader probe (custom_shaders.c only).
+COLOROFFSET_FS_PROBE_PATCH_SHA256 = "d1bede6396c170f6054f783c2f397d24616981d2c673fe97ab7830c108aaf75b"
 FLAGS = "SOFTFP_ABI=1 NO_DEBUG=1 NO_SPLASHSCREEN=1 SINGLE_THREADED_GC=1"
 EXPECTED_MAKE_COMMAND = (
     "env",
@@ -135,6 +137,11 @@ def verify_contract(
         "profile=stock-vitagl-reference ",
         "source=73dd57a physical=960x544 logical=960x540 ",
         "rt-scenes=%u GL=%s",
+        '"rt-scenes=%u" KAGE_VITA_STOCK_FBO_RT_SCENES_BANNER',
+        'KAGE_VITA_STOCK_FBO_VALID_REGION_BANNER " GL=%s\\n"',
+        '# define KAGE_VITA_STOCK_FBO_RT_SCENES_BANNER " fbo-rt-scenes=%u"',
+        '# define KAGE_VITA_STOCK_FBO_VALID_REGION_BANNER " fbo-valid-region=%s"',
+        'uint8_t vglIsaacSetupFboValidRegion(uint8_t apply);',
     ):
         require(backend, needle, "stock runtime branch")
 
@@ -316,7 +323,7 @@ def verify_coloroffset_contract(
     source_oracle: str,
     policy_oracle: str,
     gl_backend: str,
-    documentation: str,
+    readme: str,
 ) -> None:
     actual_patch_sha = hashlib.sha256(patch_bytes).hexdigest()
     if actual_patch_sha != COLOROFFSET_PATCH_SHA256:
@@ -473,7 +480,8 @@ def verify_coloroffset_contract(
         "opaque_viewport_pixels",
         "not a GPU fragment counter",
     ):
-        require(documentation, needle, "ColorOffset safety documentation")
+        require(readme, needle,
+                "stock reference README (ColorOffset safety statements)")
 
     if not re.search(
         r"option\(ISAAC_VITA_COLOROFFSET_GPU_OPTIMIZATIONS\s+"
@@ -495,6 +503,170 @@ def verify_coloroffset_contract(
         "phase_profile=%s\\n",
     ):
         require(build, needle, "quiet stock vitaGL counter switch")
+
+
+def verify_coloroffset_fs_probe_contract(
+    build: str,
+    patch_bytes: bytes,
+    cmake: str,
+    phase_profile: str,
+    phase_profile_header: str,
+    probe_header: str,
+    gl_backend: str,
+    readme: str,
+) -> None:
+    """0008 owns diagnostic modes 1/2 and the separate opt-in neutral mode 3.
+    All default OFF, custom_shaders.c only, stock fallback and shared ABI."""
+    actual_patch_sha = hashlib.sha256(patch_bytes).hexdigest()
+    if actual_patch_sha != COLOROFFSET_FS_PROBE_PATCH_SHA256:
+        raise AssertionError(
+            "ColorOffset FS probe patch SHA-256 changed: "
+            f"{actual_patch_sha} != {COLOROFFSET_FS_PROBE_PATCH_SHA256}"
+        )
+    patch = patch_bytes.decode("utf-8")
+    touched = set(re.findall(r"(?m)^\+\+\+ b/(.+)$", patch))
+    if touched != {"source/custom_shaders.c"}:
+        raise AssertionError(
+            f"ColorOffset FS probe patch surface drifted: {sorted(touched)!r}")
+    for needle in (
+        "#ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE",
+        '#error "Isaac ColorOffset FS probe requires the exact ColorOffset bundle"',
+        "#if HAVE_ISAAC_COLOROFFSET_FS_PROBE < 1 || HAVE_ISAAC_COLOROFFSET_FS_PROBE > 3",
+        "isaac_coloroffset_fs_probe_note_exact_source(s);",
+        "isaac_coloroffset_fs_probe_link(p);",
+        "isaac_coloroffset_fs_probe_release(p);",
+        "isaac_coloroffset_fs_probe_select(",
+        "void vglGetIsaacColorOffsetFsProbeStats(",
+        # NODISCARD derivation receipts on the authenticated 2052-byte source.
+        "#define ISAAC_COLOROFFSET_FS_PROBE_DISCARD_OFFSET 903u",
+        "#define ISAAC_COLOROFFSET_FS_PROBE_DISCARD_SIZE 73u",
+        "#define ISAAC_COLOROFFSET_FS_PROBE_DISCARD_FNV1A 0xeed28c60u",
+        "#define ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_SIZE 1979u",
+        "#define ISAAC_COLOROFFSET_FS_PROBE_NODISCARD_FNV1A 0xfc8c5c9bu",
+        # fail-closed link checks and translator bracketing
+        "sceGxmProgramCheck(candidate) != 0",
+        "sceGxmProgramGetType(candidate) != SCE_GXM_FRAGMENT_PROGRAM",
+        "sceGxmProgramGetParameterCount(candidate) != 1u",
+        "stock_fragment->unif_buf_size",
+        'sceGxmProgramFindParameterByName(candidate, "Texture0")',
+        "if (!is_shark_online && !start_shader_compiler()) {",
+        "glsl_sema_mode = VGL_MODE_SHADER_PAIR;",
+        "glsl_bindings_map = saved_bindings;",
+        "glsl_translator_set_process(p->vshader, &probe);",
+        # the probe fragment program mirrors the stock blend/output/MSAA
+        "&blend_info.info, p->vshader->prog, &entry->fragment_program);",
+        "SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 :",
+        "#define ISAAC_COLOROFFSET_FS_PROBE_CACHE_CAPACITY 4u",
+        "#if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 3",
+        "isaac_coloroffset_neutral_draw_is_eligible(",
+        "isaac_coloroffset_contiguous_vertices_are_neutral(vertices,",
+        "p->attr_map[index] != index",
+        "size < 0x9cu",
+        "vec3 Colorized = mix(Color.rgb, dot(Color.rgb, _lum) * ColorizeOut.rgb, ColorizeOut.a);",
+        "fragColor = vec4(Colorized + ColorOffsetOut * Color.a, Color.a);",
+    ):
+        require(patch, needle, "ColorOffset FS probe patch")
+    for forbidden in (
+        # never the public header, never gxm.c
+        "source/vitaGL.h", "source/gxm.c",
+        # no guest-visible shader handles for the probe object
+        "glCreateShader(", "glShaderSource(", "glCompileShader(",
+        # NODISCARD is derived at runtime; neutral mode contains no clip/pixelate.
+        "ClipPlaneOut", "PixelationAmountOut",
+        # the stock shader object and its 0003 link record stay untouched
+        "isaac_coloroffset_source_exact[index] = 0;",
+        "p->fshader->id = ",
+        "p->fprog = ",
+    ):
+        if forbidden in patch:
+            raise AssertionError(
+                f"ColorOffset FS probe patch contains {forbidden!r}")
+
+    for needle in (
+        "coloroffset_fs_probe=${ISAAC_COLOROFFSET_FS_PROBE:-0}",
+        'coloroffset_fs_probe_patch="$script_dir/0008-isaac-coloroffset-fs-probe.patch"',
+        "coloroffset_fs_probe must be exactly 0, 1 (TRIVIAL), 2 (NODISCARD) or 3 (NEUTRAL)",
+        "ColorOffset FS probe requires ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS=1",
+        'apply_source_patch "$coloroffset_fs_probe_patch"',
+        "HAVE_ISAAC_COLOROFFSET_FS_PROBE=$coloroffset_fs_probe",
+        "-DHAVE_ISAAC_COLOROFFSET_FS_PROBE=$coloroffset_fs_probe",
+        '"$coloroffset_fs_probe" "$coloroffset_fs_probe_patch_sha"',
+        "ColorOffset FS probe leaked into vitaGL.h",
+        "ColorOffset FS probe endpoint escaped its opt-in build",
+        "coloroffset_fs_probe=%s\\n",
+        "coloroffset_fs_probe_mode=%s\\n",
+        "coloroffset_fs_probe_patch_sha256=%s\\n",
+    ):
+        require(build, needle, "ColorOffset FS probe build.sh contract")
+    order = [build.index(f'apply_source_patch "${name}_patch"')
+             for name in ("coloroffset", "coloroffset_fs_probe", "shader_cache")]
+    if order != sorted(order):
+        raise AssertionError("build.sh applies 0008 outside 0003..0004")
+
+    if not re.search(
+        r"set\(ISAAC_VITA_COLOROFFSET_FS_PROBE OFF CACHE STRING\s*\n\s*\"",
+        cmake,
+    ):
+        raise AssertionError("ColorOffset FS probe CMake knob is not default OFF")
+    if not re.search(
+        r"option\(ISAAC_VITA_COLOROFFSET_NEUTRAL_FASTPATH\s+"
+        r'"[^"]+" OFF\)', cmake,
+    ):
+        raise AssertionError("ColorOffset neutral fastpath is not default OFF")
+    for needle in (
+        'ISAAC_VITA_COLOROFFSET_FS_PROBE_UPPER STREQUAL "TRIVIAL"',
+        'ISAAC_VITA_COLOROFFSET_FS_PROBE_UPPER STREQUAL "NODISCARD"',
+        "ISAAC_VITA_COLOROFFSET_FS_PROBE must be OFF, TRIVIAL or NODISCARD",
+        "NOT ISAAC_VITA_COLOROFFSET_GPU_OPTIMIZATIONS OR",
+        "NOT ISAAC_VITA_COLOROFFSET_NEUTRAL_FASTPATH AND",
+        "NOT ISAAC_VITA_PHASE_PROFILE)))",
+        "option(ISAAC_VITA_COLOROFFSET_NEUTRAL_FASTPATH",
+        "set(ISAAC_VITA_COLOROFFSET_FS_PROBE_MODE 3)",
+        "ISAAC_COLOROFFSET_FS_PROBE=${ISAAC_VITA_COLOROFFSET_FS_PROBE_MODE}",
+        "vitagl-stock-reference/0008-isaac-coloroffset-fs-probe.patch",
+        "ISAAC_VITA_COLOROFFSET_FS_PROBE=${ISAAC_VITA_COLOROFFSET_FS_PROBE_MODE})",
+        "never ship this build",
+    ):
+        require(cmake, needle, "ColorOffset FS probe production CMake")
+
+    for needle in (
+        '"[kage-vita] ph120.kp bid=%.32s win=%u loops=%u mode=%u "',
+        "vglGetIsaacColorOffsetFsProbeStats(&s_window_fs_probe);",
+        "kage_vita_profile_coloroffset_fs_probe_delta(",
+        '# include "gl_vita_coloroffset_fs_probe.h"',
+    ):
+        require(phase_profile, needle, "ColorOffset FS probe ph120.kp owner")
+    require(phase_profile_header, ",k,kp,b,", "ph120 record order")
+    for needle in (
+        "typedef struct vglIsaacColorOffsetFsProbeStats {",
+        "uint32_t draws_opaque_overridden;",
+        "== 21u * sizeof(uint32_t)",
+        "void vglGetIsaacColorOffsetFsProbeStats(vglIsaacColorOffsetFsProbeStats *stats);",
+    ):
+        require(probe_header, needle, "ColorOffset FS probe consumer ABI")
+    for needle in (
+        '"KAGE VITA COLOROFFSET FS PROBE LINK: prog=%u mode=%u "',
+        "gl_vita_backend_coloroffset_fs_probe_link_receipt(program);",
+    ):
+        require(gl_backend, needle, "ColorOffset FS probe link receipt")
+
+    for needle in (
+        "ISAAC_VITA_COLOROFFSET_FS_PROBE",
+        "0008-isaac-coloroffset-fs-probe.patch",
+        "ph120.kp",
+        "never ship",
+        # the production profile's deferred-path statement stays true
+        "static_eligible`, `static_hits`, and `static_pixels`",
+        "remain zero by construction",
+    ):
+        require(readme, needle,
+                "stock reference README (ColorOffset FS probe statements)")
+    for needle in (
+        "| `ISAAC_VITA_COLOROFFSET_FS_PROBE` | 0008 |",
+        "0008-isaac-coloroffset-fs-probe.patch",
+        "never ships",
+    ):
+        require(readme, needle, "stock reference README")
 
 
 def expect_rejected(
@@ -553,11 +725,25 @@ def main() -> int:
     cmake = (vita / "CMakeLists.txt").read_text(encoding="utf-8")
     backend = (runtime / "kage_vita_backend.c").read_text(encoding="utf-8")
     gl_backend = (runtime / "gl_vita_backend.c").read_text(encoding="utf-8")
-    coloroffset_documentation = (
-        recipe_dir / "COLOROFFSET_GPU_OPTIMIZATION.md"
+    fs_probe_patch_bytes = (
+        recipe_dir / "0008-isaac-coloroffset-fs-probe.patch"
+    ).read_bytes()
+    phase_profile = (
+        runtime / "kage_vita_phase_profile.c"
     ).read_text(encoding="utf-8")
+    phase_profile_header = (
+        runtime / "kage_vita_phase_profile.h"
+    ).read_text(encoding="utf-8")
+    fs_probe_header = (
+        runtime / "gl_vita_coloroffset_fs_probe.h"
+    ).read_text(encoding="utf-8")
+    stock_readme = (recipe_dir / "README.md").read_text(encoding="utf-8")
 
     verify_contract(build, patch_bytes, cmake, backend)
+    verify_coloroffset_fs_probe_contract(
+        build, fs_probe_patch_bytes, cmake, phase_profile,
+        phase_profile_header, fs_probe_header, gl_backend, stock_readme,
+    )
     verify_gpu_draw_contract(
         build, gpu_draw_patch_bytes, gpu_draw_policy_bytes,
         gxm_state_policy_bytes, cmake
@@ -565,7 +751,7 @@ def main() -> int:
     verify_coloroffset_contract(
         build, coloroffset_patch_bytes, coloroffset_policy_bytes, cmake,
         source_matcher, source_oracle, coloroffset_policy_oracle, gl_backend,
-        coloroffset_documentation,
+        stock_readme,
     )
     for needle in (
         "0x7054709cu",

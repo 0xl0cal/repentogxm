@@ -1,0 +1,94 @@
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1347,6 +1347,11 @@
+ #ifdef HAVE_ISAAC_FBO_RT_REUSE
+ #include "isaac_fbo_rt_reuse.h"
+ #endif
++#if defined(HAVE_ISAAC_FBO_RT_REUSE_LEASE) && HAVE_ISAAC_FBO_RT_REUSE_LEASE
++#if !defined(HAVE_ISAAC_FBO_RT_REUSE) || FRAME_PURGE_FREQ != 4
++#error "Isaac bounded RT lease requires RT reuse and the four-bucket collector"
++#endif
++#endif
+ 
+ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(framebuffer *fb, GLenum attachment, texture *tex, GLuint tex_id) {
+ 	// Extracting texture data
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -587,6 +587,20 @@
+ 		sceDisplayWaitVblankStartMulti(vsync_interval);
+ }
+ 
++#if defined(HAVE_ISAAC_FBO_RT_REUSE_LEASE) && HAVE_ISAAC_FBO_RT_REUSE_LEASE
++/* This is called only after Finish. Take rechecks this retirement's actual
++ * original Collect witness; detach before the driver, never before deadline. */
++void vglIsaacFboRtDrainAfterFinish(void) {
++	SceGxmRenderTarget *rt = (SceGxmRenderTarget *)isaacFboRtRecoveryTake();
++	if (rt) {
++#ifdef HAVE_ISAAC_NATIVE_RESOURCE_PROFILE
++		isaacNativeResourceRetireRT(rt);
++#endif
++		sceGxmDestroyRenderTarget(rt);
++	}
++}
++#endif
++
+ // Garbage collector
+ #if defined(HAVE_PTHREAD) && !defined(HAVE_SINGLE_THREADED_GC)
+ void garbage_collector(void *arg) {
+@@ -1004,7 +1018,21 @@
+ 						msaa_mode == SCE_GXM_MULTISAMPLE_NONE);
+ #endif
+ #ifdef HAVE_ISAAC_FBO_RT_SCENES
++#if defined(HAVE_ISAAC_FBO_RT_REUSE_LEASE) && HAVE_ISAAC_FBO_RT_REUSE_LEASE
++				if (r && isaacFboRtHasSpare()) {
++					isaacFboRtRecoveryBegin();
++					/* Immature pressure only revokes; no added Finish or GC.
++					 * Take still rechecks after a possibly reentrant Finish. */
++					if (isaacFboRtHasMatureSpare()) {
++						sceGxmFinish(gxm_context);
++						vglIsaacFboRtDrainAfterFinish();
++					}
++					isaacFboRtRecoveryEnd();
++				}
++#endif
++				/* Preserve the original requested-eight then fallback-one order.
++				 * The lease does not add another eight-scene creation attempt. */
+ 				if (r && gxm_fbo_rt_size != 1) {
+ 					// Fail closed: a target sized for several scenes needs more driver memory; fall back to the stock single slot rather than leave the framebuffer without a rendertarget
+ 					active_write_fb->target = NULL;
+ 					r = setup_render_target(&active_write_fb->target, active_write_fb->width, active_write_fb->height, 1);
+diff --git a/source/utils/gpu_utils.c b/source/utils/gpu_utils.c
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -160,7 +160,14 @@
+ 	// Performing a garbage collection cycle prior to attempting to allocate the memory again
+ 	unsafe_allocator_counter++;
+ 	if (unsafe_allocator_counter == 1) {
++#if defined(HAVE_ISAAC_FBO_RT_REUSE_LEASE) && HAVE_ISAAC_FBO_RT_REUSE_LEASE
++		isaacFboRtRecoveryBegin();
++#endif
+ 		glFinish();
++#if defined(HAVE_ISAAC_FBO_RT_REUSE_LEASE) && HAVE_ISAAC_FBO_RT_REUSE_LEASE
++		vglIsaacFboRtDrainAfterFinish();
++		isaacFboRtRecoveryEnd();
++#endif
+ 	}
+ #if defined(HAVE_SINGLE_THREADED_GC) && !defined(HAVE_PTHREAD)
+ 	garbage_collector(0, NULL);
+@@ -184,7 +191,14 @@
+ 	unsafe_allocator_counter++;
+ 	if (unsafe_allocator_counter == 1) {
+ 		// Ideally we'd want glFinish here, but this would cause a circular dependency if the allocation failing is related to a depthstencil surface allocation
++#if defined(HAVE_ISAAC_FBO_RT_REUSE_LEASE) && HAVE_ISAAC_FBO_RT_REUSE_LEASE
++		isaacFboRtRecoveryBegin();
++#endif
+ 		sceGxmFinish(gxm_context);
++#if defined(HAVE_ISAAC_FBO_RT_REUSE_LEASE) && HAVE_ISAAC_FBO_RT_REUSE_LEASE
++		vglIsaacFboRtDrainAfterFinish();
++		isaacFboRtRecoveryEnd();
++#endif
+ 	}
+ #if defined(HAVE_SINGLE_THREADED_GC) && !defined(HAVE_PTHREAD)
+ 	garbage_collector(0, NULL);

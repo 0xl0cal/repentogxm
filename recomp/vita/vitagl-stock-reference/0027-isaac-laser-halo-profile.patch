@@ -1,0 +1,34 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -2809,5 +2809,8 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 				GLboolean halo_staged = GL_FALSE;
+ #ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++#if defined(HAVE_ISAAC_LASER_HALO_PROFILE) && HAVE_ISAAC_LASER_HALO_PROFILE
++				uint32_t halo_outcome = ISAAC_HALO_META;
++#endif
+ #if defined(HAVE_ISAAC_COLOROFFSET_METADATA_ONCE) && \
+     HAVE_ISAAC_COLOROFFSET_METADATA_ONCE && !defined(HAVE_TEX_CACHE)
+ 				/* This result lives only through this packed draw. A failed halo
+@@ -2831,13 +2834,20 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 					halo_staged = isaac_light_halo_try_stage(isaac_coloroffset_texture,
+ 						(uint32_t)p->frag_texunits[0]->sampler_index,
+ 						(void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]],
+-						top_idx, idx_buf, count, halo_submission, &ptrs[0], &top_idx);
++						top_idx, idx_buf, count, halo_submission, &ptrs[0], &top_idx
++						ISAAC_HALO_REASON_ARG(&halo_outcome));
+ 					if (halo_staged) {
+ 						idx_buf = halo_submission->indices;
+ 						count = halo_submission->count;
+ 						isaac_neutral_staging = ISAAC_COLOROFFSET_STAGING_PLAIN;
+ 					}
+ 				}
++#if defined(HAVE_ISAAC_LASER_HALO_PROFILE) && HAVE_ISAAC_LASER_HALO_PROFILE
++				/* Exactly one terminal outcome per packed-copy opportunity,
++				 * including metadata rejection. The fallback below is not a
++				 * second attempt, even if 0026 must recheck after recovery. */
++				isaac_halo_profile_commit(halo_outcome);
++#endif
+ #endif
+ 				ISAAC_NOTE_VERTEX_COPY(top_idx, isaac_copy_stride);
+ 				if (!halo_staged) {

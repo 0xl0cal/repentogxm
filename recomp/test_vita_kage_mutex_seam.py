@@ -535,14 +535,16 @@ def verify_corpus(generated: Path, baseline: Path | None,
                 continue
             # Other seams may be on in the regenerated corpus: the floor
             # thunk fast path (generation-time switch
-            # GUEST_FLOOR_THUNK_FASTPATH=1, guest_0184.c) and the shader
-            # attrib fast path (unconditional, guest_0167.c).  Their text is
+            # GUEST_FLOOR_THUNK_FASTPATH=1, guest_0184.c), the shader
+            # attrib fast path (unconditional, guest_0167.c) and the KAGE
+            # refcount seam (unconditional, guest_0000.c).  Their text is
             # fenced and must strip back to the baseline exactly, so nothing
             # but declared seams ever differs.
             unfenced = re.sub(
                 r"#if defined\(__vita__\) && "
                 r"defined\(ISAAC_VITA_(?:FLOOR_THUNK_FASTPATH|"
-                r"SHADER_ATTRIB_FASTPATH)\)\n(?:.*\n)*?#endif\n",
+                r"SHADER_ATTRIB_FASTPATH|KAGE_REFCOUNT_SEAM)\)\n"
+                r"(?:.*\n)*?#endif\n",
                 "", new_path.read_text(encoding="utf-8"))
             require(unfenced == base_path.read_text(encoding="utf-8"),
                     f"{new_path.name} differs from the baseline corpus")

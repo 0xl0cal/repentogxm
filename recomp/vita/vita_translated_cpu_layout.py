@@ -97,8 +97,16 @@ def main(argv=None) -> int:
         print("vita_translated_cpu_layout: hot set is empty", file=sys.stderr)
         return 1
     text = render(hot, declared, args.cold_rest)
-    with open(args.output, "w", encoding="utf-8", newline="\n") as out:
-        out.write(text)
+    # Every generated unit force-includes this header.  Preserve its mtime
+    # across identical configurations so Ninja keeps the existing objects.
+    try:
+        with open(args.output, "rb") as existing:
+            unchanged = existing.read() == text.encode("utf-8")
+    except FileNotFoundError:
+        unchanged = False
+    if not unchanged:
+        with open(args.output, "w", encoding="utf-8", newline="\n") as out:
+            out.write(text)
     known = sum(1 for f in hot if f in set(declared))
     print(f"hot={known}/{len(hot)} declared={len(declared)} "
           f"cold_rest={int(args.cold_rest)}")

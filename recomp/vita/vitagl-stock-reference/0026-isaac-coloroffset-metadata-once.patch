@@ -1,0 +1,42 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -2811,6 +2811,22 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ #ifdef HAVE_ISAAC_LASER_LIGHT_HALO_CLIP
++#if defined(HAVE_ISAAC_COLOROFFSET_METADATA_ONCE) && \
++    HAVE_ISAAC_COLOROFFSET_METADATA_ONCE && !defined(HAVE_TEX_CACHE)
++				/* This result lives only through this packed draw. A failed halo
++				 * publishes no count/layout changes. Recovery may refresh stale
++				 * is_fbo_float via scene_reset: repeat admission if it changed.
++				 * Texture-cache eviction is deliberately excluded. Keep all
++				 * allocations, client-byte reads and staging proofs in place. */
++				const GLboolean isaac_metadata_fbo_float = is_fbo_float;
++				const GLboolean isaac_metadata_eligible =
++					isaac_coloroffset_neutral_metadata_is_eligible(
++						p, isaac_coloroffset_fragment_exact,
++						isaac_coloroffset_texture, attributes, streams,
++						count, base_idx, isaac_coloroffset_original_index_type);
++				if (isaac_metadata_eligible) {
++#else
+ 				if (isaac_coloroffset_neutral_metadata_is_eligible(
+ 						p, isaac_coloroffset_fragment_exact,
+ 						isaac_coloroffset_texture, attributes, streams,
+ 						count, base_idx, isaac_coloroffset_original_index_type)) {
++#endif
+ 					halo_staged = isaac_light_halo_try_stage(isaac_coloroffset_texture,
+@@ -2829,7 +2845,14 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 				ptrs[0] = gpu_alloc_mapped_temp(top_idx * isaac_copy_stride);
++#if defined(HAVE_ISAAC_COLOROFFSET_METADATA_ONCE) && \
++    HAVE_ISAAC_COLOROFFSET_METADATA_ONCE && \
++    defined(HAVE_ISAAC_LASER_LIGHT_HALO_CLIP) && !defined(HAVE_TEX_CACHE)
++				if (isaac_metadata_fbo_float == is_fbo_float ? isaac_metadata_eligible :
++#else
++				if (
++#endif
+-				if (isaac_coloroffset_neutral_metadata_is_eligible(
++					isaac_coloroffset_neutral_metadata_is_eligible(
+ 						p, isaac_coloroffset_fragment_exact,
+ 						isaac_coloroffset_texture, attributes, streams,
+ 						count, base_idx, isaac_coloroffset_original_index_type))
+ 					isaac_neutral_staging = isaac_coloroffset_copy_and_prove_neutral(
+ 						ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]],

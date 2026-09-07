@@ -24,8 +24,17 @@
 
 #define SCE_ENOENT ((int32_t)UINT32_C(0x80010002))
 #define SCE_EIO    ((int32_t)UINT32_C(0x80010005))
+#define SCE_ENODEV ((int32_t)UINT32_C(0x80010013))
 
 static const unsigned char s_bytes[] = "abcdefghij";
+/* Same ten-byte length as s_bytes; the word at offset 4 is a valid
+ * ArchivedFile block header (flag bit set, 4-byte block). */
+static const unsigned char s_header_bytes[] = {
+    0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x80, 'i', 'j'
+};
+static const unsigned char *s_pread_source = s_bytes;
+static int64_t s_size_override = -1;
+static uint32_t s_reopen_native_calls;
 static char s_guest_mode_rb[] = "rb";
 _Alignas(16) static uint32_t s_guest_stack[64];
 _Alignas(16) static unsigned char s_guest_output[16];
@@ -96,6 +105,12 @@ static void reset_oracle(void)
     s_file_lock = 0U;
     s_mapped_path = AFTERBIRTHP;
     memset(s_guest_output, 0, sizeof s_guest_output);
+    s_pread_source = s_bytes;
+    s_size_override = -1;
+    s_reopen_native_calls = 0U;
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    memset(&s_descriptor_recover, 0, sizeof s_descriptor_recover);
+#endif
 }
 
 int isaac_vita_archive_raw_fallback_key(
@@ -146,6 +161,17 @@ int isaac_vita_archive_cache_close(isaac_vita_archive_cache_file *file)
     (void)file;
     errno = EBADF;
     return EOF;
+}
+
+/* The newlib-lane recovery seam is never taken by a raw token; count it. */
+FILE *isaac_vita_archive_cache_reopen_native(const char *native_path,
+                                             const char *mode)
+{
+    (void)native_path;
+    (void)mode;
+    ++s_reopen_native_calls;
+    errno = ENOMEM;
+    return NULL;
 }
 
 uint32_t isaac_vita_archive_diag_record(
@@ -218,7 +244,8 @@ int32_t isaac_vita_crt_raw_archive_oracle_get_size(
         return SCE_EIO;
     if (s_size_result < 0)
         return s_size_result;
-    *size = (int64_t)(sizeof s_bytes - 1U);
+    *size = s_size_override >= 0 ? s_size_override
+        : (int64_t)(sizeof s_bytes - 1U);
     return 0;
 }
 
@@ -244,7 +271,7 @@ int32_t isaac_vita_crt_raw_archive_oracle_pread(
     result = size < available ? size : available;
     if (result > s_max_chunk)
         result = s_max_chunk;
-    memcpy(buffer, s_bytes + offset, result);
+    memcpy(buffer, s_pread_source + offset, result);
     return (int32_t)result;
 }
 
@@ -655,6 +682,119 @@ static int test_seek_stdio_surface_and_close(void)
     return 0;
 }
 
+static int test_sticky_eof_and_rearm(void)
+{
+    vita_crt_file_token *entry;
+    unsigned char output[16];
+    unsigned char before[16];
+    uint32_t calls;
+    CPU cpu;
+    uint32_t arguments[4];
+    uint32_t esp;
+    size_t repeated_result;
+
+    reset_oracle();
+    CHECK(open_slot(0U) == 0 && open_slot(1U) == 0);
+    entry = &s_file_tokens[0];
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, sizeof output) == 10U &&
+          s_pread_calls == 2U && entry->raw_archive.eof &&
+          !entry->raw_archive.error && entry->raw_archive.position == 10);
+    calls = s_pread_calls;
+    memset(output, 0xcc, sizeof output);
+    memcpy(before, output, sizeof before);
+    errno = EACCES;
+    repeated_result = vita_crt_raw_archive_fread(entry, output, 1U, 4U);
+    if (s_pread_calls != calls)
+        fprintf(stderr, "sticky EOF issued extra pread: before=%u after=%u\n",
+                (unsigned)calls, (unsigned)s_pread_calls);
+    CHECK(repeated_result == 0U &&
+          s_pread_calls == calls && errno == EACCES &&
+          entry->raw_archive.eof && !entry->raw_archive.error &&
+          entry->raw_archive.position == 10 &&
+          memcmp(output, before, sizeof output) == 0);
+
+    /* EOF is sticky: a hypothetical later kernel failure must not become a
+     * new stream error until a successful positioning operation rearms IO. */
+    s_fail_pread_call = calls + 1U;
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 4U) == 0U &&
+          s_pread_calls == calls && errno == EACCES && !entry->raw_archive.error);
+    CHECK(vita_crt_raw_archive_fseek(entry, -1L, SEEK_SET) == -1 &&
+          errno == EINVAL && entry->raw_archive.eof && entry->raw_archive.position == 10);
+    CHECK(vita_crt_raw_archive_fseek(entry, 0L, 99) == -1 &&
+          errno == EINVAL && entry->raw_archive.eof && entry->raw_archive.position == 10);
+    errno = EACCES;
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 4U) == 0U &&
+          s_pread_calls == calls && errno == EACCES && !entry->raw_archive.error);
+
+    /* The public import still consumes just its cdecl return and preserves
+     * the host errno and existing guest errno on an ordinary EOF result. */
+    arguments[0] = (uint32_t)(uintptr_t)s_guest_output;
+    arguments[1] = 1U; arguments[2] = 1U; arguments[3] = entry->token;
+    esp = prepare_cdecl(&cpu, arguments, 4U);
+    g_isaac_vita_crt_errno = EINVAL;
+    vita_crt_fread(&cpu);
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && cpu.eax == 0U &&
+          s_pread_calls == calls && errno == EACCES &&
+          g_isaac_vita_crt_errno == EINVAL && s_file_lock == 0U);
+
+    /* Another live token retains its own cursor and is not suppressed. */
+    s_fail_pread_call = 0U;
+    CHECK(vita_crt_raw_archive_fread(&s_file_tokens[1], output, 1U, 2U) == 2U &&
+          memcmp(output, "ab", 2U) == 0 && s_file_tokens[1].raw_archive.position == 2 &&
+          !s_file_tokens[1].raw_archive.eof && entry->raw_archive.position == 10);
+    calls = s_pread_calls;
+    CHECK(vita_crt_raw_archive_fseek(entry, 0L, SEEK_CUR) == 0 &&
+          !entry->raw_archive.eof && entry->raw_archive.position == 10);
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 1U) == 0U &&
+          s_pread_calls == calls + 1U && entry->raw_archive.eof);
+    CHECK(vita_crt_raw_archive_fseek(entry, 0L, SEEK_SET) == 0 &&
+          !entry->raw_archive.eof);
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 3U) == 3U &&
+          memcmp(output, "abc", 3U) == 0 && entry->raw_archive.position == 3);
+    CHECK(vita_crt_raw_archive_fseek(entry, -2L, SEEK_END) == 0 &&
+          !entry->raw_archive.eof && entry->raw_archive.position == 8);
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 3U) == 2U &&
+          memcmp(output, "ij", 2U) == 0 && entry->raw_archive.eof);
+
+    /* Keep the pre-existing zero-size/overflow ordering ahead of EOF. */
+    calls = s_pread_calls;
+    errno = EACCES;
+    CHECK(vita_crt_raw_archive_fread(entry, output, 0U, 3U) == 0U &&
+          vita_crt_raw_archive_fread(entry, output, 3U, 0U) == 0U &&
+          s_pread_calls == calls && entry->raw_archive.eof &&
+          !entry->raw_archive.error && errno == EACCES);
+    CHECK(vita_crt_raw_archive_fread(entry, output, UINT32_MAX, 2U) == 0U &&
+          s_pread_calls == calls && entry->raw_archive.eof &&
+          entry->raw_archive.error && errno == EOVERFLOW);
+    errno = EACCES;
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 1U) == 0U &&
+          s_pread_calls == calls && entry->raw_archive.eof &&
+          entry->raw_archive.error && errno == EACCES);
+    entry->raw_archive.position = INT64_MAX - 1;
+    entry->raw_archive.error = 0U;
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 2U) == 0U &&
+          s_pread_calls == calls && entry->raw_archive.eof &&
+          entry->raw_archive.error && errno == EOVERFLOW);
+    CHECK(vita_crt_raw_archive_fseek(entry, 2L, SEEK_CUR) == -1 &&
+          errno == EOVERFLOW && entry->raw_archive.eof &&
+          entry->raw_archive.position == INT64_MAX - 1);
+
+    /* Sticky error alone is NOT an EOF shortcut; successful Seek clears
+     * EOF, not error. A re-open clears both, as for a fresh native stream. */
+    CHECK(vita_crt_raw_archive_fseek(entry, 0L, SEEK_SET) == 0 &&
+          !entry->raw_archive.eof && entry->raw_archive.error);
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 2U) == 2U &&
+          s_pread_calls == calls + 1U && entry->raw_archive.error &&
+          memcmp(output, "ab", 2U) == 0);
+    entry->raw_archive.eof = 1U;
+    entry->raw_archive.live = 0U;
+    CHECK(vita_crt_raw_archive_fread(entry, output, 1U, 1U) == 0U && errno == EBADF);
+    entry->raw_archive.live = 1U;
+    CHECK(vita_crt_raw_archive_close(entry) == 0 && open_slot(0U) == 0 &&
+          !entry->raw_archive.eof && !entry->raw_archive.error);
+    return 0;
+}
+
 static int test_vfprintf_rejects_raw_token(void)
 {
     vita_crt_file_token *entry;
@@ -730,6 +870,233 @@ static int test_sixteen_slots_and_independent_positions(void)
     return 0;
 }
 
+/* fread with the measured adapter frame: [ESP] = the adapter's return,
+ * [EBP+4] = the ArchivedFile header edge that owns the four-byte request. */
+static uint32_t prepare_archive_header_fread(CPU *cpu, uint32_t token,
+                                             uint32_t parent)
+{
+    uint32_t arguments[4] = {
+        (uint32_t)(uintptr_t)s_guest_output, 4U, 1U, token
+    };
+    uint32_t esp = prepare_cdecl(cpu, arguments, 4U);
+    uint32_t ebp = (uint32_t)(uintptr_t)&s_guest_stack[40];
+
+    st32(esp, ISAAC_VITA_CRT_FREAD_RETURN_RVA);
+    cpu->ebp = ebp;
+    st32(ebp + 4U, parent);
+    return esp;
+}
+
+/* SceIofilemgr invalidated the descriptor (suspend/resume): the pread under
+ * the exact ArchivedFile header read fails with SCE_ERROR_ERRNO_ENODEV.
+ * With ISAAC_VITA_CRT_DESCRIPTOR_RECOVER the token is reopened once at its
+ * cursor and the read redone; without it the pre-existing fatal path runs. */
+static int test_descriptor_enodev_on_header_read(void)
+{
+    uint32_t fopen_arguments[2] = {
+        1U, (uint32_t)(uintptr_t)s_guest_mode_rb
+    };
+    uint32_t fread_arguments[4] = {
+        (uint32_t)(uintptr_t)s_guest_output, 1U, 4U, 0U
+    };
+    uint32_t one_argument[1];
+    vita_crt_file_token *entry = &s_file_tokens[0];
+    CPU cpu;
+    uint32_t esp;
+    uint32_t token;
+    uint32_t logs;
+    int32_t descriptor;
+
+    reset_oracle();
+    s_pread_source = s_header_bytes;
+    esp = prepare_cdecl(&cpu, fopen_arguments, 2U);
+    vita_crt_fopen(&cpu);
+    token = cpu.eax;
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && token != 0U &&
+          entry->raw_archive.live && s_open_calls == 1U);
+    descriptor = entry->raw_archive.descriptor;
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    CHECK(strcmp(entry->recover.path, AFTERBIRTHP) == 0 &&
+          strcmp(entry->recover.mode, "rb") == 0);
+#endif
+
+    fread_arguments[3] = token;
+    esp = prepare_cdecl(&cpu, fread_arguments, 4U);
+    vita_crt_fread(&cpu);
+    CHECK(!cpu.fault && cpu.eax == 4U && entry->raw_archive.position == 4 &&
+          s_pread_calls == 1U);
+
+    /* The header read at offset 4: its pread fails with ENODEV. */
+    s_fail_pread_call = s_pread_calls + 1U;
+    s_fail_pread_result = SCE_ENODEV;
+    logs = s_diag_logs;
+    g_isaac_vita_crt_errno = EINVAL;
+    memset(s_guest_output, 0xcc, sizeof s_guest_output);
+    esp = prepare_archive_header_fread(
+        &cpu, token, ISAAC_VITA_CRT_ARCHIVE_TYPE2_HEADER_RETURN_RVA);
+    errno = EACCES;
+    vita_crt_fread(&cpu);
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    /* Recovered: one fresh open+size, the dead descriptor closed after it,
+     * the exact header word delivered, cursor advanced, no error flag, no
+     * fault, one receipt line, host and guest errno untouched. */
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && cpu.eax == 1U &&
+          ld32((uint32_t)(uintptr_t)s_guest_output) == UINT32_C(0x80000004) &&
+          entry->raw_archive.live && entry->raw_archive.position == 8 &&
+          !entry->raw_archive.error && !entry->raw_archive.eof &&
+          entry->raw_archive.descriptor != descriptor &&
+          entry->token == token && strcmp(entry->file.key, "afterbirthp.a") == 0 &&
+          s_open_calls == 2U && s_size_calls == 2U && s_close_calls == 1U &&
+          s_pread_calls == 3U && s_reopen_native_calls == 0U &&
+          s_diag_logs == logs + 1U && errno == EACCES &&
+          g_isaac_vita_crt_errno == EINVAL && s_file_lock == 0U);
+    CHECK(s_descriptor_recover.enodev == 1U &&
+          s_descriptor_recover.recovered == 1U &&
+          s_descriptor_recover.unknown_pos == 0U &&
+          s_descriptor_recover.reopen_fail == 0U &&
+          s_descriptor_recover.redo_fail == 0U);
+    descriptor = entry->raw_archive.descriptor;
+
+    /* The fresh descriptor serves the following read at the right cursor. */
+    fread_arguments[0] = (uint32_t)(uintptr_t)&s_guest_output[4];
+    fread_arguments[1] = 1U;
+    fread_arguments[2] = 2U;
+    esp = prepare_cdecl(&cpu, fread_arguments, 4U);
+    vita_crt_fread(&cpu);
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && cpu.eax == 2U &&
+          memcmp(&s_guest_output[4], "ij", 2U) == 0 &&
+          entry->raw_archive.position == 10 && !entry->raw_archive.eof);
+
+    /* A second death whose reopen fails (ENOENT): the token is untouched,
+     * the ordinary fatal header path runs, the guest errno is ENODEV. */
+    CHECK(vita_crt_raw_archive_fseek(entry, 4L, SEEK_SET) == 0);
+    s_open_result = SCE_ENOENT;
+    s_fail_pread_call = s_pread_calls + 1U;
+    g_isaac_vita_crt_errno = EINVAL;
+    esp = prepare_archive_header_fread(
+        &cpu, token, ISAAC_VITA_CRT_ARCHIVE_TYPE1_HEADER_RETURN_RVA);
+    errno = EACCES;
+    vita_crt_fread(&cpu);
+    CHECK(cpu.fault &&
+          strcmp(cpu.fault, "ArchivedFile block header is invalid") == 0 &&
+          cpu.esp == esp && entry->raw_archive.live &&
+          entry->raw_archive.error && entry->raw_archive.position == 4 &&
+          entry->raw_archive.descriptor == descriptor &&
+          s_open_calls == 3U && s_size_calls == 2U && s_close_calls == 1U &&
+          strcmp(s_last_diag_reason, "header-bound") == 0 &&
+          g_isaac_vita_crt_errno == ENODEV && errno == EACCES &&
+          s_file_lock == 0U &&
+          s_descriptor_recover.enodev == 2U &&
+          s_descriptor_recover.recovered == 1U &&
+          s_descriptor_recover.reopen_fail == 1U);
+    s_open_result = 0;
+
+    /* A fresh descriptor whose size differs from the one recorded at open
+     * is refused and released. */
+    entry->raw_archive.error = 0U;
+    CHECK(vita_crt_raw_archive_fseek(entry, 4L, SEEK_SET) == 0);
+    s_size_override = 11;
+    s_fail_pread_call = s_pread_calls + 1U;
+    g_isaac_vita_crt_errno = EINVAL;
+    esp = prepare_archive_header_fread(
+        &cpu, token, ISAAC_VITA_CRT_ARCHIVE_TYPE2_HEADER_RETURN_RVA);
+    vita_crt_fread(&cpu);
+    CHECK(cpu.fault && cpu.esp == esp &&
+          entry->raw_archive.descriptor == descriptor &&
+          entry->raw_archive.error && entry->raw_archive.position == 4 &&
+          s_open_calls == 4U && s_size_calls == 3U && s_close_calls == 2U &&
+          s_descriptor_recover.reopen_fail == 2U &&
+          g_isaac_vita_crt_errno == ENODEV && s_file_lock == 0U);
+    s_size_override = -1;
+
+    /* A plain multi-element read dying mid-way (one complete element
+     * already delivered) is redone whole: identical bytes, exact cursor.
+     * The sticky error flag left by the refused recoveries above is kept,
+     * exactly as newlib keeps __SERR across a successful read. */
+    CHECK(vita_crt_raw_archive_fseek(entry, 2L, SEEK_SET) == 0 &&
+          entry->raw_archive.error);
+    s_max_chunk = 2U;
+    logs = s_pread_calls;
+    s_fail_pread_call = s_pread_calls + 2U;
+    fread_arguments[0] = (uint32_t)(uintptr_t)s_guest_output;
+    fread_arguments[1] = 2U;
+    fread_arguments[2] = 3U;
+    esp = prepare_cdecl(&cpu, fread_arguments, 4U);
+    memset(s_guest_output, 0xcc, sizeof s_guest_output);
+    g_isaac_vita_crt_errno = EINVAL;
+    errno = EACCES;
+    vita_crt_fread(&cpu);
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && cpu.eax == 3U);
+    CHECK(memcmp(s_guest_output, s_header_bytes + 2, 6U) == 0);
+    CHECK(entry->raw_archive.position == 8 && entry->raw_archive.error &&
+          entry->raw_archive.descriptor != descriptor);
+    CHECK(s_pread_calls == logs + 5U);
+    CHECK(s_open_calls == 5U && s_size_calls == 4U && s_close_calls == 3U);
+    CHECK(s_descriptor_recover.enodev == 4U &&
+          s_descriptor_recover.recovered == 2U &&
+          s_descriptor_recover.reopen_fail == 2U);
+    CHECK(errno == EACCES && g_isaac_vita_crt_errno == EINVAL);
+    s_max_chunk = UINT32_MAX;
+
+    /* The counter line, then fclose releases the fresh descriptor and the
+     * retained path with it. */
+    logs = s_diag_logs;
+    isaac_vita_crt_descriptor_recover_report("oracle");
+    CHECK(s_diag_logs == logs + 1U);
+    one_argument[0] = token;
+    esp = prepare_cdecl(&cpu, one_argument, 1U);
+    vita_crt_fclose(&cpu);
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && cpu.eax == 0U &&
+          s_close_calls == 4U && !vita_crt_dynamic_file_is_live(entry) &&
+          !entry->recover.path[0] && !entry->recover.mode[0]);
+#else
+    /* The pre-existing fatal path: the header word never arrived. */
+    CHECK(cpu.fault &&
+          strcmp(cpu.fault, "ArchivedFile block header is invalid") == 0 &&
+          cpu.esp == esp && entry->raw_archive.live &&
+          entry->raw_archive.error && entry->raw_archive.position == 4 &&
+          entry->raw_archive.descriptor == descriptor &&
+          s_open_calls == 1U && s_size_calls == 1U && s_close_calls == 0U &&
+          s_pread_calls == 2U && s_reopen_native_calls == 0U &&
+          strcmp(s_last_diag_reason, "header-bound") == 0 &&
+          g_isaac_vita_crt_errno == ENODEV && errno == EACCES &&
+          s_file_lock == 0U);
+    (void)logs;
+    one_argument[0] = token;
+    esp = prepare_cdecl(&cpu, one_argument, 1U);
+    vita_crt_fclose(&cpu);
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && cpu.eax == 0U &&
+          s_close_calls == 1U && !vita_crt_dynamic_file_is_live(entry));
+#endif
+    return 0;
+}
+
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+static int test_recover_publish_bounds(void)
+{
+    static char long_path[ISAAC_VITA_STARTUP_PATH_MAX + 8U];
+    vita_crt_file_token *entry = &s_file_tokens[0];
+
+    reset_oracle();
+    memset(long_path, 'p', sizeof long_path - 1U);
+    long_path[sizeof long_path - 1U] = '\0';
+    vita_crt_recover_publish(entry, "rb", long_path);
+    CHECK(!entry->recover.path[0] && !entry->recover.mode[0]);
+    vita_crt_recover_publish(entry, "wb", AFTERBIRTHP);
+    CHECK(!entry->recover.path[0]);
+    vita_crt_recover_publish(entry, "r+", AFTERBIRTHP);
+    CHECK(!entry->recover.path[0]);
+    vita_crt_recover_publish(entry, "a", AFTERBIRTHP);
+    CHECK(!entry->recover.path[0]);
+    vita_crt_recover_publish(entry, "r", AFTERBIRTHP);
+    CHECK(strcmp(entry->recover.path, AFTERBIRTHP) == 0 &&
+          strcmp(entry->recover.mode, "r") == 0);
+    vita_crt_recover_clear(entry);
+    CHECK(!entry->recover.path[0] && !entry->recover.mode[0]);
+    return 0;
+}
+#endif
+
 int main(void)
 {
     CHECK(test_strict_fallback_gate() == 0);
@@ -737,8 +1104,16 @@ int main(void)
     CHECK(test_outer_fopen_receipt_and_table_full() == 0);
     CHECK(test_short_reads_and_element_overlap() == 0);
     CHECK(test_seek_stdio_surface_and_close() == 0);
+    CHECK(test_sticky_eof_and_rearm() == 0);
     CHECK(test_vfprintf_rejects_raw_token() == 0);
     CHECK(test_sixteen_slots_and_independent_positions() == 0);
+    CHECK(test_descriptor_enodev_on_header_read() == 0);
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    CHECK(test_recover_publish_bounds() == 0);
+    puts("Vita CRT raw packed-archive ENOMEM fallback host oracle "
+         "(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER): PASS");
+#else
     puts("Vita CRT raw packed-archive ENOMEM fallback host oracle: PASS");
+#endif
     return 0;
 }

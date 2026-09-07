@@ -66,13 +66,20 @@ def cmake_build_id_quote_oracle(vita: Path, cc: str) -> None:
     if production.count(quote_block) != 1:
         raise AssertionError("production PNG build-ID CMake block drifted")
     section_start = production.index(
-        "  if(ISAAC_VITA_PNG_DECODE_PROFILE)\n"
+        "  if(ISAAC_VITA_PNG_DECODE_PROFILE OR ISAAC_VITA_PNG_WINDOW_PROFILE)\n"
         "    # gen_all proves eight unique frozen owners"
     )
     section_end = production.index(
         "  if(ISAAC_VITA_ANM2_MISSING_LAYER_GUARD)", section_start
     )
     block = production[section_start:section_end]
+    window_start = production.index(
+        '    if(ISAAC_VITA_PNG_WINDOW_PROFILE)\n'
+        '      list(APPEND ISAAC_VITA_RUNTIME_SOURCES\n'
+        '        "${ISAAC_RUNTIME}/host_vita_png_outer_profile.c")'
+    )
+    window_end = production.index('    if(ISAAC_VITA_ANM2_WINDOW_PROFILE)', window_start)
+    window_block = production[window_start:window_end]
 
     with tempfile.TemporaryDirectory(prefix="isaac-png-cmake-quote-") as value:
         root = Path(value)
@@ -109,9 +116,15 @@ def cmake_build_id_quote_oracle(vita: Path, cc: str) -> None:
             "int png_profile_quote_fixture(void){return build_id[0];}\n",
             encoding="utf-8",
         )
+        for name in ("host_vita_native_png", "kage_vita_phase_profile",
+                     "host_vita_png_outer_profile"):
+            (root / (name + ".c")).write_text(
+                f"int {name}_fixture(void){{return 0;}}\n", encoding="utf-8"
+            )
         (root / "CMakeLists.txt").write_text(
             "cmake_minimum_required(VERSION 3.20)\n"
             "project(png_profile_quote C)\n"
+            f'include("{(vita / "generated_definitions.cmake").as_posix()}")\n'
             "set(CMAKE_EXPORT_COMPILE_COMMANDS ON)\n"
             "set(ISAAC_RUNTIME \"${CMAKE_CURRENT_SOURCE_DIR}\")\n"
             "set(ISAAC_VITA_GUEST_LINK_ID \"perf:png.profile-fixture\")\n"
@@ -120,19 +133,25 @@ def cmake_build_id_quote_oracle(vita: Path, cc: str) -> None:
             "  \"${CMAKE_CURRENT_SOURCE_DIR}/guest_0002.c\"\n"
             "  \"${CMAKE_CURRENT_SOURCE_DIR}/guest_0003.c\"\n"
             "  \"${CMAKE_CURRENT_SOURCE_DIR}/guest_9999.c\")\n"
-            "set(ISAAC_VITA_RUNTIME_SOURCES)\n" + block +
+            "set(ISAAC_VITA_RUNTIME_SOURCES\n"
+            "  \"${ISAAC_RUNTIME}/host_vita_native_png.c\"\n"
+            "  \"${ISAAC_RUNTIME}/kage_vita_phase_profile.c\")\n"
+            + block + window_block +
             "add_library(png_profile_quote OBJECT ${ISAAC_GENERATED_C} "
             "${ISAAC_VITA_RUNTIME_SOURCES})\n",
             encoding="utf-8",
         )
-        for enabled in (False, True):
-            build = root / ("build-on" if enabled else "build-off")
+        for enabled, window in ((False, False), (True, False),
+                                (False, True), (True, True)):
+            build = root / f"build-decode-{int(enabled)}-window-{int(window)}"
             configure_command = [
                     cmake, "-S", str(root), "-B", str(build), "-G", "Ninja",
                     f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}",
                     f"-DCMAKE_C_COMPILER={Path(cc).as_posix()}",
                     "-DISAAC_VITA_PNG_DECODE_PROFILE=" +
                     ("ON" if enabled else "OFF"),
+                    "-DISAAC_VITA_PNG_WINDOW_PROFILE=" +
+                    ("ON" if window else "OFF"),
                 ] + windows_toolchain
             configured = subprocess.run(
                 configure_command,
@@ -154,9 +173,12 @@ def cmake_build_id_quote_oracle(vita: Path, cc: str) -> None:
             expected_names = {
                 "guest_0001.c", "guest_0002.c", "guest_0003.c",
                 "guest_9999.c",
+                "host_vita_native_png.c", "kage_vita_phase_profile.c",
             }
             if enabled:
                 expected_names.add("kage_vita_png_decode_profile.c")
+            if window:
+                expected_names.add("host_vita_png_outer_profile.c")
             if (not isinstance(commands, list) or
                     {Path(item["file"]).name for item in commands} !=
                     expected_names):
@@ -174,9 +196,19 @@ def cmake_build_id_quote_oracle(vita: Path, cc: str) -> None:
                     "kage_vita_png_decode_profile.c",
                 }
                 if ("ISAAC_VITA_PNG_DECODE_PROFILE=1" in rendered) != (
-                        enabled and owns_hook):
+                        (enabled and owns_hook) or
+                        (window and name == "guest_0001.c") or
+                        (enabled and window and name == "host_vita_png_outer_profile.c")):
                     raise AssertionError(
                         f"PNG feature macro scope changed: {name}: {rendered}"
+                    )
+                if ("ISAAC_VITA_PNG_WINDOW_PROFILE=1" in rendered) != (
+                        window and name in {"host_vita_native_png.c",
+                                            "kage_vita_phase_profile.c",
+                                            "host_vita_png_outer_profile.c",
+                                            "kage_vita_png_decode_profile.c"}):
+                    raise AssertionError(
+                        f"PNG combined/window macro scope changed: {name}: {rendered}"
                     )
                 quoted = (
                     'ISAAC_VITA_PNG_DECODE_PROFILE_BUILD_ID='
@@ -190,11 +222,49 @@ def cmake_build_id_quote_oracle(vita: Path, cc: str) -> None:
                     )
 
 
+def outer_profile_oracle(runtime: Path, cc: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="isaac-png-outer-") as value:
+        for legacy in (False, True):
+            executable = Path(value) / (
+                ("outer-combined" if legacy else "outer-only") +
+                (".exe" if os.name == "nt" else "")
+            )
+            command = [
+                cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                "-DISAAC_KAGE_VITA_PNG_DECODE_PROFILE_ORACLE=1",
+                "-DISAAC_PNG_OUTER_PROFILE_ORACLE=1",
+                "-DISAAC_VITA_PNG_WINDOW_PROFILE=1",
+                f"-I{runtime}",
+                str(runtime / "host_vita_png_outer_profile.c"),
+                str(runtime / "kage_vita_png_decode_profile_oracle.c"),
+                "-o", str(executable),
+            ]
+            if legacy:
+                command.extend([
+                    "-DISAAC_VITA_PNG_DECODE_PROFILE=1",
+                    str(runtime / "kage_vita_png_decode_profile.c"),
+                ])
+            subprocess.run(command, check=True)
+            completed = subprocess.run(
+                [str(executable)], check=False, text=True, capture_output=True,
+            )
+            if completed.returncode != 0 or (
+                "Vita PNG every-image outer attribution oracle: PASS"
+                not in completed.stdout
+            ):
+                raise AssertionError(
+                    f"PNG outer mode legacy={legacy} failed: "
+                    f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+                )
+            print(f"PNG every-image outer legacy={legacy}: PASS")
+
+
 def main() -> int:
     vita = Path(__file__).resolve().parent
     runtime = vita.parent / "runtime"
     cc = compiler()
     cmake_build_id_quote_oracle(vita, cc)
+    outer_profile_oracle(runtime, cc)
     with tempfile.TemporaryDirectory(prefix="isaac-png-profile-") as value:
         executable = Path(value) / (
             "png-profile.exe" if os.name == "nt" else "png-profile"

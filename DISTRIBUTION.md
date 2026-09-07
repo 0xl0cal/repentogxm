@@ -31,8 +31,10 @@ licence (GPL-2.0-or-later, see LICENSE) is in place. Set it back to
 
 ## Before a release
 
-1. Build from a clean checkout of the tagged revision.
+1. Build from a clean checkout of the tagged revision with the release's CMake
+   initial cache (`release/<version>.cmake`).
 2. Run `python tools/release_audit.py --strict --include-untracked` on that
    checkout; it must end with `release audit: GO`.
-3. Put the eboot SHA-256 and the tested build settings in
-   `release/RELEASE_NOTES.md`, then attach the VPK to the GitHub Release.
+3. Describe the tested build configuration and the hardware session in
+   `release/RELEASE_NOTES.md` (steps in `release/README.md`), then attach the
+   VPK to the GitHub Release together with its SHA-256 and the eboot SHA-256.

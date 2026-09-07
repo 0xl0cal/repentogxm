@@ -1,0 +1,84 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index c7ebee3..57f5fcf 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -68,6 +68,10 @@ static void isaac_coloroffset_fs_probe_note_exact_source(const shader *s);
+ #define ISAAC_COLOROFFSET_STAGING_MEMCPY vgl_fast_memcpy
+ #include "isaac_coloroffset_staging.h"
+ #undef ISAAC_COLOROFFSET_STAGING_MEMCPY
++#if !defined(HAVE_ISAAC_COLOROFFSET_PLAIN_FASTPATH) || HAVE_ISAAC_COLOROFFSET_PLAIN_FASTPATH != 1
++#error "Isaac ColorOffset plain specialization requires its opt-in flag"
++#endif
++typedef struct isaac_coloroffset_plain_state isaac_coloroffset_plain_state;
+ _Static_assert(VERTEX_ATTRIBS_NUM == ISAAC_VITAGL_MAX_VERTEX_ATTRIBUTES,
+ 	"Isaac GPU draw policy attribute ceiling drifted");
+ _Static_assert(sizeof(SceGxmVertexAttribute) ==
+@@ -467,6 +471,7 @@ typedef struct {
+ 	const SceGxmProgram *isaac_coloroffset_fs_probe_link_vertex_program;
+ 	uint32_t isaac_coloroffset_fs_probe_link_source_generation;
+ #endif
++	isaac_coloroffset_plain_state *isaac_coloroffset_plain;
+ } program;
+ 
+ // Internal shaders and array
+@@ -1627,6 +1632,8 @@ void vglGetIsaacColorOffsetFsProbeStats(vglIsaacColorOffsetFsProbeStats *stats)
+ }
+ #endif
+ 
++#include "isaac_coloroffset_plain_vitagl.h"
++
+ #ifdef STRICT_UNIFORMS_COMPLIANCE
+ static inline __attribute__((always_inline)) uniform *get_uniform_from_ptr(GLint ptr, uint32_t *offset) {
+ 	uniform_location u;
+@@ -2815,12 +2822,26 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
+ 		{
+ #if HAVE_ISAAC_COLOROFFSET_FS_PROBE == 3
+ 			if (isaac_staged && isaac_single_stream &&
+-					isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_NEUTRAL)
++					(isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_NEUTRAL ||
++					 isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_PLAIN))
+ #endif
+ 			{
+-				SceGxmFragmentProgram *isaac_probe_fragment =
++				SceGxmFragmentProgram *isaac_probe_fragment = NULL;
++				if (isaac_neutral_staging == ISAAC_COLOROFFSET_STAGING_PLAIN)
++					isaac_probe_fragment = isaac_coloroffset_plain_select(p);
++				if (isaac_probe_fragment) {
++					/* Preserve the existing neutral-family request/bound
++					 * counters; plain(q,b,f) identifies its exact subset. */
++					ISAAC_COLOROFFSET_FS_PROBE_COUNT(draw_requests);
++					ISAAC_COLOROFFSET_FS_PROBE_COUNT(draws_bound);
++					if (isaac_opaque_fragment)
++						ISAAC_COLOROFFSET_FS_PROBE_COUNT(draws_opaque_overridden);
++				} else {
++					/* Plain unavailable: retain today's neutral shader. */
++					isaac_probe_fragment =
+ 					isaac_coloroffset_fs_probe_select(
+ 						p, isaac_opaque_fragment ? GL_TRUE : GL_FALSE);
++				}
+ 				if (isaac_probe_fragment)
+ 					isaac_opaque_fragment = isaac_probe_fragment;
+ 			}
+@@ -3440,6 +3461,7 @@ GLuint glCreateProgram(void) {
+ 			progs[i].isaac_coloroffset_fs_probe_link_vertex_program = NULL;
+ 			progs[i].isaac_coloroffset_fs_probe_link_source_generation = 0;
+ #endif
++			progs[i].isaac_coloroffset_plain = NULL;
+ 			for (j = 0; j < VERTEX_ATTRIBS_NUM; j++) {
+ 				progs[i].attr[j].regIndex = 0xDEAD;
+ 			}
+@@ -3538,6 +3560,7 @@ void glDeleteProgram(GLuint prog) {
+ 		isaac_coloroffset_release_fragment_cache(p);
+ #endif
+ #ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
++		isaac_coloroffset_plain_release(p);
+ 		isaac_coloroffset_fs_probe_release(p);
+ #endif
+ 		if (p->vert_uniforms) {
+@@ -4010,5 +4033,6 @@ void glLinkProgram(GLuint progr) {
+ #endif
+ #ifdef HAVE_ISAAC_COLOROFFSET_FS_PROBE
+ 	isaac_coloroffset_fs_probe_link(p);
++	isaac_coloroffset_plain_link(p);
+ #endif
+ }

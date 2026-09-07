@@ -17,9 +17,15 @@
    see host_vita_shader_attrib_fastpath_oracle.c for the case list (the
    review added: every slot word corrupted with zero/near/foreign-registered
    tokens including the glVertexAttribPointer slot, a frame straddling the
-   stack ceiling, ESP below the floor).
-5. Build gate: the CMake option is default OFF and requires
-   ISAAC_VITA_GL_SHIM_FASTDISPATCH.
+   stack ceiling, ESP below the floor).  Three flavours of the same oracle:
+   the frozen build, ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO (frozen cases
+   against an emptied memo, then fill/hit/miss/relink/reuse/unmemoisable/
+   decline cases whose hit streams are the reference minus its
+   glGetAttribLocation lines) and the VERIFY variant (every lookup still
+   performed; a forced stale entry counts one mismatch per attribute).
+5. Build gate: the CMake options are default OFF; the fast path requires
+   ISAAC_VITA_GL_SHIM_FASTDISPATCH, the memo requires the fast path and
+   VERIFY requires the memo.
 6. CMake census: the real owner/seam census block of recomp/vita/CMakeLists.txt
    runs under `cmake -P` (set_property stubbed) against the corpus - exactly
    one owner unit and one seam line per root - and must reject a corpus
@@ -64,6 +70,63 @@ ORACLE_RESULT = (
     "Vita shader attrib fast path oracle: PASS; cases=150; "
     "handled=80; rejected=70; backend=1360; probes=5"
 )
+# ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO flavours of the same oracle: the
+# frozen cases run against an emptied memo (identical streams), then the memo
+# section (fill/hit/miss/relink/reuse/unmemoisable/decline); VERIFY performs
+# every lookup and counts the forced stale entry (6 attributes) exactly once.
+ORACLE_FLAVOURS = {
+    "base": ([], ORACLE_RESULT),
+    "memo": (["/DISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO=1"],
+             "Vita shader attrib fast path oracle: PASS; cases=186; "
+             "handled=115; rejected=71; backend=2021; probes=5; "
+             "memo-mismatches=0"),
+    "memo-verify": (["/DISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO=1",
+                     "/DISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY=1"],
+                    "Vita shader attrib fast path oracle: PASS; cases=188; "
+                    "handled=117; rejected=71; backend=2057; probes=5; "
+                    "memo-mismatches=6"),
+    # ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE: the same cases with the replay
+    # handing its attribute set to the (recorded) backend batch; every
+    # handled replay with attributes takes exactly one batch and the streams
+    # stay identical.  direct-decline forces the batch's declined verdict, so
+    # every case proves the fail-closed per-call fallback (one decline per
+    # handled replay with attributes, same streams).
+    "direct": (["/DISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=1"],
+               "Vita shader attrib fast path oracle: PASS; cases=150; "
+               "handled=80; rejected=70; backend=1360; probes=5; "
+               "direct(batch,decl)=78,0"),
+    "direct-decline": (["/DISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=1",
+                        "/DORACLE_ATTRIB_DIRECT_DECLINE=1"],
+                       "Vita shader attrib fast path oracle: PASS; cases=150; "
+                       "handled=80; rejected=70; backend=1360; probes=5; "
+                       "direct(batch,decl)=0,78"),
+    "direct-memo": (["/DISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=1",
+                     "/DISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO=1"],
+                    "Vita shader attrib fast path oracle: PASS; cases=186; "
+                    "handled=115; rejected=71; backend=2021; probes=5; "
+                    "memo-mismatches=0; direct(batch,decl)=112,0"),
+    "direct-memo-verify": (["/DISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=1",
+                            "/DISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO=1",
+                            "/DISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY=1"],
+                           "Vita shader attrib fast path oracle: PASS; cases=188; "
+                           "handled=117; rejected=71; backend=2057; probes=5; "
+                           "memo-mismatches=6; direct(batch,decl)=114,0"),
+    # ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB (ph120.gt mode=sdk32 scope=attrib):
+    # the same frozen cases with the 1/32 replay timer compiled in; every
+    # HANDLED replay is counted per kind, residue 0 times the ordinals 0, 32,
+    # 64, ... (ceil(replays / 32) per kind), the streams and every other
+    # census stay identical, and the clock-read total is pinned.
+    "sparse-attrib": (["/DISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB=1"],
+                      "Vita shader attrib fast path oracle: PASS; cases=150; "
+                      "handled=80; rejected=70; backend=1360; probes=5; "
+                      "sparse(en,di,ten,tdi,clocks)=54,26,2,1,6"),
+    "direct-sparse-attrib": (["/DISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=1",
+                              "/DISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB=1"],
+                             "Vita shader attrib fast path oracle: PASS; cases=150; "
+                             "handled=80; rejected=70; backend=1360; probes=5; "
+                             "direct(batch,decl)=78,0; "
+                             "sparse(en,di,ten,tdi,clocks)=54,26,2,1,6"),
+}
 
 COMMON = [
     "/nologo", "/W4", "/WX", "/O2", "/Gy", "/std:c11",
@@ -302,8 +365,10 @@ def extract_bodies(generated_dir: Path) -> tuple[Path, dict[str, str]]:
 
 # ---- 4. oracle -----------------------------------------------------------------
 
-def build_and_run_oracle(env, compiler: str, work: Path, bodies: dict[str, str],
-                         tables: bytes) -> str:
+def build_bodies(env, compiler: str, work: Path,
+                 bodies: dict[str, str]) -> list[str]:
+    """The four link-time variants of the two translated bodies; shared by
+    every oracle flavour (the memo define never reaches generated units)."""
     source = ["/* Generated by test_vita_shader_attrib_fastpath.py from the",
               " * frozen corpus unit; the only edit is the seam guard. */",
               "#include <math.h>", '#include "guest.h"',
@@ -334,10 +399,16 @@ def build_and_run_oracle(env, compiler: str, work: Path, bodies: dict[str, str],
             extra + ["/I", str(RUNTIME), "/c", str(bodies_c),
                      "/Fo:" + str(obj)], env)
         objects.append(str(obj))
-    exe = work / "shader-attrib-oracle.exe"
-    objdir = work / "obj"
+    return objects
+
+
+def build_and_run_oracle(env, compiler: str, work: Path, objects: list[str],
+                         tables: bytes, flavour: str,
+                         extra_defines: list[str]) -> str:
+    exe = work / f"shader-attrib-oracle-{flavour}.exe"
+    objdir = work / f"obj-{flavour}"
     objdir.mkdir()
-    run([compiler] + COMMON + DISPATCH_DEFINES + [
+    run([compiler] + COMMON + DISPATCH_DEFINES + extra_defines + [
         "/I", str(RUNTIME),
         str(RUNTIME / "host_vita_shader_attrib_fastpath_oracle.c"),
         str(RUNTIME / "gl_bridge.c"),
@@ -347,8 +418,26 @@ def build_and_run_oracle(env, compiler: str, work: Path, bodies: dict[str, str],
         "/link", "/LARGEADDRESSAWARE", "/OPT:REF", "/INCREMENTAL:NO",
     ], env)
     out = run([str(exe), tables.hex()], env)
-    (work / "oracle.out").write_text(out, encoding="utf-8")
+    (work / f"oracle-{flavour}.out").write_text(out, encoding="utf-8")
     return out
+
+
+def run_oracle_flavours(env, compiler: str, work: Path,
+                        bodies: dict[str, str], tables: bytes) -> list[str]:
+    objects = build_bodies(env, compiler, work, bodies)
+    results = []
+    for flavour, (extra_defines, expected) in ORACLE_FLAVOURS.items():
+        out = build_and_run_oracle(env, compiler, work, objects, tables,
+                                   flavour, extra_defines)
+        lines = out.strip().splitlines()
+        result = lines[-1] if lines else ""
+        failures = [line for line in lines if line.startswith("FAIL")]
+        if failures or result != expected:
+            print(out[-8000:])
+            raise AssertionError(
+                f"oracle result changed ({flavour}): {result!r}")
+        results.append(f"[{flavour}] {result}")
+    return results
 
 
 # ---- 5. build gate --------------------------------------------------------------
@@ -361,6 +450,51 @@ def verify_build_gate() -> None:
     require("ISAAC_VITA_SHADER_ATTRIB_FASTPATH requires "
             "ISAAC_VITA_GL_SHIM_FASTDISPATCH" in cmake,
             "GL_SHIM_FASTDISPATCH prerequisite gate missing")
+    for option in ("ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO",
+                   "ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY"):
+        require(re.search(
+            r"option\(" + option + r"\s+\"[^\"]+\"\s+OFF\)", cmake) is not None,
+            f"{option} is not default OFF")
+    require("ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO requires "
+            "ISAAC_VITA_SHADER_ATTRIB_FASTPATH" in cmake,
+            "memo prerequisite gate missing")
+    require("ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY requires "
+            "ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO" in cmake,
+            "memo VERIFY prerequisite gate missing")
+    require(cmake.count("ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO=1") == 1 and
+            cmake.count("ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY=1") == 1,
+            "memo compile definitions have more than one owner list each")
+    # ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE: default OFF, needs the fast
+    # path, rejects the per-attribute wrapper-time split and the stall-probe
+    # breadcrumbs, one owner list (replay TU + typed backend) and the sampler
+    # define reaching the backend only under it.
+    require(re.search(
+        r"option\(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE\s+\"[^\"]+\"\s+OFF\)",
+        cmake) is not None, "direct state is not default OFF")
+    require("ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE requires "
+            "ISAAC_VITA_SHADER_ATTRIB_FASTPATH" in cmake,
+            "direct state prerequisite gate missing")
+    require(re.search(
+        r"if\(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE AND ISAAC_VITA_GL_WRAPPER_TIME\)"
+        r"\s*message\(FATAL_ERROR", cmake) is not None,
+        "direct state does not reject GL_WRAPPER_TIME")
+    require(re.search(
+        r"if\(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE AND ISAAC_VITA_STALL_PROBE\)"
+        r"\s*message\(FATAL_ERROR", cmake) is not None,
+        "direct state does not reject STALL_PROBE")
+    require(cmake.count("ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=1") == 1,
+            "direct state compile definition has more than one owner list")
+    require(re.search(
+        r"if\(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE\)\s*(?:#[^\n]*\n\s*)*"
+        r"set_property\(SOURCE\s+"
+        r"\"\$\{ISAAC_RUNTIME\}/host_vita_shader_attrib_fastpath\.c\"\s+"
+        r"\"\$\{ISAAC_RUNTIME\}/gl_vita_backend\.c\"\s+"
+        r"APPEND PROPERTY COMPILE_DEFINITIONS\s+"
+        r"ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=1\)\s*"
+        r"if\(ISAAC_VITA_GUEST_SAMPLER\)\s*set_property\(SOURCE\s+"
+        r"\"\$\{ISAAC_RUNTIME\}/gl_vita_backend\.c\"\s+"
+        r"APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GUEST_SAMPLER=1\)",
+        cmake) is not None, "direct state owner list drifted")
     for marker in (ROOTS[ENABLE_ROOT][2], ROOTS[DISABLE_ROOT][2]):
         require(marker in cmake, f"CMake census lacks marker {marker!r}")
     require('"${ISAAC_RUNTIME}/host_vita_shader_attrib_fastpath.c"' in cmake,
@@ -410,6 +544,9 @@ def run_census(cmake: str, work: Path, tag: str, units: list[Path],
     script = work / f"census_{tag}.cmake"
     script.write_text("\n".join([
         "cmake_minimum_required(VERSION 3.16)",
+        "# The census reads definitions through the configure-local index",
+        "# CMakeLists.txt includes before the block.",
+        f'include("{posix(VITA_CMAKE.parent / "generated_definitions.cmake")}")',
         "# set_property(SOURCE ...) is not scriptable; the census only needs",
         "# its verdicts, the owner list and the routed replay TU.",
         "function(set_property)",
@@ -526,21 +663,19 @@ def main() -> int:
         for line in verify_census(arguments.generated_dir, owner,
                                   arguments.keep, env):
             print(line)
-        out = build_and_run_oracle(env, compiler, arguments.keep, bodies, tables)
+        results = run_oracle_flavours(env, compiler, arguments.keep, bodies,
+                                      tables)
     else:
         with tempfile.TemporaryDirectory(prefix="isaac-shader-attrib-") as tmp:
             for line in verify_census(arguments.generated_dir, owner,
                                       Path(tmp), env):
                 print(line)
-            out = build_and_run_oracle(env, compiler, Path(tmp), bodies, tables)
-    lines = out.strip().splitlines()
-    result = lines[-1] if lines else ""
-    failures = [line for line in lines if line.startswith("FAIL")]
-    if failures or result != ORACLE_RESULT:
-        print(out[-8000:])
-        raise AssertionError(f"oracle result changed: {result!r}")
-    print(result)
-    print("Vita shader attrib fast path: PASS; roots=2; owner-unit seams=2")
+            results = run_oracle_flavours(env, compiler, Path(tmp), bodies,
+                                          tables)
+    for result in results:
+        print(result)
+    print("Vita shader attrib fast path: PASS; roots=2; owner-unit seams=2; "
+          f"oracle flavours={len(results)}")
     return 0
 
 

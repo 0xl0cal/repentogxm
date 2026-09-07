@@ -293,6 +293,89 @@ def compile_oracles(cc: str, root: Path) -> tuple[NativeMiniZ, str]:
     return NativeMiniZ(library), run([str(guest)]).strip()
 
 
+def verify_archive_xor(pe_path: Path, cc: str, root: Path) -> list[str]:
+    """Execute the real freshly emitted byte loop and PRNG, not a model."""
+    require(pe_path.stat().st_size == PE_SIZE and digest(pe_path) == PE_SHA256,
+            "archive XOR differential requires the frozen PE")
+    os.environ["REPENTOGXM_PE"] = str(pe_path)
+    sys.path.insert(0, str(HERE))
+    import gen_all
+    from image import DEFAULT_BASE, Image
+
+    image = Image(str(pe_path), DEFAULT_BASE)
+    owner = gen_all.ARCHIVE_MASK_OWNER_RVA
+    site = gen_all.ARCHIVE_MASK_SWITCH_RVA
+    cases = gen_all.ARCHIVE_MASK_CASES
+    info = {owner: {"entries": tuple(sorted(cases)), "edges": {site: cases},
+                    "rejected": (), "tables": {site: cases}}}
+    bodies = []
+    for rva in (0x005B06F0, owner):
+        generated = gen_all._translate_function(
+            image, {"rva": rva}, None, info, pin_img=image)
+        require(generated["stub"] is None, f"archive XOR root {rva:x} stubbed")
+        text = generated["text"]
+        if rva == owner:
+            # Only rename the emitted function definition so the fixture can
+            # count original refresh calls. Its instructions and byte-loop
+            # callsite remain generated from the PE, not a copied model.
+            definition = "void sub_005c2fd0(CPU *__restrict c)"
+            require(text.count(definition) == 1, "refresh definition changed")
+            text = text.replace(definition,
+                                "void archive_xor_original_refresh_body(CPU *__restrict c)")
+        bodies.append(text)
+    generated_path = root / "archive_xor_generated.c"
+    generated_path.write_text(
+        '#include "guest.h"\nvoid sub_005c2fd0(CPU *__restrict c);\n' +
+        "\n".join(bodies), encoding="utf-8")
+    table = image.code_at(gen_all.ARCHIVE_MASK_TABLE_RVA, 16)
+    require(len(table) == 16, "frozen PRNG table truncated")
+    (root / "archive_xor_generated.h").write_text(
+        f"#define ARCHIVE_XOR_TABLE_ADDRESS 0x{image.va(gen_all.ARCHIVE_MASK_TABLE_RVA):08x}U\n"
+        "static const unsigned char archive_xor_table[16] = {" +
+        ",".join(str(byte) for byte in table) + "};\n", encoding="ascii")
+    outputs = []
+    modes = ((0, 1, 0), (1, 1, 0), (1, 0, 0), (1, 0, 1))
+    for native_refresh, flags_local, stack_guard, gpr_local in (
+            (refresh, *mode) for refresh in (0, 1) for mode in modes):
+        binary = root / f"archive_xor_{flags_local}{stack_guard}{gpr_local}_refresh{native_refresh}.exe"
+        run([
+            cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-DGUEST_STACK_REQUIRED=1", "-DISAAC_VITA_ARCHIVE_XOR_FASTPATH=1",
+            "-DISAAC_VITA_HEAP_RANGE_LEASE=1",
+            f"-DISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH={native_refresh}",
+            "-DISAAC_VITA_ARCHIVE_XOR_REFRESH_ORACLE=1",
+            f"-DGUEST_FLAGS_LOCAL={flags_local}",
+            f"-DGUEST_GENERATED_STACK_GUARD={stack_guard}",
+            f"-DGUEST_GPR_LOCAL={gpr_local}",
+            "-I", str(RUNTIME), "-I", str(root),
+            str(RUNTIME / "host_vita_archive_xor.c"),
+            str(RUNTIME / "host_vita_archive_miniz_guest_oracle.c"),
+            str(generated_path), "-o", str(binary),
+        ])
+        result = run([str(binary)]).strip()
+        require(result.startswith("archive XOR generated differential: PASS;"),
+                "archive XOR differential result missing")
+        outputs.append(f"refresh={'NATIVE' if native_refresh else 'ORIGINAL'} "
+                       f"flags-local={flags_local} stack-guard={stack_guard} "
+                       f"gpr-local={gpr_local}: {result}")
+    cmake = (HERE / "vita" / "CMakeLists.txt").read_text(encoding="utf-8")
+    require('option(ISAAC_VITA_ARCHIVE_XOR_FASTPATH\n' in cmake and
+            '"Word-XOR frozen mode-2 archive blocks, retaining the translated PRNG" OFF)' in cmake,
+            "archive XOR default-OFF option changed")
+    require(cmake.count("-Wl,--wrap=sub_005b06f0") == 1 and
+            cmake.count("ISAAC_VITA_ARCHIVE_XOR_FASTPATH=1") == 1,
+            "archive XOR runtime-only link/compile scope changed")
+    require('option(ISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH\n' in cmake and
+            '"Run the frozen PRNG refresh natively only inside leased archive XOR" OFF)' in cmake,
+            "archive native refresh lost its separate default-OFF option")
+    require('if(ISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH AND NOT ISAAC_VITA_ARCHIVE_XOR_FASTPATH)' in cmake and
+            cmake.count('ISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH=1') == 1 and
+            'set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_archive_xor.c"\n'
+            '        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH=1)' in cmake,
+            "archive native refresh dependency/runtime-only scope changed")
+    return outputs
+
+
 def verify_build_wiring() -> None:
     cmake = (HERE / "vita" / "CMakeLists.txt").read_text(encoding="utf-8")
     builder = (ROOT_DIR / "tools" / "build_vita.py").read_text(
@@ -305,7 +388,10 @@ def verify_build_wiring() -> None:
             "archive MiniZ CMake option is missing or duplicated")
     require(cmake.count("ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH=1") == 1,
             "archive MiniZ generated/guest/heap compile fence changed")
-    require(cmake.count("host_vita_archive_miniz_native.c") == 1 and
+    # Native PNG also conditionally reuses the same native miniz owner when
+    # the archive path is OFF; do not count its explanatory comment as code.
+    require(cmake.count('"${ISAAC_RUNTIME}/host_vita_archive_miniz_native.c"') == 2 and
+            "if(NOT ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH)" in cmake and
             cmake.count("host_vita_archive_miniz_guest.c") == 3,
             "archive MiniZ runtime source ownership changed")
     require('f"-DISAAC_VITA_ARCHIVE_MINIZ_FASTPATH="' in builder,
@@ -358,10 +444,18 @@ def main() -> int:
     parser.add_argument("--pe", required=True, type=Path)
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--cc")
+    parser.add_argument("--xor-only", action="store_true",
+                        help="only the frozen mode-2 XOR generated differential")
     arguments = parser.parse_args()
 
     require(arguments.pe.stat().st_size == PE_SIZE, "frozen PE size changed")
     require(digest(arguments.pe) == PE_SHA256, "frozen PE hash changed")
+    if arguments.xor_only:
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="isaac-archive-xor-", dir=SCRATCH) as value:
+            for output in verify_archive_xor(arguments.pe, compiler(arguments.cc), Path(value)):
+                print(output)
+        return 0
     verify_codegen(arguments.pe)
     verify_build_wiring()
 
@@ -370,6 +464,7 @@ def main() -> int:
             prefix="isaac-archive-miniz-", dir=SCRATCH) as value:
         temporary = Path(value)
         verify_allocator_gate_scope(temporary)
+        xor_outputs = verify_archive_xor(arguments.pe, compiler(arguments.cc), temporary)
         native, guest = compile_oracles(compiler(arguments.cc), temporary)
         try:
             synthetic_calls = verify_synthetic(native)
@@ -382,6 +477,8 @@ def main() -> int:
     require(guest.startswith("archive MiniZ guest oracle: PASS;"),
             "archive MiniZ guest ABI oracle changed")
     print(guest)
+    for output in xor_outputs:
+        print(output)
     print(f"archive MiniZ synthetic differential: PASS; calls={synthetic_calls}")
     if archive_result is not None:
         calls, needs_more, complete = archive_result

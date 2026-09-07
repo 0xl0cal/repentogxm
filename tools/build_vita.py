@@ -1073,8 +1073,11 @@ def cmake_configure_command(
     lua_source: Path | None = None,
     sim_cadence_receipt: bool = False,
     audio_stream_receipt: bool = False,
+    heap_terminal_fastpath: bool = False,
     world_seam_diag: bool = False,
     stable_30_presentation: bool = False,
+    laser_ring_shadow_skip: bool = False,
+    ogg_queue_emergency: bool = False,
 ) -> list[str]:
     on_off = lambda value: "ON" if value else "OFF"
     lua_source_value = _lua_source_option_value(lua, lua_source)
@@ -1145,6 +1148,7 @@ def cmake_configure_command(
         f"-DISAAC_VITA_ARCHIVE_VALIDATION_SKIP={on_off(archive_validation_skip)}",
         f"-DISAAC_VITA_ARCHIVE_VALIDATION_RECEIPT={on_off(archive_validation_receipt)}",
         f"-DISAAC_VITA_FIOS_CACHE={on_off(fios_cache)}",
+        f"-DISAAC_VITA_OGG_QUEUE_EMERGENCY={on_off(ogg_queue_emergency)}",
         f"-DISAAC_VITA_CRT_SEEK_SHADOW={on_off(crt_seek_shadow)}",
         f"-DISAAC_VITA_CONTINUE_PROFILE={on_off(continue_profile)}",
         f"-DISAAC_VITA_EXIT_MENU_PROFILE={on_off(exit_menu_profile)}",
@@ -1163,6 +1167,12 @@ def cmake_configure_command(
         "-DISAAC_VITA_PILL_BLOOM_BYPASS=OFF",
         "-DISAAC_VITA_TRANSIENT_BLOOM_HALF_RES=OFF",
         "-DISAAC_VITA_LASER_PROFILE=OFF",
+        f"-DISAAC_VITA_LASER_RING_SHADOW_SKIP={on_off(laser_ring_shadow_skip)}",
+        # Driver prerequisites only; ordinary builds never inherit an
+        # experimental P8 cache entry or opt game textures into P8 storage.
+        "-DISAAC_VITA_VITAGL_P8_SAFE_UPLOAD=OFF",
+        "-DISAAC_VITA_LASER_ATLAS_P8=OFF",
+        "-DISAAC_VITA_LASER_LIGHT_HALO_CLIP=OFF",
         "-DISAAC_VITA_POOP_FX_PROFILE=OFF",
         "-DISAAC_VITA_POOP_FX_SINGLE_CLOUD=OFF",
         "-DISAAC_VITA_STALL_PROBE=OFF",
@@ -1190,6 +1200,7 @@ def cmake_configure_command(
         f"-DISAAC_VITA_HEAP_LEDGER_MEMBLOCK={on_off(heap_ledger_memblock)}",
         f"-DISAAC_VITA_HEAP_LEDGER_BACKSHIFT={on_off(heap_ledger_backshift)}",
         f"-DISAAC_VITA_HEAP_OVERFLOW_MSPACE={on_off(heap_overflow_mspace)}",
+        f"-DISAAC_VITA_HEAP_TERMINAL_FASTPATH={on_off(heap_terminal_fastpath)}",
         f"-DISAAC_VITA_ROOM_ENTRY_SLAB={on_off(room_entry_slab)}",
         f"-DISAAC_VITA_ROOM_ENTRY_HYBRID={on_off(room_entry_hybrid)}",
     ])
@@ -1961,8 +1972,11 @@ def validate_cmake_contract(
     lua_source: Path | None = None,
     sim_cadence_receipt: bool = False,
     audio_stream_receipt: bool = False,
+    heap_terminal_fastpath: bool = False,
     world_seam_diag: bool = False,
     stable_30_presentation: bool = False,
+    laser_ring_shadow_skip: bool = False,
+    ogg_queue_emergency: bool = False,
 ) -> dict[str, object]:
     """Prove that CMake used the requested feature/base/heap contract."""
 
@@ -2004,6 +2018,7 @@ def validate_cmake_contract(
         "ISAAC_VITA_ARCHIVE_VALIDATION_SKIP": archive_validation_skip,
         "ISAAC_VITA_ARCHIVE_VALIDATION_RECEIPT": archive_validation_receipt,
         "ISAAC_VITA_FIOS_CACHE": fios_cache,
+        "ISAAC_VITA_OGG_QUEUE_EMERGENCY": ogg_queue_emergency,
         "ISAAC_VITA_CRT_SEEK_SHADOW": crt_seek_shadow,
         "ISAAC_VITA_CONTINUE_PROFILE": continue_profile,
         "ISAAC_VITA_EXIT_MENU_PROFILE": exit_menu_profile,
@@ -2017,6 +2032,10 @@ def validate_cmake_contract(
         "ISAAC_VITA_PILL_BLOOM_BYPASS": False,
         "ISAAC_VITA_TRANSIENT_BLOOM_HALF_RES": False,
         "ISAAC_VITA_LASER_PROFILE": False,
+        "ISAAC_VITA_LASER_RING_SHADOW_SKIP": laser_ring_shadow_skip,
+        "ISAAC_VITA_VITAGL_P8_SAFE_UPLOAD": False,
+        "ISAAC_VITA_LASER_ATLAS_P8": False,
+        "ISAAC_VITA_LASER_LIGHT_HALO_CLIP": False,
         "ISAAC_VITA_POOP_FX_PROFILE": False,
         "ISAAC_VITA_POOP_FX_SINGLE_CLOUD": False,
         "ISAAC_VITA_STALL_PROBE": False,
@@ -2038,6 +2057,7 @@ def validate_cmake_contract(
         "ISAAC_VITA_HEAP_LEDGER_MEMBLOCK": heap_ledger_memblock,
         "ISAAC_VITA_HEAP_LEDGER_BACKSHIFT": heap_ledger_backshift,
         "ISAAC_VITA_HEAP_OVERFLOW_MSPACE": heap_overflow_mspace,
+        "ISAAC_VITA_HEAP_TERMINAL_FASTPATH": heap_terminal_fastpath,
         "ISAAC_VITA_ROOM_ENTRY_SLAB": room_entry_slab,
         "ISAAC_VITA_ROOM_ENTRY_HYBRID": room_entry_hybrid,
     }
@@ -2989,6 +3009,12 @@ def _argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--ogg-queue-emergency",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="allow exact OGG Queue OOM recovery through the idle one-slot reserve",
+    )
+    parser.add_argument(
         "--lua",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -3131,6 +3157,15 @@ def _argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--laser-ring-shadow-skip",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "omit only sampled/ring laser floor shadows, preserving beam "
+            "rendering and gameplay (default: disabled)"
+        ),
+    )
+    parser.add_argument(
         "--world-seam-diag",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -3224,6 +3259,15 @@ def _argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--heap-terminal-fastpath",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "read the terminal heap latch without taking the allocator lock "
+            "(default: disabled; requires --heap-overflow-mspace)"
+        ),
+    )
+    parser.add_argument(
         "--room-entry-slab",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3245,6 +3289,14 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--reanalyse",
         action="store_true",
         help="discard and rebuild the switch-analysis cache too",
+    )
+    parser.add_argument(
+        "--generate-only",
+        action="store_true",
+        help=(
+            "stop after the C corpus in --generated-dir is regenerated and "
+            "verified; configure and build nothing"
+        ),
     )
     parser.add_argument(
         "--cmake",
@@ -3536,6 +3588,8 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         raise BuildError("--lua requires --lua-source")
     if not args.lua and args.lua_source is not None:
         raise BuildError("--lua-source is only valid with --lua")
+    if args.generate_only and args.release:
+        raise BuildError("--generate-only is not valid with --release")
     if not 1 <= args.jobs <= 32:
         raise BuildError("--jobs must be between 1 and 32")
     if not heap_mb_is_supported(args.heap_mb):
@@ -3556,6 +3610,10 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         raise BuildError(
             "--heap-overflow-mspace requires --heap-mb=81, "
             "--heap-ledger-memblock and --heap-ledger-backshift"
+        )
+    if args.heap_terminal_fastpath and not args.heap_overflow_mspace:
+        raise BuildError(
+            "--heap-terminal-fastpath requires --heap-overflow-mspace"
         )
     if args.room_entry_slab and not args.heap_overflow_mspace:
         raise BuildError(
@@ -3598,6 +3656,8 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         )
     if args.stable_30_presentation and not args.kage:
         raise BuildError("--stable-30-presentation requires --kage")
+    if args.laser_ring_shadow_skip and not args.kage:
+        raise BuildError("--laser-ring-shadow-skip requires --kage")
     if args.audio_stream_receipt and (not args.kage or not args.audio):
         raise BuildError(
             "--audio-stream-receipt requires --kage and --audio"
@@ -3628,6 +3688,7 @@ def _validate_arguments(args: argparse.Namespace) -> None:
             ("--texture-churn-profile", args.texture_churn_profile),
             ("--sim-cadence-receipt", args.sim_cadence_receipt),
             ("--stable-30-presentation", args.stable_30_presentation),
+            ("--laser-ring-shadow-skip", args.laser_ring_shadow_skip),
             ("--audio-stream-receipt", args.audio_stream_receipt),
             ("--world-seam-diag", args.world_seam_diag),
         )
@@ -4152,6 +4213,11 @@ def _self_test() -> None:
             "-DISAAC_VITA_PILL_BLOOM_BYPASS=OFF",
             "-DISAAC_VITA_TRANSIENT_BLOOM_HALF_RES=OFF",
             "-DISAAC_VITA_LASER_PROFILE=OFF",
+            "-DISAAC_VITA_LASER_RING_SHADOW_SKIP=OFF",
+            "-DISAAC_VITA_OGG_QUEUE_EMERGENCY=OFF",
+            "-DISAAC_VITA_VITAGL_P8_SAFE_UPLOAD=OFF",
+            "-DISAAC_VITA_LASER_ATLAS_P8=OFF",
+            "-DISAAC_VITA_LASER_LIGHT_HALO_CLIP=OFF",
             "-DISAAC_VITA_POOP_FX_PROFILE=OFF",
             "-DISAAC_VITA_POOP_FX_SINGLE_CLOUD=OFF",
             "-DISAAC_VITA_STALL_PROBE=OFF",
@@ -4172,6 +4238,7 @@ def _self_test() -> None:
             "-DISAAC_VITA_HEAP_LEDGER_MEMBLOCK=ON",
             "-DISAAC_VITA_HEAP_LEDGER_BACKSHIFT=ON",
             "-DISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON",
+            "-DISAAC_VITA_HEAP_TERMINAL_FASTPATH=OFF",
             "-DISAAC_VITA_ROOM_ENTRY_SLAB=ON",
             "-DISAAC_VITA_ROOM_ENTRY_HYBRID=ON",
             "-DISAAC_VITA_SCAFFOLD_ONLY=OFF",
@@ -4295,7 +4362,12 @@ def _self_test() -> None:
             room_entry_hybrid=False,
             source_date_epoch=1_700_000_000,
             release=True,
+            heap_terminal_fastpath=True,
         )
+        assert rollback_command.count(
+            "-DISAAC_VITA_HEAP_TERMINAL_FASTPATH=ON"
+        ) == 1
+        assert "-DISAAC_VITA_HEAP_TERMINAL_FASTPATH=OFF" not in rollback_command
         assert "-DISAAC_VITA_ROOM_ENTRY_HYBRID=OFF" in rollback_command
         assert "-DISAAC_VITA_ROOM_ENTRY_HYBRID=ON" not in rollback_command
         assert "-DISAAC_VITA_FIOS_CACHE=OFF" in rollback_command
@@ -5088,6 +5160,11 @@ def _self_test() -> None:
                 "ISAAC_VITA_PILL_BLOOM_BYPASS:BOOL=OFF",
                 "ISAAC_VITA_TRANSIENT_BLOOM_HALF_RES:BOOL=OFF",
                 "ISAAC_VITA_LASER_PROFILE:BOOL=OFF",
+                "ISAAC_VITA_LASER_RING_SHADOW_SKIP:BOOL=OFF",
+                "ISAAC_VITA_OGG_QUEUE_EMERGENCY:BOOL=OFF",
+                "ISAAC_VITA_VITAGL_P8_SAFE_UPLOAD:BOOL=OFF",
+                "ISAAC_VITA_LASER_ATLAS_P8:BOOL=OFF",
+                "ISAAC_VITA_LASER_LIGHT_HALO_CLIP:BOOL=OFF",
                 "ISAAC_VITA_POOP_FX_PROFILE:BOOL=OFF",
                 "ISAAC_VITA_POOP_FX_SINGLE_CLOUD:BOOL=OFF",
                 "ISAAC_VITA_STALL_PROBE:BOOL=OFF",
@@ -5116,6 +5193,7 @@ def _self_test() -> None:
                 "ISAAC_VITA_HEAP_LEDGER_MEMBLOCK:BOOL=ON",
                 "ISAAC_VITA_HEAP_LEDGER_BACKSHIFT:BOOL=ON",
                 "ISAAC_VITA_HEAP_OVERFLOW_MSPACE:BOOL=ON",
+                "ISAAC_VITA_HEAP_TERMINAL_FASTPATH:BOOL=OFF",
                 "ISAAC_VITA_ROOM_ENTRY_SLAB:BOOL=ON",
                 "ISAAC_VITA_ROOM_ENTRY_HYBRID:BOOL=ON",
                 "SOURCE_DATE_EPOCH:STRING=1700000000",
@@ -5222,6 +5300,27 @@ def _self_test() -> None:
         assert texture_configuration["features"][
             "ISAAC_VITA_VITAGL_STOCK_REFERENCE"
         ] is True
+        terminal_cache = dict(texture_cache)
+        terminal_cache["ISAAC_VITA_HEAP_TERMINAL_FASTPATH"] = "ON"
+        terminal_configuration = validate_cmake_contract(
+            terminal_cache, heap_terminal_fastpath=True,
+            **texture_contract_arguments,
+        )
+        assert terminal_configuration["features"][
+            "ISAAC_VITA_HEAP_TERMINAL_FASTPATH"
+        ] is True
+        for requested, stale_value in ((True, "OFF"), (False, "ON")):
+            stale_terminal_cache = dict(texture_cache)
+            stale_terminal_cache["ISAAC_VITA_HEAP_TERMINAL_FASTPATH"] = stale_value
+            try:
+                validate_cmake_contract(
+                    stale_terminal_cache, heap_terminal_fastpath=requested,
+                    **texture_contract_arguments,
+                )
+            except BuildError as exc:
+                assert "ISAAC_VITA_HEAP_TERMINAL_FASTPATH" in str(exc)
+            else:
+                raise AssertionError("terminal fastpath accepted stale cache")
         for stale_key, stale_value in (
             ("ISAAC_VITA_DIRECT_DEFAULT", "OFF"),
             ("ISAAC_VITA_RASTER_PROBE", "ON"),
@@ -6171,6 +6270,14 @@ def _self_test() -> None:
     assert not defaults.texture_churn_profile
     assert not defaults.sim_cadence_receipt
     assert not defaults.stable_30_presentation
+    assert not defaults.laser_ring_shadow_skip
+    assert not defaults.ogg_queue_emergency
+    assert parser.parse_args(["--ogg-queue-emergency"]).ogg_queue_emergency
+    laser_args = parser.parse_args([
+        "--pe", "fixture", "--vitasdk", "sdk", "--laser-ring-shadow-skip",
+    ])
+    assert laser_args.laser_ring_shadow_skip
+    _validate_arguments(laser_args)
     stable_args = parser.parse_args([
         "--pe", "fixture", "--vitasdk", "sdk", "--kage",
         "--stable-30-presentation",
@@ -6200,6 +6307,22 @@ def _self_test() -> None:
     assert defaults.heap_ledger_memblock
     assert defaults.heap_ledger_backshift
     assert defaults.heap_overflow_mspace
+    assert not defaults.heap_terminal_fastpath
+    terminal_args = parser.parse_args([
+        "--pe", "fixture", "--vitasdk", "sdk", "--heap-terminal-fastpath",
+    ])
+    assert terminal_args.heap_terminal_fastpath
+    _validate_arguments(terminal_args)
+    assert not parser.parse_args([
+        "--heap-terminal-fastpath", "--no-heap-terminal-fastpath",
+    ]).heap_terminal_fastpath
+    terminal_args.heap_overflow_mspace = False
+    try:
+        _validate_arguments(terminal_args)
+    except BuildError as exc:
+        assert "--heap-terminal-fastpath requires --heap-overflow-mspace" in str(exc)
+    else:
+        raise AssertionError("terminal fastpath accepted without overflow mspace")
     assert defaults.room_entry_slab
     assert defaults.room_entry_hybrid
     assert defaults.openal_pool
@@ -6490,7 +6613,27 @@ def _self_test() -> None:
     assert cmake_source.count("ISAAC_VITA_POOP_FX_SINGLE_CLOUD=1") == 1
     assert cmake_source.count('sub_004e(c3b0|daa0)') == 1
     assert 'option(ISAAC_VITA_PNG_DECODE_PROFILE' in cmake_source
-    assert cmake_source.count("ISAAC_VITA_PNG_DECODE_PROFILE=1") == 1
+    # The combined WINDOW+DECODE build suppresses the outer module's aliases:
+    # the sampled module alone owns image_begin/end and forwards timestamps.
+    # Pin both source-scoped assignments, not only their textual count.
+    png_owner_definition = (
+        'set_property(SOURCE\n'
+        '      ${ISAAC_VITA_PNG_DECODE_PROFILE_OWNERS}\n'
+        '      "${ISAAC_RUNTIME}/kage_vita_png_decode_profile.c"\n'
+        '      ${ISAAC_VITA_PNG_DECODE_PROFILE_NATIVE_SOURCES}\n'
+        '      APPEND PROPERTY COMPILE_DEFINITIONS\n'
+        '        ISAAC_VITA_PNG_DECODE_PROFILE=1)'
+    )
+    png_combined_definition = (
+        'set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_png_outer_profile.c"\n'
+        '          APPEND PROPERTY COMPILE_DEFINITIONS '
+        'ISAAC_VITA_PNG_DECODE_PROFILE=1)'
+    )
+    assert cmake_source.count(png_owner_definition) == 1
+    assert cmake_source.count(png_combined_definition) == 1
+    assert "ISAAC_VITA_PNG_DECODE_PROFILE=1" not in cmake_source.replace(
+        png_owner_definition, ""
+    ).replace(png_combined_definition, "")
     assert (
         'ISAAC_VITA_PNG_DECODE_PROFILE_BUILD_ID=\\"'
         '${ISAAC_VITA_GUEST_LINK_ID}\\"'
@@ -6632,6 +6775,9 @@ def main(argv: list[str] | None = None) -> int:
             "generated contract verified: "
             f"recipe={manifest['recipe_id']} outputs={manifest['output_set_id']}"
         )
+        if args.generate_only:
+            print(f"generate-only: corpus ready in {generated_dir}")
+            return 0
 
         configure = cmake_configure_command(
             str(cmake_executable),
@@ -6675,8 +6821,11 @@ def main(argv: list[str] | None = None) -> int:
             lua_source=lua_source,
             sim_cadence_receipt=args.sim_cadence_receipt,
             audio_stream_receipt=args.audio_stream_receipt,
+            heap_terminal_fastpath=args.heap_terminal_fastpath,
             world_seam_diag=args.world_seam_diag,
             stable_30_presentation=args.stable_30_presentation,
+            laser_ring_shadow_skip=args.laser_ring_shadow_skip,
+            ogg_queue_emergency=args.ogg_queue_emergency,
         )
         print("\n== CMake configure ==", flush=True)
         run_command(configure, environment)
@@ -6745,8 +6894,11 @@ def main(argv: list[str] | None = None) -> int:
             lua_source=lua_source,
             sim_cadence_receipt=args.sim_cadence_receipt,
             audio_stream_receipt=args.audio_stream_receipt,
+            heap_terminal_fastpath=args.heap_terminal_fastpath,
             world_seam_diag=args.world_seam_diag,
             stable_30_presentation=args.stable_30_presentation,
+            laser_ring_shadow_skip=args.laser_ring_shadow_skip,
+            ogg_queue_emergency=args.ogg_queue_emergency,
         )
         toolchain_identity = collect_toolchain_identity(
             cmake_executable=Path(cmake_executable).resolve(),

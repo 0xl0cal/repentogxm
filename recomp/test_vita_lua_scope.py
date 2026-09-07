@@ -5,6 +5,7 @@ ISAAC_VITA_LUA_SCOPE_FASTPATH (host_vita_lua.c) is compiled in both states;
 the oracle (runtime/vita_lua_scope_oracle.c) must pass identically with the
 new code (1, default) and the pre-knob code (0).  32-bit MSVC like the other
 Lua bridge oracles: the raw lua_State/stack pointer ABI is part of the test.
+The native getClass/getExact seam's owner protocol is included in both builds.
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ def build_and_run(fastpath: int, lua_source: Path | None,
     bridge_compile = " ".join(
         ["cl", "/nologo", "/std:c11", "/O2", "/W4", "/WX", "/MT", "/wd4310",
          f"/DISAAC_VITA_LUA_SCOPE_FASTPATH={fastpath}",
+         "/DISAAC_VITA_LUA_NATIVE_GETCLASS=1",
          f"/I{quote(source / 'src')}", f"/I{quote(RUNTIME)}", "/c"]
         + [quote(path) for path in bridge_sources]
     )

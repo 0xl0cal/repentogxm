@@ -14,7 +14,9 @@
  * header (length, sink tag) into one bounded byte ring shared by every
  * producer thread (game thread, audio worker, save writer, guest sampler,
  * native vorbis worker).  One logger thread drains the ring strictly FIFO and
- * performs the sinks, one call per line.  A full ring drops the line and
+ * performs the sinks. With FILE_BATCH enabled, already queued adjacent FILE
+ * records may share one file append; debug output remains one call per line.
+ * A full ring drops the line and
  * counts it; the logger thread reports "[kage-vita] log-async dropped=N" when
  * the count changes, at most once per ISAAC_VITA_LOG_ASYNC_DROP_REPORT_US
  * unless a flush forces it.
@@ -30,11 +32,10 @@
  * Logger thread: priority 191, the lowest user priority (game thread default
  * 160, guest sampler 96, native vorbis worker 170), pinned to CPU 2
  * (SCE_KERNEL_CPU_MASK_USER_2) where the OpenAL mixer and the vorbis worker
- * already live.  The game thread must stay alone on cores 0/1 (the sampler
- * owns core 1 at 96), so the logger kernel I/O never lands there; on core 2
- * both audio threads outrank it and preempt it immediately, and the logger is
- * I/O bound (blocked inside sceIoWrite / the debug printf), so it costs them
- * cache lines rather than cycles.  If the kernel rejects 191 the start falls
+ * already live. This affinity keeps the logger's user thread off the game
+ * and sampler cores; it does not establish where all kernel I/O work runs or
+ * eliminate CPU, cache, storage, or audio contention. Both audio threads have
+ * higher priority on CPU 2. If the kernel rejects 191 the start falls
  * back to the process default priority and reports it.
  *
  * Host oracle: recomp/runtime/host_vita_log_async_oracle.c drives the same
@@ -132,6 +133,15 @@ void isaac_vita_log_async_get_stats(IsaacVitaLogAsyncStats *stats);
  * (log_write), called by the logger thread once per FILE line. */
 void isaac_vita_log_sink_file(const char *line, unsigned int size);
 
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+/* Private drain/platform seam. No record is held waiting for a future enqueue;
+ * debug output still receives one call per original record. */
+# define ISAAC_VITA_LOG_ASYNC_FILE_BATCH_RECORDS 8u
+# define ISAAC_VITA_LOG_ASYNC_FILE_BATCH_BYTES 4096u
+void isaac_vita_log_sink_file_batch(char *payload, const uint16_t *lengths,
+                                   unsigned records);
+#endif
+
 /* One-call-one-record printf for the hot-path [kage-vita] owners.  With the
  * option OFF every owner defines the same name as sceClibPrintf itself, so the
  * OFF objects are byte-identical to the unrouted source. */
@@ -148,6 +158,14 @@ typedef void (*isaac_vita_log_async_sink_fn)(const char *line,
                                              unsigned length);
 extern isaac_vita_log_async_sink_fn g_isaac_vita_log_async_oracle_file_sink;
 extern isaac_vita_log_async_sink_fn g_isaac_vita_log_async_oracle_printf_sink;
+#if defined(ISAAC_VITA_LOG_ASYNC_FILE_BATCH)
+typedef void (*isaac_vita_log_async_batch_sink_fn)(char *payload,
+                                                  const uint16_t *lengths,
+                                                  unsigned records);
+extern isaac_vita_log_async_batch_sink_fn
+    g_isaac_vita_log_async_oracle_file_batch_sink;
+extern int g_isaac_vita_log_async_oracle_sink_lock_fail;
+#endif
 extern uint64_t g_isaac_vita_log_async_oracle_now_us;
 extern uint32_t g_isaac_vita_log_async_oracle_wakes;
 extern uint32_t g_isaac_vita_log_async_oracle_lock_faults;

@@ -53,7 +53,8 @@ _Static_assert(sizeof(archive_tinfl_huff_table) == 0xda0U,
                "frozen tinfl Huffman table layout changed");
 _Static_assert(offsetof(archive_tinfl_state, bit_buf) == 0x38U,
                "frozen tinfl bit-buffer offset changed");
-_Static_assert(offsetof(archive_tinfl_state, tables) == 0x40U,
+_Static_assert(offsetof(archive_tinfl_state, tables) ==
+                   ISAAC_VITA_ARCHIVE_MINIZ_HEADER_BYTES,
                "frozen tinfl table offset changed");
 _Static_assert(offsetof(archive_tinfl_state, raw_header) == 0x2920U,
                "frozen tinfl raw-header offset changed");
@@ -179,14 +180,25 @@ static uint16_t read_le16(const uint8_t *bytes)
     return (uint16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
 }
 
-int isaac_vita_archive_miniz_native(
+/* A PNG-only second translation unit may select an exact Adler updater.
+ * With neither override, the archive entry and scalar body are unchanged. */
+#ifndef ISAAC_MINIZ_NATIVE_ENTRY
+#define ISAAC_MINIZ_NATIVE_ENTRY isaac_vita_archive_miniz_native
+#endif
+#ifndef ISAAC_MINIZ_HISTORY_ARGUMENT
+#define ISAAC_MINIZ_HISTORY_ARGUMENT
+#endif
+#ifndef ISAAC_MINIZ_HISTORY_UNSAFE
+#define ISAAC_MINIZ_HISTORY_UNSAFE(condition) ((void)0)
+#endif
+int ISAAC_MINIZ_NATIVE_ENTRY(
     void *state,
     const uint8_t *input,
     uint32_t *input_size,
     uint8_t *output_start,
     uint8_t *output_next,
     uint32_t *output_size,
-    uint32_t flags)
+    uint32_t flags ISAAC_MINIZ_HISTORY_ARGUMENT)
 {
     static const int length_base[31] = {
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
@@ -327,6 +339,21 @@ int isaac_vita_archive_miniz_native(
                     *code++ = 7U;
                 for (; index <= 287U; ++index)
                     *code++ = 8U;
+#if defined(ISAAC_MINIZ_FIXED_LIT_LOOKUP) && \
+    defined(ISAAC_MINIZ_FIXED_DIST_LOOKUP)
+                /* PNG-only exact fixed alphabet: preserve all code sizes and
+                 * both cleared trees, including the unused distance suffix.
+                 * The generic builder would finish at type == UINT32_MAX.
+                 * Fixed alphabets are complete, so they cannot mark history
+                 * unsafe or take a table-construction failure/coroutine exit. */
+                memcpy(r->tables[0].look_up, ISAAC_MINIZ_FIXED_LIT_LOOKUP,
+                       sizeof(r->tables[0].look_up));
+                memcpy(r->tables[1].look_up, ISAAC_MINIZ_FIXED_DIST_LOOKUP,
+                       sizeof(r->tables[1].look_up));
+                TINFL_CLEAR(r->tables[0].tree);
+                TINFL_CLEAR(r->tables[1].tree);
+                r->type = UINT32_MAX;
+#endif
             } else {
                 static const uint8_t table_bits[3] = { 5, 5, 4 };
                 for (counter = 0U; counter < 3U; ++counter) {
@@ -375,6 +402,7 @@ int isaac_vita_archive_miniz_native(
                 if (total != 65536U && used_symbols > 1U)
                     TINFL_CR_RETURN_FOREVER(
                         35, ISAAC_VITA_ARCHIVE_MINIZ_FAILED);
+                ISAAC_MINIZ_HISTORY_UNSAFE(total != 65536U);
 
                 tree_next = -1;
                 for (symbol_index = 0U;
@@ -548,6 +576,11 @@ int isaac_vita_archive_miniz_native(
                     TINFL_GET_BITS(27, extra_bits, num_extra);
                     dist += extra_bits;
                 }
+                /* Observation only in the PNG reuse entry: preserve the old
+                 * permissive decoder, but never retain a result which could
+                 * read unwritten output through a reserved distance/length.
+                 * Run before BOTH the boundary and bulk-copy branches. */
+                ISAAC_MINIZ_HISTORY_UNSAFE(dist == 0U || counter < 3U);
 
                 dist_from_output_start =
                     (uint32_t)(output_cur - output_start);
@@ -571,6 +604,21 @@ int isaac_vita_archive_miniz_native(
                     }
                     continue;
                 }
+#ifdef ISAAC_MINIZ_MATCH_COPY
+                if ((flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF) &&
+                        ISAAC_MINIZ_MATCH_COPY(output_cur, source,
+                                              counter, dist,
+                                              dist_from_output_start)) {
+                    /* Retain even the old copy loop's residual scalar
+                     * counter, so all coroutine state remains identical
+                     * if the next symbol yields at an input boundary. */
+                    uint32_t tail = counter >= 9U && counter <= dist
+                        ? counter & 7U : counter;
+                    output_cur += counter;
+                    counter = tail % 3U;
+                    continue;
+                }
+#endif
                 if (counter >= 9U && counter <= dist) {
                     const uint8_t *source_end = source + (counter & ~7U);
                     do {
@@ -633,6 +681,10 @@ common_exit:
 
     if ((flags & (TINFL_FLAG_PARSE_ZLIB_HEADER |
                   TINFL_FLAG_COMPUTE_ADLER32)) && status >= 0) {
+#ifdef ISAAC_MINIZ_ADLER32_UPDATE
+        r->check_adler32 = ISAAC_MINIZ_ADLER32_UPDATE(
+            r->check_adler32, output_next, *output_size);
+#else
         const uint8_t *cursor = output_next;
         uint32_t remaining = *output_size;
         uint32_t sum1 = r->check_adler32 & 0xffffU;
@@ -661,6 +713,7 @@ common_exit:
             block = 5552U;
         }
         r->check_adler32 = (sum2 << 16U) + sum1;
+#endif
         if (status == ISAAC_VITA_ARCHIVE_MINIZ_DONE &&
                 (flags & TINFL_FLAG_PARSE_ZLIB_HEADER) &&
                 r->check_adler32 != r->z_adler32) {
@@ -684,3 +737,4 @@ common_exit:
 #undef TINFL_CLEAR
 #undef TINFL_MAX
 #undef TINFL_MIN
+#undef ISAAC_MINIZ_NATIVE_ENTRY

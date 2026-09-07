@@ -12,17 +12,25 @@ mkdir -p "$work"
 ISAAC_ARCHIVE_CACHE_TEST_OUT="$work/archive-cache" \
     bash "$root/vita/test_archive_cache.sh"
 
-"$host_cc" $common $includes \
+# Twice: without ISAAC_VITA_CRT_DESCRIPTOR_RECOVER (the pre-existing fatal
+# ENODEV path, identity) and with it (one reopen at the cursor, redo).
+for recover in off on; do
+recover_flag=
+if [ "$recover" = on ]; then
+    recover_flag=-DISAAC_VITA_CRT_DESCRIPTOR_RECOVER=1
+fi
+"$host_cc" $common $includes $recover_flag \
     "$root/runtime/guest_stack_legacy_oracle_stub.c" \
     "$root/runtime/host_vita_crt_raw_archive_oracle.c" \
     -Wl,--gc-sections -no-pie \
-    -o "$work/vita-crt-raw-archive-host"
+    -o "$work/vita-crt-raw-archive-host-$recover"
 
 if command -v timeout >/dev/null 2>&1; then
-    timeout 20s "$work/vita-crt-raw-archive-host"
+    timeout 20s "$work/vita-crt-raw-archive-host-$recover"
 else
-    "$work/vita-crt-raw-archive-host"
+    "$work/vita-crt-raw-archive-host-$recover"
 fi
+done
 
 sha256sum \
     "$root/runtime/host_vita_archive_cache.h" \
@@ -31,5 +39,6 @@ sha256sum \
     "$root/runtime/host_vita_crt_raw_archive_oracle.c" \
     "$root/vita/test_archive_cache.sh" \
     "$root/vita/test_crt_raw_archive.sh" \
-    "$work/vita-crt-raw-archive-host"
+    "$work/vita-crt-raw-archive-host-off" \
+    "$work/vita-crt-raw-archive-host-on"
 echo "Vita CRT exact-ENOMEM packed-archive raw SceIo host behavior: PASS"

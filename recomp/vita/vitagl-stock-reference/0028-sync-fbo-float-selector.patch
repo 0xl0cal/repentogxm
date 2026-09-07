@@ -1,0 +1,14 @@
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -626,6 +626,10 @@ void scene_reset(void) {
+ 			if (sceGxmColorSurfaceGetData(&active_write_fb->colorbuffer) != active_write_fb->tex->data) {
+ 				_glFramebufferTexture2D(active_write_fb, GL_COLOR_ATTACHMENT0, active_write_fb->tex, 1);
+ 			}
++			/* Lazy attachment sync may change the color-surface register size.
++			 * Match its shader selector before depth/RT setup or any draw. */
++			is_fbo_float = active_write_fb->is_float;
++
+ 			
+ 			// If the depthbuffer is dirty, we re-gen it
+ 			if (!(active_write_fb->depthbuffer_state & DEPTHBUFFER_READY)) {

@@ -417,6 +417,54 @@ static int test_force_discard_and_drop(void)
     return 0;
 }
 
+/* The CRT's descriptor-recovery open: an idle stream is evicted first
+ * exactly like any miss, the fresh stream is never retained, and a later
+ * discard closes it without touching the idle slot. */
+static int test_reopen_native_is_a_miss(void)
+{
+    isaac_vita_archive_cache_file cached =
+        ISAAC_VITA_ARCHIVE_CACHE_FILE_INITIALIZER;
+    isaac_vita_archive_cache_file discard =
+        ISAAC_VITA_ARCHIVE_CACHE_FILE_INITIALIZER;
+    FILE *fresh;
+    char bytes[8];
+    int hit;
+
+    CHECK(isaac_vita_archive_cache_open(&cached, ARCHIVE_A, "rb", &hit));
+    CHECK(isaac_vita_archive_cache_close(&cached) == 0 && s_live_files == 1U);
+    reset_events();
+    fresh = isaac_vita_archive_cache_reopen_native(ARCHIVE_B, "rb");
+    CHECK(fresh && strcmp(s_events, "CO") == 0 && s_live_files == 1U);
+    CHECK(fread(bytes, 1U, 3U, fresh) == 3U && memcmp(bytes, "uvw", 3U) == 0);
+    discard.stream = fresh;
+    CHECK(isaac_vita_archive_cache_force_discard(&discard) == 0 &&
+          !discard.stream && strcmp(s_events, "COC") == 0 &&
+          s_live_files == 0U);
+    reset_events();
+    CHECK(isaac_vita_archive_cache_open(&cached, ARCHIVE_A, "rb", &hit));
+    CHECK(hit == 0 && strcmp(s_events, "O") == 0);
+    CHECK(isaac_vita_archive_cache_close(&cached) == 0);
+    CHECK(isaac_vita_archive_cache_drop() == 0 && s_live_files == 0U);
+
+    reset_events();
+    fresh = isaac_vita_archive_cache_reopen_native(ARCHIVE_A, "rb");
+    CHECK(fresh && strcmp(s_events, "O") == 0 && s_live_files == 1U);
+    discard.stream = fresh;
+    CHECK(isaac_vita_archive_cache_force_discard(&discard) == 0 &&
+          s_live_files == 0U);
+    errno = 0;
+    CHECK(!isaac_vita_archive_cache_reopen_native(NULL, "rb") &&
+          errno == EINVAL);
+    errno = 0;
+    CHECK(!isaac_vita_archive_cache_reopen_native(ARCHIVE_A, NULL) &&
+          errno == EINVAL);
+    errno = 0;
+    CHECK(!isaac_vita_archive_cache_reopen_native(
+              ROOT "/resources/packed/missing.a", "rb") &&
+          errno == ENOENT && s_live_files == 0U);
+    return 0;
+}
+
 static int test_key_contracts(void)
 {
     char key[ISAAC_VITA_ARCHIVE_CACHE_KEY_CAPACITY];
@@ -469,6 +517,7 @@ int main(void)
     CHECK(test_reset_failure_falls_back() == 0);
     CHECK(test_reset_cursor_mismatch_falls_back() == 0);
     CHECK(test_force_discard_and_drop() == 0);
+    CHECK(test_reopen_native_is_a_miss() == 0);
     CHECK(test_key_contracts() == 0);
     CHECK(test_diag_ring_tail() == 0);
     CHECK(test_diag_log_bound() == 0);

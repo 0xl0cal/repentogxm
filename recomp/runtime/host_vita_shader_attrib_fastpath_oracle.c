@@ -45,6 +45,18 @@
 #define isaac_vita_shader_attribs_enable_try oracle_attrib_enable_impl
 #define isaac_vita_shader_attribs_disable_try oracle_attrib_disable_impl
 #include "host_vita_shader_attrib_fastpath.c"
+#if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB)
+/* sdk32 scope=attrib clock (the TU declares the prototype on the host):
+ * monotonic fixture, every read counted, so the summary pins how many reads
+ * the 1/32 selection made across the whole case list. */
+static unsigned s_clock_reads;
+static IsaacVitaAttribReplaySparse s_sparse_summary;
+uint64_t sceKernelGetProcessTimeWide(void)
+{
+    ++s_clock_reads;
+    return (uint64_t)s_clock_reads * 7u;
+}
+#endif
 #undef isaac_vita_shader_attribs_enable_try
 #undef isaac_vita_shader_attribs_disable_try
 
@@ -111,6 +123,21 @@ int guest_host_dynamic(CPU *__restrict c, uint32_t token)
         return 0;
     return isaac_vita_gl_dynamic_counted(c, token, &g_host_dynamic_calls);
 }
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+/* gl_vita_backend.c is not linked: the oracle owns the generation word the
+ * memo is keyed on and bumps it the way the backend does on a mutation
+ * (the backend side of that contract is pinned by gl_vita_backend_oracle.c
+ * in the coalesce-memo mode of test_gl_vita_backend.ps1). */
+uint32_t g_isaac_vita_gl_location_generation = 1u;
+static unsigned s_memo_mismatches;
+# if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY)
+void isaac_vita_gl_location_memo_note_mismatch(void)
+{
+    ++s_memo_mismatches;
+}
+# endif
+#endif
 
 /* ---- trace ------------------------------------------------------------ */
 
@@ -242,11 +269,17 @@ static const char *const s_missing_names[] = {
 
 /* ---- recording backend ------------------------------------------------ */
 
+/* Program-state epoch of the recording backend: a "relink" (memo cases)
+ * changes every answer, so a stale memo hit shows up as a differing
+ * glEnableVertexAttribArray/glVertexAttribPointer/glDisableVertexAttribArray
+ * argument in the compared streams. */
+static uint32_t s_link_epoch;
+
 static guest_gl_int rec_glGetAttribLocation(guest_gl_uint program,
                                             guest_gl_addr name)
 {
     const char *text = (const char *)(uintptr_t)name;
-    uint32_t hash = program * 33u;
+    uint32_t hash = program * 33u + s_link_epoch * 7919u;
     const char *p;
 
     ++s_backend_calls;
@@ -259,7 +292,7 @@ static guest_gl_int rec_glGetAttribLocation(guest_gl_uint program,
     trace("be glGetAttribLocation(%u,%08x,\"%s\")\n", program, name, text);
     if (text[0] == 'x')
         return -1;
-    return (guest_gl_int)(hash % 13u);
+    return (guest_gl_int)(hash % 13u + 16u * s_link_epoch);
 }
 
 static void rec_glEnableVertexAttribArray(guest_gl_uint index)
@@ -319,6 +352,120 @@ static void install_recording_backend(int with_pointer)
     backend.glCullFace = rec_glCullFace;
     guest_gl_install_backend(&backend);
 }
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+/* ---- direct-state batch stand-ins ------------------------------------
+ * gl_vita_backend.c is not linked; these record what the real batch would
+ * hand to vitaGL: the per-attribute wrapper sequence (lookup unless the
+ * replay supplied the locations, enable + pointer / disable) in the per-call
+ * order with the per-call arguments, into the same trace the reference
+ * translated body produces through the recording backend.  So a passing
+ * comparison proves the replay marshals count, names/locations, components,
+ * stride and running base exactly as its per-call loop does (the backend
+ * side - batch(args) == per-call(args) on the real wrappers - is pinned by
+ * the *-direct modes of test_gl_vita_backend.ps1).  The acceptance checks
+ * mirror the real ones (own table members, count <= 16, components 1..4,
+ * non-NULL locations/tokens, non-zero tokens); ORACLE_ATTRIB_DIRECT_DECLINE
+ * forces the declined verdict so every case also proves the fail-closed
+ * per-call fallback. */
+static unsigned s_direct_batches, s_direct_declines;
+
+static int direct_accept(const guest_gl_backend *backend, uint32_t count,
+                         const guest_gl_int *locations,
+                         const IsaacVitaAttribReplayTokens *tokens,
+                         int with_pointer)
+{
+    if (!backend || !locations || !tokens || count > 16u)
+        return 0;
+    if (backend->glGetAttribLocation != rec_glGetAttribLocation)
+        return 0;
+    if (with_pointer)
+        return backend->glEnableVertexAttribArray ==
+                   rec_glEnableVertexAttribArray &&
+               backend->glVertexAttribPointer == rec_glVertexAttribPointer;
+    return backend->glDisableVertexAttribArray ==
+           rec_glDisableVertexAttribArray;
+}
+
+int gl_vita_backend_attribs_replay_enable(
+    const guest_gl_backend *backend, guest_gl_uint program,
+    uint32_t count, const guest_gl_addr *names, guest_gl_int *locations,
+    const uint8_t *components, guest_gl_sizei stride, guest_gl_addr base,
+    const IsaacVitaAttribReplayTokens *tokens)
+{
+    uint32_t i;
+
+    if (!components ||
+            !direct_accept(backend, count, locations, tokens, 1)) {
+        ++s_direct_declines;
+        return 0;
+    }
+    for (i = 0u; i < count; ++i)
+        if (components[i] < 1u || components[i] > 4u) {
+            ++s_direct_declines;
+            return 0;
+        }
+#if defined(ORACLE_ATTRIB_DIRECT_DECLINE)
+    (void)program;
+    (void)names;
+    (void)stride;
+    (void)base;
+    ++s_direct_declines;
+    return 0;
+#else
+    if (tokens->toggle == 0u || tokens->get_location == 0u ||
+            tokens->pointer == 0u) {
+        ++s_direct_declines;
+        return 0;
+    }
+    ++s_direct_batches;
+    trace("fastpath batch enable %u\n", count);
+    for (i = 0u; i < count; ++i) {
+        guest_gl_int location = names ?
+            backend->glGetAttribLocation(program, names[i]) : locations[i];
+        locations[i] = location;
+        backend->glEnableVertexAttribArray((guest_gl_uint)location);
+        backend->glVertexAttribPointer(
+            (guest_gl_uint)location, (guest_gl_int)components[i],
+            (guest_gl_enum)ISAAC_VITA_SHADER_ATTRIB_GL_FLOAT,
+            (guest_gl_boolean)0u, stride, base);
+        base += (guest_gl_addr)components[i] * 4u;
+    }
+    return 1;
+#endif
+}
+
+int gl_vita_backend_attribs_replay_disable(
+    const guest_gl_backend *backend, guest_gl_uint program,
+    uint32_t count, const guest_gl_addr *names, guest_gl_int *locations,
+    const IsaacVitaAttribReplayTokens *tokens)
+{
+    if (!direct_accept(backend, count, locations, tokens, 0)) {
+        ++s_direct_declines;
+        return 0;
+    }
+#if defined(ORACLE_ATTRIB_DIRECT_DECLINE)
+    (void)program;
+    (void)names;
+    ++s_direct_declines;
+    return 0;
+#else
+    if (tokens->toggle == 0u || tokens->get_location == 0u) {
+        ++s_direct_declines;
+        return 0;
+    }
+    ++s_direct_batches;
+    trace("fastpath batch disable %u\n", count);
+    for (uint32_t i = 0u; i < count; ++i) {
+        guest_gl_int location = names ?
+            backend->glGetAttribLocation(program, names[i]) : locations[i];
+        locations[i] = location;
+        backend->glDisableVertexAttribArray((guest_gl_uint)location);
+    }
+    return 1;
+#endif
+}
+#endif
 
 /* ---- image words at their real addresses ------------------------------ */
 
@@ -400,6 +547,12 @@ typedef struct attrib_case {
     int nested;
     int foreign;
     int missing_pointer;      /* backend without glVertexAttribPointer */
+    int memo_keep;            /* memo builds: do not bump the generation
+                               * before the runs (default: every run starts
+                               * with an empty memo, the frozen stream) */
+    int expect_memo_hit;      /* memo builds without VERIFY: the seamed
+                               * stream is the reference minus its
+                               * glGetAttribLocation lines */
     int expect_handled;       /* verdicts of the seamed run */
     int expect_rejected;
     int fault_mid_replay;     /* compare trace + fault only */
@@ -410,6 +563,7 @@ typedef struct attrib_case {
 
 typedef struct census {
     unsigned dyn, calls, imports, backend, log, handled, rejected;
+    unsigned batches, declines;   /* direct-state builds; zero otherwise */
 } census;
 
 static void census_take(census *out)
@@ -421,6 +575,13 @@ static void census_take(census *out)
     out->log = s_log_calls;
     out->handled = s_handled;
     out->rejected = s_rejected;
+#if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+    out->batches = s_direct_batches;
+    out->declines = s_direct_declines;
+#else
+    out->batches = 0u;
+    out->declines = 0u;
+#endif
 }
 
 static void census_delta(const census *before, census *after)
@@ -432,6 +593,8 @@ static void census_delta(const census *before, census *after)
     after->log -= before->log;
     after->handled -= before->handled;
     after->rejected -= before->rejected;
+    after->batches -= before->batches;
+    after->declines -= before->declines;
 }
 
 static void oracle_entry(CPU *__restrict c)
@@ -577,6 +740,12 @@ static int run_variant(const attrib_case *k, guest_fn body, guest_fn nested,
     census before;
     int stop;
 
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+    /* A fresh generation empties the memo (as a mutation would) so every
+     * case outside the memo section sees the frozen full-lookup stream. */
+    if (!k->memo_keep)
+        ++g_isaac_vita_gl_location_generation;
+#endif
     prepare(k, c, storage, &entry_esp);
     install_recording_backend(!k->missing_pointer);
     s_nested_body = k->nested ? nested : NULL;
@@ -614,12 +783,39 @@ static void fail(const char *name, const char *tag, const char *why)
     printf("FAIL %s [%s]: %s\n", name, tag, why);
 }
 
+/* Drop every trace line starting with `prefix` in place. */
+static void strip_lines(char *buffer, const char *prefix)
+{
+    size_t prefix_len = strlen(prefix);
+    char *p = buffer;
+    char *out = buffer;
+
+    while (*p) {
+        char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) + 1u : strlen(p);
+        if (strncmp(p, prefix, prefix_len) != 0) {
+            memmove(out, p, len);
+            out += len;
+        }
+        p += len;
+    }
+    *out = '\0';
+}
+
 static void compare(const attrib_case *k, const char *tag, guest_fn ref,
                     guest_fn seam)
 {
     census ref_census, seam_census;
     unsigned crossings;
+    unsigned expected_backend;
+    int expect_hit = 0;
 
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO) && \
+    !defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY)
+    /* VERIFY performs every lookup, so only the plain memo build removes
+     * the glGetAttribLocation crossings from a hit. */
+    expect_hit = k->expect_memo_hit;
+#endif
     if (!run_variant(k, ref, ref, s_ref_trace, sizeof s_ref_trace,
                      s_ref_state, sizeof s_ref_state, &ref_census)) {
         fail(k->name, tag, "reference trace overflow");
@@ -638,27 +834,23 @@ static void compare(const attrib_case *k, const char *tag, guest_fn ref,
     s_total_handled += seam_census.handled;
     s_total_rejected += seam_census.rejected;
     s_total_backend += ref_census.backend;
-    printf("case %-26s %-4s verdict=%u/%u be=%u dyn=%u,%u calls=%u,%u "
+    printf("case %-26s %-4s verdict=%u/%u be=%u,%u dyn=%u,%u calls=%u,%u "
            "imp=%u,%u log=%u\n",
            k->name, tag, seam_census.handled, seam_census.rejected,
-           ref_census.backend, ref_census.dyn, seam_census.dyn,
+           ref_census.backend, seam_census.backend,
+           ref_census.dyn, seam_census.dyn,
            ref_census.calls, seam_census.calls, ref_census.imports,
            seam_census.imports, ref_census.log);
-    {
-        /* The verdict trace lines exist only in the seamed run; strip them
-         * before comparing the backend streams. */
-        char *p = s_seam_trace;
-        char *out = s_seam_trace;
-        while (*p) {
-            char *end = strchr(p, '\n');
-            size_t len = end ? (size_t)(end - p) + 1u : strlen(p);
-            if (strncmp(p, "fastpath ", 9) != 0) {
-                memmove(out, p, len);
-                out += len;
-            }
-            p += len;
-        }
-        *out = '\0';
+    /* The verdict trace lines exist only in the seamed run; strip them
+     * before comparing the backend streams. */
+    strip_lines(s_seam_trace, "fastpath ");
+    expected_backend = ref_census.backend;
+    if (expect_hit) {
+        /* A memo hit is the reference stream minus exactly its lookups:
+         * same enable/pointer/disable calls with the same locations, in the
+         * same order, one crossing fewer per attribute. */
+        strip_lines(s_ref_trace, "be glGetAttribLocation(");
+        expected_backend -= k->count;
     }
     if (strcmp(s_ref_trace, s_seam_trace) != 0) {
         fail(k->name, tag, "backend call stream differs");
@@ -672,10 +864,34 @@ static void compare(const attrib_case *k, const char *tag, guest_fn ref,
     if (seam_census.handled != (unsigned)k->expect_handled ||
         seam_census.rejected != (unsigned)k->expect_rejected)
         fail(k->name, tag, "fast-path verdicts differ from the expectation");
-    if (seam_census.backend != ref_census.backend ||
+    if (seam_census.backend != expected_backend ||
         seam_census.log != ref_census.log ||
         seam_census.imports != ref_census.imports)
         fail(k->name, tag, "backend/log/import censuses differ");
+    /* Direct state: the reference never reaches a batch; a handled replay
+     * with attributes takes exactly one batch (or, with the forced decline,
+     * exactly one declined batch and then the per-call loop); a declined
+     * replay and count 0 never ask the backend.  The nested case starts its
+     * outer batch and then faults out of the run from inside it, so its
+     * batch count is one with a handled count of zero: the trace compare
+     * above already pins it. */
+    if (ref_census.batches || ref_census.declines)
+        fail(k->name, tag, "reference body reached the direct-state batch");
+#if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+    if (!k->nested) {
+        unsigned expect_batches = 0u, expect_declines = 0u;
+        if (k->expect_handled && k->count) {
+# if defined(ORACLE_ATTRIB_DIRECT_DECLINE)
+            expect_declines = 1u;
+# else
+            expect_batches = 1u;
+# endif
+        }
+        if (seam_census.batches != expect_batches ||
+            seam_census.declines != expect_declines)
+            fail(k->name, tag, "direct-state batch/decline census differs");
+    }
+#endif
     /* Census design: the reference dispatches every GL call through
      * guest_call (one guest_calls and one dyn increment each, unless a
      * hostile import table owns the token); a handled replay skips exactly
@@ -707,6 +923,32 @@ static void compare_both(const attrib_case *k)
     compare(k, "gpr", ref, seam);
     compare(k, "mem", mem_ref, mem_seam);
 }
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+/* One memo step: the same object again (memo_keep), with the hit/miss
+ * expectation of this run; gpr spelling unless `memory` is set. */
+static void memo_case(attrib_case *k, const char *name, int expect_hit,
+                      int memory)
+{
+    k->name = name;
+    k->memo_keep = 1;
+    k->expect_memo_hit = expect_hit;
+    if (memory)
+        compare(k, "mem", k->kind ? mem_ref_sub_005673f0 : mem_ref_sub_005672d0,
+                k->kind ? mem_sub_005673f0 : mem_sub_005672d0);
+    else
+        compare(k, "gpr", k->kind ? ref_sub_005673f0 : ref_sub_005672d0,
+                k->kind ? sub_005673f0 : sub_005672d0);
+}
+
+static char s_mutable_name[16];
+/* 64 printable bytes: one past the memoisable maximum (the shim cache's
+ * own GL_VITA_LOCATION_NAME_MAX), so the object is never remembered. */
+static const char s_long_name[] =
+    "aVeryLongAttributeNameThatExceedsTheSixtyThreeByteMemoLimit01234";
+_Static_assert(sizeof s_long_name == 65u, "the long name must be 64 bytes");
+static const char s_control_name[] = "aTab\tName";
+#endif
 
 static void case_init(attrib_case *k, const char *name, int kind,
                       uint32_t count)
@@ -1059,6 +1301,109 @@ int main(int argc, char **argv)
     case_init(&k, "enable-owner-after-foreign", 0, 3u);
     compare_both(&k);
 
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+    printf("=== location memo: fill, hit, miss, invalidation, reuse ===\n");
+    /* Fill (full lookups, stream identical), then hits in both spellings
+     * and from the Disable replay, which shares the entry. */
+    case_init(&k, "memo-enable-fill", 0, 7u);
+    memo_case(&k, "memo-enable-fill", 0, 0);
+    memo_case(&k, "memo-enable-hit", 1, 0);
+    memo_case(&k, "memo-enable-hit-mem", 1, 1);
+    k.kind = 1;
+    memo_case(&k, "memo-disable-hit", 1, 0);
+    memo_case(&k, "memo-disable-hit-mem", 1, 1);
+    k.kind = 0;
+    /* A different name pointer misses (fallback, refill), then hits. */
+    k.names[3] = s_names[12];
+    memo_case(&k, "memo-name-pointer-miss", 0, 0);
+    memo_case(&k, "memo-name-pointer-hit", 1, 0);
+    /* The same pointer with rewritten bytes: same length, shorter (NUL
+     * where a byte is remembered), longer (a byte where the NUL was). */
+    strcpy(s_mutable_name, "aMutable");
+    k.names[0] = s_mutable_name;
+    memo_case(&k, "memo-mutable-fill", 0, 0);
+    memo_case(&k, "memo-mutable-hit", 1, 0);
+    s_mutable_name[7] = 'X';
+    memo_case(&k, "memo-mutable-rewrite-miss", 0, 0);
+    memo_case(&k, "memo-mutable-rewrite-hit", 1, 0);
+    s_mutable_name[4] = '\0';
+    memo_case(&k, "memo-mutable-shorter-miss", 0, 0);
+    memo_case(&k, "memo-mutable-shorter-hit", 1, 0);
+    strcpy(s_mutable_name, "aMutLonger");
+    memo_case(&k, "memo-mutable-longer-miss", 0, 0);
+    memo_case(&k, "memo-mutable-longer-hit", 1, 0);
+    /* Count and program words of the object. */
+    k.count = 6u;
+    memo_case(&k, "memo-count-miss", 0, 0);
+    memo_case(&k, "memo-count-hit", 1, 0);
+    k.program = 8u;
+    memo_case(&k, "memo-program-miss", 0, 0);
+    memo_case(&k, "memo-program-hit", 1, 0);
+    /* Relink: the backend bumps the generation before glLinkProgram and the
+     * answers change; a stale hit would replay the old locations into the
+     * enable/pointer calls and differ from the reference. */
+    ++s_link_epoch;
+    ++g_isaac_vita_gl_location_generation;
+    memo_case(&k, "memo-relink-miss", 0, 0);
+    memo_case(&k, "memo-relink-hit", 1, 0);
+    /* glDeleteProgram + glCreateProgram recycling the same name: two bumps,
+     * same program word, new answers. */
+    ++s_link_epoch;
+    g_isaac_vita_gl_location_generation += 2u;
+    memo_case(&k, "memo-reuse-miss", 0, 0);
+    memo_case(&k, "memo-reuse-hit", 1, 0);
+    /* Names the shim cache would not memoise either are never remembered:
+     * every run of such an object does the full lookups. */
+    k.names[1] = s_long_name;
+    memo_case(&k, "memo-long-name-miss", 0, 0);
+    memo_case(&k, "memo-long-name-miss-again", 0, 0);
+    k.names[1] = s_names[1];
+    k.names[2] = s_control_name;
+    memo_case(&k, "memo-control-name-miss", 0, 0);
+    memo_case(&k, "memo-control-name-miss-again", 0, 0);
+    k.names[2] = s_names[2];
+    memo_case(&k, "memo-names-restored-fill", 0, 0);
+    memo_case(&k, "memo-names-restored-hit", 1, 0);
+    /* A -1 answer is remembered like any other. */
+    k.names[4] = s_missing_names[0];
+    memo_case(&k, "memo-missing-fill", 0, 0);
+    memo_case(&k, "memo-missing-hit", 1, 0);
+    k.names[4] = s_names[4];
+    memo_case(&k, "memo-missing-restored-fill", 0, 0);
+    /* Declines never consult or disturb the memo: the entry still hits. */
+    k.program = 0u;
+    k.expect_handled = 0; k.expect_rejected = 1;
+    memo_case(&k, "memo-decline-program-zero", 0, 0);
+    k.program = 8u;
+    k.expect_handled = 1; k.expect_rejected = 0;
+    memo_case(&k, "memo-hit-after-decline", 1, 0);
+    k.count = 0u;
+    memo_case(&k, "memo-count-0", 0, 0);
+    k.count = 6u;
+    memo_case(&k, "memo-hit-after-count-0", 1, 0);
+# if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY)
+    /* A stale entry (answers changed with no generation bump: impossible
+     * through the typed surface, forced here): VERIFY looks every hit up,
+     * counts one mismatch per attribute, uses the looked-up value (stream
+     * identical to the reference) and refreshes the entry. */
+    {
+        unsigned before = s_memo_mismatches;
+        ++s_link_epoch;
+        memo_case(&k, "memo-verify-stale", 1, 0);
+        if (s_memo_mismatches != before + k.count)
+            fail("memo-verify-stale", "gpr",
+                 "VERIFY did not count one mismatch per stale attribute");
+        before = s_memo_mismatches;
+        memo_case(&k, "memo-verify-refreshed", 1, 0);
+        if (s_memo_mismatches != before)
+            fail("memo-verify-refreshed", "gpr",
+                 "VERIFY counted a mismatch on a refreshed entry");
+    }
+# endif
+    /* Back to the frozen stream for the probes below. */
+    ++g_isaac_vita_gl_location_generation;
+#endif
+
     printf("=== fast-path-only probes (translated body cannot run these) ===\n");
     case_init(&k, "probe-enable-count-max", 0, 0xffffffffu);
     probe_rejects(&k);
@@ -1087,14 +1432,53 @@ int main(int argc, char **argv)
             fail(k.name, "probe", "unbound CPU was modified");
     }
 
+#if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB)
+    {
+        /* Every HANDLED replay of both kinds is counted (probes and the
+         * nested outer replay never reach HANDLED), residue 0 selects the
+         * ordinals 0, 32, 64, ... of each kind (ceil(replays / 32) timed),
+         * each timed replay reads the clock exactly twice (a rejected attempt
+         * at a selected ordinal adds one read), the fixture clock never runs
+         * backwards, and the take zeroes everything but the new residue. */
+        IsaacVitaAttribReplaySparse sparse, zero;
+
+        isaac_vita_attrib_replay_sparse_take(&sparse, 2u);
+        isaac_vita_attrib_replay_sparse_take(&zero, 3u);
+        if (sparse.enable_replays + sparse.disable_replays != s_total_handled ||
+                sparse.residue != 0u || sparse.bad_clock != 0u ||
+                sparse.enable.calls != (sparse.enable_replays + 31u) / 32u ||
+                sparse.disable.calls != (sparse.disable_replays + 31u) / 32u ||
+                s_clock_reads < 2u * (sparse.enable.calls + sparse.disable.calls) ||
+                (sparse.enable.calls && !sparse.enable.us) ||
+                (sparse.disable.calls && !sparse.disable.us) ||
+                zero.residue != 2u || zero.enable_replays || zero.disable_replays ||
+                zero.enable.calls || zero.disable.calls || zero.bad_clock)
+            fail("sparse-attrib", "census",
+                 "sdk32 scope=attrib replay counts/selection/take differ");
+        s_sparse_summary = sparse;
+    }
+#endif
     if (s_failures) {
         printf("Vita shader attrib fast path oracle: FAIL; failures=%u\n",
                s_failures);
         return 1;
     }
     printf("Vita shader attrib fast path oracle: PASS; cases=%u; "
-           "handled=%u; rejected=%u; backend=%u; probes=%u\n",
+           "handled=%u; rejected=%u; backend=%u; probes=%u",
            s_cases, s_total_handled, s_total_rejected, s_total_backend,
            s_probes);
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+    printf("; memo-mismatches=%u", s_memo_mismatches);
+#endif
+#if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+    printf("; direct(batch,decl)=%u,%u", s_direct_batches, s_direct_declines);
+#endif
+#if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB)
+    printf("; sparse(en,di,ten,tdi,clocks)=%u,%u,%u,%u,%u",
+           s_sparse_summary.enable_replays, s_sparse_summary.disable_replays,
+           s_sparse_summary.enable.calls, s_sparse_summary.disable.calls,
+           s_clock_reads);
+#endif
+    printf("\n");
     return 0;
 }

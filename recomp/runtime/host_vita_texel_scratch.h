@@ -35,7 +35,33 @@ int isaac_vita_texel_scratch_realloc(
     void *pointer, size_t size,
     isaac_vita_texel_scratch_decision *decision);
 
+#if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE)
+struct IsaacVitaPngPremultiply;
+/* Pure in-place transform of an exact live PNG-owned scratch allocation.
+ * Try-lock rejection changes no pixels or ownership. Never calls the guest. */
+int isaac_vita_texel_scratch_png_premultiply(
+    const struct IsaacVitaPngPremultiply *params);
+#endif
+
+#if defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION)
+/* Read-only O(1) admission for exactly one live PNG-owned scratch request.
+ * Busy, stale, foreign owner/base and size mismatch all return zero. */
+int isaac_vita_texel_scratch_png_exact(uint32_t base, uint32_t bytes);
+#endif
+
+#if defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH)
+/* Copy only middle rows into the live PNG scratch while holding its owner
+ * lock. First/final rows and all padding remain the caller's responsibility. */
+int isaac_vita_texel_scratch_png_middle_rows(uint32_t base, uint32_t stride,
+    uint32_t rowbytes, uint32_t height, const uint8_t *filtered_rows);
+#endif
+
 #ifdef ISAAC_VITA_TEXEL_SCRATCH_ORACLE
+#if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE) || \
+    defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION)
+int isaac_vita_texel_scratch_oracle_hold_lock(void);
+void isaac_vita_texel_scratch_oracle_drop_lock(void);
+#endif
 typedef struct isaac_vita_texel_scratch_snapshot {
     uintptr_t base;
     int32_t uid;

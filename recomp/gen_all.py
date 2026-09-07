@@ -835,6 +835,104 @@ VITA_SHADER_ATTRIB_FASTPATH_ROOTS = {
     },
 }
 
+# KAGE::Graphics::Image::PushQuad (wf/cpu-render).  sub_0055f990 is the quad
+# builder every sprite, tile and text draw goes through (~2000 calls per
+# present in heavy rooms, 491 x86 instructions each plus the ring reserve,
+# the attribute size table, the snapped-quad rebuild and four floor thunk
+# calls per snapped quad).  The body is a leaf over guest memory: it culls
+# against the target size (two virtual getters through the target's vtable),
+# snaps the quad to pixels, reserves 6 indices and 4 vertices in the batch
+# rings, writes the interleaved vertices per attribute format, decrements
+# the global depth cursor and marks the image dirty.  The host owner
+# (recomp/runtime/host_vita_kage_quad_fastpath.c) replays exactly that at
+# the root when every pin below holds and declines (no side effect) into the
+# translated body otherwise.  The root has no vtable exposure: its four
+# direct callers are the only references, so one root marker covers every
+# use.
+VITA_KAGE_QUAD_FASTPATH_ROOT_RVA = 0x0055F990
+VITA_KAGE_QUAD_FASTPATH_ROOT_END_RVA = 0x00560253
+VITA_KAGE_QUAD_FASTPATH_ROOT_INSNS = 491
+VITA_KAGE_QUAD_FASTPATH_ROOT_LAST_RVA = 0x00560250
+VITA_KAGE_QUAD_FASTPATH_ROOT_BODY_SHA256 = (
+    "7a8543c1188288ed850993822d075203"
+    "8221e57fd929cbc274bb00b878d64d77"
+)
+VITA_KAGE_QUAD_FASTPATH_ROOT_ORDER_SHA256 = (
+    "baed4b2775742480cd855a361bedc9ef"
+    "0c54f437958757b875abc91ccf12fdb6"
+)
+# Callees the replay reproduces natively: {rva: (end_rva, body_sha256)}.
+VITA_KAGE_QUAD_FASTPATH_CALLEES = {
+    # Ring::Alloc (vertex/index reserve; growth path is a decline reason)
+    0x0055EE80: (0x0055EF30,
+                 "e6b8e03847472f03b127189099820c56"
+                 "43f7705e240c3eaaea23da6fcf15dfb1"),
+    # attribute format -> byte size (8-entry jump table below)
+    0x00561E20: (0x00561E57,
+                 "3d315961a659b75f734d5887feb0b8db"
+                 "d4c1f099e56e5034047d467d474f794d"),
+    # snapped quad rebuild (nx0,ny0),(nx3,ny0),(nx0,ny3),(nx3,ny3)
+    0x0055E590: (0x0055E613,
+                 "b38d693bdb1ec270a3cd6825c508ee27"
+                 "2ed496dd8517c75bb7ec06d14f85fb13"),
+}
+# Tail callees the replay reaches by direct call with the exact register and
+# stack state of the body's `call rel32` sites (step 2, the unbatched path):
+# {rva: (end_rva, body_sha256)}.  The replay depends on their stack ABI
+# (`ret 4` / `ret 4` / `ret 8`) and on the caller-frame words they read
+# ([ebp+8] = the pushed argument; sub_00026fb0 also [ebp+0xc] -> [F+0x34]),
+# so the bodies are pinned like the reproduced callees above.
+VITA_KAGE_QUAD_FASTPATH_TAIL_CALLEES = {
+    # blend descriptor + batch select (thiscall, bool; ret 4)
+    0x005607A0: (0x005609E8,
+                 "42f2187bcd7b470aa6744b8b4009a4d5"
+                 "f1376424d009ccca83d5c345c8759d41"),
+    # blend descriptor reset (thiscall on the Renderer, arg 0; ret 4)
+    0x00561FF0: (0x00562023,
+                 "d3b224087f2db07d4c57582ce93cff21"
+                 "c025f1d4c055c30fca4d37ae9bbfba99"),
+    # dirty-image vector growth (thiscall, insert position, &value; ret 8)
+    0x00026FB0: (0x0002707C,
+                 "280db1a222a2f48b22e39b5f1822fb6a"
+                 "c3192f22197ca1d872d75908fd46a0e8"),
+}
+VITA_KAGE_QUAD_FASTPATH_SIZE_TABLE_RVA = 0x00561E58
+VITA_KAGE_QUAD_FASTPATH_SIZE_TABLE_BYTES = 32
+VITA_KAGE_QUAD_FASTPATH_SIZE_TABLE_SHA256 = (
+    "572a678c9020d1a6ebfdf469212d8b0c"
+    "023515448de3ec118285a99a104151f3"
+)
+VITA_KAGE_QUAD_FASTPATH_CALLERS = (
+    0x0055F425, 0x0055F486, 0x0055F5F9, 0x0055F675)
+# Every direct call inside the root: {site: target}.  The four floor thunk
+# sites are the hot sites of the floor fast path; the replay performs the
+# same import receipts itself.  The batch select, the two ring reserves when
+# they grow, the dirty-vector growth and the blend reset are made by the
+# replay as direct calls into the translated callee with the site's exact
+# register/stack state (return words 0x55fb74, 0x55fd59, 0x55fd6c, 0x5601f3,
+# 0x560218).
+VITA_KAGE_QUAD_FASTPATH_CALL_SITES = {
+    0x0055FB6F: 0x005607A0,      # unbatched blend/batch select (direct call)
+    0x0055FBE9: VITA_FLOOR_THUNK_FASTPATH_ROOT_RVA,
+    0x0055FC2E: VITA_FLOOR_THUNK_FASTPATH_ROOT_RVA,
+    0x0055FC73: VITA_FLOOR_THUNK_FASTPATH_ROOT_RVA,
+    0x0055FCB8: VITA_FLOOR_THUNK_FASTPATH_ROOT_RVA,
+    0x0055FCF8: 0x0055E590,
+    0x0055FD54: 0x0055EE80,      # index reserve (direct call when it grows)
+    0x0055FD67: 0x0055EE80,      # vertex reserve (direct call when it grows)
+    0x0055FDE0: 0x00561E20,
+    0x005601EE: 0x00026FB0,      # dirty-image vector growth (direct call)
+    0x00560213: 0x00561FF0,      # unbatched blend reset (direct call)
+}
+# `call eax` to the target's GetWidth/GetHeight (vtable +0x28/+0x2c); the
+# replay routes them through guest_call exactly like the translated body.
+VITA_KAGE_QUAD_FASTPATH_INDIRECT_SITES = (0x0055F9F3, 0x0055FA1C)
+VITA_KAGE_QUAD_FASTPATH_RET_SITES = (0x0055FB2D, 0x00560250)
+VITA_KAGE_QUAD_FASTPATH_GUARD = (
+    "#if defined(__vita__) && defined(ISAAC_VITA_KAGE_QUAD_FASTPATH)")
+VITA_KAGE_QUAD_FASTPATH_MARKER = "Authenticated Image::PushQuad host fast path"
+VITA_KAGE_QUAD_FASTPATH_HELPER = "isaac_vita_kage_quad_try"
+
 MANUAL_KAGE_HEADER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "runtime", "manual_kage.h"
 )
@@ -1685,6 +1783,22 @@ VITA_PNG_DECODE_PROFILE_PE_SHA256 = (
 )
 VITA_PNG_DECODE_PROFILE_OUTER_RVA = 0x005A0E10
 VITA_PNG_DECODE_PROFILE_ROW_RVA = 0x005C6BF0
+VITA_PNG_PREMULTIPLY_START_RVA = 0x005A142C
+VITA_PNG_PREMULTIPLY_HEAD_RVA = 0x005A1460
+VITA_PNG_PREMULTIPLY_END_RVA = 0x005A152D
+VITA_ANM2_OUTER_ROOT_RVA = 0x00009B40
+VITA_ANM2_OUTER_END_RVA = 0x0000E98F
+VITA_ANM2_OUTER_BODY_SHA256 = (
+    "3c349aba4e530ff2ea9f554e8e9145245d448510b4cc5820bdfaa6e7a5e42df6")
+VITA_ANM2_OUTER_CALLERS = (0x00008D7C, 0x00009990)
+VITA_ANM2_OUTER_C_RETURNS = 144
+VITA_PNG_PREMULTIPLY_LOOP_SHA256 = (
+    "299c71dd9b249a350969d39aabe34e4f4aeb5e7153c63408392c289238d94a62"
+)
+VITA_PNG_PREMULTIPLY_TABLES = (
+    (0x00626A40, "db5c2e6963f3adf1c31dbd5194396e55c237fdb374378d3a4b60569735a8f82c"),
+    (0x00636A40, "418853ec87753026005a03396b5361073ee4c6a446aeb22d6ce917e3f4f50806"),
+)
 VITA_PNG_DECODE_PROFILE_OWNERS = {
     0x005A0C50: {
         "kind": "image",
@@ -2943,6 +3057,144 @@ if (set(VITA_KAGE_MUTEX_SEAM_SPECS) != set(VITA_REFCOUNT_SYNC_IAT_ROOT_SPECS) or
             set(spec["required"]) - set(range(rva, VITA_REFCOUNT_SYNC_IAT_ROOT_SPECS[rva]["end"]))
             for rva, spec in VITA_KAGE_MUTEX_SEAM_SPECS.items())):
     raise RuntimeError("KAGE mutex seam specification changed")
+
+# KAGE ReferenceCount<ImageBase> AddRef / weak-lock / Release native seam
+# (ISAAC_VITA_KAGE_REFCOUNT_SEAM).  The three frozen helpers wrap one
+# Mutex::Lock(-1) .. Mutex::Unlock pair (two pairs on the weak-lock alive
+# path) around a 16-bit count update; the heavy pit room runs ~6.6k such
+# pairs per frame, the menu ~3k.  All three bodies are already authenticated
+# by VITA_REFCOUNT_DIRECT_EDGE_ROOT_SPECS (PE bytes, CFG order, vtable slots
+# and every direct edge); the seam pins in addition EVERY instruction of each
+# body (the replayed paths and the rejected destroy path alike, so the
+# "strong == 1 -> translated" decision is authenticated too) and emits one
+# guarded early return at the top of each body, rendered with the mutex
+# seam's helpers under its own fence.  host_vita_kage_refcount_seam.c replays
+# the handled paths; the translated body stays complete below the seam.
+VITA_KAGE_REFCOUNT_SEAM_FENCE = (
+    "#if defined(__vita__) && defined(ISAAC_VITA_KAGE_REFCOUNT_SEAM)")
+VITA_KAGE_REFCOUNT_SEAM_SPECS = {
+    VITA_RENDERFRAME_FASTPATH_DECREMENT_RVA: {          # 0x7af0 Release
+        "helper": "isaac_vita_kage_refcount_release_try",
+        "marker": ("KAGE ReferenceCount::Release native seam (count >= 2); "
+                   "exact translated fallback follows."),
+        "coverage_id": 259,
+        "fence": VITA_KAGE_REFCOUNT_SEAM_FENCE,
+        "required": {
+            0x00007AF0: ("push", "esi"),
+            0x00007AF1: ("mov", "esi, ecx"),
+            0x00007AF3: ("push", "edi"),
+            0x00007AF4: ("push", "-1"),
+            0x00007AF6: ("mov", "eax, dword ptr [esi + 8]"),
+            0x00007AF9: ("lea", "ecx, [esi + 8]"),
+            0x00007AFC: ("call", "dword ptr [eax + 0xc]"),
+            0x00007AFF: ("movzx", "eax, word ptr [esi + 4]"),
+            0x00007B03: ("test", "ax, ax"),
+            0x00007B06: ("je", "0x7b3b"),
+            0x00007B08: ("dec", "eax"),
+            0x00007B09: ("mov", "word ptr [esi + 4], ax"),
+            0x00007B0D: ("test", "ax, ax"),
+            0x00007B10: ("jne", "0x7b3b"),
+            # Destroy path (strong == 1): rejected by the seam, pinned so the
+            # decision to leave it translated is authenticated as well.
+            0x00007B12: ("mov", "eax, dword ptr [esi + 8]"),
+            0x00007B15: ("lea", "ecx, [esi + 8]"),
+            0x00007B18: ("call", "dword ptr [eax + 0x10]"),
+            0x00007B1B: ("mov", "ecx, dword ptr [esi + 0x14]"),
+            0x00007B1E: ("test", "ecx, ecx"),
+            0x00007B20: ("je", "0x7b30"),
+            0x00007B22: ("mov", "eax, dword ptr [ecx]"),
+            0x00007B24: ("push", "1"),
+            0x00007B26: ("call", "dword ptr [eax + 0x60]"),
+            0x00007B29: ("mov", "dword ptr [esi + 0x14], 0"),
+            0x00007B30: ("mov", "eax, dword ptr [esi]"),
+            0x00007B32: ("mov", "ecx, esi"),
+            0x00007B34: ("pop", "edi"),
+            0x00007B35: ("pop", "esi"),
+            0x00007B36: ("mov", "eax, dword ptr [eax + 0x14]"),
+            0x00007B39: ("jmp", "eax"),
+            # Common tail (strong == 0 or the decremented count != 0).
+            0x00007B3B: ("mov", "eax, dword ptr [esi + 8]"),
+            0x00007B3E: ("lea", "ecx, [esi + 8]"),
+            0x00007B41: ("call", "dword ptr [eax + 0x10]"),
+            0x00007B44: ("pop", "edi"),
+            0x00007B45: ("mov", "al, 1"),
+            0x00007B47: ("pop", "esi"),
+            0x00007B48: ("ret", ""),
+        },
+    },
+    VITA_RENDERFRAME_FASTPATH_INCREMENT_RVA: {          # 0x7b50 AddRef
+        "helper": "isaac_vita_kage_refcount_addref_try",
+        "marker": ("KAGE ReferenceCount::AddRef native seam; "
+                   "exact translated fallback follows."),
+        "coverage_id": 260,
+        "fence": VITA_KAGE_REFCOUNT_SEAM_FENCE,
+        "required": {
+            0x00007B50: ("push", "esi"),
+            0x00007B51: ("mov", "esi, ecx"),
+            0x00007B53: ("push", "edi"),
+            0x00007B54: ("push", "-1"),
+            0x00007B56: ("mov", "eax, dword ptr [esi + 8]"),
+            0x00007B59: ("lea", "ecx, [esi + 8]"),
+            0x00007B5C: ("call", "dword ptr [eax + 0xc]"),
+            0x00007B5F: ("inc", "word ptr [esi + 4]"),
+            0x00007B63: ("lea", "ecx, [esi + 8]"),
+            0x00007B66: ("mov", "eax, dword ptr [esi + 8]"),
+            0x00007B69: ("pop", "edi"),
+            0x00007B6A: ("pop", "esi"),
+            0x00007B6B: ("jmp", "dword ptr [eax + 0x10]"),
+        },
+    },
+    VITA_RENDERFRAME_FASTPATH_INCREMENT_NONZERO_RVA: {  # 0x7b70 weak-lock
+        "helper": "isaac_vita_kage_refcount_weaklock_try",
+        "marker": ("KAGE ReferenceCount weak-lock native seam; "
+                   "exact translated fallback follows."),
+        "coverage_id": 261,
+        "fence": VITA_KAGE_REFCOUNT_SEAM_FENCE,
+        "required": {
+            0x00007B70: ("push", "esi"),
+            0x00007B71: ("push", "edi"),
+            0x00007B72: ("mov", "edi, ecx"),
+            0x00007B74: ("push", "-1"),
+            0x00007B76: ("mov", "eax, dword ptr [edi + 8]"),
+            0x00007B79: ("lea", "ecx, [edi + 8]"),
+            0x00007B7C: ("call", "dword ptr [eax + 0xc]"),
+            0x00007B7F: ("mov", "eax, dword ptr [edi + 8]"),
+            0x00007B82: ("lea", "ecx, [edi + 8]"),
+            0x00007B85: ("add", "eax, 0x10"),
+            0x00007B88: ("cmp", "word ptr [edi + 4], 0"),
+            0x00007B8D: ("jne", "0x7b96"),
+            0x00007B8F: ("call", "dword ptr [eax]"),
+            0x00007B91: ("pop", "edi"),
+            0x00007B92: ("xor", "al, al"),
+            0x00007B94: ("pop", "esi"),
+            0x00007B95: ("ret", ""),
+            0x00007B96: ("call", "dword ptr [eax]"),
+            0x00007B98: ("mov", "eax, dword ptr [edi]"),
+            0x00007B9A: ("mov", "ecx, edi"),
+            0x00007B9C: ("call", "dword ptr [eax + 8]"),
+            0x00007B9F: ("pop", "edi"),
+            0x00007BA0: ("mov", "al, 1"),
+            0x00007BA2: ("pop", "esi"),
+            0x00007BA3: ("ret", ""),
+        },
+    },
+}
+# Consistency with the direct-edge proof this seam builds on: every root is a
+# direct-edge root, every body is pinned completely (required == insns, all
+# inside [rva, end), root first), and every direct-edge site of the root --
+# elided or rejected -- is among the pinned instructions.
+if (set(VITA_KAGE_REFCOUNT_SEAM_SPECS) - set(VITA_REFCOUNT_DIRECT_EDGE_ROOT_SPECS) or
+        len(VITA_KAGE_REFCOUNT_SEAM_SPECS) != 3 or
+        any(rva not in spec["required"] or
+            len(spec["required"]) !=
+            VITA_REFCOUNT_DIRECT_EDGE_ROOT_SPECS[rva]["insns"] or
+            set(spec["required"]) -
+            set(range(rva, VITA_REFCOUNT_DIRECT_EDGE_ROOT_SPECS[rva]["end"])) or
+            any(edge[0] not in spec["required"]
+                for edge in VITA_REFCOUNT_DIRECT_EDGE_ROOT_SPECS[rva]["edges"]) or
+            spec["fence"] != VITA_KAGE_REFCOUNT_SEAM_FENCE
+            for rva, spec in VITA_KAGE_REFCOUNT_SEAM_SPECS.items())):
+    raise RuntimeError("KAGE refcount seam specification changed")
 
 # FXLayers::Init appends a 0x4c-byte lighting-FX record before loading its
 # ImageBase.  Its existing NULL branch logs the failed load but leaves that
@@ -8190,6 +8442,127 @@ LUA_PC_ROOM_INIT_FORMAT = b"Lua mem usage: %d KB and %d bytes\n\0"
 LUA_PC_ROOM_INIT_CALL_RVAS = (0x003B586E, 0x003B587A, 0x003B5887)
 LUA_PC_ROOM_INIT_RELOC_RVAS = (0x003B585D, 0x003B5863, 0x003B588E)
 
+# Coarse transition scopes, copied from the existing generated call chain and
+# xmap names.  A Room::Init tail can be entered through any of the seven
+# already-pinned roots above; all seven belong to the same logical category.
+# This observes complete native C invocations, including ordinary error exits.
+# A nonlocal escape is deliberately left for the runtime's incomplete/unwind
+# handling, just like the existing ANM2 function-scope observer.
+VITA_DEEP_PROFILE_ROOT_SCOPES = {
+    0x00007160: "KVD_ANM2_LOAD",
+    0x000073A0: "KVD_ANM2_GRAPHICS",
+    0x00520160: "KVD_ROOM_STATE_RESET",
+    0x00314FC0: "KVD_ROOM_SNAPSHOT",
+    0x003EBFD0: "KVD_ROOM_TRANSITION",
+    0x003EB2F0: "KVD_ROOM_SWITCH",
+    0x002D0BC0: "KVD_GAME_CHANGE_ROOM",
+    0x0030CFD0: "KVD_LEVEL_CHANGE_ROOM",
+    0x0030BA40: "KVD_ROOM_SETUP",
+    0x003A9D70: "KVD_ROOM_CLEANUP",
+    0x003AE2D0: "KVD_ROOM_SAVE",
+    0x003CA670: "KVD_ROOM_PRERENDER",
+    0x003CAD40: "KVD_ROOM_RENDER",
+    **{root: "KVD_ROOM_INIT" for root in LUA_PC_ROOM_INIT_BYPASS_ROOTS},
+}
+# Complete public ANM2 Load/LoadGraphics bodies from the same frozen PE as
+# the existing parser scope. These observe instance/cache/binding work; they
+# do not replace the parser scope at 00009b40 or imply semantic load success.
+VITA_DEEP_ANM2_PROFILE_PINS = {
+    0x00007160: (0x000072AC, 0x000072A9, 111, "c20800",
+                 "ee60919e0604c4b57edddd85b48542dff5833098ae438ce327f820a953f33476"),
+    0x000073A0: (0x000075FB, 0x000075F8, 204, "c20400",
+                 "fea8a2affa3e2485f348e0f74ae1bf77e2deb78dd272e03f44cd98b290345995"),
+}
+# Complete original bodies measured by room-reset-scopes-20260906/measure-pins.py.
+# These split the pre-marker reset/copy work; Room::SaveState retains category7.
+# No scope is added inside either 525-record loop.
+VITA_DEEP_ROOM_STATE_PROFILE_PINS = {
+    0x00520160: (0x00520AB9, 0x00520AB8, 495, "c3",
+                 "7205fa45e4d7d29ad4c30c75b5df66d9f69a0cf7cdaacfaa0d35ff502a307eac"),
+    0x00314FC0: (0x00315331, 0x0031532E, 204, "c20400",
+                 "d96aad09b870eaaea3f87a585f52059a2bd48770f7f9f13d66176ce28ed2ad84"),
+}
+
+
+def vita_wav_buffered_rewind_prologue(img, root_rva, extra_entries=()):
+    """Preserve block zero only at the frozen WAV loader's Seek(0, SET)."""
+    if root_rva != 0x0059C690:
+        return ()
+    # Complete stream/loader bodies and its vtable copied from the
+    # frozen PE. The runtime admits only their exact first-buffer rewind state.
+    spans = (
+        (0x0059C170, 0x0059C26A,
+         "d05ec40aa360d8b9896562906d285767974883cdfcfd258104f58b9fd0a919a9"),
+        (0x0059C270, 0x0059C68C,
+         "6253e8e1fb1f34e09994f3bcc9174d19ddfe57593168abe58fa6ef6f424b29b6"),
+        (0x0059C690, 0x0059C73E,
+         "91095e529bc24877fbf6c3d20a6e5a9a8931e80ba265e8cffda1e9f1755aba71"),
+        (0x005A3B30, 0x005A3C3E,
+         "7a6e319dbcb25b3a3f5233abea2de8a8ba1ef01fefd56d8687257e0bd1e9728e"),
+        (0x005BF4E0, 0x005BF60D,
+         "6ca5abb747643ac6e16085be78ec389b74fc16f26018aa47af62bd18ee6b1cfe"),
+        (0x0059C750, 0x0059C812,
+         "471cdaadfdf5e785c68739245fddd914d005d8925a7bbb2483e94005987f5982"),
+        (0x00765128, 0x00765148,
+         "62cfc4a6e8905ba7f14ddba042e3866d7f2fc2c5a2992cd25ade8867a00904c9"),
+    )
+    if extra_entries or any(
+            hashlib.sha256(img.code_at(start, end - start)).hexdigest() != digest
+            for start, end, digest in spans):
+        raise RuntimeError("WAV buffered rewind frozen entry/caller changed")
+    return (
+        "#if defined(__vita__) && defined(ISAAC_VITA_WAV_BUFFERED_REWIND) && "
+        "ISAAC_VITA_WAV_BUFFERED_REWIND",
+        "    extern int isaac_vita_wav_buffered_rewind_try(CPU *__restrict);",
+        "    if (!g_guest_coverage_functions && !g_guest_coverage_cases &&",
+        "            isaac_vita_wav_buffered_rewind_try(c)) return;",
+        "#endif",
+    )
+
+
+def vita_deep_profile_prologue(img, root_rva, insns, order,
+                               extra_entries, setjmp_sites):
+    """Emit one local token only for the selected whole-function roots."""
+    category = VITA_DEEP_PROFILE_ROOT_SCOPES.get(root_rva)
+    if category is None:
+        return ()
+    pins = VITA_DEEP_ANM2_PROFILE_PINS.get(root_rva)
+    identity = "ANM2 Load/Graphics"
+    if pins is None:
+        pins = VITA_DEEP_ROOM_STATE_PROFILE_PINS.get(root_rva)
+        identity = "Room reset/snapshot"
+    if pins is not None:
+        end, last, count, ret, digest = pins
+        raw = Image(img.path, img.orig_base)
+        if (os.path.getsize(img.path) != VITA_PNG_DECODE_PROFILE_PE_SIZE or
+                _vita_pill_bloom_bypass_file_sha256(img.path) !=
+                VITA_PNG_DECODE_PROFILE_PE_SHA256 or
+                hashlib.sha256(raw.code_at(root_rva, end - root_rva)).hexdigest() != digest or
+                len(order) != count or not order or order[0] != root_rva or
+                order[-1] != last or max(order) != last or
+                extra_entries or setjmp_sites or last not in insns or
+                insns[last].mnemonic != "ret" or
+                bytes(insns[last].bytes) != bytes.fromhex(ret)):
+            raise RuntimeError("%s deep-scope identity changed" % identity)
+    return (
+        "#if defined(__vita__) && defined(ISAAC_VITA_DEEP_PROFILE) && "
+        "ISAAC_VITA_DEEP_PROFILE",
+        "    KAGE_VITA_DEEP_SCOPE(%s);" % category,
+        "#endif",
+    )
+
+
+def vita_deep_profile_unit_include(unit):
+    """Keep unaffected generated TUs and the shared header byte-identical."""
+    if not any("KAGE_VITA_DEEP_SCOPE(" in text for text in unit):
+        return ""
+    return (
+        "#if defined(__vita__) && defined(ISAAC_VITA_DEEP_PROFILE) && "
+        "ISAAC_VITA_DEEP_PROFILE\n"
+        '#include "kage_vita_deep_profile.h"\n'
+        "#endif\n\n"
+    )
+
 
 def read_manual_rvas(path, expected, label):
     """Read one public/manual split from its C interface X-macro list."""
@@ -11421,6 +11794,24 @@ def render_vita_laser_profile_end(spec):
     )
 
 
+def render_vita_laser_ring_shadow_skip(spec):
+    """Skip only the authenticated sampled-laser shadow owner's active path."""
+    if not spec["shadow"]:
+        return ()
+    # The original visibility / signed sample-byte guards have already run.
+    # No local vector or shared_ptr has been constructed at this point.  The
+    # original common epilogue restores SEH, EDI/ESI/EBP and ESP, sets AL=1,
+    # and performs ret 4.  Do not replace that epilogue with a C return.
+    # Main Entity_Laser::Render (including its callbacks) and simulation/sample
+    # storage are untouched.  Keep the existing optional profile begin/end
+    # paired so it can still attribute the now-empty shadow invocation.
+    return (
+        "#if defined(__vita__) && defined(ISAAC_VITA_LASER_RING_SHADOW_SKIP)",
+        "    goto L_%08x;" % spec["epilogue_site"],
+        "#endif",
+    )
+
+
 def vita_laser_profile_host_oracle(events):
     """Classify the scalar tuples emitted at the exact active seams."""
     result = {
@@ -11642,6 +12033,247 @@ def _vita_png_decode_profile_rel32_xrefs(img, target_rva):
         if ((site + 5 + displacement) & 0xFFFFFFFF) == target_rva:
             found.append(site)
     return tuple(found)
+
+
+VITA_ROOM_RESET_PUBLISH_SITES = (
+    (0x00520385, 0x003063A0, ("ecx", "esp")),
+    (0x0052038D, 0x002DA0D0, ("ecx", "esp")),
+    (0x0052039E, 0x00020480, ("eax", "ecx", "esp")),
+    (0x005203A8, 0x005EB08E, ("esp",)),
+    (0x005203B3, 0x002DA0D0, ("ecx", "esp")),
+    (0x005203BB, 0x0001AD80, ("ecx", "esp")),
+)
+VITA_ROOM_RESET_PUBLISH_GUARD = (
+    "#if defined(__vita__) && defined(ISAAC_VITA_ROOM_RESET_DIRTY_PUBLISH) && "
+    "ISAAC_VITA_ROOM_RESET_DIRTY_PUBLISH && GUEST_GPR_LOCAL && "
+    "!GUEST_GENERATED_STACK_GUARD && !defined(GUEST_CHECKED_MEMORY)")
+
+
+def vita_room_reset_publish_for_body(img, root_rva, em, insns, order,
+                                     extra_entries):
+    """Only caller-local equality, never a callee-saved register assumption.
+
+    Each selected site follows a full RELOAD and only changes its listed GPRs.
+    The CPU is host-private/restrict; guest stack stores do not alias it.
+    Keep every actual call, push, return word and complete post-call reload.
+    The loop-entry call is excluded because it has an incoming CFG join.
+    """
+    if root_rva != 0x00520160:
+        return False
+    raw = Image(img.path, img.orig_base)
+    if (hashlib.sha256(raw.code_at(0x00520160, 0x959)).hexdigest() !=
+            "7205fa45e4d7d29ad4c30c75b5df66d9f69a0cf7cdaacfaa0d35ff502a307eac" or
+            len(order) != 495 or order[0] != 0x00520160 or
+            order[-1] != 0x00520AB8 or max(order) != 0x00520AB8 or
+            extra_entries or 0x00520370 not in em.labels or
+            any(0x0052037B <= label < 0x005203C0 for label in em.labels)):
+        raise RuntimeError("Room reset publication owner/control identity changed")
+    return True
+
+
+def vita_room_reset_publish_render(text):
+    """Run AFTER seam bracketing: any intervening observer changes the pin.
+
+    No partial CPU write is allowed to become an automatically bracketed seam;
+    that would read stale unchanged locals back or add a full publication.
+    The independent corpus contract recognizes only these exact six blocks.
+    """
+    start = text.index("    /* 0052037b ")
+    end = text.index("    /* 005203c0 ")
+    span = text[start:end]
+    anchor = ("    GPUSH(0x52037bU); GUEST_STACK_CALLSITE_BARRIER(); "
+              "GUEST_GPR_FLUSH(c); sub_002c4260(c); GUEST_GPR_RELOAD(c);\n")
+    if (not text[:start].endswith(anchor) or
+            hashlib.sha256(span.encode()).hexdigest() !=
+            "083a92d402cc27c440ee84eb9e459d89bf3f797057e0a5c8b799fb097bc2e4c9"):
+        raise RuntimeError("Room reset publication rendered span/seam changed")
+    for site, callee, dirty in VITA_ROOM_RESET_PUBLISH_SITES:
+        push = "GPUSH(0x%xU); GUEST_STACK_CALLSITE_BARRIER();" % (site + 5)
+        call = "sub_%08x(c); GUEST_GPR_RELOAD(c);" % callee
+        original = "    %s GUEST_GPR_FLUSH(c); %s\n" % (push, call)
+        if span.count(original) != 1:
+            raise RuntimeError("Room reset publication call identity changed")
+        replacement = "\n".join((
+            VITA_ROOM_RESET_PUBLISH_GUARD,
+            "    /* ROOM_RESET_DIRTY_PUBLISH site %08x: full reload retained. */" % site,
+            "    " + push,
+            "    " + " ".join("c->%s = GR(%s);" % (r, r) for r in dirty),
+            "    " + call,
+            "#else",
+            original.rstrip("\n"),
+            "#endif", ""))
+        span = span.replace(original, replacement)
+    return text[:start] + span + text[end:]
+
+
+def guest_stack_accounting_text(root_rva, text):
+    """Restore only the six authenticated dual-spelled publication blocks.
+
+    This spelling is private to stack accounting, not legacy_text or unit
+    packing: legacy_size_delta already removes these blocks' packing cost.
+    Keep every unrelated ESP write visible to the ordinary prohibition.
+    """
+    if "ROOM_RESET_DIRTY_PUBLISH" not in text:
+        return text
+    if root_rva != 0x00520160:
+        raise RuntimeError("Room reset publication escaped stack census owner")
+    original_text = text
+    for site, callee, dirty in VITA_ROOM_RESET_PUBLISH_SITES:
+        push = "GPUSH(0x%xU); GUEST_STACK_CALLSITE_BARRIER();" % (site + 5)
+        call = "sub_%08x(c); GUEST_GPR_RELOAD(c);" % callee
+        original = "    %s GUEST_GPR_FLUSH(c); %s\n" % (push, call)
+        expected = "\n".join((
+            VITA_ROOM_RESET_PUBLISH_GUARD,
+            "    /* ROOM_RESET_DIRTY_PUBLISH site %08x: full reload retained. */" % site,
+            "    " + push,
+            "    " + " ".join("c->%s = GR(%s);" % (r, r) for r in dirty),
+            "    " + call, "#else", original.rstrip("\n"), "#endif", ""))
+        if text.count(expected) != 1:
+            raise RuntimeError("Room reset publication stack block changed at %08x" % site)
+        text = text.replace(expected, original)
+    if ("ROOM_RESET_DIRTY_PUBLISH" in text or
+            vita_room_reset_publish_render(text) != original_text):
+        raise RuntimeError("Room reset publication stack span changed")
+    return text
+
+
+def guest_stack_codegen_accounting(root_rva, text):
+    """The canonical full-generation census and generic raw-writer check."""
+    text = guest_stack_accounting_text(root_rva, text)
+    # Count lowering sites, not conditional spellings, inlined leaf copies or
+    # the duplicate operands introduced by IAT/SSE/GPR lowering switches.
+    census_text = legacy_text(text)
+    counts = {}
+    for key, needles in (
+            ("set_generated", ("guest_stack_set_generated(c,", "GESP_SET(")),
+            ("adjust_generated", ("guest_stack_adjust_generated(c,", "GESP_ADJ(")),
+            ("address_generated", ("guest_stack_address_generated(c,", "GSTACK_ADDR(")),
+            ("address_at", ("guest_stack_address(c,",)),
+            ("push_generated", ("gpush_generated(c,", "GPUSH(")),
+            ("push_at", ("gpush_at(c,",)),
+            ("pop_generated", ("gpop_generated(c)", "GPOP()")),
+            ("pop_at", ("gpop_at(c,",))):
+        counts[key] = sum(census_text.count(needle) for needle in needles)
+    return (counts, len(GUEST_STACK_DIRECT_WRITER_RE.findall(text)),
+            len(re.findall(r"\bg(?:push|pop)\s*\(", text)))
+
+
+def vita_room_grid_init_for_body(img, root_rva, em, insns, order,
+                                 extra_entries):
+    """One pinned constructor prefix; leave its final original row intact."""
+    if root_rva != 0x002C4260:
+        return False
+    raw = Image(img.path, img.orig_base)
+    incoming = tuple(i.address for i in insns.values()
+                     if i.mnemonic.startswith("j") and
+                     i.op_str == "0x2c4330")
+    if (hashlib.sha256(raw.code_at(0x002C4260, 0x2E9)).hexdigest() !=
+            "c572ee5def8a685d34973ac3812f4da70ccc678dbc7cb13898858559561a5371" or
+            len(order) != 189 or not order or order[0] != 0x002C4260 or
+            order[-1] != 0x002C4548 or max(order) != 0x002C4548 or
+            extra_entries or incoming != (0x002C436A,) or
+            0x002C4330 not in em.labels or 0x002C4314 in em.labels or
+            order[order.index(0x002C4330) - 1] != 0x002C4327 or
+            bytes(insns[0x002C4314].bytes) != bytes.fromhex("b9c0010000")):
+        raise RuntimeError("Room grid constructor/alignment/loop identity changed")
+    return True
+
+
+VITA_ROOM_GRID_REZERO_PINS = (
+    (0x002C4260, 0x002C4549,
+     "c572ee5def8a685d34973ac3812f4da70ccc678dbc7cb13898858559561a5371"),
+    (0x002DA150, 0x002DA1FE,
+     "4e4492fe03a4ab856682f2a4ec40c381bbe6eba76106278ef7cd7b09c4d307bd"),
+    (0x000C3C30, 0x000C3C8D,
+     "7ea6454dabf3961cd45ca598420aad71543360a3fe217eaa1080c894f415bd6e"),
+    (0x000C3B30, 0x000C3BB6,
+     "85931de0650344a8fa2f5d35644b68524f758e763337cf997f04b7e0a68bab8e"),
+    (0x00020480, 0x000204B9,
+     "f734dc8c0e3d56d32dada6e84c9799c5a3f0f2205c02b2e00d6156b599cc1002"),
+)
+
+
+def vita_room_grid_rezero_for_body(img, root_rva, em, insns, order,
+                                   extra_entries):
+    """Elide only repeated zero stores in the exact fresh constructor.
+
+    002c4330 already zeros every row's first word. Between that pass and
+    002c4510, both 104-byte vectors start null/empty: their reserve paths only
+    allocate 1664/3328 bytes and publish the three vector pointers. There are
+    no live elements to move or destroy. The newly allocated tree head has
+    head+0xd == 1, so 00020480 returns without walking/freeing any node. None
+    of these successful paths receives or writes the grid. The native malloc
+    bridge has no guest new-handler callback (vita_heap_callnewh returns 0).
+    Allocation/error/destruction order is unchanged; no work is moved across
+    a call. Keep the last original row for exact EAX/ECX/lazy flags.
+    """
+    if root_rva != 0x002C4260:
+        return False
+    raw = Image(img.path, img.orig_base)
+    incoming = tuple(i.address for i in insns.values()
+                     if i.mnemonic.startswith("j") and
+                     i.op_str == "0x2c4510")
+    if (_vita_pill_bloom_bypass_file_sha256(img.path) !=
+            "31846486979cfa07c8c968221553052c3ff603518681ca11912d445f96ca9404" or
+            any(hashlib.sha256(raw.code_at(start, end - start)).hexdigest()
+                != digest for start, end, digest in VITA_ROOM_GRID_REZERO_PINS) or
+            len(order) != 189 or not order or order[0] != 0x002C4260 or
+            order[-1] != 0x002C4548 or max(order) != 0x002C4548 or
+            extra_entries or incoming != (0x002C4523,) or
+            0x002C4510 not in em.labels or
+            order[order.index(0x002C4510) - 1] != 0x002C450B or
+            bytes(insns[0x002C44C2].bytes) != bytes.fromhex("33c9") or
+            raw.code_at(0x002C4510, 0x15) != bytes.fromhex(
+                "8b4768c704010000000083c12081f90038000072eb")):
+        raise RuntimeError("Room grid repeated-zero constructor/callee identity changed")
+    return True
+
+
+def vita_png_premultiply_for_body(img, root_rva, em, insns, order):
+    """Pin the existing ImagePng loop; keep its final original row/tail."""
+    if root_rva != VITA_PNG_DECODE_PROFILE_OUTER_RVA:
+        return False
+    raw = Image(img.path, img.orig_base)
+    head = VITA_PNG_PREMULTIPLY_HEAD_RVA
+    # The preceding PNG owner proof already pins the complete PE, 596 decoded
+    # instructions, body/order hashes, caller xrefs and local longjmp closure.
+    # This narrower identity proves the exact byte-loop and immutable tables.
+    incoming = tuple(i.address for i in insns.values()
+                     if i.mnemonic.startswith("j") and i.op_str == "0x%x" % head)
+    if (hashlib.sha256(raw.code_at(VITA_PNG_PREMULTIPLY_START_RVA,
+            VITA_PNG_PREMULTIPLY_END_RVA - VITA_PNG_PREMULTIPLY_START_RVA)).hexdigest()
+            != VITA_PNG_PREMULTIPLY_LOOP_SHA256 or
+            raw.code_at(0x005A145A, 6) != bytes.fromhex("8db780000000") or
+            raw.code_at(head, 7) != bytes.fromhex("0fb78784000000") or
+            incoming != (0x005A151B,) or head not in em.labels or
+            VITA_PNG_PREMULTIPLY_END_RVA not in em.labels or
+            order[order.index(head) - 1] != 0x005A145A or
+            any(hashlib.sha256(raw.code_at(rva, 65536)).hexdigest() != digest
+                for rva, digest in VITA_PNG_PREMULTIPLY_TABLES)):
+        raise RuntimeError("ImagePng premultiply loop/table identity changed")
+    return True
+
+
+def vita_anm2_outer_for_body(img, root_rva, insns, order,
+                             extra_entries, setjmp_sites):
+    """One full-function scope, not the later scratch-pool lifetime."""
+    if root_rva != VITA_ANM2_OUTER_ROOT_RVA:
+        return False
+    raw = Image(img.path, img.orig_base)
+    if (os.path.getsize(img.path) != VITA_PNG_DECODE_PROFILE_PE_SIZE or
+            _vita_pill_bloom_bypass_file_sha256(img.path) !=
+            VITA_PNG_DECODE_PROFILE_PE_SHA256 or
+            hashlib.sha256(raw.code_at(root_rva,
+                VITA_ANM2_OUTER_END_RVA - root_rva)).hexdigest() !=
+            VITA_ANM2_OUTER_BODY_SHA256 or len(order) != 5558 or
+            not order or order[0] != root_rva or order[-1] != 0x0000E98C or
+            extra_entries or setjmp_sites or
+            insns[0x0000E98C].mnemonic != "ret" or
+            bytes(insns[0x0000E98C].bytes) != bytes.fromhex("c20800") or
+            _vita_png_decode_profile_rel32_xrefs(raw, root_rva) !=
+            VITA_ANM2_OUTER_CALLERS):
+        raise RuntimeError("ANM2 whole-loader entry/return identity changed")
+    return True
 
 
 def vita_png_decode_profile_for_body(
@@ -15201,10 +15833,48 @@ def vita_kage_mutex_seam_for_body(img, root_rva, insns, order, sync_iat_sites):
     return spec
 
 
+def vita_kage_refcount_seam_for_body(img, root_rva, insns, order,
+                                     refcount_direct_edges):
+    """Authenticate one KAGE ReferenceCount helper for the native seam.
+
+    Returns the seam spec for the three frozen roots (0x7af0 Release, 0x7b50
+    AddRef, 0x7b70 weak-lock), None for every other root.  The refcount
+    direct-edge authenticator has already pinned the body bytes, the CFG
+    order, the counter/mutex vtable slots and every direct edge of these
+    roots (it raises on drift); this function requires that proof to have
+    selected every edge of the root and pins in addition every instruction
+    of the body (host_vita_kage_refcount_seam.c replays the handled paths
+    and leaves the destroy path to the translated body)."""
+    spec = VITA_KAGE_REFCOUNT_SEAM_SPECS.get(root_rva)
+    if spec is None:
+        return None
+    if (os.path.getsize(img.path) != VITA_EXIT_MENU_PROFILE_PE_SIZE or
+            _vita_pill_bloom_bypass_file_sha256(img.path) !=
+            VITA_EXIT_MENU_PROFILE_PE_SHA256):
+        raise RuntimeError("KAGE refcount seam input PE identity changed")
+    owner = VITA_REFCOUNT_DIRECT_EDGE_ROOT_SPECS[root_rva]
+    selected = tuple(edge["site"] for edge in refcount_direct_edges)
+    expected = tuple(edge[0] for edge in owner["edges"])
+    if selected != expected or len(order) != owner["insns"]:
+        raise RuntimeError(
+            "KAGE refcount seam requires the authenticated direct edges at "
+            "%08x" % root_rva)
+    for site, want in spec["required"].items():
+        instruction = insns.get(site)
+        if (instruction is None or
+                (instruction.mnemonic, instruction.op_str) != want):
+            raise RuntimeError(
+                "KAGE refcount seam ABI/algorithm changed at %08x" % site)
+    return spec
+
+
 def render_vita_kage_mutex_seam_declaration(spec):
-    """The fenced extern declaration of the seam helper (body prologue)."""
+    """The fenced extern declaration of the seam helper (body prologue).
+
+    The fence is the spec's own when it carries one (refcount seam), the
+    mutex fence otherwise, so the mutex output stays byte-identical."""
     return (
-        VITA_KAGE_MUTEX_SEAM_FENCE,
+        spec.get("fence", VITA_KAGE_MUTEX_SEAM_FENCE),
         "    extern int %s(CPU *__restrict);" % spec["helper"],
         "#endif",
     )
@@ -15217,7 +15887,7 @@ def render_vita_kage_mutex_seam(spec):
     with GUEST_GPR_FLUSH/RELOAD, so the helper sees the published register
     file and a handled call returns with the CPU struct authoritative."""
     return (
-        VITA_KAGE_MUTEX_SEAM_FENCE,
+        spec.get("fence", VITA_KAGE_MUTEX_SEAM_FENCE),
         "    /* %s */" % spec["marker"],
         "    if (%s(c)) return;" % spec["helper"],
         "#endif",
@@ -15397,6 +16067,109 @@ def _vita_shader_attrib_packing_delta(text):
     return unit_packing_size(text) - unit_packing_size("\n".join(stripped))
 
 
+def vita_kage_quad_fastpath_for_body(img, root_rva, insns, order):
+    """Authenticate the Image::PushQuad root (sub_0055f990).
+
+    Returns the seam spec (marker, helper) or None.  Pins: the frozen PE, the
+    root body bytes and emitted CFG order, the three callee bodies the host
+    replay reproduces (ring reserve, attribute size table with its 8-entry
+    jump table, snapped quad rebuild), the three tail callees it enters by
+    direct call (batch select, dirty-vector growth, blend reset), the four
+    direct callers as the only references to the root (no address word),
+    every direct call site and its target (the four floor thunk sites are
+    hot sites of the floor fast path), the two `call eax` getter sites and
+    both `ret 0x18` epilogues."""
+    if root_rva != VITA_KAGE_QUAD_FASTPATH_ROOT_RVA:
+        return None
+    if (os.path.getsize(img.path) != VITA_EXIT_MENU_PROFILE_PE_SIZE or
+            _vita_pill_bloom_bypass_file_sha256(img.path) !=
+            VITA_EXIT_MENU_PROFILE_PE_SHA256):
+        raise RuntimeError("kage-quad fast-path input PE identity changed")
+
+    raw_img = Image(img.path, img.orig_base)
+    raw = raw_img.code_at(
+        root_rva, VITA_KAGE_QUAD_FASTPATH_ROOT_END_RVA - root_rva)
+    if (hashlib.sha256(raw).hexdigest() !=
+            VITA_KAGE_QUAD_FASTPATH_ROOT_BODY_SHA256 or
+            len(order) != VITA_KAGE_QUAD_FASTPATH_ROOT_INSNS or
+            not order or order[0] != root_rva or
+            order[-1] != VITA_KAGE_QUAD_FASTPATH_ROOT_LAST_RVA or
+            rva_sequence_sha256(order) !=
+            VITA_KAGE_QUAD_FASTPATH_ROOT_ORDER_SHA256):
+        raise RuntimeError(
+            "kage-quad body/CFG identity changed at %08x" % root_rva)
+    for callee, (end_rva, body_sha256) in sorted(
+            VITA_KAGE_QUAD_FASTPATH_CALLEES.items()):
+        body = raw_img.code_at(callee, end_rva - callee)
+        if hashlib.sha256(body).hexdigest() != body_sha256:
+            raise RuntimeError(
+                "kage-quad callee body changed at %08x" % callee)
+    for callee, (end_rva, body_sha256) in sorted(
+            VITA_KAGE_QUAD_FASTPATH_TAIL_CALLEES.items()):
+        body = raw_img.code_at(callee, end_rva - callee)
+        if hashlib.sha256(body).hexdigest() != body_sha256:
+            raise RuntimeError(
+                "kage-quad tail callee body changed at %08x" % callee)
+    table = raw_img.code_at(VITA_KAGE_QUAD_FASTPATH_SIZE_TABLE_RVA,
+                            VITA_KAGE_QUAD_FASTPATH_SIZE_TABLE_BYTES)
+    if (hashlib.sha256(table).hexdigest() !=
+            VITA_KAGE_QUAD_FASTPATH_SIZE_TABLE_SHA256):
+        raise RuntimeError("kage-quad attribute size table changed")
+
+    calls = _vita_png_decode_profile_rel32_xrefs(raw_img, root_rva)
+    address_refs = tuple(
+        rva for rva in sorted(raw_img.reloc_rvas)
+        if int.from_bytes(raw_img.code_at(rva, 4), "little") ==
+        raw_img.va(root_rva)
+    )
+    if calls != VITA_KAGE_QUAD_FASTPATH_CALLERS or address_refs:
+        raise RuntimeError(
+            "kage-quad caller provenance changed at %08x" % root_rva)
+    if not set(VITA_KAGE_QUAD_FASTPATH_CALL_SITES) >= {
+            site for site in VITA_FLOOR_THUNK_FASTPATH_HOT_SITES
+            if root_rva <= site < VITA_KAGE_QUAD_FASTPATH_ROOT_END_RVA}:
+        raise RuntimeError("kage-quad floor hot sites changed")
+
+    for site, target in sorted(VITA_KAGE_QUAD_FASTPATH_CALL_SITES.items()):
+        instruction = insns.get(site)
+        if (instruction is None or instruction.mnemonic != "call" or
+                instruction.op_str != "0x%x" % target or
+                site not in order):
+            raise RuntimeError(
+                "kage-quad direct call identity changed at %08x" % site)
+    for site in VITA_KAGE_QUAD_FASTPATH_INDIRECT_SITES:
+        instruction = insns.get(site)
+        if (instruction is None or instruction.mnemonic != "call" or
+                instruction.op_str != "eax" or site not in order):
+            raise RuntimeError(
+                "kage-quad getter call identity changed at %08x" % site)
+    for site in VITA_KAGE_QUAD_FASTPATH_RET_SITES:
+        instruction = insns.get(site)
+        if (instruction is None or instruction.mnemonic != "ret" or
+                instruction.op_str != "0x18" or site not in order):
+            raise RuntimeError(
+                "kage-quad stdcall epilogue changed at %08x" % site)
+    return {"marker": VITA_KAGE_QUAD_FASTPATH_MARKER,
+            "helper": VITA_KAGE_QUAD_FASTPATH_HELPER}
+
+
+def _vita_kage_quad_packing_delta(text):
+    """Bytes the kage-quad declaration/seam blocks add to a body's text
+    (taken back out of the packing size like the shader-attrib seam)."""
+    stripped = []
+    skipping = False
+    for line in text.split("\n"):
+        if line == VITA_KAGE_QUAD_FASTPATH_GUARD:
+            skipping = True
+            continue
+        if skipping:
+            if line == "#endif":
+                skipping = False
+            continue
+        stripped.append(line)
+    return unit_packing_size(text) - unit_packing_size("\n".join(stripped))
+
+
 def require_upstream_contracts():
     functions_recipe_id, _ = Funcs.contract_recipe()
     functions_manifest = BC.require_manifest(
@@ -15460,6 +16233,16 @@ def contract_recipe(functions_manifest, bounds_manifest):
             # GUEST_SSE_LOWER as a -D) are not generation inputs.
             "sse_lower": sse_lower.enabled(),
             "floor_thunk_fastpath": vita_floor_thunk_fastpath_enabled(),
+            # Tiny-leaf inlining (GUEST_LEAF_INLINE with its
+            # GUEST_LEAF_INLINE_MAX_INSNS bound) rewrites every call site of
+            # an inlined leaf: two corpora that differ only in it must not
+            # share a recipe.  The bound is recorded only when the switch is
+            # on (0 otherwise).
+            "leaf_inline": leaf_inline.enabled_by_environment(),
+            "leaf_inline_max_insns": (
+                leaf_inline.max_insns_from_environment()
+                if leaf_inline.enabled_by_environment() else 0
+            ),
         },
         BC.tool_ids(),
     )
@@ -17226,6 +18009,8 @@ LUA_CALLBACK_NEUTRAL_TRANSLATION = {
     "vita_laser_profile": False,
     "vita_poop_fx": False,
     "vita_png_decode_profile": None,
+    "vita_png_premultiply": False,
+    "vita_anm2_outer": False,
     "vita_png_inflate_profile": None,
     "vita_png_inflate_flush_fastpath": False,
     "vita_png_crc32_fastpath": False,
@@ -17247,8 +18032,10 @@ LUA_CALLBACK_NEUTRAL_TRANSLATION = {
     "vita_save_reader_direct_edges": (),
     "vita_memset_thunk_fastpath": False,
     "vita_kage_mutex_seam": False,
+    "vita_kage_refcount_seam": False,
     "vita_floor_thunk_fastpath": False,
     "vita_shader_attrib_fastpath": None,
+    "vita_kage_quad_fastpath": False,
     "pc_clock": False,
     "pc_clock_inline_seams": (),
     "pc_display_dimension": None,
@@ -22113,6 +22900,16 @@ def _translate_function(img, fn, known, switch_info,
         pin_img, rva, em, _insns, order, body)
     vita_png_decode_profile = vita_png_decode_profile_for_body(
         pin_img, rva, _insns, order, body, extra_entries, indirect_edges)
+    vita_png_premultiply = vita_png_premultiply_for_body(
+        pin_img, rva, em, _insns, order)
+    vita_room_grid_init = vita_room_grid_init_for_body(
+        pin_img, rva, em, _insns, order, extra_entries)
+    vita_room_grid_rezero = vita_room_grid_rezero_for_body(
+        pin_img, rva, em, _insns, order, extra_entries)
+    vita_room_reset_publish = vita_room_reset_publish_for_body(
+        pin_img, rva, em, _insns, order, extra_entries)
+    vita_anm2_outer = vita_anm2_outer_for_body(
+        pin_img, rva, _insns, order, extra_entries, setjmp_sites)
     vita_png_inflate_profile = vita_png_inflate_profile_for_body(
         pin_img, rva, _insns, order, body, extra_entries, indirect_edges)
     vita_png_inflate_flush_fastpath = \
@@ -22179,6 +22976,8 @@ def _translate_function(img, fn, known, switch_info,
         pin_img, rva, _insns, order, img.base)
     vita_kage_mutex_seam = vita_kage_mutex_seam_for_body(
         pin_img, rva, _insns, order, vita_refcount_sync_iat)
+    vita_kage_refcount_seam = vita_kage_refcount_seam_for_body(
+        pin_img, rva, _insns, order, vita_refcount_direct_edges)
     vita_floor_thunk_fastpath = vita_floor_thunk_fastpath_for_body(
         pin_img, rva, _insns, order, img.base)
     # Bytes the floor seam adds to the rendered text.  They are taken back
@@ -22187,6 +22986,8 @@ def _translate_function(img, fn, known, switch_info,
     vita_floor_thunk_seam_bytes = 0
     vita_shader_attrib_fastpath = vita_shader_attrib_fastpath_for_body(
         pin_img, rva, _insns, order, img.base)
+    vita_kage_quad_fastpath = vita_kage_quad_fastpath_for_body(
+        pin_img, rva, _insns, order)
     vita_rooted_file_probe = vita_rooted_file_probe_for_body(
         pin_img, rva, em, order)
     vita_stable30_manager_guard_label = (
@@ -22210,7 +23011,30 @@ def _translate_function(img, fn, known, switch_info,
         "void %s(CPU *__restrict c)" % name,
         "{",
     ]
+    vita_wav_rewind_seam = vita_wav_buffered_rewind_prologue(
+        pin_img, rva, extra_entries)
+    vita_wav_rewind_seam_bytes = sum(len(line) + 1 for line in vita_wav_rewind_seam)
     lines.extend("    %s" % line for line in B.flag_state_prologue(em))
+    vita_deep_profile_seam = vita_deep_profile_prologue(
+        pin_img, rva, _insns, order, extra_entries, setjmp_sites)
+    lines.extend(vita_deep_profile_seam)
+    vita_deep_profile_seam_bytes = sum(
+        len(line) + 1 for line in vita_deep_profile_seam)
+    vita_anm2_outer_seam_bytes = 0
+    if vita_anm2_outer:
+        seam = [
+            "#if defined(__vita__) && defined(ISAAC_VITA_ANM2_WINDOW_PROFILE)",
+            "    /* Native function-scope token: all ordinary C returns close; "
+            "nonlocal escapes stay incomplete. */",
+            "    extern uint64_t isaac_vita_anm2_outer_begin(void);",
+            "    extern void isaac_vita_anm2_outer_cleanup(uint64_t *);",
+            "    uint64_t _vita_anm2_outer_token "
+            "__attribute__((cleanup(isaac_vita_anm2_outer_cleanup))) = "
+            "isaac_vita_anm2_outer_begin();",
+            "#endif",
+        ]
+        lines.extend(seam)
+        vita_anm2_outer_seam_bytes = sum(len(line) + 1 for line in seam)
     if vita_sim_cadence_receipt:
         lines.append(
             "#if defined(__vita__) && "
@@ -22308,6 +23132,9 @@ def _translate_function(img, fn, known, switch_info,
     if vita_kage_mutex_seam:
         lines.extend(render_vita_kage_mutex_seam_declaration(
             vita_kage_mutex_seam))
+    if vita_kage_refcount_seam:
+        lines.extend(render_vita_kage_mutex_seam_declaration(
+            vita_kage_refcount_seam))
     if vita_floor_thunk_fastpath:
         floor_extern_lines = [
             "#if defined(__vita__) && "
@@ -22324,6 +23151,12 @@ def _translate_function(img, fn, known, switch_info,
         lines.append(
             "    extern int %s(CPU *__restrict);" %
             vita_shader_attrib_fastpath["helper"])
+        lines.append("#endif")
+    if vita_kage_quad_fastpath:
+        lines.append(VITA_KAGE_QUAD_FASTPATH_GUARD)
+        lines.append(
+            "    extern int %s(CPU *__restrict);" %
+            vita_kage_quad_fastpath["helper"])
         lines.append("#endif")
     if vita_archive_validation_skip:
         lines.append(
@@ -22847,6 +23680,10 @@ def _translate_function(img, fn, known, switch_info,
     vita_stage_memory_hooks = []
     vita_continue_profile_hooks = []
     vita_exit_menu_profile_hooks = []
+    vita_png_premultiply_seam_bytes = 0
+    vita_png_row_batch_seam_bytes = 0
+    vita_room_grid_init_seam_bytes = 0
+    vita_room_grid_rezero_seam_bytes = 0
     # Seams that skip the original instructions jump to the instruction
     # after the skipped range; that label exists only under the seam's own
     # fence, so a build without the seam sees no unused label.
@@ -22855,11 +23692,86 @@ def _translate_function(img, fn, known, switch_info,
                        "defined(ISAAC_VITA_RENDERFRAME_FASTPATH)")
         for spec in vita_renderframe_fastpath
     }
-    if kage_pc_loop_stages and KAGE_PC_RENDER_RETURN_RVA in order:
-        fenced_labels[KAGE_PC_RENDER_RETURN_RVA] = (
-            "#if defined(__vita__) && "
-            "defined(ISAAC_VITA_FULLSPEED_SCHEDULER)")
     for ins, stmts in body:
+        if vita_room_grid_init and ins.address in (0x002C4314, 0x002C4330):
+            fence = ("#if defined(__vita__) && "
+                     "defined(ISAAC_VITA_ROOM_GRID_INIT_NATIVE) && "
+                     "ISAAC_VITA_ROOM_GRID_INIT_NATIVE && "
+                     "!defined(GUEST_CHECKED_MEMORY)")
+            if ins.address == 0x002C4314:
+                # ECX still holds the raw allocation here. Its short native
+                # local lifetime ends before any original opaque child call.
+                seam = [fence,
+                        "    const uint32_t _vita_room_grid_raw = c->ecx;",
+                        "#endif"]
+            else:
+                # BEFORE the existing label: attempt once on fallthrough,
+                # not on every original backedge. The final row remains.
+                seam = [fence,
+                        "    {",
+                        "        extern int isaac_vita_room_grid_init_try(CPU *__restrict, uint32_t);",
+                        "        if (!g_guest_coverage_functions && !g_guest_coverage_cases &&",
+                        "            isaac_vita_room_grid_init_try(c, _vita_room_grid_raw) < 0)",
+                        "            return;",
+                        "    }",
+                        "#endif"]
+            lines.extend(seam)
+            vita_room_grid_init_seam_bytes += sum(len(line) + 1 for line in seam)
+        if vita_room_grid_rezero and ins.address == 0x002C4510:
+            # Register-token spelling is deliberate: this is a proved local
+            # dead-store elision, not a CPU-consuming host call. No publication
+            # or new native pointer lifetime is needed. Run before the label
+            # so a refused original backedge does not retry the admission.
+            seam = [
+                "#if defined(__vita__) && defined(ISAAC_VITA_ROOM_GRID_REZERO_ELISION) && ISAAC_VITA_ROOM_GRID_REZERO_ELISION && !defined(GUEST_CHECKED_MEMORY)",
+                "    /* ROOM_GRID_REZERO_ELISION: retain the original final row. */",
+                "    if (!g_guest_coverage_functions && !g_guest_coverage_cases &&",
+                "        !c->fault && GR(ecx) == 0U)",
+                "        GR(ecx) = 0x37e0U;",
+                "#endif",
+            ]
+            lines.extend(seam)
+            vita_room_grid_rezero_seam_bytes += sum(
+                len(legacy_spelling(line)) + 1 for line in seam)
+        if vita_png_premultiply and ins.address == 0x005A13A2:
+            # Full ImagePng owner/read-row call is pinned by the PNG profile
+            # selector. The first call already decoded/served row zero; keep
+            # the last original loop iteration and its final state.
+            if not setjmp_cleanup:
+                raise RuntimeError("PNG row batch lost setjmp cleanup")
+            seam = [
+                "#if defined(__vita__) && defined(ISAAC_VITA_NATIVE_PNG_ROW_BATCH)",
+                "    {",
+                "        extern int isaac_vita_native_png_middle_rows_try(CPU *__restrict);",
+                "        if (c->edi > 2U && c->esi == ld32(c->ebp - 0x43cU) &&",
+                "            !g_guest_coverage_functions && !g_guest_coverage_cases &&",
+                "            isaac_vita_native_png_middle_rows_try(c) < 0)",
+                "            goto %s;" % setjmp_cleanup,
+                "    }",
+                "#endif",
+            ]
+            lines.extend(seam)
+            vita_png_row_batch_seam_bytes += sum(len(line) + 1 for line in seam)
+        if vita_png_premultiply and ins.address == VITA_PNG_PREMULTIPLY_HEAD_RVA:
+            # Deliberately before the EXISTING loop label: the native prefix
+            # executes once on initial fallthrough, never on a guest backedge.
+            # No CALL/RET is skipped and the final original row recreates the
+            # complete final CPU/local/flags state. Fatal lease failure uses
+            # the existing local setjmp cleanup, not another C return.
+            if not setjmp_cleanup:
+                raise RuntimeError("ImagePng premultiply lost setjmp cleanup")
+            seam = [
+                "#if defined(__vita__) && defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE)",
+                "    /* Exact native ImagePng prefix; final row remains guest. */",
+                "    {",
+                "        extern int isaac_vita_png_premultiply_guest_try(CPU *__restrict);",
+                "        if (isaac_vita_png_premultiply_guest_try(c) < 0)",
+                "            goto %s;" % setjmp_cleanup,
+                "    }",
+                "#endif",
+            ]
+            lines.extend(seam)
+            vita_png_premultiply_seam_bytes += sum(len(line) + 1 for line in seam)
         if (ins.address in fenced_labels and
                 ins.address not in em.labels):
             lines.append(fenced_labels[ins.address])
@@ -23202,6 +24114,8 @@ def _translate_function(img, fn, known, switch_info,
             lines.append("#endif")
         if vita_kage_mutex_seam and ins.address == rva:
             lines.extend(render_vita_kage_mutex_seam(vita_kage_mutex_seam))
+        if vita_kage_refcount_seam and ins.address == rva:
+            lines.extend(render_vita_kage_mutex_seam(vita_kage_refcount_seam))
         if (vita_floor_thunk_fastpath and
                 ins.address == VITA_FLOOR_THUNK_FASTPATH_ROOT_RVA):
             iat_address = ((img.base +
@@ -23229,6 +24143,15 @@ def _translate_function(img, fn, known, switch_info,
                 vita_shader_attrib_fastpath["marker"])
             lines.append(
                 "    if (%s(c))" % vita_shader_attrib_fastpath["helper"])
+            lines.append("        return;")
+            lines.append("#endif")
+        if vita_kage_quad_fastpath and ins.address == rva:
+            lines.append(VITA_KAGE_QUAD_FASTPATH_GUARD)
+            lines.append(
+                "    /* %s; exact translated fallback follows. */" %
+                vita_kage_quad_fastpath["marker"])
+            lines.append(
+                "    if (%s(c))" % vita_kage_quad_fastpath["helper"])
             lines.append("        return;")
             lines.append("#endif")
         stage_reuse = VITA_STAGE_MEMORY_REUSE_SPECS.get(
@@ -23741,7 +24664,7 @@ def _translate_function(img, fn, known, switch_info,
                  VITA_FULLSPEED_INTERPOLATION_OFFSET,
                  VITA_FULLSPEED_GAME_FRAME_OFFSET))
             lines.append("            kage_pc_backend_note_render_skipped();")
-            lines.append("            goto L_%08x;" % KAGE_PC_RENDER_RETURN_RVA)
+            lines.append("            goto L_vita_fullspeed_render_done;")
             lines.append("        }")
             lines.append("    }")
             lines.append("#endif")
@@ -23783,8 +24706,17 @@ def _translate_function(img, fn, known, switch_info,
             lines.append("        if (kage_pc_backend_mode() != 0)")
             lines.append("            %s();" % note_function)
             lines.append("    }")
-        # KAGE_PC_RENDER_RETURN_RVA: the fullspeed skip lands on the fenced
-        # label emitted above this instruction (fenced_labels).
+        if (kage_pc_loop_stages and
+                ins.address == KAGE_PC_RENDER_RETURN_RVA):
+            # A skipped Render closes Update in note_render_skipped, but has
+            # no Render entry/return.  Land after the return heartbeat while
+            # retaining the original continuation instruction below.  This
+            # seam-only label must not replace any native x86 branch label.
+            lines.append(
+                "#if defined(__vita__) && "
+                "defined(ISAAC_VITA_FULLSPEED_SCHEDULER)")
+            lines.append("L_vita_fullspeed_render_done:")
+            lines.append("#endif")
         if (vita_audio_cooperative_poll and
                 ins.address == VITA_AUDIO_COOPERATIVE_POLL_SITE_RVA):
             lines.append(
@@ -24203,6 +25135,7 @@ def _translate_function(img, fn, known, switch_info,
         if (vita_laser_profile is not None and
                 ins.address == vita_laser_profile["site"]):
             lines.extend(render_vita_laser_profile_begin(vita_laser_profile))
+            lines.extend(render_vita_laser_ring_shadow_skip(vita_laser_profile))
         if (vita_poop_fx is not None and
                 ins.address in VITA_POOP_FX_OWNERS[rva]["sites"]):
             lines.extend(render_vita_poop_fx_site(
@@ -24256,6 +25189,9 @@ def _translate_function(img, fn, known, switch_info,
     if lines[2] != "{":
         raise RuntimeError("rendered body header changed at %08x" % rva)
     lines[3:] = bracket_seam_regions(lines[3:], name)
+    # This entry-only helper consumes ret 8 itself. Insert after bracketing so
+    # no local-register flush is generated before GUEST_GPR_DECL exists.
+    lines[3:3] = vita_wav_rewind_seam
     lines.append("}")
     expected_stage_hooks = (
         tuple(vita_stage_memory["hooks"]) if vita_stage_memory else ())
@@ -24280,6 +25216,15 @@ def _translate_function(img, fn, known, switch_info,
             % (rva, tuple(vita_exit_menu_profile_hooks),
                expected_exit_menu_hooks))
     text = "\n".join(lines) + "\n"
+    vita_room_reset_publish_delta = 0
+    if vita_room_reset_publish:
+        published_text = vita_room_reset_publish_render(text)
+        vita_room_reset_publish_delta = (len(legacy_text(published_text)) -
+                                         len(legacy_text(text)))
+        text = published_text
+        lines = text.splitlines()
+    if vita_anm2_outer and text.count("return;") != VITA_ANM2_OUTER_C_RETURNS:
+        raise RuntimeError("ANM2 whole-loader ordinary return census changed")
     legacy_size_delta = 0
     if em.iat_jmp_sites:
         legacy_size_delta = _iat_legacy_packing_delta(
@@ -24289,11 +25234,26 @@ def _translate_function(img, fn, known, switch_info,
         # The seam lines are new text; keep the unit packing what it was.
         legacy_size_delta -= vita_kage_mutex_seam_packing_bytes(
             vita_kage_mutex_seam)
+    if vita_kage_refcount_seam:
+        # Same contract: the refcount seam lines never move a function
+        # between units (unit membership stays that of the v12 corpus).
+        legacy_size_delta -= vita_kage_mutex_seam_packing_bytes(
+            vita_kage_refcount_seam)
     # The switched-on floor seam is not part of the packing budget (the
     # bracket pass adds only sync lines, which legacy_text() drops).
     legacy_size_delta -= vita_floor_thunk_seam_bytes
+    legacy_size_delta -= vita_png_premultiply_seam_bytes
+    legacy_size_delta -= vita_png_row_batch_seam_bytes
+    legacy_size_delta -= vita_room_grid_init_seam_bytes
+    legacy_size_delta -= vita_room_grid_rezero_seam_bytes
+    legacy_size_delta -= vita_room_reset_publish_delta
+    legacy_size_delta -= vita_anm2_outer_seam_bytes
+    legacy_size_delta -= vita_deep_profile_seam_bytes
+    legacy_size_delta -= vita_wav_rewind_seam_bytes
     if vita_shader_attrib_fastpath:
         legacy_size_delta -= _vita_shader_attrib_packing_delta(text)
+    if vita_kage_quad_fastpath:
+        legacy_size_delta -= _vita_kage_quad_packing_delta(text)
     return {
         "rva": rva, "public_name": public_name, "name": name,
         "manual": rva in MANUAL_RVAS, "stub": None,
@@ -24338,6 +25298,8 @@ def _translate_function(img, fn, known, switch_info,
         "vita_laser_profile": vita_laser_profile is not None,
         "vita_poop_fx": vita_poop_fx is not None,
         "vita_png_decode_profile": vita_png_decode_profile,
+        "vita_png_premultiply": vita_png_premultiply,
+        "vita_anm2_outer": vita_anm2_outer,
         "vita_png_inflate_profile": vita_png_inflate_profile,
         "vita_png_inflate_flush_fastpath": bool(
             vita_png_inflate_flush_fastpath),
@@ -24377,10 +25339,12 @@ def _translate_function(img, fn, known, switch_info,
         "vita_memset_thunk_fastpath": bool(
             vita_memset_thunk_fastpath),
         "vita_kage_mutex_seam": bool(vita_kage_mutex_seam),
+        "vita_kage_refcount_seam": bool(vita_kage_refcount_seam),
         "vita_floor_thunk_fastpath": bool(vita_floor_thunk_fastpath),
         "vita_shader_attrib_fastpath": (
             vita_shader_attrib_fastpath["kind"]
             if vita_shader_attrib_fastpath else None),
+        "vita_kage_quad_fastpath": bool(vita_kage_quad_fastpath),
         "pc_clock": bool(pc_clock),
         "pc_clock_inline_seams": tuple(
             spec["site"] for spec in pc_clock_inline_seams),
@@ -25034,6 +25998,7 @@ def _main(force=False, reanalyse=False, jobs=1):
             fh.write("/* GENERATED by recomp/gen_all.py -- do not edit. */\n")
             fh.write("#include <math.h>\n#include \"guest.h\"\n")
             fh.write("#include \"guest_funcs.h\"\n\n")
+            fh.write(vita_deep_profile_unit_include(unit))
             for text in unit:
                 fh.write(text)
                 fh.write("\n")
@@ -25236,27 +26201,14 @@ def _main(force=False, reanalyse=False, jobs=1):
             # SSE lowering) repeats its producer's operand expression, which
             # may be an esp-relative address, and the census must not depend
             # on any generation switch.
-            census_text = legacy_text(text)
-            for key, needles in (
-                    ("set_generated", ("guest_stack_set_generated(c,",
-                                       "GESP_SET(")),
-                    ("adjust_generated", ("guest_stack_adjust_generated(c,",
-                                          "GESP_ADJ(")),
-                    ("address_generated", ("guest_stack_address_generated(c,",
-                                           "GSTACK_ADDR(")),
-                    ("address_at", ("guest_stack_address(c,",)),
-                    ("push_generated", ("gpush_generated(c,", "GPUSH(")),
-                    ("push_at", ("gpush_at(c,",)),
-                    ("pop_generated", ("gpop_generated(c)", "GPOP()")),
-                    ("pop_at", ("gpop_at(c,",))):
-                for needle in needles:
-                    guest_stack_codegen_census[key] += census_text.count(needle)
+            counts, direct_writers, legacy_calls = guest_stack_codegen_accounting(
+                rva, text)
+            for key, count in counts.items():
+                guest_stack_codegen_census[key] += count
             gpr_sync_flushes += text.count("GUEST_GPR_FLUSH(c)")
             gpr_sync_reloads += text.count("GUEST_GPR_RELOAD(c)")
-            guest_stack_direct_writers += len(
-                GUEST_STACK_DIRECT_WRITER_RE.findall(text))
-            guest_stack_legacy_calls += len(
-                re.findall(r"\bg(?:push|pop)\s*\(", text))
+            guest_stack_direct_writers += direct_writers
+            guest_stack_legacy_calls += legacy_calls
             insns_total += result["insns"]
             total_lines += result["lines"]
             total_bytes += len(text)

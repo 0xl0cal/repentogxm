@@ -10,6 +10,11 @@ static uint64_t s_now;
 static uint32_t s_log_calls;
 static uint32_t s_disable_log_calls;
 static uint32_t s_delay_fail;
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+static uint32_t s_test_service_us = 500u;
+static uint32_t s_test_overshoot_us, s_test_variable_wake, s_test_waits;
+static uint32_t s_test_backward_wait;
+#endif
 
 #define ORACLE_MAX_GAME_UPDATES 1024u
 
@@ -18,6 +23,19 @@ int sceKernelDelayThread(unsigned int delay_us)
 {
     if (s_delay_fail)
         return -1;
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+    if (s_test_backward_wait) {
+        s_test_backward_wait = 0u;
+        --s_now;
+        return 0;
+    }
+    {
+        const uint32_t multipliers[] = {0u, 2u, 1u, 3u, 0u, 1u};
+        s_now += (uint64_t)s_test_overshoot_us *
+            (s_test_variable_wake ? multipliers[s_test_waits % 6u] : 1u);
+        ++s_test_waits;
+    }
+#endif
     s_now += delay_us;
     return 0;
 }
@@ -57,6 +75,10 @@ typedef struct ScenarioResult {
     uint32_t maximum_game_updates_per_second;
     uint64_t game_update_times[ORACLE_MAX_GAME_UPDATES];
     uint64_t elapsed_us;
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+    uint32_t present_time_count;
+    uint64_t present_times[ORACLE_MAX_GAME_UPDATES * 2u];
+#endif
 } ScenarioResult;
 
 typedef struct OracleGame {
@@ -76,7 +98,11 @@ static int run_one_tick(
 
     kage_vita_fullspeed_scheduler_note_loop_head();
     kage_vita_fullspeed_scheduler_note_service();
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+    s_now += s_test_service_us;
+#else
     s_now += 500u;
+#endif
     kage_vita_fullspeed_scheduler_note_manager_dispatch();
     kage_vita_fullspeed_scheduler_note_manager_entry(
         game->manager_pointer, game->manager_counter,
@@ -107,6 +133,11 @@ static int run_one_tick(
         s_now += render_us;
         kage_vita_fullspeed_scheduler_note_present();
         kage_vita_fullspeed_scheduler_note_render_return();
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+        if (result->present_time_count >= ORACLE_MAX_GAME_UPDATES * 2u)
+            return 0;
+        result->present_times[result->present_time_count++] = s_now;
+#endif
         if (game->wrapper_ticks_since_present >
                 result->maximum_wrapper_ticks_between_presents)
             result->maximum_wrapper_ticks_between_presents =
@@ -1032,6 +1063,201 @@ static int check_wait_failure_fail_open(void)
     return 1;
 }
 
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+static int prepare_advanced_head(OracleGame *game, ScenarioResult *result)
+{
+    memset(game, 0, sizeof *game);
+    memset(result, 0, sizeof *result);
+    game->manager_pointer = 0x10000000u;
+    game->game_pointer = 0x20000000u;
+    s_now = 0u;
+    s_delay_fail = s_test_backward_wait = 0u;
+    s_test_overshoot_us = s_test_variable_wake = s_test_waits = 0u;
+    s_test_service_us = 500u;
+    kage_vita_fullspeed_scheduler_reset();
+    CHECK(run_one_tick(game, 2500u, 500u, 5000u, 1u, result));
+    CHECK(run_one_tick(game, 2500u, 500u, 5000u, 1u, result));
+    return 1;
+}
+
+static int check_advanced_head_transitions(void)
+{
+    /* 0 active; 1 paused; 2..5 current identity misses; 6 rebase;
+     * 7 publication; 8 menu; 9 clock retreat before a successful floor wait.
+     * None of these baseline-permitted transitions becomes a new fault. */
+    for (uint32_t mode = 0u; mode < 10u; ++mode) {
+        OracleGame game;
+        ScenarioResult result;
+        KageVitaFullspeedSnapshot snap;
+        uint64_t before_floor, after_floor, next_head;
+        CHECK(prepare_advanced_head(&game, &result));
+        kage_vita_fullspeed_scheduler_note_loop_head();
+        CHECK(s_now >= 28833u && s_now <= 28834u);
+        kage_vita_fullspeed_scheduler_note_service();
+        s_now += 500u;
+        kage_vita_fullspeed_scheduler_note_manager_dispatch();
+        if (mode == 2u) game.manager_pointer += 16u;
+        if (mode == 3u) game.game_pointer += 16u;
+        if (mode == 4u) game.manager_counter += 2u;
+        if (mode == 5u) game.game_frame += 10u;
+        if (mode == 6u) ++game.manager_counter;
+        if (mode == 7u || mode == 8u) game.game_pointer = 0u;
+        kage_vita_fullspeed_scheduler_note_manager_entry(
+            game.manager_pointer, game.manager_counter, 1u,
+            game.game_pointer, game.game_frame);
+        if (mode == 6u) {
+            kage_vita_fullspeed_scheduler_note_manager_counter_rebase(
+                game.manager_pointer, game.manager_counter, game.manager_counter + 1u);
+            ++game.manager_counter;
+        }
+        if (mode == 7u) {
+            kage_vita_fullspeed_scheduler_note_game_pointer_publish(
+                game.manager_pointer, game.manager_counter, 0u, 0x30000000u);
+            game.game_pointer = 0x30000000u;
+        }
+        if (mode == 9u) s_now -= 1500u;
+        before_floor = after_floor = s_now;
+        if (game.game_pointer) {
+            kage_vita_fullspeed_scheduler_note_game_update_begin(
+                game.manager_counter, game.game_pointer, game.game_frame);
+            after_floor = s_now;
+            CHECK(after_floor >= result.game_update_times[0] + 33333u);
+            s_now += 2500u;
+            if (mode == 1u)
+                kage_vita_fullspeed_scheduler_note_game_update_early_return(
+                    KAGE_VITA_FULLSPEED_GAME_UPDATE_ZERO_FRAME_RETURN_RVA);
+            else ++game.game_frame;
+            kage_vita_fullspeed_scheduler_note_game_update_end(
+                game.game_pointer, game.game_frame);
+        }
+        ++game.manager_counter;
+        CHECK(kage_vita_fullspeed_scheduler_plan_render(
+            game.manager_pointer, game.manager_counter, 1u,
+            game.game_pointer, game.game_frame));
+        kage_vita_fullspeed_scheduler_note_render_entry();
+        kage_vita_fullspeed_scheduler_note_render_body(
+            game.manager_pointer, game.manager_counter, 1u);
+        s_now += 5000u;
+        kage_vita_fullspeed_scheduler_note_present();
+        kage_vita_fullspeed_scheduler_note_render_return();
+        kage_vita_fullspeed_scheduler_note_loop_head();
+        next_head = s_now;
+        if (mode == 0u || mode == 8u)
+            CHECK(next_head >= 50000u && next_head <= 50002u);
+        else
+            CHECK(next_head >= 50000u + after_floor - before_floor &&
+                  next_head <= 50002u + after_floor - before_floor);
+        kage_vita_fullspeed_scheduler_snapshot(&snap);
+        CHECK(snap.runtime_disables == 0u && snap.sequence_violations == 0u);
+        CHECK(snap.game_frame_violations == 0u && snap.game_pointer_violations == 0u);
+    }
+    return 1;
+}
+
+static int check_advanced_head_faults(void)
+{
+    OracleGame game;
+    ScenarioResult result;
+    KageVitaFullspeedSnapshot snap;
+    for (uint32_t mode = 0u; mode < 10u; ++mode) {
+        CHECK(prepare_advanced_head(&game, &result));
+        if (mode == 0u) s_delay_fail = 1u;
+        if (mode == 1u) s_test_backward_wait = 1u;
+        if (mode == 2u) s_now = 10u;
+        if (mode == 9u) s_now = UINT64_MAX / 3u + 1u;
+        kage_vita_fullspeed_scheduler_note_loop_head();
+        if (mode >= 3u && mode != 9u) {
+            kage_vita_fullspeed_scheduler_note_service();
+            if (mode == 8u) kage_vita_fullspeed_scheduler_note_service();
+            s_now += 500u;
+            kage_vita_fullspeed_scheduler_note_manager_dispatch();
+            kage_vita_fullspeed_scheduler_note_manager_entry(
+                game.manager_pointer, game.manager_counter, 1u,
+                game.game_pointer, game.game_frame);
+            if (mode == 3u) s_delay_fail = 1u;
+            if (mode == 4u) s_test_backward_wait = 1u;
+            kage_vita_fullspeed_scheduler_note_game_update_begin(
+                game.manager_counter, game.game_pointer, game.game_frame);
+            if (mode == 5u) s_now -= 1u;
+            if (mode == 6u) s_now = UINT64_MAX / 3u + 1u;
+            ++game.game_frame;
+            if (mode == 7u)
+                (void)kage_vita_fullspeed_scheduler_plan_render(
+                    game.manager_pointer, game.manager_counter + 1u, 1u,
+                    game.game_pointer, game.game_frame); /* lost return token */
+            else
+                kage_vita_fullspeed_scheduler_note_game_update_end(
+                    game.game_pointer, game.game_frame);
+        }
+        kage_vita_fullspeed_scheduler_snapshot(&snap);
+        if (mode == 0u || mode == 3u || mode >= 5u) {
+            CHECK(snap.runtime_disables == 1u);
+            CHECK(!kage_vita_fullspeed_scheduler_bypass_limiter());
+        } else {
+            CHECK(snap.clock_resets == 1u && snap.runtime_disables == 0u);
+        }
+        kage_vita_fullspeed_scheduler_deactivate();
+        CHECK(!kage_vita_fullspeed_scheduler_bypass_limiter());
+        s_now = 100u;
+        s_delay_fail = s_test_backward_wait = 0u;
+        kage_vita_fullspeed_scheduler_reset();
+        kage_vita_fullspeed_scheduler_note_loop_head();
+        CHECK(s_now == 100u);
+        kage_vita_fullspeed_scheduler_snapshot(&snap);
+        CHECK(snap.clock_resets == 0u && snap.runtime_disables == 0u);
+    }
+    return 1;
+}
+
+static int check_advanced_head_present_intervals(void)
+{
+    for (uint32_t pattern = 0u; pattern < 4u; ++pattern) {
+        for (uint32_t wake = 0u; wake < 3u; ++wake) {
+            OracleGame game;
+            ScenarioResult result;
+            KageVitaFullspeedSnapshot snap;
+            CHECK(prepare_advanced_head(&game, &result));
+            /* Start a fresh epoch with the same public callback sequence. */
+            game.manager_counter = game.game_frame = 0u;
+            memset(&result, 0, sizeof result);
+            s_now = 0u;
+            s_test_waits = 0u;
+            s_test_overshoot_us = wake == 0u ? 0u : wake == 1u ? 180u : 900u;
+            s_test_variable_wake = 1u;
+            kage_vita_fullspeed_scheduler_reset();
+            for (uint32_t tick = 0u; tick < 960u; ++tick) {
+                uint32_t full = (game.manager_counter & 1u) == 0u;
+                uint32_t index = game.manager_counter / 2u;
+                s_test_service_us = 300u;
+                if (full && pattern == 1u && (index & 1u)) s_test_service_us += 1000u;
+                if (full && pattern >= 2u && index % 16u == 15u)
+                    s_test_service_us += pattern == 2u ? 4000u : 30000u;
+                (void)run_one_tick(&game, 2200u, 300u, 9500u, 1u, &result);
+            }
+            kage_vita_fullspeed_scheduler_snapshot(&snap);
+            CHECK(snap.runtime_disables == 0u && snap.dropped_ticks == 0u);
+            CHECK(result.game_update_time_count == 480u);
+            for (uint32_t i = 1u; i < result.game_update_time_count; ++i) {
+                CHECK(result.game_update_times[i] - result.game_update_times[i - 1u] >= 30000u);
+                CHECK((uint64_t)i * KAGE_VITA_FULLSPEED_GAME_TICK_UNITS <=
+                      3u * (result.game_update_times[i] - result.game_update_times[0]));
+            }
+            if (pattern < 2u) {
+                CHECK(snap.presents == 960u && snap.render_skips == 0u);
+                for (uint32_t i = 241u; i < result.present_time_count; ++i) {
+                    uint64_t delta = result.present_times[i] - result.present_times[i - 1u];
+                    /* Reject the former 10.57/22.77-ms "60 FPS" grid policy. */
+                    CHECK(delta >= 14000u && delta <= 20000u);
+                }
+            }
+        }
+    }
+    s_test_service_us = 500u;
+    s_test_overshoot_us = s_test_variable_wake = s_test_waits = 0u;
+    return 1;
+}
+#endif
+
 int main(void)
 {
     if (!check_scenario(5000u, 1u) ||
@@ -1080,6 +1306,13 @@ int main(void)
             !check_game_pointer_hostile_cases() ||
             !check_wait_failure_fail_open())
         return 1;
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+    if (!check_advanced_head_transitions() || !check_advanced_head_faults() ||
+            !check_advanced_head_present_intervals())
+        return 1;
+    puts("Vita full-head advance: PASS (current identity/refusal, pause rollback, "
+         "head/floor wait and clock faults, deactivate/reset, actual Game/Present intervals)");
+#endif
     puts(
         "Vita cadence30 scheduler oracle: PASS "
         "(60-Hz monotonic wrapper; native 30-Hz Game parity; "

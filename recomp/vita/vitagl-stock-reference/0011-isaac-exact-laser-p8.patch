@@ -1,0 +1,229 @@
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -483,6 +483,10 @@
+ 	}
+ #endif
+ 	
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	if (tex_id && tex_id < TEXTURES_NUM)
++		isaacLaserP8Restore(&texture_slots[tex_id]);
++#endif
+ 	_glFramebufferTexture2D(fb, attachment, &texture_slots[tex_id], tex_id);
+ }
+ 
+@@ -499,6 +503,10 @@
+ 	}
+ #endif
+ 	
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	if (tex_id && tex_id < TEXTURES_NUM)
++		isaacLaserP8Restore(&texture_slots[tex_id]);
++#endif
+ 	_glFramebufferTexture2D(fb, attachment, &texture_slots[tex_id], tex_id);
+ }
+ 
+@@ -924,6 +932,9 @@
+ 	texture_unit *tex_unit = &texture_units[server_texture_unit];
+ 	int texture2d_idx = tex_unit->tex_id[0];
+ 	texture *tex = &texture_slots[texture2d_idx];
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaacLaserP8Restore(tex);
++#endif
+ 
+ 	switch (target) {
+ 	case GL_TEXTURE_2D: {
+diff --git a/source/textures.c b/source/textures.c
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -25,6 +25,9 @@
+ 
+ #ifdef HAVE_ISAAC_P8_SAFE_UPLOAD
+ #include "isaac_p8_texture_safety.h"
++#endif
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++#include "isaac_laser_p8.h"
+ #endif
+ 
+ #ifdef HAVE_UNPURE_TEXFORMATS
+@@ -86,6 +89,10 @@
+ int unpack_row_len = 0; // Current setting for GL_UNPACK_ROW_LENGTH
+ 
+ static inline __attribute__((always_inline)) void _glTexParameterx(texture *tex, GLenum target, GLenum pname, GLfixed param) {
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	if (target != GL_TEXTURE_2D) isaacLaserP8Restore(tex);
++	else isaac_laser_p8_parameter(tex, pname, param);
++#endif
+ 	switch (target) {
+ 	case GL_TEXTURE_CUBE_MAP:
+ 		switch (pname) {
+@@ -280,6 +287,10 @@
+ }
+ 
+ static inline __attribute__((always_inline)) void _glTexParameteri(texture *tex, GLenum target, GLenum pname, GLint param) {
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	if (target != GL_TEXTURE_2D) isaacLaserP8Restore(tex);
++	else isaac_laser_p8_parameter(tex, pname, param);
++#endif
+ 	switch (target) {
+ 	case GL_TEXTURE_CUBE_MAP:
+ 		switch (pname) {
+@@ -474,6 +485,9 @@
+ }
+ 
+ static inline __attribute__((always_inline)) void _glTexImage2D_CubeIMPL(texture *tex, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *data, int index) {
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaacLaserP8Restore(tex);
++#endif
+ 	SceGxmTextureFormat tex_format;
+ 	SceGxmTransferFormat src_format;
+ 	uint8_t data_bpp = 0;
+@@ -592,6 +606,9 @@
+ }
+ 
+ static inline __attribute__((always_inline)) void _glTexImage2D_FlatIMPL(texture *tex, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *data) {
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaacLaserP8Restore(tex);
++#endif
+ 	SceGxmTextureFormat tex_format;
+ 	uint8_t data_bpp = 0;
+ 	GLboolean fast_store = GL_FALSE;
+@@ -949,6 +966,9 @@
+ }
+ 
+ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaacLaserP8Restore(tex);
++#endif
+ #ifdef HAVE_ISAAC_P8_SAFE_UPLOAD
+ 	if (tex->status == TEX_VALID &&
+ 		vglGetTexFormat(&tex->gxm_tex) == SCE_GXM_TEXTURE_FORMAT_P8_ABGR) {
+@@ -1304,6 +1324,9 @@
+ 
+ void _glCompressedTexImage2D(texture *tex, GLenum target, GLint level, GLenum internalFormat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
+ 	THREAD_SAFE()
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaacLaserP8Restore(tex);
++#endif
+ 
+ #ifdef HAVE_ISAAC_P8_SAFE_UPLOAD
+ 	if (target == GL_TEXTURE_2D && level == 0 &&
+@@ -1809,6 +1832,11 @@
+ #endif
+ 
+ 	// Setting current in use texture id for the in use server texture unit
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	if (texture < TEXTURES_NUM &&
++		(target != GL_TEXTURE_2D || samplers[server_texture_unit]))
++		isaacLaserP8Restore(&texture_slots[texture]);
++#endif
+ 	switch (target) {
+ 	case GL_TEXTURE_2D:
+ 		texture_units[server_texture_unit].tex_id[0] = texture;
+@@ -1902,6 +1930,12 @@
+ 	int texture2d_idx;
+ 	resolve_tex_target(target, SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, target));
+ 	texture *tex = &texture_slots[texture2d_idx];
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	if (isaac_laser_p8_try_upload(tex, target, level, internalFormat,
++		width, height, border, format, type, data, unpack_row_len))
++		return;
++	isaacLaserP8Restore(tex);
++#endif
+ 
+ #ifndef SKIP_ERROR_HANDLING
+ 	// Checking if texture is too big for sceGxm
+@@ -1956,6 +1990,12 @@
+ 	THREAD_SAFE()
+ 
+ 	texture *tex = &texture_slots[tex_id];
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	if (isaac_laser_p8_try_upload(tex, GL_TEXTURE_2D, level, internalFormat,
++		width, height, border, format, type, data, unpack_row_len))
++		return;
++	isaacLaserP8Restore(tex);
++#endif
+ 	
+ #ifndef SKIP_ERROR_HANDLING
+ 	// Checking if texture is too big for sceGxm
+@@ -2209,6 +2249,9 @@
+ 	texture_unit *tex_unit = &texture_units[server_texture_unit];
+ 	int texture2d_idx = tex_unit->tex_id[0];
+ 	texture *tex = &texture_slots[texture2d_idx];
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaacLaserP8Restore(tex);
++#endif
+ 
+ #ifndef SKIP_ERROR_HANDLING
+ 	// Checking if current texture is valid
+@@ -2249,6 +2292,9 @@
+ 
+ 	// Setting some aliases to make code more readable
+ 	texture *tex = &texture_slots[target];
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaacLaserP8Restore(tex);
++#endif
+ 
+ #ifndef SKIP_ERROR_HANDLING
+ 	// Checking if current texture is valid
+@@ -2586,6 +2632,11 @@
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_VALUE, unit)
+ 	}
+ #endif
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	if (smp && unit < COMBINED_TEXTURE_IMAGE_UNITS_NUM &&
++		texture_units[unit].tex_id[0] < TEXTURES_NUM)
++		isaacLaserP8Restore(&texture_slots[texture_units[unit].tex_id[0]]);
++#endif
+ 	samplers[unit] = (sampler *)smp;
+ }
+ 
+@@ -2707,6 +2758,9 @@
+ 	int texture2d_idx;
+ 	resolve_tex_target(target, SET_GL_ERROR_WITH_RET(GL_INVALID_ENUM, NULL));
+ 	texture *tex = &texture_slots[texture2d_idx];
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaac_laser_p8_escape(tex);
++#endif
+ 
+ 	switch (target) {
+ 	case GL_TEXTURE_CUBE_MAP:
+@@ -2728,6 +2782,9 @@
+ 	int texture2d_idx;
+ 	resolve_tex_target(target, SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, target));
+ 	texture *tex = &texture_slots[texture2d_idx];
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaac_laser_p8_escape(tex);
++#endif
+ 
+ 	switch (target) {
+ 	case GL_TEXTURE_CUBE_MAP:
+@@ -2748,6 +2805,9 @@
+ 	int texture2d_idx;
+ 	resolve_tex_target(target, SET_GL_ERROR_WITH_RET(GL_INVALID_ENUM, NULL));
+ 	texture *tex = &texture_slots[texture2d_idx];
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaac_laser_p8_escape(tex);
++#endif
+ 
+ 	switch (target) {
+ 	case GL_TEXTURE_CUBE_MAP:
+diff --git a/source/utils/gpu_utils.h b/source/utils/gpu_utils.h
+--- a/source/utils/gpu_utils.h
++++ b/source/utils/gpu_utils.h
+@@ -151,7 +151,15 @@
+ void gpu_alloc_planar_texture(uint32_t w, uint32_t h, SceGxmTextureFormat format, const void *data, texture *tex);
+ 
+ // Dealloc a texture data
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++/* Private owned-atlas lifecycle, implemented in textures.c (0011). */
++void isaacLaserP8ReleaseBackup(texture *tex);
++void isaacLaserP8Restore(texture *tex);
++#endif
+ static inline __attribute__((always_inline)) void gpu_free_texture_data(texture *tex) {
++#ifdef HAVE_ISAAC_LASER_ATLAS_P8
++	isaacLaserP8ReleaseBackup(tex);
++#endif
+ 	// Deallocating texture
+ 	if (tex->data != NULL) {
+ #ifdef HAVE_TEX_CACHE

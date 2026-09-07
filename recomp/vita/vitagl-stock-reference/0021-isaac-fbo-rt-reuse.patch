@@ -1,0 +1,129 @@
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index 80724d6..1fc0fe9 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -209,6 +209,9 @@ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *
+ #endif
+ 	for (i = 0; i < BUFFERS_NUM; i++) {
+ 		if (!framebuffers[i].active) {
++#ifdef HAVE_ISAAC_FBO_RT_REUSE
++			isaacFboRtInvalidate((uintptr_t)&framebuffers[i]);
++#endif
+ 			ids[j++] = (GLuint)&framebuffers[i];
+ 			framebuffers[i].active = GL_TRUE;
+ 			framebuffers[i].depthbuffer_state = DEPTHBUFFER_MISSING;
+@@ -256,6 +259,9 @@ void glDeleteFramebuffers(GLsizei n, const GLuint *ids) {
+ 	while (n > 0) {
+ 		framebuffer *fb = (framebuffer *)ids[--n];
+ 		if (fb) {
++#ifdef HAVE_ISAAC_FBO_RT_REUSE
++			isaacFboRtInvalidate((uintptr_t)fb);
++#endif
+ 			// Check if the framebuffer is currently bound
+ 			if (fb == active_read_fb) {
+ 				active_read_fb = NULL;
+diff --git a/source/gxm.c b/source/gxm.c
+index 128933a..d6cc38d 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -614,6 +614,18 @@ int garbage_collector(unsigned int args, void *arg) {
+ 			} else
+ 				break;
+ 		}
++#ifdef HAVE_ISAAC_FBO_RT_REUSE
++		/* A held target keeps exactly its original purge bucket. It was
++		 * never inserted into frame_rt_purge_list and has one owner here. */
++		SceGxmRenderTarget *isaac_expired_rt =
++			(SceGxmRenderTarget *)isaacFboRtCollect(frame_purge_clean_idx);
++		if (isaac_expired_rt) {
++#ifdef HAVE_ISAAC_NATIVE_RESOURCE_PROFILE
++			isaacNativeResourceRetireRT(isaac_expired_rt);
++#endif
++			sceGxmDestroyRenderTarget(isaac_expired_rt);
++		}
++#endif
+ 		frame_purge_clean_idx = (frame_purge_clean_idx + 1) % FRAME_PURGE_FREQ;
+ 		frame_purge_idx = (frame_purge_idx + 1) % FRAME_PURGE_FREQ;
+ 		frame_elem_purge_idx = 0;
+@@ -983,6 +995,15 @@ void scene_reset(void) {
+ 				active_write_fb->target = (SceGxmRenderTarget *)get_free_render_target(active_write_fb->width, active_write_fb->height);
+ #else
+ 				int r = setup_render_target(&active_write_fb->target, active_write_fb->width, active_write_fb->height, ISAAC_FBO_RT_SCENES());
++#ifdef HAVE_ISAAC_FBO_RT_REUSE
++				/* Record only this successful eight-scene creation. The stock
++				 * one-scene fallback below deliberately remains uncacheable. */
++				isaacFboRtCreated((uintptr_t)active_write_fb,
++						r ? 0 : (uintptr_t)active_write_fb->target,
++						active_write_fb->width, active_write_fb->height,
++						!r && ISAAC_FBO_RT_SCENES() == 8 &&
++						msaa_mode == SCE_GXM_MULTISAMPLE_NONE);
++#endif
+ #ifdef HAVE_ISAAC_FBO_RT_SCENES
+ 				if (r && gxm_fbo_rt_size != 1) {
+ 					// Fail closed: a target sized for several scenes needs more driver memory; fall back to the stock single slot rather than leave the framebuffer without a rendertarget
+diff --git a/source/shared.h b/source/shared.h
+index fadded8..581443a 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1346,6 +1346,10 @@ static inline __attribute__((always_inline)) uint32_t get_color_from_texture(Sce
+ 	}
+ }
+ 
++#ifdef HAVE_ISAAC_FBO_RT_REUSE
++#include "isaac_fbo_rt_reuse.h"
++#endif
++
+ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(framebuffer *fb, GLenum attachment, texture *tex, GLuint tex_id) {
+ 	// Extracting texture data
+ 	int old_w = fb->width, old_h = fb->height;
+@@ -1369,6 +1373,9 @@ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(frameb
+ 
+ 		// Detaching attached texture if passed texture ID is 0
+ 		if (tex_id == 0) {
++#ifdef HAVE_ISAAC_FBO_RT_REUSE
++			isaacFboRtInvalidate((uintptr_t)fb);
++#endif
+ 			if (fb->target) {
+ 				mark_rt_as_dirty(fb->target);
+ 				fb->target = NULL;
+@@ -1376,9 +1383,23 @@ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(frameb
+ 			fb->tex = NULL;
+ 			return;
+ 		} else if (old_w != fb->width || old_h != fb->height) {
+-			if (fb->target) {
+-				mark_rt_as_dirty(fb->target);
+-				fb->target = NULL;
++			/* Only the native target may survive a compatible size round-trip.
++			 * Keep the original depth, texture and scene-reset path below. */
++#ifdef HAVE_ISAAC_FBO_RT_REUSE
++			uintptr_t isaac_next_rt = 0;
++			if (isaacFboRtSwitch((uintptr_t)fb, (uintptr_t)fb->target,
++					old_w, old_h, fb->width, fb->height,
++					msaa_mode == SCE_GXM_MULTISAMPLE_NONE &&
++					vglIsaacSetupFboRenderTargetScenes(0) == 8,
++					frame_purge_idx, &isaac_next_rt)) {
++				fb->target = (SceGxmRenderTarget *)isaac_next_rt;
++			} else
++#endif
++			{
++				if (fb->target) {
++					mark_rt_as_dirty(fb->target);
++					fb->target = NULL;
++				}
+ 			}
+ 			if (fb->depthbuffer_ptr) {
+ #ifndef DEPTH_STENCIL_HACK
+diff --git a/source/textures.c b/source/textures.c
+index 7e4e626..4ead4df 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -1878,6 +1878,9 @@ void glDeleteTextures(GLsizei n, const GLuint *gl_textures) {
+ 							fb = active_read_fb;
+ 						else if (active_write_fb && active_write_fb->tex == &texture_slots[i])
+ 							fb = active_write_fb;
++#ifdef HAVE_ISAAC_FBO_RT_REUSE
++						isaacFboRtInvalidate((uintptr_t)fb);
++#endif
+ 						if (fb) {
+ 							gpu_free_texture(&texture_slots[i]);
+ 							if (fb->depthbuffer_ptr) {

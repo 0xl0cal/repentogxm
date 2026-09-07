@@ -33,6 +33,7 @@ ISAAC_CRT_SEEK_SHADOW_TEST_OUT="$work/seek-shadow" \
 
 "$cc" $common_flags -DGUEST_IMAGE_BASE=0x98000000u \
     -DISAAC_VITA_ARCHIVE_FILE_CACHE=1 \
+    -DISAAC_VITA_CRT_DESCRIPTOR_RECOVER=1 \
     -DISAAC_VITA_CRT_FREAD_ORACLE=1 \
     -I"$root/runtime" -I"$root/vita" \
     "$root/runtime/guest_stack_legacy_oracle_stub.c" \

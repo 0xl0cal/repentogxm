@@ -13,6 +13,9 @@
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+#include "host_vita_png_outer_profile.h"
+#endif
 
 #if defined(ISAAC_KAGE_VITA_PNG_DECODE_PROFILE_ORACLE)
 int sceClibPrintf(const char *format, ...);
@@ -313,6 +316,9 @@ void kage_vita_png_profile_image_begin(void)
 {
     png_inc(&s_png.images_started);
     if (s_png.image_depth != 0u) {
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+        isaac_vita_png_outer_begin();
+#endif
         png_inc(&s_png.nested_images);
         png_bad();
         png_inc(&s_png.image_depth);
@@ -335,7 +341,15 @@ void kage_vita_png_profile_image_begin(void)
     if (s_image_timed != 0u) {
         png_calibrate_clock();
         s_image_started_at = png_region_begin();
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+        isaac_vita_png_outer_begin_at(s_image_started_at);
+#endif
     }
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+    else {
+        isaac_vita_png_outer_begin();
+    }
+#endif
 }
 
 static void png_abandon_inner_regions(void)
@@ -371,11 +385,17 @@ void kage_vita_png_profile_image_end(void)
     uint32_t elapsed = 0u;
 
     if (s_png.image_depth == 0u) {
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+        isaac_vita_png_outer_end();
+#endif
         png_inc(&s_png.mismatches);
         png_bad();
         return;
     }
     if (s_png.image_depth > 1u) {
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+        isaac_vita_png_outer_end();
+#endif
         --s_png.image_depth;
         png_inc(&s_png.mismatches);
         png_bad();
@@ -383,8 +403,22 @@ void kage_vita_png_profile_image_end(void)
     }
 
     png_abandon_inner_regions();
-    if (s_image_timed != 0u)
+    if (s_image_timed != 0u) {
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+        uint64_t now;
+        png_inc(&s_png.timed_regions_completed);
+        now = png_profile_clock();
+        elapsed = png_delta(s_image_started_at, now);
+        isaac_vita_png_outer_end_at(now);
+#else
         elapsed = png_region_end(s_image_started_at);
+#endif
+    }
+#if defined(ISAAC_VITA_PNG_WINDOW_PROFILE)
+    else {
+        isaac_vita_png_outer_end();
+    }
+#endif
     s_png.image_depth = 0u;
     png_inc(&s_png.images_completed);
     if (s_image_timed != 0u) {

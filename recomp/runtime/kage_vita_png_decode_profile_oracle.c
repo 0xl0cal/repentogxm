@@ -1,6 +1,11 @@
 /* Hostile deterministic oracle for the aligned whole-image PNG cohort. */
 #include "kage_vita_png_decode_profile.h"
+#if defined(ISAAC_PNG_OUTER_PROFILE_ORACLE)
+#include "host_vita_png_outer_profile.h"
+#include <setjmp.h>
+#endif
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,6 +27,7 @@ static uint32_t s_log_embedded_newlines;
 static size_t s_log_lengths[64];
 static char s_logs[32768];
 static size_t s_log_size;
+static int s_clock_errno;
 
 uint64_t sceKernelGetProcessTimeWide(void)
 {
@@ -29,6 +35,8 @@ uint64_t sceKernelGetProcessTimeWide(void)
 
     ++s_clock_calls;
     s_now += s_clock_step;
+    if (s_clock_errno)
+        errno = ERANGE;
     return result;
 }
 
@@ -61,6 +69,7 @@ int sceClibPrintf(const char *format, ...)
     return written;
 }
 
+#if !defined(ISAAC_PNG_OUTER_PROFILE_ORACLE)
 static KageVitaPngDecodeProfileSnapshot snapshot(void)
 {
     KageVitaPngDecodeProfileSnapshot result;
@@ -372,3 +381,171 @@ int main(void)
     puts("Vita PNG decode aligned cohort profiler oracle: PASS");
     return 0;
 }
+#else
+static IsaacVitaPngOuterSnapshot outer_snapshot(void)
+{
+    IsaacVitaPngOuterSnapshot value;
+    memset(&value, 0xa5, sizeof value);
+    isaac_vita_png_outer_snapshot(&value);
+    return value;
+}
+
+static void outer_reset(void)
+{
+    isaac_vita_png_outer_oracle_reset();
+#if defined(ISAAC_VITA_PNG_DECODE_PROFILE)
+    kage_vita_png_profile_reset();
+#endif
+    s_now = 1000u;
+    s_clock_step = 0u;
+    s_clock_calls = s_log_calls = 0u;
+    s_clock_errno = 0;
+    s_log_size = 0u;
+    memset(s_logs, 0, sizeof s_logs);
+}
+
+static int outer_hook_modes(void)
+{
+    IsaacVitaPngOuterSnapshot got;
+    uint32_t i;
+    outer_reset();
+    for (i = 0u; i < 64u; ++i) {
+        kage_vita_png_profile_image_begin();
+        s_now += 3u;
+        kage_vita_png_profile_image_end();
+    }
+    got = outer_snapshot();
+    CHECK(got.started == 64u && got.completed == 64u && got.timed == 64u);
+    CHECK(got.total_us == 192u && got.max_us == 3u);
+    CHECK(got.depth == 0u && got.nested == 0u && !got.bad_clock &&
+          !got.bad_sequence && !got.saturated);
+#if defined(ISAAC_VITA_PNG_DECODE_PROFILE)
+    {
+        KageVitaPngDecodeProfileSnapshot legacy;
+        CHECK(kage_vita_png_profile_snapshot_get(&legacy));
+        CHECK(legacy.image_samples == 2u &&
+              legacy.image_sample_raw_total_us == 6u);
+        CHECK(legacy.profile_clock_calls == 4u &&
+              legacy.calibration_clock_calls == 65u && !legacy.bad);
+        CHECK(s_clock_calls == 128u + 65u); /* shared, not 128 + 69 */
+        CHECK(s_log_calls != 0u); /* only the explicitly enabled old mode */
+    }
+#else
+    CHECK(s_clock_calls == 128u && s_log_calls == 0u);
+#endif
+    outer_reset();
+    kage_vita_png_profile_image_begin();
+    s_now += 1u;
+    kage_vita_png_profile_image_begin();
+    s_now += 2u;
+    kage_vita_png_profile_image_end();
+    s_now += 7u;
+    kage_vita_png_profile_image_end();
+    got = outer_snapshot();
+    CHECK(got.started == 1u && got.completed == 1u && got.timed == 1u &&
+          got.nested == 1u && got.depth == 0u && got.total_us == 10u);
+#if defined(ISAAC_VITA_PNG_DECODE_PROFILE)
+    CHECK(s_clock_calls == 67u); /* old mode still rejects nested cohort */
+    outer_reset();
+    kage_vita_png_profile_image_begin();
+    kage_vita_png_profile_row_begin(16u, 32u, 4u);
+    s_now += 20u;
+    /* ImagePng's error return skips a row-end hook but not the outer end. */
+    kage_vita_png_profile_image_end();
+    got = outer_snapshot();
+    CHECK(got.completed == 1u && got.timed == 1u && got.total_us == 20u &&
+          got.depth == 0u && !got.bad_sequence && s_clock_calls == 68u);
+#else
+    CHECK(s_clock_calls == 2u && s_log_calls == 0u);
+#endif
+    return 0;
+}
+
+static int outer_scope_edges(void)
+{
+    IsaacVitaPngOuterSnapshot got, before;
+    jmp_buf png_error;
+    outer_reset();
+    s_clock_errno = 1;
+    errno = EDOM;
+    isaac_vita_png_outer_begin();
+    CHECK(errno == EDOM && s_clock_calls == 1u);
+    s_now += 2u;
+    isaac_vita_png_outer_begin();
+    s_now += 3u;
+    before = outer_snapshot();
+    CHECK(before.depth == 2u && before.nested == 1u && before.total_us == 0u);
+    isaac_vita_png_outer_end();
+    s_now += 5u;
+    isaac_vita_png_outer_end();
+    got = outer_snapshot();
+    CHECK(got.started == 1u && got.completed == 1u && got.timed == 1u);
+    CHECK(got.total_us == 10u && got.max_us == 10u && got.depth == 0u);
+    CHECK(s_clock_calls == 2u && errno == EDOM);
+    isaac_vita_png_outer_snapshot(NULL);
+    CHECK(s_clock_calls == 2u && s_log_calls == 0u);
+    isaac_vita_png_outer_end();
+    CHECK(outer_snapshot().bad_sequence == 1u && s_clock_calls == 2u);
+
+    /* The guest's png setjmp returns inside ImagePng; its caller's outer end
+     * still executes. Exercise the same closure, not a per-row finally hook. */
+    isaac_vita_png_outer_begin();
+    if (setjmp(png_error) == 0) {
+        s_now += 19u;
+        longjmp(png_error, 1);
+    }
+    isaac_vita_png_outer_end();
+    got = outer_snapshot();
+    CHECK(got.completed == 2u && got.timed == 2u && got.total_us == 29u &&
+          got.max_us == 19u && got.depth == 0u && s_clock_calls == 4u);
+
+    isaac_vita_png_outer_begin();
+    s_now -= 1u;
+    isaac_vita_png_outer_end();
+    got = outer_snapshot();
+    CHECK(got.completed == 3u && got.timed == 2u && got.bad_clock == 1u &&
+          got.total_us == 29u && got.depth == 0u && s_clock_calls == 6u);
+    isaac_vita_png_outer_begin();
+    isaac_vita_png_outer_end();
+    got = outer_snapshot();
+    CHECK(got.completed == 4u && got.timed == 3u && got.total_us == 29u);
+    return 0;
+}
+
+static int outer_saturation(void)
+{
+    IsaacVitaPngOuterSnapshot seed = {0}, got;
+    outer_reset();
+    seed.started = seed.completed = seed.timed = UINT32_MAX;
+    seed.total_us = UINT64_MAX - 1u;
+    isaac_vita_png_outer_oracle_seed(&seed);
+    isaac_vita_png_outer_begin();
+    s_now += 2u;
+    isaac_vita_png_outer_end();
+    got = outer_snapshot();
+    CHECK(got.started == UINT32_MAX && got.completed == UINT32_MAX &&
+          got.timed == UINT32_MAX && got.total_us == UINT64_MAX &&
+          got.saturated == 1u && got.depth == 0u);
+    outer_reset();
+    memset(&seed, 0, sizeof seed);
+    seed.depth = UINT32_MAX;
+    isaac_vita_png_outer_oracle_seed(&seed);
+    isaac_vita_png_outer_begin();
+    isaac_vita_png_outer_end();
+    got = outer_snapshot();
+    CHECK(got.depth == UINT32_MAX && got.nested == 1u &&
+          got.bad_sequence == 1u && got.saturated == 1u);
+    CHECK(got.completed == 0u && s_clock_calls == 0u);
+    return 0;
+}
+
+int main(void)
+{
+    CHECK(ISAAC_VITA_PNG_OUTER_PROFILE_ABI == 1u);
+    CHECK(outer_hook_modes() == 0);
+    CHECK(outer_scope_edges() == 0);
+    CHECK(outer_saturation() == 0);
+    puts("Vita PNG every-image outer attribution oracle: PASS");
+    return 0;
+}
+#endif

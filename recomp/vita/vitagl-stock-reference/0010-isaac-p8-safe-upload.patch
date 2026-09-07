@@ -1,0 +1,50 @@
+diff --git a/source/textures.c b/source/textures.c
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -23,6 +23,10 @@
+ 
+ #include "shared.h"
+ 
++#ifdef HAVE_ISAAC_P8_SAFE_UPLOAD
++#include "isaac_p8_texture_safety.h"
++#endif
++
+ #ifdef HAVE_UNPURE_TEXFORMATS
+ #define resolve_tex_target(target, unresolved_action) \
+ 	switch (target) { \
+@@ -947,4 +951,16 @@
+ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
++#ifdef HAVE_ISAAC_P8_SAFE_UPLOAD
++	if (tex->status == TEX_VALID &&
++		vglGetTexFormat(&tex->gxm_tex) == SCE_GXM_TEXTURE_FORMAT_P8_ABGR) {
++		GLenum error = isaac_p8_promote_rgba_subimage(tex, target, level,
++			xoffset, yoffset, width, height, format, type, pixels, unpack_row_len);
++		if (error != GL_NO_ERROR) {
++			SET_GL_ERROR(error)
++		}
++		return;
++	}
++#endif
++
+ #ifdef HAVE_UNPURE_TEXTURES
+ 	level -= tex->mip_start;
+ #endif
+@@ -1289,6 +1305,18 @@
+ void _glCompressedTexImage2D(texture *tex, GLenum target, GLint level, GLenum internalFormat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
+ 	THREAD_SAFE()
+ 
++#ifdef HAVE_ISAAC_P8_SAFE_UPLOAD
++	if (target == GL_TEXTURE_2D && level == 0 &&
++		internalFormat == GL_PALETTE8_RGBA8_OES) {
++		GLenum error = isaac_p8_image_level0(tex, width, height,
++			border, imageSize, data);
++		if (error != GL_NO_ERROR) {
++			SET_GL_ERROR(error)
++		}
++		return;
++	}
++#endif
++
+ #ifdef HAVE_UNPURE_TEXTURES
+ 	if (tex->mip_start < 0)
+ 		tex->mip_start = level;

@@ -11,6 +11,8 @@ $work = if ($env:ISAAC_RBO_HOST_OUT) {
     Join-Path $env:TEMP 'isaac-rbo-oracle-x86'
 }
 New-Item -ItemType Directory -Path $work -Force | Out-Null
+& python (Join-Path $PSScriptRoot 'test_vita_attrib_boundaries.py') --output $work
+if ($LASTEXITCODE -ne 0) { throw 'Fresh attribute owner extraction failed' }
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere)) {
@@ -47,18 +49,34 @@ foreach ($name in @(
     'glBlendFunc', 'glBlendFunci', 'glBlendFuncSeparatei',
     'glBindBuffer', 'glBindVertexArray',
     'glViewportArrayv', 'glViewportIndexedf', 'glViewportIndexedfv',
-    'glPushAttrib', 'glPopAttrib')) {
+    'glPushAttrib', 'glPopAttrib',
+    # ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO and the shim location cache
+    # rely on every attribute-location mutator bumping the generation;
+    # glBindAttribLocation would move locations without one.
+    'glBindAttribLocation')) {
     if ($surface.Contains('"' + $name + '"')) {
         throw "GL backend surface gained an unmodelled mutator: $name"
     }
 }
 $outputs = @()
-foreach ($mode in @(
+$modes = @(
     'off', 'on', 'typed-no-profile', 'typed', 'typed720',
     'redundancy', 'typed-redundancy', 'typed-bundle', 'coloroffset',
     'canonical', 'fxray', 'texture', 'texture-fxray', 'fbo', 'fbo720',
-    'prod-elision', 'prod-loc', 'prod-loc-verify',
-    'prod-elision-loc-verify')) {
+    'prod-elision', 'prod-elision-drop', 'prod-loc', 'prod-loc-verify',
+    'prod-elision-loc-verify', 'prod-fill', 'prod-elision-drop-fill',
+    'coalesce', 'coalesce-profile', 'coalesce-canonical',
+    'coalesce-wrapper-time', 'coalesce-memo',
+    'direct-plain', 'typed-direct', 'coalesce-direct', 'coalesce-direct-loc',
+    'coalesce-direct-fill')
+if ($env:ISAAC_RBO_HOST_MODES) {
+    foreach ($requested in $env:ISAAC_RBO_HOST_MODES.Split(',')) {
+        if ($requested -notin $modes) { throw "Unknown host mode: $requested" }
+    }
+}
+foreach ($mode in $modes) {
+    if ($env:ISAAC_RBO_HOST_MODES -and
+        $mode -notin $env:ISAAC_RBO_HOST_MODES.Split(',')) { continue }
     $modeWork = Join-Path $work $mode
     New-Item -ItemType Directory -Path $modeWork -Force | Out-Null
     $output = Join-Path $modeWork 'gl-vita-rbo-oracle.exe'
@@ -141,9 +159,26 @@ foreach ($mode in @(
     } else {
         ''
     }
+    # prod-fill / prod-elision-drop-fill: the GL fill census with its
+    # one-frame draw dump (ph120.fa/fp shadows, pass model, kpx arithmetic)
+    # alone and on top of the depth-drop elision, whose absorbed clears the
+    # census must not count.
+    $fillDefine = if (
+            $mode -eq 'prod-fill' -or $mode -eq 'prod-elision-drop-fill') {
+        '/DISAAC_VITA_GL_FILL_CENSUS=1 ' +
+        '/DISAAC_VITA_GL_FILL_CENSUS_DUMP=1 '
+    } else {
+        ''
+    }
     $elisionDefine = if (
             $mode -eq 'prod-elision' -or $mode -eq 'prod-elision-loc-verify') {
         '/DISAAC_VITA_FBO_CLEAR_ELISION=1 '
+    } elseif ($mode -eq 'prod-elision-drop' -or
+            $mode -eq 'prod-elision-drop-fill') {
+        # Depth-drop sub-mode: colour clears native, owed depth clear dropped
+        # at the owing FBO's colour re-attach (ph120.e a/d counters).
+        '/DISAAC_VITA_FBO_CLEAR_ELISION=1 ' +
+        '/DISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP=1 '
     } else {
         ''
     }
@@ -160,6 +195,36 @@ foreach ($mode in @(
     } else {
         ''
     }
+    $coalesceDefine = if ($mode -like 'coalesce*') {
+        '/DISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE=1 /DISAAC_VITA_GL_TYPED_STATE_CACHE=1 ' +
+        '/DISAAC_VITA_GL_SHIM_FASTDISPATCH=1 /DISAAC_VITA_SHADER_ATTRIB_FASTPATH=1 ' +
+        $(if ($mode -ne 'coalesce') { '/DISAAC_VITA_PHASE_PROFILE=1 ' } else { '' }) +
+        $(if ($mode -eq 'coalesce-canonical') { '/DISAAC_VITA_CANONICAL_QUAD_ZERO_COPY=1 ' } else { '' }) +
+        # coalesce-wrapper-time: ISAAC_VITA_GL_WRAPPER_TIME on top of the GL
+        # time profile (gl_bridge.c owns the profile; gl_vita_backend.c runs
+        # the ph120.gd draw split whose gl part must equal the gt draw bracket).
+        $(if ($mode -eq 'coalesce-wrapper-time') { '/DISAAC_VITA_GL_TIME_PROFILE=1 /DISAAC_VITA_GL_WRAPPER_TIME=1 ' } else { '' }) +
+        # coalesce-memo: ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO (+VERIFY) on
+        # the backend side only - the generation word the replay memo is
+        # keyed on and its bump sites (the replay TU itself is proven by
+        # recomp/test_vita_shader_attrib_fastpath.py).
+        $(if ($mode -eq 'coalesce-memo') { '/DISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO=1 /DISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY=1 ' } else { '' })
+    } else { '' }
+    # *direct*: ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE, the one-call batch the
+    # attrib replays hand their attribute set to.  The oracle drives the same
+    # scripted replays through the per-call wrappers and the batch and
+    # compares the fake-vitaGL call trace, the typed-state shadow, the
+    # coalescer's pending count and every phase counter: without the typed
+    # state cache (direct-plain), with it (typed-direct), with the coalescer
+    # (coalesce-direct), plus the shim location cache answering the batch's
+    # lookups (-loc) and the fill census shadows (-fill).
+    $directDefine = if ($mode -like '*direct*') {
+        '/DISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=1 ' +
+        '/DISAAC_VITA_GL_SHIM_FASTDISPATCH=1 /DISAAC_VITA_SHADER_ATTRIB_FASTPATH=1 ' +
+        $(if ($mode -eq 'typed-direct') { '/DISAAC_VITA_GL_TYPED_STATE_CACHE=1 /DISAAC_VITA_PHASE_PROFILE=1 ' } else { '' }) +
+        $(if ($mode -eq 'coalesce-direct-loc') { '/DISAAC_VITA_GL_LOCATION_CACHE=1 ' } else { '' }) +
+        $(if ($mode -eq 'coalesce-direct-fill') { '/DISAAC_VITA_GL_FILL_CENSUS=1 ' } else { '' })
+    } else { '' }
     $command = '"' + $developerShell + '" -arch=x86 -host_arch=x64 >nul && ' +
         'cl /nologo /std:c11 /O2 /W4 /WX /wd4310 ' +
         '/D_CRT_SECURE_NO_WARNINGS /DISAAC_GL_VITA_BACKEND_ORACLE=1 ' +
@@ -167,7 +232,9 @@ foreach ($mode in @(
         $typedDefine +
         $coloroffsetDefine + $canonicalDefine + $fxrayDefine +
         $textureDefine + $fboDefine +
-        $prodDefine + $elisionDefine + $locationDefine + $verifyDefine +
+        $prodDefine + $elisionDefine + $locationDefine + $verifyDefine + $coalesceDefine +
+        $fillDefine + $directDefine +
+        '/I"' + $work + '" ' +
         '/DGUEST_IMAGE_BASE=0x98000000u /I"' + $runtime + '" ' +
         '"' + (Join-Path $runtime 'gl_bridge.c') + '" ' +
         '"' + (Join-Path $runtime 'gl_vita_backend.c') + '" ' +

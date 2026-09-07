@@ -5,6 +5,8 @@
 
 enum {
     ISAAC_VITA_ARCHIVE_MINIZ_STATE_BYTES = 0x2af0U,
+    /* All coroutine scalar fields precede the first Huffman table. */
+    ISAAC_VITA_ARCHIVE_MINIZ_HEADER_BYTES = 0x40U,
     ISAAC_VITA_ARCHIVE_MINIZ_INPUT_MAX = 0x7ffU,
     ISAAC_VITA_ARCHIVE_MINIZ_OUTPUT_BYTES = 0x400U
 };

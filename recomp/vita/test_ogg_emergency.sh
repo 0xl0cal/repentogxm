@@ -42,6 +42,22 @@ common="-std=gnu11 -O2 -Wall -Wextra -Werror -Wno-maybe-uninitialized \
     -o "$work/ogg-emergency-host-oracle"
 "$work/ogg-emergency-host-oracle"
 
+# Reuse the same host routing fixture for the opt-in second owner. The default
+# build above still proves Queue is excluded and keeps its old object policy.
+"$host_cc" $common -DISAAC_VITA_OGG_EMERGENCY_ORACLE=1 \
+    -DISAAC_VITA_OGG_QUEUE_EMERGENCY=1 -I"$fake_include" \
+    -c "$root/runtime/host_vita_ogg_emergency.c" \
+    -o "$work/ogg-emergency.queue.state.o"
+"$host_cc" $common -DISAAC_VITA_OGG_EMERGENCY_ORACLE=1 \
+    -DISAAC_VITA_OGG_QUEUE_EMERGENCY=1 -I"$fake_include" \
+    -c "$root/runtime/host_vita_ogg_emergency_oracle.c" \
+    -o "$work/ogg-emergency.queue.oracle.o"
+"$host_cc" -pthread -Wl,--gc-sections \
+    "$work/host-vita-heap.ogg-routing.o" "$work/guest.ogg-routing.o" \
+    "$work/ogg-emergency.queue.state.o" "$work/ogg-emergency.queue.oracle.o" \
+    -o "$work/ogg-emergency-queue-host-oracle"
+"$work/ogg-emergency-queue-host-oracle"
+
 "$host_nm" -u "$work/host-vita-heap.ogg-routing.o" \
     > "$work/host-vita-heap.ogg-routing.undefined"
 for symbol in isaac_vita_ogg_emergency_malloc \
@@ -55,6 +71,15 @@ do
         exit 3
     fi
 done
+# The slot free path must reach the router's weak vorbis observer (the
+# heap_routing_oracle above asserts exactly one call per accepted slot free
+# and none for rejected frees); the routing object references it weakly.
+if ! grep -Eq "[[:space:]]w[[:space:]]+isaac_nv_guest_buffer_freed$" \
+        "$work/host-vita-heap.ogg-routing.undefined"; then
+    cat "$work/host-vita-heap.ogg-routing.undefined" >&2
+    echo "heap routing object lost the weak vorbis free observer" >&2
+    exit 3
+fi
 
 pe_contract=SKIP
 if [ -n "${ISAAC_OGG_PE_PATH:-}" ]; then
