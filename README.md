@@ -27,6 +27,7 @@ mod. Output is the Vita's native 960x544. Game logic runs at its normal 30
 updates per second; the port presents up to 60 frames per second.
 
 [Video of v0.1.0-alpha](https://www.youtube.com/watch?v=R6Imi5NVfwI) (at first lags cause of EID warning, sorry)
+[Video of v0.1.1-alpha and v0.1.0-alpha in same rooms](https://www.youtube.com/watch?v=1u4kBMvUUZI)
 
 The current release is v0.1.1-alpha (2026-09-07);
 [release/RELEASE_NOTES.md](release/RELEASE_NOTES.md) lists what changed.
