@@ -10,6 +10,7 @@ import pathlib
 import re
 import struct
 
+from gpr_flush_mask import legacy_text as unmask_flushes
 from gpr_locals import legacy_text
 
 from test_ogg_emergency_contract import (
@@ -227,8 +228,11 @@ def verify_generated(
             try:
                 # Register/stack spelling and the GPR sync lines are the
                 # contract of test_flags_local_corpus_contract.py; the frozen
-                # statements here are pinned in the pre-token spelling.
-                guest_units[name] = legacy_text(normalized.decode("ascii"))
+                # statements here are pinned in the pre-token spelling.  A
+                # GUEST_GPR_FLUSH_MASK=1 corpus spells some FLUSH lines as
+                # masks; each is read as the FLUSH it replaces first.
+                guest_units[name] = legacy_text(
+                    unmask_flushes(normalized.decode("ascii")))
             except UnicodeDecodeError as error:
                 fail(f"{name} is not ASCII: {error}")
     if verified_outputs != sorted(

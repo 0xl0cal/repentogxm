@@ -391,10 +391,18 @@ static CPU invoke(const char *name, const uint32_t *arguments,
                      UINT32_C(0x12345678));
 }
 
+#ifdef ISAAC_VITA_AUDIO_REFILL_HOOKS
+/* alSourcePlay calls seen by the fake OpenAL (guest and shield). */
+static unsigned s_play_calls;
+#endif
+
 void alSourcePlay(ALuint source)
 {
     s_capture.operation = OP_SOURCE_PLAY;
     s_capture.u[0] = source;
+#ifdef ISAAC_VITA_AUDIO_REFILL_HOOKS
+    ++s_play_calls;
+#endif
 }
 
 #ifdef ISAAC_VITA_AUDIO_REFILL_HOOKS
@@ -403,7 +411,10 @@ void alSourcePlay(ALuint source)
 static uint64_t s_refill_now_us;
 static int32_t s_mock_processed;
 static int32_t s_mock_queued;
-#ifdef ISAAC_VITA_AUDIO_REFILL_REPLAYS
+#if defined(ISAAC_VITA_AUDIO_REFILL_REPLAYS) || \
+    defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD) || \
+    defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+#define ORACLE_MOCK_SOURCE_STATE 1
 static int32_t s_mock_state;
 #endif
 
@@ -425,8 +436,9 @@ void alGetSourcei(ALuint source, ALenum parameter, ALint *value)
         *value = s_mock_processed;
     else if (parameter == ISAAC_VITA_AUDIO_AL_BUFFERS_QUEUED)
         *value = s_mock_queued;
-#ifdef ISAAC_VITA_AUDIO_REFILL_REPLAYS
-    /* the replay test sets a real AL state; 0 keeps the generic -73 probe */
+#ifdef ORACLE_MOCK_SOURCE_STATE
+    /* the replay/shield/drop tests set a real AL state; 0 keeps the generic
+     * -73 probe */
     else if (parameter == ISAAC_VITA_AUDIO_AL_SOURCE_STATE && s_mock_state)
         *value = s_mock_state;
 #endif
@@ -1858,6 +1870,450 @@ static void test_refill_hooks_through_adapters(void)
     }
 #endif
 }
+
+#if defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD) || \
+    defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+#define SHIELD_LIST_OFFSET   (AUX_OFFSET + 0x000U)
+#define SHIELD_STREAM_OFFSET (AUX_OFFSET + 0x040U)
+#define SHIELD_OTHER_OFFSET  (AUX_OFFSET + 0x100U)
+#define SHIELD_NAMES_OFFSET  (AUX_OFFSET + 0x200U)
+#define SHIELD_OWNER_OFFSET  (AUX_OFFSET + 0x400U)
+#define SHIELD_STREAM_SOURCE 66U
+
+/* A live manager owner (the shield and the drop receipt read the active
+ * list / AL context of the owner) whose active list holds one foreign
+ * object and one StreamSourceOgg on source 66, looping, not at eof. */
+static uint32_t shield_open_manager(void)
+{
+    uint32_t manager = s_base + MANAGER_OFFSET;
+    uint32_t list = s_base + SHIELD_LIST_OFFSET;
+    uint32_t stream = s_base + SHIELD_STREAM_OFFSET;
+    uint32_t other = s_base + SHIELD_OTHER_OFFSET;
+    uint32_t al_error = UINT32_MAX;
+
+    memset((void *)(uintptr_t)manager, 0, 0x344U);
+    memset(&s_manager_capture, 0, sizeof s_manager_capture);
+    s_mock_al_error = AL_NO_ERROR;
+    CHECK(isaac_vita_audio_manager_initialize(manager, &al_error) ==
+              ISAAC_VITA_AUDIO_MANAGER_OK,
+          "shield oracle could not open the manager owner");
+    memset((void *)(uintptr_t)other, 0, 0x100U);
+    st32(other, UINT32_C(0x27001234));
+    memset((void *)(uintptr_t)stream, 0, 0xa0U);
+    st32(stream, (uint32_t)GUEST_IMAGE_BASE + ISAAC_VITA_AUDIO_OGG_VTABLE_RVA);
+    st32(stream + ISAAC_VITA_AUDIO_OGG_SOURCE_OFFSET, SHIELD_STREAM_SOURCE);
+    st8(stream + ISAAC_VITA_AUDIO_OGG_STOPPED_OFFSET, 1U);
+    st8(stream + ISAAC_VITA_AUDIO_OGG_LOOP_OFFSET, 1U);
+    st32(list, other);
+    st32(list + 4U, stream);
+    st32(manager + ISAAC_VITA_AUDIO_MANAGER_ACTIVE_BEGIN_OFFSET, list);
+    st32(manager + ISAAC_VITA_AUDIO_MANAGER_ACTIVE_END_OFFSET, list + 8U);
+    return manager;
+}
+
+/* One stream refill on the source: alSourceQueueBuffers returning to the
+ * QueueData site with the source in the mocked state after the queue. */
+static void shield_stream_queue(uint32_t source, unsigned *calls)
+{
+    uint32_t args[3];
+
+    args[0] = source;
+    args[1] = 1U;
+    args[2] = s_base + SHIELD_NAMES_OFFSET;
+    (void)invoke_at(ISAAC_VITA_AUDIO_SOURCE_QUEUE_BUFFERS_NAME, args, 3U,
+                    calls, ISAAC_VITA_AUDIO_STREAM_QUEUE_RETURN);
+}
+#endif
+
+#ifdef ISAAC_VITA_AUDIO_STARVATION_SHIELD
+/* The IsPlaying query as the frozen body issues it: alGetSourcei(source,
+ * AL_SOURCE_STATE, &local) with the bare return marker 0x5be808; returns
+ * the state the guest reads back. */
+static int32_t shield_probe(uint32_t source, uint32_t parameter,
+                            uint32_t return_address, unsigned *calls)
+{
+    uint32_t args[3];
+    uint32_t local = s_base + DATA_OFFSET;
+
+    args[0] = source;
+    args[1] = parameter;
+    args[2] = local;
+    st32(local, 0U);
+    (void)invoke_at(ISAAC_VITA_AUDIO_GET_SOURCE_I_NAME, args, 3U, calls,
+                    return_address);
+    return (int32_t)ld32(local);
+}
+
+/* ISAAC_VITA_AUDIO_STARVATION_SHIELD decision table through the real
+ * alGetSourcei adapter. */
+static void test_starvation_shield_through_adapters(void)
+{
+    unsigned calls = 0U;
+    uint32_t args[3];
+    uint32_t manager = shield_open_manager();
+    uint32_t stream = s_base + SHIELD_STREAM_OFFSET;
+    uint32_t list = s_base + SHIELD_LIST_OFFSET;
+    const uint32_t site = ISAAC_VITA_AUDIO_STREAM_IS_PLAYING_RETURN;
+    const uint32_t based = (uint32_t)GUEST_IMAGE_BASE + site;
+    const uint32_t foreign = UINT32_C(0x12345678);
+    const uint32_t src = SHIELD_STREAM_SOURCE;
+    unsigned log_before;
+    unsigned plays_before;
+    unsigned events;
+    unsigned expected_logs;
+
+    s_refill_now_us = UINT64_C(7000000);
+    s_mock_state = ISAAC_VITA_AUDIO_AL_STOPPED;
+    s_mock_queued = 4;
+    s_mock_processed = 4;
+
+    /* 1. a live OGG object owns the source, but the source never refilled
+     * from the stream site: not registered, truthful AL_STOPPED. */
+    log_before = s_audio_log_calls;
+    plays_before = s_play_calls;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_STOPPED &&
+              s_play_calls == plays_before &&
+              s_audio_log_calls == log_before,
+          "unregistered stream source was shielded");
+
+    /* register it: one refill, the source found AL_STOPPED after the queue
+     * (the buffer is fresh: queued into a stopped source, never played) */
+    shield_stream_queue(src, &calls);
+
+    /* EOF wins even over fresh PCM bookkeeping. A real non-looping end
+     * must neither restart nor consume the pending shield replay. */
+    st8(stream + ISAAC_VITA_AUDIO_OGG_LOOP_OFFSET, 0U);
+    st8(stream + ISAAC_VITA_AUDIO_OGG_EOF_OFFSET, 1U);
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_STOPPED &&
+              s_play_calls == plays_before &&
+              s_audio_log_calls == log_before,
+          "non-looping EOF with fresh bookkeeping was shielded");
+    st8(stream + ISAAC_VITA_AUDIO_OGG_EOF_OFFSET, 0U);
+    st8(stream + ISAAC_VITA_AUDIO_OGG_LOOP_OFFSET, 1U);
+
+    /* 2. registered + AL_STOPPED + fresh buffer: the shield replays the
+     * source (alSourcePlay 66 is the last AL call) and answers AL_PLAYING;
+     * receipt n=1 replays=1. */
+    log_before = s_audio_log_calls;
+    plays_before = s_play_calls;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_PLAYING,
+          "stopped stream with a fresh buffer was not answered AL_PLAYING");
+    CHECK(s_play_calls == plays_before + 1U &&
+              s_capture.operation == OP_SOURCE_PLAY &&
+              s_capture.u[0] == src,
+          "shield did not alSourcePlay the stopped stream with fresh PCM");
+    CHECK(s_audio_log_calls == log_before + 1U &&
+              strcmp(s_last_audio_log,
+                     "KAGE VITA AUDIO SHIELD: n=1 replays=1 starved=0 src=66 "
+                     "queued=4 processed=4") == 0,
+          "first shield receipt drifted");
+    events = 1U;
+
+    /* 3. registered + AL_STOPPED + nothing fresh: AL_PLAYING, no play. */
+    plays_before = s_play_calls;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_PLAYING &&
+              s_play_calls == plays_before,
+          "starved stream was not answered AL_PLAYING without a play");
+    CHECK(s_audio_log_calls == log_before + 2U &&
+              strcmp(s_last_audio_log,
+                     "KAGE VITA AUDIO SHIELD: n=2 replays=1 starved=1 src=66 "
+                     "queued=4 processed=4") == 0,
+          "starved shield receipt drifted");
+    ++events;
+
+    /* 4. eof: a non-looping track that really ended passes through. */
+    st8(stream + ISAAC_VITA_AUDIO_OGG_EOF_OFFSET, 1U);
+    log_before = s_audio_log_calls;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_STOPPED &&
+              s_play_calls == plays_before &&
+              s_audio_log_calls == log_before,
+          "stream at eof was shielded");
+    st8(stream + ISAAC_VITA_AUDIO_OGG_EOF_OFFSET, 0U);
+
+    /* 5. another parameter at the IsPlaying site passes through (and the
+     * pacer does not claim AL_BUFFERS_PROCESSED from this site either). */
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_BUFFERS_QUEUED, site, &calls)
+              == 4 &&
+              shield_probe(src, ISAAC_VITA_AUDIO_AL_BUFFERS_PROCESSED, site,
+                           &calls) == 4 &&
+              s_play_calls == plays_before &&
+              s_audio_log_calls == log_before,
+          "another alGetSourcei parameter at the IsPlaying site was touched");
+
+    /* 6. another return site passes through; the based marker of the same
+     * site is still the site. */
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, foreign, &calls)
+              == ISAAC_VITA_AUDIO_AL_STOPPED &&
+              s_play_calls == plays_before &&
+              s_audio_log_calls == log_before,
+          "AL_SOURCE_STATE from a foreign return site was shielded");
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, based, &calls)
+              == ISAAC_VITA_AUDIO_AL_PLAYING &&
+              s_play_calls == plays_before,
+          "GUEST_IMAGE_BASE + RVA IsPlaying marker was not recognised");
+    ++events;
+
+    /* 7. a state other than AL_STOPPED is never touched. */
+    s_mock_state = ISAAC_VITA_AUDIO_AL_INITIAL;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_INITIAL &&
+              s_play_calls == plays_before,
+          "a fresh AL_INITIAL stream was shielded");
+    s_mock_state = ISAAC_VITA_AUDIO_AL_PLAYING;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_PLAYING &&
+              s_play_calls == plays_before,
+          "a playing stream made the shield act");
+    s_mock_state = ISAAC_VITA_AUDIO_AL_STOPPED;
+
+    /* 8. the guest's own alSourceStop: truthful until the guest's next
+     * alSourcePlay restores eligibility, even with fresh PCM recorded. */
+    shield_stream_queue(src, &calls);
+    args[0] = src;
+    (void)invoke_at(ISAAC_VITA_AUDIO_SOURCE_STOP_NAME, args, 1U, &calls,
+                    foreign);
+    plays_before = s_play_calls;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_STOPPED &&
+              s_play_calls == plays_before,
+          "guest-stopped stream was shielded");
+    (void)invoke_at(ISAAC_VITA_AUDIO_SOURCE_PLAY_NAME, args, 1U, &calls,
+                    foreign);
+    plays_before = s_play_calls;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_PLAYING &&
+              s_play_calls == plays_before,
+          "guest alSourcePlay did not restore the shield");
+    ++events;
+
+    /* 9. the object left the active list (Stop() erases it before touching
+     * the source): truthful. */
+    st32(manager + ISAAC_VITA_AUDIO_MANAGER_ACTIVE_END_OFFSET, list + 4U);
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_STOPPED &&
+              s_play_calls == plays_before,
+          "source without a live OGG owner was shielded");
+    st32(manager + ISAAC_VITA_AUDIO_MANAGER_ACTIVE_END_OFFSET, list + 8U);
+
+    /* 10. a fresh buffer consumed by the guest's own play (QueueData found
+     * IsPlaying false itself) is not replayed again by the shield. */
+    shield_stream_queue(src, &calls);
+    (void)invoke_at(ISAAC_VITA_AUDIO_SOURCE_PLAY_NAME, args, 1U, &calls,
+                    foreign);
+    plays_before = s_play_calls;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_PLAYING &&
+              s_play_calls == plays_before,
+          "shield replayed a buffer the guest had already started");
+    ++events;
+    /* a refill into a PLAYING source is pending, not fresh: the next dry
+     * probe must not restart the whole queue */
+    s_mock_state = ISAAC_VITA_AUDIO_AL_PLAYING;
+    shield_stream_queue(src, &calls);
+    s_mock_state = ISAAC_VITA_AUDIO_AL_STOPPED;
+    CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site, &calls)
+              == ISAAC_VITA_AUDIO_AL_PLAYING &&
+              s_play_calls == plays_before,
+          "a buffer queued into a playing source was treated as fresh");
+    ++events;
+
+    /* 11. receipt cadence: the first 8 events, then every 64th. */
+    expected_logs = s_audio_log_calls;
+    while (events < 130U) {
+        CHECK(shield_probe(src, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, site,
+                           &calls) == ISAAC_VITA_AUDIO_AL_PLAYING,
+              "starved stream stopped being shielded");
+        ++events;
+        if (events <= 8U || events % 64U == 0U)
+            ++expected_logs;
+    }
+    CHECK(s_audio_log_calls == expected_logs,
+          "shield receipt cadence is not first-8-then-every-64th");
+    CHECK(strncmp(s_last_audio_log, "KAGE VITA AUDIO SHIELD: n=128 ",
+                  30U) == 0,
+          "shield receipt at n=128 was not the last line");
+
+#ifdef ISAAC_VITA_AUDIO_REFILL_REPLAYS
+    /* 12. the shield replay is counted in the existing replay counters. */
+    drive_refill_line(s_base + DATA_OFFSET, &calls);
+    CHECK(refill_receipt_field(" replays=") >= 1UL,
+          "REFILL line does not count the shield replay");
+#endif
+
+    /* 13. the final summary line. */
+    isaac_vita_audio_log_final();
+    CHECK(strncmp(s_last_audio_log,
+                  "KAGE VITA AUDIO SHIELD FINAL: events=", 37U) == 0 ||
+              strstr(s_last_audio_log, "MUSIC DROP FINAL") != NULL,
+          "final audio log lost the shield summary");
+
+    s_mock_state = 0;
+    isaac_vita_audio_manager_close(manager);
+    CHECK(isaac_vita_audio_manager_is_active() == 0,
+          "shield oracle left the manager owner open");
+}
+#endif
+
+#ifdef ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT
+static unsigned s_real_reset_calls;
+static uint32_t s_real_reset_ecx;
+
+void __wrap_sub_0056e9a0(CPU *__restrict c);
+void __real_sub_0056e9a0(CPU *__restrict c)
+{
+    ++s_real_reset_calls;
+    s_real_reset_ecx = c->ecx;
+}
+
+/* Build the frozen frames around the slot reset call: [esp] = return marker
+ * into the slot update, [ebp] = MusicManager::Update's ebp, [ebp+4] = the
+ * return into MusicManager::Update, [outer_ebp-4] = the manager. */
+static void drop_call(uint32_t site, uint32_t caller, uint32_t owner,
+                      uint32_t slot, unsigned *reset_calls_before)
+{
+    CPU cpu;
+    uint32_t stack = s_base + STACK_OFFSET;
+    uint32_t inner_ebp = stack + 0x100U;
+    uint32_t outer_ebp = stack + 0x200U;
+
+    memset(&cpu, 0, sizeof cpu);
+    memset(&s_capture, 0, sizeof s_capture);
+    st32(stack, site);
+    st32(inner_ebp, outer_ebp);
+    st32(inner_ebp + 4U, caller);
+    st32(outer_ebp - 4U, owner);
+    cpu.esp = stack;
+    cpu.ebp = inner_ebp;
+    cpu.ecx = slot;
+    *reset_calls_before = s_real_reset_calls;
+    __wrap_sub_0056e9a0(&cpu);
+    CHECK(s_real_reset_calls == *reset_calls_before + 1U &&
+              s_real_reset_ecx == slot,
+          "wrapped slot reset did not reach the translated body once");
+    CHECK(cpu.esp == stack && cpu.ebp == inner_ebp && cpu.ecx == slot &&
+              cpu.fault == NULL,
+          "wrapped slot reset changed the CPU before the body");
+}
+
+/* ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT through the linker seam. */
+static void test_music_drop_receipt(void)
+{
+    unsigned calls = 0U;
+    unsigned before;
+    unsigned log_before;
+    unsigned drops;
+    char expected[256];
+    uint32_t manager = shield_open_manager();
+    uint32_t stream = s_base + SHIELD_STREAM_OFFSET;
+    uint32_t owner = s_base + SHIELD_OWNER_OFFSET;
+    const uint32_t site = ISAAC_VITA_AUDIO_MUSIC_DROP_RETURN;
+    const uint32_t foreign_site = UINT32_C(0x00488f5f);
+    uint32_t slot;
+
+    memset((void *)(uintptr_t)owner, 0, 0x360U);
+    s_mock_state = ISAAC_VITA_AUDIO_AL_STOPPED;
+    s_mock_queued = 4;
+    s_mock_processed = 4;
+    /* the stream refilled 250 ms before the drop */
+    s_refill_now_us = UINT64_C(9000000);
+    shield_stream_queue(SHIELD_STREAM_SOURCE, &calls);
+    s_refill_now_us += UINT64_C(250000);
+
+    /* slot 2 of the loop (return 0x39fd4f): index from the frames */
+    slot = owner + 2U * ISAAC_VITA_AUDIO_MUSIC_SLOT_STRIDE;
+    st32(slot, stream);
+    log_before = s_audio_log_calls;
+    drop_call(site, ISAAC_VITA_AUDIO_MUSIC_SLOT_LOOP_RETURN, owner, slot,
+              &before);
+    snprintf(expected, sizeof expected,
+             "KAGE VITA AUDIO MUSIC DROP: slot=2 stream=0x%08x src=66 "
+             "state=%d queued=4 processed=4 eof=0 loop=1 last_refill_ms=250",
+             (unsigned)stream, (int)ISAAC_VITA_AUDIO_AL_STOPPED);
+    CHECK(s_audio_log_calls == log_before + 1U &&
+              strcmp(s_last_audio_log, expected) == 0,
+          "music drop receipt for slot 2 drifted");
+    drops = 1U;
+
+    /* slot 0 (return 0x39fd3e), eof set on a non-looping stream */
+    st8(stream + ISAAC_VITA_AUDIO_OGG_EOF_OFFSET, 1U);
+    st8(stream + ISAAC_VITA_AUDIO_OGG_LOOP_OFFSET, 0U);
+    st32(owner, stream);
+    drop_call(site, ISAAC_VITA_AUDIO_MUSIC_SLOT0_RETURN, owner, owner,
+              &before);
+    ++drops;
+    CHECK(strncmp(s_last_audio_log,
+                  "KAGE VITA AUDIO MUSIC DROP: slot=0 ", 35U) == 0 &&
+              strstr(s_last_audio_log, " eof=1 loop=0 ") != NULL,
+          "music drop receipt for slot 0 drifted");
+    st8(stream + ISAAC_VITA_AUDIO_OGG_EOF_OFFSET, 0U);
+    st8(stream + ISAAC_VITA_AUDIO_OGG_LOOP_OFFSET, 1U);
+
+    /* the eighth slot (return 0x3a1b56, this+0x32c) */
+    slot = owner + ISAAC_VITA_AUDIO_MUSIC_SLOT7_OFFSET;
+    st32(slot, stream);
+    drop_call(site, ISAAC_VITA_AUDIO_MUSIC_SLOT7_RETURN, owner, slot,
+              &before);
+    ++drops;
+    CHECK(strncmp(s_last_audio_log,
+                  "KAGE VITA AUDIO MUSIC DROP: slot=7 ", 35U) == 0,
+          "music drop receipt for the eighth slot drifted");
+
+    /* an unknown caller of the slot update: index 255, still a drop */
+    drop_call(site, UINT32_C(0x11111111), owner, slot, &before);
+    ++drops;
+    CHECK(strncmp(s_last_audio_log,
+                  "KAGE VITA AUDIO MUSIC DROP: slot=255 ", 37U) == 0,
+          "unknown slot caller was not reported as 255");
+
+    /* an empty slot (no stream): zero fields, no AL query */
+    st32(slot, 0U);
+    drop_call(site, ISAAC_VITA_AUDIO_MUSIC_SLOT7_RETURN, owner, slot,
+              &before);
+    ++drops;
+    CHECK(strcmp(s_last_audio_log,
+                 "KAGE VITA AUDIO MUSIC DROP: slot=7 stream=0x00000000 src=0 "
+                 "state=0 queued=0 processed=0 eof=0 loop=0 "
+                 "last_refill_ms=4294967295") == 0 &&
+              s_capture.operation == OP_NONE,
+          "empty slot drop receipt drifted");
+    st32(slot, stream);
+
+    /* another caller of the reset (the jingle player): counted, no receipt */
+    log_before = s_audio_log_calls;
+    drop_call(foreign_site, UINT32_C(0x11111111), owner, slot, &before);
+    CHECK(s_audio_log_calls == log_before,
+          "foreign slot reset produced a music drop receipt");
+
+    /* cadence: first 16 drops, then every 16th */
+    log_before = s_audio_log_calls;
+    while (drops < 33U) {
+        drop_call(site, ISAAC_VITA_AUDIO_MUSIC_SLOT7_RETURN, owner, slot,
+                  &before);
+        ++drops;
+        if (drops <= 16U || drops % 16U == 0U)
+            ++log_before;
+    }
+    CHECK(s_audio_log_calls == log_before,
+          "music drop receipt cadence is not first-16-then-every-16th");
+
+    /* the final summary counts both kinds */
+    isaac_vita_audio_log_final();
+    CHECK(strcmp(s_last_audio_log,
+                 "KAGE VITA AUDIO MUSIC DROP FINAL: drops=33 "
+                 "other_resets=1") == 0,
+          "music drop final summary drifted");
+
+    s_mock_state = 0;
+    isaac_vita_audio_manager_close(manager);
+    CHECK(isaac_vita_audio_manager_is_active() == 0,
+          "drop oracle left the manager owner open");
+}
+#endif
 #endif
 
 #if defined(ISAAC_VITA_STATIC_SFX_PROFILE) && ISAAC_VITA_STATIC_SFX_PROFILE
@@ -2099,6 +2555,12 @@ int main(void)
 #endif
 #ifdef ISAAC_VITA_AUDIO_REFILL_HOOKS
     test_refill_hooks_through_adapters();
+#ifdef ISAAC_VITA_AUDIO_STARVATION_SHIELD
+    test_starvation_shield_through_adapters();
+#endif
+#ifdef ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT
+    test_music_drop_receipt();
+#endif
 #endif
     CHECK(isaac_vita_audio_manager_is_active() == 0,
           "fresh audio runtime started materialisation-ready");
@@ -2123,6 +2585,12 @@ int main(void)
     }
 #ifdef ISAAC_VITA_OPENAL_POOL_ROUTER_ORACLE
     puts("Vita OpenAL pool router oracle: PASS (indexed/manager init-before-first-API + exact fixed-image range + bounded init/A005/final telemetry + retry-safe explicit final)");
+#elif defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD) && defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+    puts("Vita OpenAL starvation-shield + music-drop oracle: PASS (IsPlaying site: unregistered/eof/other parameter/other site/other state/guest stop/no live owner pass through, fresh -> replay + AL_PLAYING, starved -> AL_PLAYING, first-8-then-every-64th receipt; --wrap slot reset: slot index from the frozen frames, AL state next to eof/loop/last refill, foreign caller counted only, first-16-then-every-16th receipt, final summary)");
+#elif defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+    puts("Vita OpenAL starvation-shield oracle: PASS (IsPlaying site decision table through the real alGetSourcei adapter, replay counted, bounded receipt, final summary)");
+#elif defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+    puts("Vita OpenAL music-drop oracle: PASS (--wrap slot reset receipt: frozen frames, AL state, cadence, final summary)");
 #elif defined(ISAAC_VITA_AUDIO_REFILL_REPLAYS)
     puts("Vita OpenAL refill-replays oracle: PASS (refill hooks + alSourcePlay from QueueData: AL_INITIAL start, AL_STOPPED replay, guest alSourceStop restart, foreign play, out-of-table source never a replay; partial stream refill counted)");
 #elif defined(ISAAC_VITA_AUDIO_REFILL_HOOKS)

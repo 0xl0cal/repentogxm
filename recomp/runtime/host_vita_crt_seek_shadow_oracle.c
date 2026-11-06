@@ -83,6 +83,13 @@ static int s_fseek_fail_enodev;
 static int s_fstat_fail_enodev;
 static uint32_t s_reopen_native_calls;
 static int s_reopen_fail_errno;
+/* errno of the next seam failure; 0 means ENODEV. */
+static int s_fail_errno;
+/* newlib's __sfp hands a just-released FILE to the next fopen (first
+ * _flags == 0 slot, findfp.c).  When armed, the next force_discard keeps the
+ * FILE and the next open reuses that same FILE through freopen. */
+static int s_recycle_discard;
+static FILE *s_recycled_stream;
 /* 16 bytes: a valid ArchivedFile header word at 0 (0x80000004), an
  * oversize one at 8 (0x00001000 > the 0x800 block bound). */
 static const unsigned char s_header_fixture[16] = {
@@ -120,7 +127,8 @@ int isaac_vita_crt_seek_shadow_oracle_fseek(FILE *stream, long offset,
         ++s_real_fseek_other;
     if (s_fseek_fail_enodev) {
         s_fseek_fail_enodev = 0;
-        errno = ENODEV;
+        errno = s_fail_errno ? s_fail_errno : ENODEV;
+        s_fail_errno = 0;
         return -1;
     }
     return fseek(stream, offset, origin);
@@ -163,7 +171,8 @@ size_t isaac_vita_crt_oracle_fread(void *buffer, size_t size,
         if (s_fread_fail_partial)
             copied = fread(buffer, 1U, s_fread_fail_partial, stream);
         s_fread_fail_partial = 0U;
-        errno = ENODEV;
+        errno = s_fail_errno ? s_fail_errno : ENODEV;
+        s_fail_errno = 0;
         return size ? copied / size : 0U;
     }
     return fread(buffer, size, count, stream);
@@ -218,8 +227,14 @@ FILE *isaac_vita_archive_cache_open(isaac_vita_archive_cache_file *file,
         errno = s_force_fopen_errno;
         return NULL;
     }
-    stream = fopen(s_open_path_override ? s_open_path_override :
-                   mode[0] == 'r' ? s_fixture_path : s_scratch_path, mode);
+    if (s_recycled_stream) {
+        stream = freopen(mode[0] == 'r' ? s_fixture_path : s_scratch_path,
+                         mode, s_recycled_stream);
+        s_recycled_stream = NULL;
+    } else {
+        stream = fopen(s_open_path_override ? s_open_path_override :
+                       mode[0] == 'r' ? s_fixture_path : s_scratch_path, mode);
+    }
     if (!stream)
         return NULL;
     file->stream = stream;
@@ -230,8 +245,12 @@ FILE *isaac_vita_archive_cache_open(isaac_vita_archive_cache_file *file,
 int isaac_vita_archive_cache_force_discard(
     isaac_vita_archive_cache_file *file)
 {
-    if (file->stream)
+    if (file->stream && s_recycle_discard) {
+        s_recycle_discard = 0;
+        s_recycled_stream = file->stream;
+    } else if (file->stream) {
         (void)fclose(file->stream);
+    }
     memset(file, 0, sizeof *file);
     return 0;
 }
@@ -267,6 +286,14 @@ int isaac_vita_archive_cache_drop(void)
 {
     return 0;
 }
+
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+void isaac_vita_archive_fd_repair_counts(uint32_t *repaired, uint32_t *leaked)
+{
+    *repaired = 0U;
+    *leaked = 0U;
+}
+#endif
 
 uint32_t isaac_vita_archive_diag_record(
     isaac_vita_archive_diag_event *event)
@@ -424,6 +451,11 @@ static void reset_oracle(void)
     s_fstat_fail_enodev = 0;
     s_reopen_native_calls = 0U;
     s_reopen_fail_errno = 0;
+    s_fail_errno = 0;
+    s_recycle_discard = 0;
+    if (s_recycled_stream)
+        (void)fclose(s_recycled_stream);
+    s_recycled_stream = NULL;
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     memset(&s_descriptor_recover, 0, sizeof s_descriptor_recover);
 #endif
@@ -1124,12 +1156,18 @@ static int test_attribution_keys(void)
      * when that option is compiled in). */
     s_log_lines = 0U;
     isaac_vita_crt_seek_shadow_report("oracle");
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+    /* The access cache line comes last; drop it from the counts below. */
+    CHECK(strncmp(s_log_last[(s_log_lines - 1U) & 3U],
+                  "KAGE VITA ACCESS CACHE: why=oracle ", 35U) == 0);
+    --s_log_lines;
+#endif
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     CHECK(s_log_lines == 3U &&
           strcmp(s_log_last[2],
                  "KAGE VITA CRT DESCRIPTOR RECOVER: why=oracle enodev=0 "
                  "recovered=0 unknown_pos=0 reopen_fail=0 redo_fail=0 "
-                 "retained=0") == 0);
+                 "retained=0 ebadf=0 fd_repaired=0 fd_leaked=0") == 0);
 #else
     CHECK(s_log_lines == 2U);
 #endif
@@ -1676,8 +1714,11 @@ static int test_recover_never_for_write_modes(void)
     int index;
 
     reset_oracle();
-    for (mode_index = 0U; mode_index < 3U; ++mode_index) {
-        CHECK(drive_fopen(modes[mode_index], &token) == 0 && token != 0U);
+    for (mode_index = 0U; mode_index < 6U; ++mode_index) {
+        int trigger = mode_index < 3U ? ENODEV : EBADF;
+
+        CHECK(drive_fopen(modes[mode_index % 3U], &token) == 0 &&
+              token != 0U);
         index = token_index(token);
         CHECK(index >= 0);
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
@@ -1685,9 +1726,10 @@ static int test_recover_never_for_write_modes(void)
               !s_file_tokens[index].recover.mode[0]);
 #endif
         s_fseek_fail_enodev = 1;
+        s_fail_errno = trigger;
         g_isaac_vita_crt_errno = 0;
         CHECK(drive_fseek(token, 0, SEEK_SET, &result) == 0 && result == -1 &&
-              g_isaac_vita_crt_errno == ENODEV &&
+              g_isaac_vita_crt_errno == trigger &&
               s_reopen_native_calls == 0U);
         CHECK(drive_fclose(token, &result) == 0 && result == 0);
     }
@@ -1697,7 +1739,8 @@ static int test_recover_never_for_write_modes(void)
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     CHECK(strcmp(s_file_tokens[index].recover.path, LOOSE_XML) == 0 &&
           strcmp(s_file_tokens[index].recover.mode, "r") == 0 &&
-          s_descriptor_recover.enodev == 0U);
+          s_descriptor_recover.enodev == 0U &&
+          s_descriptor_recover.ebadf == 0U);
 #endif
     CHECK(drive_fclose(token, &result) == 0 && result == 0);
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
@@ -1747,7 +1790,7 @@ static int test_recover_reopen_failure_keeps_failure(void)
           strcmp(last_log_line(),
                  "KAGE VITA CRT DESCRIPTOR RECOVER: why=oracle enodev=1 "
                  "recovered=0 unknown_pos=0 reopen_fail=1 redo_fail=0 "
-                 "retained=1") == 0);
+                 "retained=1 ebadf=0 fd_repaired=0 fd_leaked=0") == 0);
 #else
     CHECK(s_reopen_native_calls == 0U);
 #endif
@@ -1820,6 +1863,210 @@ static int test_recover_header_edge_keeps_bound_check(void)
     s_open_path_override = NULL;
     return 0;
 }
+
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+/* Hardware 2026-10-12 (glcensus, 118.223 s): five seconds after two
+ * recovered repentance.a reads, an ArchivedFile header read came back
+ * rc=0 errno=EBADF, error flag, cursor 0, no archive key: newlib's answer
+ * for a read on a write-only FILE.  The recovery fclosed the dead FILE while
+ * its address was still the guest token; __sfp gave that FILE to the next
+ * fopen, so one token value named two live slots and the lower one won. */
+static int test_recover_token_survives_file_reuse(void)
+{
+    static const char payload[] = "0123456789";
+    uint32_t filler;
+    uint32_t token;
+    uint32_t writer;
+    FILE *reference;
+    FILE *dead;
+    int32_t position;
+    int32_t result;
+    uint32_t got;
+    int index;
+
+    reset_oracle();
+    CHECK(drive_fopen(s_mode_rb, &filler) == 0 && filler != 0U);
+    CHECK(drive_fopen(s_mode_rb, &token) == 0 && token != 0U);
+    index = token_index(token);
+    CHECK(index == 1);
+    dead = vita_crt_dynamic_stream(&s_file_tokens[index]);
+    reference = reference_open("rb");
+    CHECK(reference != NULL);
+    PAIR_SEEK(token, reference, 5000, SEEK_SET);
+    PAIR_READ(token, reference, 100U);
+    CHECK(drive_fclose(filler, &result) == 0 && result == 0);
+
+    s_recycle_discard = 1;
+    s_fread_fail_enodev = 1;
+    PAIR_READ(token, reference, 16U);
+    CHECK(got == 16U && s_descriptor_recover.recovered == 1U &&
+          s_recycled_stream == dead &&
+          vita_crt_dynamic_stream(&s_file_tokens[index]) != dead);
+
+    /* The next fopen (here a writer) receives the released FILE. */
+    CHECK(drive_fopen(s_mode_wb, &writer) == 0 && writer != 0U);
+    CHECK(token_index(writer) == 0 &&
+          vita_crt_dynamic_stream(&s_file_tokens[0]) == dead);
+    if (writer == token) {
+        const char *fault = NULL;
+
+        g_isaac_vita_crt_errno = 0;
+        (void)drive_fread_at(token, 4U, 1U,
+                             ISAAC_VITA_CRT_ARCHIVE_TYPE1_HEADER_RETURN_RVA,
+                             &got, &fault);
+        fprintf(stderr,
+                "token alias: tok=%08x fault=%s errno=%d key=%s fl=%02x "
+                "rc=%d pos=%08x>%08x\n",
+                (unsigned)token, fault ? fault : "-", g_isaac_vita_crt_errno,
+                s_last_diag.key[0] ? s_last_diag.key : "-",
+                (unsigned)s_last_diag.flags, s_last_diag.operation_result,
+                (unsigned)s_last_diag.position_before,
+                (unsigned)s_last_diag.position_after);
+        return fail(__LINE__, "writer != token");
+    }
+    CHECK(token == (uint32_t)(uintptr_t)&s_file_tokens[1] &&
+          writer == (uint32_t)(uintptr_t)&s_file_tokens[0]);
+
+    /* Each token keeps naming its own stream: reads, seeks, writes, closes. */
+    PAIR_READ(token, reference, 16U);
+    memcpy(s_guest_read, payload, sizeof payload - 1U);
+    CHECK(drive_fwrite(writer, 1U, sizeof payload - 1U, &got) == 0 &&
+          got == sizeof payload - 1U);
+    PAIR_SEEK(token, reference, -10, SEEK_END);
+    CHECK(drive_fclose(writer, &result) == 0 && result == 0);
+    CHECK(disk_size(s_scratch_path) == (long)(sizeof payload - 1U));
+    PAIR_READ(token, reference, 10U);
+    CHECK(got == 10U && position == (int32_t)FIXTURE_BYTES);
+    CHECK(drive_fclose(token, &result) == 0 && result == 0);
+    CHECK(token_index(token) < 0 && token_index(writer) < 0);
+    (void)fclose(reference);
+    return 0;
+}
+
+/* One suspend kills every descriptor and each token recovers on its own
+ * first failure: ENODEV on A's fread, then EBADF on B's fread (after a
+ * partial copy) and on C's SEEK_SET, counted apart.  Tokens never move. */
+static int test_recover_enodev_then_ebadf(void)
+{
+    uint32_t a;
+    uint32_t b;
+    uint32_t c;
+    FILE *ra;
+    FILE *rb;
+    FILE *rc;
+    int32_t position;
+    int32_t result;
+    uint32_t got;
+    uint32_t lines;
+
+    reset_oracle();
+    CHECK(drive_fopen(s_mode_rb, &a) == 0 && drive_fopen(s_mode_rb, &b) == 0 &&
+          drive_fopen(s_mode_r, &c) == 0);
+    CHECK(token_index(a) == 0 && token_index(b) == 1 && token_index(c) == 2);
+    ra = reference_open("rb");
+    rb = reference_open("rb");
+    rc = reference_open("rb");
+    CHECK(ra != NULL && rb != NULL && rc != NULL);
+    PAIR_SEEK(a, ra, 1000, SEEK_SET);
+    PAIR_SEEK(b, rb, 2000, SEEK_SET);
+    PAIR_READ(b, rb, 10U);
+    PAIR_SEEK(c, rc, 3000, SEEK_SET);
+
+    lines = s_log_lines;
+    s_fread_fail_enodev = 1;
+    PAIR_READ(a, ra, 32U);
+    s_fread_fail_enodev = 1;
+    s_fread_fail_partial = 5U;
+    s_fail_errno = EBADF;
+    PAIR_READ(b, rb, 32U);
+    CHECK(got == 32U);
+    s_fseek_fail_enodev = 1;
+    s_fail_errno = EBADF;
+    g_isaac_vita_crt_errno = 0;
+    PAIR_SEEK(c, rc, 4000, SEEK_SET);
+    CHECK(result == 0 && g_isaac_vita_crt_errno == 0);
+    PAIR_READ(c, rc, 8U);
+    CHECK(s_descriptor_recover.enodev == 1U &&
+          s_descriptor_recover.ebadf == 2U &&
+          s_descriptor_recover.recovered == 3U &&
+          s_descriptor_recover.unknown_pos == 0U &&
+          s_descriptor_recover.reopen_fail == 0U &&
+          s_descriptor_recover.redo_fail == 0U &&
+          s_reopen_native_calls == 3U && receipts_since(lines) == 3U);
+    CHECK(token_index(a) == 0 && token_index(b) == 1 && token_index(c) == 2);
+    lines = s_log_lines;
+    isaac_vita_crt_descriptor_recover_report("oracle");
+    CHECK(s_log_lines == lines + 1U &&
+          strcmp(last_log_line(),
+                 "KAGE VITA CRT DESCRIPTOR RECOVER: why=oracle enodev=1 "
+                 "recovered=3 unknown_pos=0 reopen_fail=0 redo_fail=0 "
+                 "retained=3 ebadf=2 fd_repaired=0 fd_leaked=0") == 0);
+    CHECK(drive_fclose(a, &result) == 0 && result == 0 &&
+          drive_fclose(b, &result) == 0 && result == 0 &&
+          drive_fclose(c, &result) == 0 && result == 0);
+    (void)fclose(ra);
+    (void)fclose(rb);
+    (void)fclose(rc);
+    return 0;
+}
+#endif
+
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+static int access_probe_absent(const char *path)
+{
+    (void)path;
+    return ISAAC_VITA_ACCESS_CACHE_ABSENT;
+}
+
+static uint32_t access_absent_live(void)
+{
+    isaac_vita_access_cache_stats stats;
+
+    isaac_vita_access_cache_snapshot(&stats);
+    return stats.absent_live;
+}
+
+/* The CRT side of the _access negative cache: a writing fopen that may
+ * reach mods/ forgets the absent directories, a read or a write elsewhere
+ * keeps them, and a descriptor recovery (a suspend) forgets them. */
+static int test_access_cache_invalidation(void)
+{
+    static const char mods_probe[] = ROOT "/mods/m/resources-dlc3/a.png";
+    uint32_t token;
+    uint32_t got;
+    int32_t result;
+
+    reset_oracle();
+    isaac_vita_access_cache_invalidate();
+    CHECK(isaac_vita_access_cache_absent(mods_probe, access_probe_absent) &&
+          access_absent_live() == 1U);
+    s_mapped_path = ROOT "/mods/m/metadata.xml";
+    CHECK(drive_fopen(s_mode_rb, &token) == 0 && token != 0U);
+    CHECK(drive_fclose(token, &result) == 0 && result == 0);
+    s_mapped_path = GAMESTATE;
+    CHECK(drive_fopen(s_mode_wb, &token) == 0 && token != 0U);
+    CHECK(drive_fclose(token, &result) == 0 && result == 0);
+    CHECK(access_absent_live() == 1U);
+    s_mapped_path = ROOT "/mods/m/save1.dat";
+    CHECK(drive_fopen(s_mode_a, &token) == 0 && token != 0U);
+    CHECK(access_absent_live() == 0U);
+    CHECK(drive_fclose(token, &result) == 0 && result == 0);
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    CHECK(isaac_vita_access_cache_absent(mods_probe, access_probe_absent) &&
+          access_absent_live() == 1U);
+    s_mapped_path = LOOSE_XML;
+    CHECK(drive_fopen(s_mode_rb, &token) == 0 && token != 0U);
+    s_fread_fail_enodev = 1;
+    CHECK(drive_fread(token, 1U, 8U, &got) == 0 && got == 8U &&
+          s_descriptor_recover.recovered == 1U);
+    CHECK(access_absent_live() == 0U);
+    CHECK(drive_fclose(token, &result) == 0 && result == 0);
+#else
+    (void)got;
+#endif
+    return 0;
+}
+#endif
 
 #undef PAIR_READ
 #undef PAIR_SIZE
@@ -2127,6 +2374,13 @@ int main(int argc, char **argv)
         test_recover_never_for_write_modes() ||
         test_recover_reopen_failure_keeps_failure() ||
         test_recover_header_edge_keeps_bound_check() ||
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+        test_recover_token_survives_file_reuse() ||
+        test_recover_enodev_then_ebadf() ||
+#endif
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+        test_access_cache_invalidation() ||
+#endif
         test_random_sequence_matches_reference(ops, UINT32_C(0x5eed0001)) ||
         test_random_sequence_matches_reference(ops, UINT32_C(0x00c0ffee)))
         return 1;

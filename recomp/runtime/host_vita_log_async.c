@@ -6,6 +6,9 @@
 #include <stddef.h>
 #include <string.h>
 
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+#include "host_vita_game_log.h"
+#endif
 #if defined(ISAAC_VITA_LOG_ASYNC_ORACLE)
 # include <stdio.h>
 #else
@@ -361,7 +364,11 @@ static void log_async_report_drops(int force)
         return;
     if (length >= (int)sizeof line)
         length = (int)sizeof line - 1;
+#if defined(ISAAC_VITA_LOG_ASYNC_PRINTF_FILE) && ISAAC_VITA_LOG_ASYNC_PRINTF_FILE
+    log_async_sink_file(line, (unsigned)length);
+#else
     log_async_sink_printf(line, (unsigned)length);
+#endif
 }
 
 static uint32_t log_async_drain(unsigned char *buffer, int force_report)
@@ -547,6 +554,19 @@ void isaac_vita_log_async_printf(const char *format, ...)
          * Drain what is queued so program order holds, then write the exact
          * bytes synchronously, as the unrouted call did. */
         isaac_vita_log_async_flush();
+#if defined(ISAAC_VITA_LOG_ASYNC_PRINTF_FILE) && ISAAC_VITA_LOG_ASYNC_PRINTF_FILE
+        /* Actual phase records are bounded below PRINTF_BYTES. Do not quietly
+         * truncate an unexpected longer record into the file: retain its exact
+         * original debug output and leave a durable missing-record receipt. */
+        {
+            char receipt[96];
+            int size = log_async_snprintf(receipt, sizeof receipt,
+                "[kage-vita] log-async printf-file overlong=%u network_only=1\n",
+                (unsigned)length);
+            if (size > 0 && size < (int)sizeof receipt)
+                log_async_sink_file(receipt, (unsigned)size);
+        }
+#endif
         log_async_vprintf_sync(format, again);
         va_end(again);
         return;
@@ -554,10 +574,20 @@ void isaac_vita_log_async_printf(const char *format, ...)
     va_end(again);
     if (length <= 0)
         return;
+#if defined(ISAAC_VITA_LOG_ASYNC_PRINTF_FILE) && ISAAC_VITA_LOG_ASYNC_PRINTF_FILE
+    /* Same single queue record/order, now the existing FILE sink. That sink
+     * appends exact bytes and emits ONE debug call, including FILE batching.
+     * No second enqueue, prefix formatter or game-thread I/O while started. */
+    if (isaac_vita_log_async_enqueue(ISAAC_VITA_LOG_ASYNC_SINK_FILE, line,
+                                     (unsigned)length) != 0)
+        return;
+    log_async_sink_file(line, (unsigned)length);
+#else
     if (isaac_vita_log_async_enqueue(ISAAC_VITA_LOG_ASYNC_SINK_PRINTF, line,
                                      (unsigned)length) != 0)
         return;
     log_async_sink_printf(line, (unsigned)length);
+#endif
 }
 
 void isaac_vita_log_async_flush(void)
@@ -618,6 +648,11 @@ extern void __real_abort(void) __attribute__((noreturn));
 void __wrap_abort(void) __attribute__((noreturn));
 void __wrap_abort(void)
 {
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* The game's own log.txt bytes first (bounded, never logs), then the
+     * runtime log ring. */
+    isaac_vita_game_log_abort_drain();
+#endif
     isaac_vita_log_async_flush();
     __real_abort();
 }

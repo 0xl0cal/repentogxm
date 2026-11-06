@@ -61,6 +61,24 @@ extern volatile uint32_t g_kage_vita_guest_sampler_phase;
  * Sampler builds only; production objects contain no reference to the word. */
 extern volatile uint32_t g_kage_guest_last_indirect_target;
 
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+/* ISAAC_VITA_GUEST_SAMPLER_RESIDUAL (profile-only; defined for the sampler and
+ * host_vita_lua.c): the live Lua callback boundaries on the game thread's
+ * guest stack.  host_vita_lua.c stores the guest address of each
+ * VITA_LUA_CALLBACK_RETURN word it pushes right after the push and clears it
+ * when that frame ends: C functions by callback frame slot (cleared in
+ * vita_lua_callback_frame_pop and isaac_vita_lua_abort_cpu), the guest
+ * allocator in one word saved and restored around its guest_call.  The
+ * sampler links only a word at a published address; the same word left in a
+ * frame's locals after its callback returned is stale and is counted (lbx),
+ * never linked.  Plain aligned stores, read cross-core without a lock: a torn
+ * view costs one sample. */
+# define KAGE_VITA_GUEST_SAMPLER_LUA_CFUNCTION_SLOTS 24U
+extern volatile uint32_t
+    g_kage_vita_guest_sampler_lua_cfunction[KAGE_VITA_GUEST_SAMPLER_LUA_CFUNCTION_SLOTS];
+extern volatile uint32_t g_kage_vita_guest_sampler_lua_allocator;
+#endif
+
 /* Bind the production runner's stack-owned CPU and start the sampler thread.
  * Logs one startup line (thread id, affinity, period, table sizes). */
 void kage_vita_guest_sampler_start(struct CPU *c);
@@ -70,6 +88,13 @@ void kage_vita_guest_sampler_start(struct CPU *c);
  * ph120.hot/ph120.hotc/ph120.hs records and clears the retired buffer. */
 void kage_vita_guest_sampler_report(
     const char *build_id, uint32_t window, uint32_t last_outer_loop);
+
+/* Entry tail, before guest_stack_free: unbind the CPU from the sampler and
+ * wait (bounded, like the reporter) for a sample in flight.  After it returns
+ * no sampler load touches the CPU or the guest stack; the thread itself idles
+ * until process exit.  Logs one "KAGE VITA GUEST SAMPLER: stopped" line;
+ * a no-op when the thread never started. */
+void kage_vita_guest_sampler_stop(void);
 
 # define KAGE_VITA_GUEST_SAMPLER_PHASE(phase) \
     (g_kage_vita_guest_sampler_phase = (uint32_t)(phase))

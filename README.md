@@ -110,19 +110,61 @@ outside the app directory:
 
 - saves and the game's `log.txt`:
   `ux0:data/isaacr001/Documents/My Games/Binding of Isaac Repentance/`;
-- the port's own log: `ux0:data/isaacr001/first-arm-fault.log`;
+- the port's own log: `ux0:data/isaacr001/first-arm-fault.log`; the log of
+  the launch before it is kept as `ux0:data/isaacr001/first-arm-fault.prev.log`
+  (after a crash and one relaunch the crash is in the `.prev.log` file; send
+  both);
 - mods: `ux0:data/isaacr001/mods/<workshop id>/`; a file named `disable.it`
-  inside a mod directory turns that mod off.
+  inside a mod directory turns that mod off;
+- the port's own settings, `ux0:/data/isaacr001/port.ini`, written by the
+  Manager's `ISAAC SETTINGS` page (Start on its home screen) and read once at
+  game start. Only builds configured with `ISAAC_VITA_RUNTIME_SETTINGS` and
+  `ISAAC_VITA_MANAGER_SETTINGS_UI` have it (both OFF by default; the release
+  profile turns the game-side `ISAAC_VITA_RUNTIME_SETTINGS` on and leaves the
+  Manager page OFF); today it holds the FPS lock (60/45/40/30, see
+  [INSTALL.md](INSTALL.md)). Deleting the file restores the defaults.
 
 Back up the save directory before replacing a build, and keep the old
 `eboot.bin` until the new one has loaded, entered a room and completed one
 save/load cycle. Removing the app does not remove `ux0:data/isaacr001/`. A run
 saved without a mod cannot be continued after enabling one; that is the game's
 own rule, not a port bug. When reporting a problem, include the SHA-256 of the
-installed `ux0:app/ISAACR001/eboot.bin`, the port log and the game's `log.txt`.
+installed `ux0:app/ISAACR001/eboot.bin`, both port logs and the game's
+`log.txt`.
 
 VPKs are on the Releases page. Install, update and Vita3K instructions are in
 [INSTALL.md](INSTALL.md); known failures in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+## Controls
+
+The Vita pad and the front touch screen reach the game as one XInput (Xbox)
+controller; the game applies its own default gamepad bindings. The Vita has
+two shoulder buttons where an Xbox pad has four, so Select stands in for the
+right trigger and Start is a prefix for the right shoulder and Back. There is
+no remapping UI.
+
+| Vita | XInput element | Default game action |
+|---|---|---|
+| Left stick, D-pad | left stick, D-pad | move; menu navigation |
+| Right stick | right stick | shoot |
+| Cross, Circle, Square, Triangle | A, B, X, Y | shoot down, right, left, up; in menus A confirms, B goes back |
+| L | left shoulder (LB) | bomb |
+| R | left trigger (LT) | use the active item |
+| Select | right trigger (RT) | drop: tap swaps pocket items or Schoolbag items, hold drops the trinket and pocket items; on the character select it flips to the tainted characters |
+| Start, short tap | Start | pause (applied when Start is released) |
+| Start + L | right shoulder (RB) | use a pill or card |
+| Start + R | Back | map |
+| Start held 0.8 s or longer | keyboard R | restart the run (keep holding; the game's own hold time follows) |
+| Front touch, top-left corner (active-item icon) | left trigger (LT) | use the active item |
+| Front touch, top-right corner (minimap) | Back | map |
+| Front touch, bottom-right corner (pocket-item icon) | right shoulder (RB) | use a pill or card |
+
+While Start is held, Start, L and R are withheld from the game until the chord
+is resolved; Start + L + R does nothing. A touch zone is the left or right
+quarter of the screen by its top or bottom third; a touch keeps the zone where
+it began, and the rear touch pad is not used. The touch zones have not been
+tested on hardware. The same table with implementation notes is in
+[recomp/vita/README.md](recomp/vita/README.md#controls).
 
 ## Building from source
 
@@ -146,9 +188,13 @@ executable hash and the generated code and stops on any mismatch.
 `build_vita.py` builds a slower baseline configuration. The released VPK turns
 on options the script does not expose (translated-code CPU optimizations,
 native Vorbis and PNG decoders, asynchronous logging and others); its exact
-option set is [release/v0.1.1-alpha.cmake](release/v0.1.1-alpha.cmake), a
-CMake initial cache whose header lists the three commands that reproduce the
-build. The option reference is [recomp/vita/README.md](recomp/vita/README.md).
+option set is [release/v0.1.1-alpha.cmake](release/v0.1.1-alpha.cmake) as of
+the `v0.1.1-alpha` tag, a CMake initial cache whose header lists the three
+commands that reproduce the build. On later revisions that file is the
+release profile of the development line, not a copy of the shipped build: it
+also pins knobs added after the release, three of them ON. The draft for the
+next release is [release/v0.1.2-alpha.cmake](release/v0.1.2-alpha.cmake).
+The option reference is [recomp/vita/README.md](recomp/vita/README.md).
 
 ## Broken or in progress
 
@@ -158,6 +204,7 @@ build. The option reference is [recomp/vita/README.md](recomp/vita/README.md).
 - the game heap can fill up over a long session; seen once after 27 minutes,
   when the game stopped on "Exit game" after writing the saves;
 - the on-device Save/Mod Manager and the PC sync tool are untested on hardware;
+- the Daily challenge needs Steam: the paper appears and nothing follows;
 - no controller remapping UI.
 
 ## Repository layout
@@ -251,12 +298,18 @@ The biggest external sources of code, formats, fixes and ideas:
 - [Specialist Dance](https://steamcommunity.com/sharedfiles/filedetails/?id=2575911103)
   by Jiftoo, Devector and SetoKeino -- the loading-screen animation (converted
   frames in `recomp/runtime/kage_vita_loading_specialist.inc`, rebuilt from
-  the mod with `tools/build_specialist_loader.py`).
+  the mod with `tools/build_specialist_loader.py`);
+- Lordchickenblaster -- the community LiveArea contributed in GitHub issue
+  #9: the icon, the key-art picture, the start-up gate image and the four
+  title strips (`icon0.png`, `pic0.png`, `startup.png`, `1.png`-`4.png` under
+  `recomp/vita/assets/sce_sys/`; the artwork itself is the game's).
 
 Also adapted or linked: OpenAL Soft 1.19.1, stb_vorbis v1.04, miniz v1.15,
 zlib 1.1.4, libpng 1.4.20, musl 1.2.5 (decimal float formatting), Lua 5.3.3
 (from your own source tree), capstone and pefile (PC translator tooling),
-Pillow (PC GUI only). kubridge and `libshacccg.suprx` are not included. Exact
+Pillow (PC GUI and font bake), the DejaVu fonts (Bitstream Vera derived;
+rasterised into the Manager UI2 font atlases). kubridge and `libshacccg.suprx`
+are not included. Exact
 revisions and licences are in [THIRD_PARTY.md](THIRD_PARTY.md) and
 [NOTICE.md](NOTICE.md).
 

@@ -1197,8 +1197,15 @@ static void run_seek_tests(const char *path, const uint8_t *ogg, uint32_t length
         if (round % 3U == 2U)
             CHECK(frames == ref_frames, "seek: whole remainder delivered");
         (void)wait_worker_midframe(g.f);
-        /* the game frees the alloc buffer (state inside) right away */
-        isaac_nv_guest_buffer_freed((void *)(uintptr_t)g.alloc_buffer);
+        /* frees just outside the alloc buffer must not retire the mirror
+         * (the free-watch prefilter and the slot test agree on both edges) */
+        isaac_nv_guest_buffer_freed((void *)(uintptr_t)(g.alloc_buffer - 1U));
+        isaac_nv_guest_buffer_freed((void *)(uintptr_t)(g.alloc_buffer + g.alloc_len));
+        CHECK(isaac_nv_oracle_mirror_busy(g.f) != -1, "seek: outside frees keep the mirror");
+        /* the game frees the alloc buffer (state inside) right away; on
+         * odd rounds the last interior byte stands for "contains the state" */
+        isaac_nv_guest_buffer_freed((void *)(uintptr_t)((round & 1U) ?
+            g.alloc_buffer + g.alloc_len - 1U : g.alloc_buffer));
         CHECK(isaac_nv_oracle_mirror_busy(g.f) == -1, "seek: freed mirror retired");
         r->guest_f = 0U;
         free(ref);
@@ -1987,8 +1994,35 @@ int main(int argc, char **argv)
          * chunks, the 5.1 file and the big noise file */
         run_async_early_tests(argv[i], ogg, length);
 #endif
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+        /* quiescent: no bind in flight, so the live mask is exactly the
+         * active set (the bit is set before active=1 on the one activation
+         * path and cleared after every active=0) */
+        CHECK(isaac_nv_oracle_free_watch_live() == isaac_nv_oracle_active_bits(),
+              "free-watch mask: live bits == active slots between files");
+#endif
         free(ogg);
     }
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+    {
+        uint32_t census[7];
+
+        isaac_nv_free_watch_census_take(census);
+        printf("free-watch mask: observer calls=%u live-bit sum=%u max=%u "
+               "calls by live bits 0/1/2/3+=%u/%u/%u/%u violations=%u "
+               "live=%08x active=%08x\n",
+               (unsigned)census[0], (unsigned)census[1], (unsigned)census[2],
+               (unsigned)census[3], (unsigned)census[4], (unsigned)census[5],
+               (unsigned)census[6],
+               (unsigned)isaac_nv_oracle_free_watch_violations(),
+               (unsigned)isaac_nv_oracle_free_watch_live(),
+               (unsigned)isaac_nv_oracle_active_bits());
+        CHECK(isaac_nv_oracle_free_watch_violations() == 0U,
+              "free-watch mask: every active slot had its live bit at every observer entry");
+        CHECK(census[0] == 0U || census[0] == census[3] + census[4] + census[5] + census[6],
+              "free-watch mask: census buckets add up");
+    }
+#endif
 #if NV_ORACLE_ASYNC
     if (s_async_ran) {
         isaac_nv_oracle_stats st;

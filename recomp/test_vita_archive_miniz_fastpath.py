@@ -390,7 +390,14 @@ def verify_build_wiring() -> None:
             "archive MiniZ generated/guest/heap compile fence changed")
     # Native PNG also conditionally reuses the same native miniz owner when
     # the archive path is OFF; do not count its explanatory comment as code.
-    require(cmake.count('"${ISAAC_RUNTIME}/host_vita_archive_miniz_native.c"') == 2 and
+    # Two owners (archive fast path, native PNG fallback) plus the
+    # ISAAC_VITA_INFLATE_TABLE_MEMO set_property that only adds a compile
+    # definition to the archive owner (no third list(APPEND ...)).
+    require(cmake.count('"${ISAAC_RUNTIME}/host_vita_archive_miniz_native.c"') == 3 and
+            cmake.count('list(APPEND ISAAC_VITA_RUNTIME_SOURCES\n'
+                        '      "${ISAAC_RUNTIME}/host_vita_archive_miniz_native.c"') == 1 and
+            cmake.count('list(APPEND ISAAC_VITA_RUNTIME_SOURCES\n'
+                        '          "${ISAAC_RUNTIME}/host_vita_archive_miniz_native.c"') == 1 and
             "if(NOT ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH)" in cmake and
             cmake.count("host_vita_archive_miniz_guest.c") == 3,
             "archive MiniZ runtime source ownership changed")

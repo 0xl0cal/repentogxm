@@ -42,6 +42,13 @@ static IsaacVitaPngTexelInitSnapshot s_png_init_previous;
 # include "host_vita_crt.h"
 static uint32_t s_file_hint_previous[2], s_file_hint_valid, s_file_hint_win;
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+# include "host_vita_archive_trail.h"
+/* Static: CAP records plus the key table would otherwise sit on the game
+ * thread's stack at every report. */
+static isaac_vita_archive_trail_window s_trail_take;
+static uint32_t s_trail_take_misses;
+#endif
 
 static void kage_vita_room_profile_discard(void)
 {
@@ -240,6 +247,44 @@ static void kage_vita_room_profile_report(const char *bid, uint32_t win,
         if (io.snapshot_valid) {
             s_io_baseline_valid = 1u;
             s_io_previous_win = win;
+        }
+    }
+#endif
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+    {
+        /* One rts summary per window, then one rt per recorded run: archive
+         * basename, logical offset, bytes returned, fread calls, kind/end
+         * and the process time the run opened (compare with ph120.s at= and
+         * roomlog at=).  Runs are charged to the window in which they were
+         * recorded (their seek or fclose); at= re-buckets them exactly. */
+        if (!isaac_vita_crt_archive_trail_take(&s_trail_take)) {
+            ++s_trail_take_misses;
+            KVPP_PRINTF("[kage-vita] ph120.rts bid=%.32s win=%u loops=%u "
+                "valid=0 miss=%u\n", bid, win, loops, s_trail_take_misses);
+        } else {
+            const isaac_vita_archive_trail_window *t = &s_trail_take;
+            uint32_t i;
+
+            KVPP_PRINTF("[kage-vita] ph120.rts bid=%.32s win=%u loops=%u "
+                "valid=1 abi=%u runs=%u rec=%u drop=%u cap=%u bytes=%u "
+                "freads=%u seeks=%u fail=%u empty=%u back=%u opens=%u "
+                "closes=%u implicit=%u keys=%u sat=%u miss=%u\n",
+                bid, win, loops, t->abi, t->runs, t->count, t->drop,
+                (uint32_t)ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP, t->bytes,
+                t->freads, t->seeks, t->fails, t->empty, t->back, t->opens,
+                t->closes, t->implicit, t->key_count, t->sat,
+                s_trail_take_misses);
+            for (i = 0u; i < t->count; ++i) {
+                const isaac_vita_archive_trail_run *r = &t->record[i];
+                const char *name = r->key < t->key_count
+                    ? t->keys[r->key] : "?";
+
+                KVPP_PRINTF("[kage-vita] ph120.rt bid=%.32s win=%u loops=%u "
+                    "a=%.63s o=%08x n=%u c=%u k=%c%c at=%08x%08x\n",
+                    bid, win, loops, name, r->offset, r->bytes, r->freads,
+                    (int)r->kind, r->closed ? 'c' : 's',
+                    KVPP_U64_ARGS(r->at));
+            }
         }
     }
 #endif

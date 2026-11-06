@@ -23,6 +23,21 @@ const char *kage_vita_backend_last_error(void);
 
 #define KAGE_VITA_MEMORY_SNAPSHOT_MAX_BODY 366u
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+/* GL render thread: vitaGL free space as published by the render thread
+ * (ISAAC_VITA_GL_THREAD_VGL_MEM_SNAPSHOT, kage_vita_backend.c). */
+#define KAGE_VITA_VGL_SNAPSHOT_RAM_FREE     0u
+#define KAGE_VITA_VGL_SNAPSHOT_VRAM_FREE    1u
+#define KAGE_VITA_VGL_SNAPSHOT_PHYCONT_FREE 2u
+#define KAGE_VITA_VGL_SNAPSHOT_RAM_TOTAL    3u
+#define KAGE_VITA_VGL_SNAPSHOT_WORDS        4u
+uint32_t    kage_vita_backend_vgl_mem(unsigned index);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+/* 0 = decline this interpolated render: the render thread is a frame behind. */
+int         kage_vita_backend_render_admit(void);
+#endif
+
 #if defined(ISAAC_VITA_IO_PROFILE)
 /* Called by the project-side vitaGL render-target event endpoint at the first
  * 1024x1024 FBO acquisition.  The implementation is diagnostic-only: query

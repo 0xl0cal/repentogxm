@@ -40,10 +40,29 @@ do
         exit 3
     fi
 done
+# ISAAC_VITA_DISPLAY_CENTER_Y moves only the default framebuffer's viewport
+# origin (test_gl_vita_backend.ps1 carries the same list).
+if ! grep -Fq '"glReadPixels"' "$root/runtime/gl_surface_generated.inc"; then
+    echo "display-centre surface control disappeared: glReadPixels" >&2
+    exit 3
+fi
+for name in glScissor glScissorArrayv glScissorIndexed glScissorIndexedv \
+    glBlitFramebuffer glBlitNamedFramebuffer glCopyPixels
+do
+    if grep -Fq "\"$name\"" "$root/runtime/gl_surface_generated.inc"; then
+        echo "GL backend surface gained a window-row API the display centre does not shift: $name" >&2
+        exit 3
+    fi
+done
 
 for mode in off on fxray texture texture-fxray fbo fbo720 time time-fbo720 \
     prod-elision prod-elision-drop prod-loc prod-loc-verify \
-    prod-elision-loc-verify prod-fill prod-elision-drop-fill
+    prod-elision-loc-verify prod-fill prod-elision-drop-fill \
+    readback prod-elision-drop-readback \
+    depth-scene depth-carry prod-elision-drop-depth-scene \
+    prod-elision-drop-depth-carry \
+    center-y prod-elision-drop-readback-center-y \
+    prod-elision-drop-depth-carry-center-y
 do
     if [ "$mode" = on ] || [ "$mode" = fbo720 ] || [ "$mode" = time-fbo720 ]; then
         display_define=-DISAAC_VITA_DISPLAY_RASTER_720=1
@@ -93,7 +112,34 @@ do
     else
         fill_define=
     fi
-    if [ "$mode" = prod-elision-drop ] || [ "$mode" = prod-elision-drop-fill ]; then
+    # readback / prod-elision-drop-readback: the offscreen readback sync
+    # (issue #10) alone and on top of the shipped depth-drop elision.
+    if [ "$mode" = readback ] || [ "$mode" = prod-elision-drop-readback ] ||
+            [ "$mode" = prod-elision-drop-readback-center-y ]; then
+        readback_define=-DISAAC_VITA_FBO_READBACK_FIX=1
+    else
+        readback_define=
+    fi
+    # depth-*: issue #15, vitaGL per-scene depth model (oracle only) and the
+    # stock negative control vs ISAAC_VITA_FBO_DEPTH_CARRY.
+    case $mode in
+    *depth-carry|*depth-carry-center-y) depth_define="-DORACLE_DEPTH_SCENE_MODEL=1 -DISAAC_VITA_FBO_DEPTH_CARRY=1" ;;
+    *depth-scene) depth_define=-DORACLE_DEPTH_SCENE_MODEL=1 ;;
+    *) depth_define= ;;
+    esac
+    # *center-y: ISAAC_VITA_DISPLAY_CENTER_Y (issue #5, 5.8b), alone and on
+    # the recipe-B-shaped production set (elision + depth drop with the
+    # readback fix, and with the depth carry).
+    case $mode in
+    *center-y) center_define=-DISAAC_VITA_DISPLAY_CENTER_Y=1 ;;
+    *) center_define= ;;
+    esac
+    if [ "$mode" = prod-elision-drop ] || [ "$mode" = prod-elision-drop-fill ] ||
+            [ "$mode" = prod-elision-drop-readback ] ||
+            [ "$mode" = prod-elision-drop-readback-center-y ] ||
+            [ "$mode" = prod-elision-drop-depth-scene ] ||
+            [ "$mode" = prod-elision-drop-depth-carry ] ||
+            [ "$mode" = prod-elision-drop-depth-carry-center-y ]; then
         elision_define="-DISAAC_VITA_FBO_CLEAR_ELISION=1 -DISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP=1"
     elif [ "$mode" = prod-elision ] || [ "$mode" = prod-elision-loc-verify ]; then
         elision_define=-DISAAC_VITA_FBO_CLEAR_ELISION=1
@@ -121,7 +167,7 @@ do
     "$cc" $oracle_flags $display_define $fxray_define $texture_define \
         $fbo_define $time_define \
         $prod_define $elision_define $location_define $verify_define \
-        $fill_define \
+        $fill_define $readback_define $depth_define $center_define \
         -DISAAC_GL_VITA_BACKEND_ORACLE=1 \
         -DGUEST_IMAGE_BASE=0x98000000u \
         -I"$root/runtime" \
@@ -135,7 +181,7 @@ do
     "$cc" $production_flags $display_define $fxray_define $texture_define \
         $fbo_define $time_define \
         $production_prod_define $elision_define $location_define $verify_define \
-        $fill_define \
+        $fill_define $readback_define $depth_define $center_define \
         $production_include \
         -DGUEST_IMAGE_BASE=0x98000000u \
         -I"$root/runtime" -I"$root/vita" \

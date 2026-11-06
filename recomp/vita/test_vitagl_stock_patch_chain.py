@@ -60,6 +60,7 @@ TRANSFORM_WITH_CACHE_SHA256 = "71ac71f8a637b22c4de50cba110590f4348b5cfdd3869710d
 TRANSFORM_WITHOUT_CACHE_SHA256 = "c15c96580aaf3a391f8d0a27714d0858037f6230cc931b7e4b103d3a9e4d1e76"
 TRANSFORM_WITH_HALO_SHA256 = "5d8df29f49e2994f38181d061b27829273f92841262597cae832a30279d4dea8"
 ATLAS_NEAREST_PATCH = "0019-isaac-laser-atlas-nearest.patch"
+SCENE_GUARD_PATCH = "0034-isaac-scene-guard.patch"
 ATLAS_NEAREST_WITH_CACHE_SHA256 = (
     "c4b77d487337a853a87abf6b0d3be265fdf69218c88d9666c64a868fc3b67ee2",
     "5ac2bedbaf323475dd586ed85b7b392ce53436b9fddb16a5a64e89690a52e613",
@@ -1054,6 +1055,191 @@ def prove_sdk_sparse(recipe: Path, temporary: Path, stock_tar: Path | None,
         print(f"SDK-sparse fresh pinned chain atlas={int(atlas)}: source population/hash checks PASS")
 
 
+def _strip_scene_guard(text: str) -> str:
+    """Pure-Python unifdef of HAVE_ISAAC_SCENE_GUARD keeping the #else branches."""
+    out: list[str] = []
+    state = "copy"
+    for line in text.split("\n"):
+        if state == "copy":
+            if line == "#ifdef HAVE_ISAAC_SCENE_GUARD":
+                state = "drop"
+            else:
+                out.append(line)
+        elif state == "drop":
+            if line == "#else":
+                state = "keep"
+            elif line == "#endif":
+                state = "copy"
+            else:
+                assert not line.startswith("#"), line
+        else:
+            if line == "#endif":
+                state = "copy"
+            else:
+                assert not line.startswith("#"), line
+                out.append(line)
+    assert state == "copy"
+    return "\n".join(out)
+
+
+def _check_scene_guard_host(temporary: Path, gxm: str, cc: str, label: str) -> None:
+    """Drive the actual guard and scene_end bodies against SDK stand-ins."""
+    start = gxm.index("#ifdef HAVE_ISAAC_SCENE_GUARD\n/* Isaac 0034 scene guard.")
+    end = gxm.index("\n#endif\n", start)
+    block = gxm[start:end + len("\n#endif\n")]
+    end_start = gxm.index("static inline __attribute__((always_inline)) void scene_end(void) {")
+    end_stop = gxm.index("\n}\n", end_start) + len("\n}\n")
+    end_body = gxm[end_start:end_stop]
+    program = temporary / f"scene-guard-{label}-host.c"
+    program.write_text(
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n"
+        "typedef unsigned char GLboolean;\n#define GL_FALSE 0\n#define GL_TRUE 1\n"
+        "#define HAVE_ISAAC_SCENE_GUARD 1\n"
+        # Timer-OFF definitions from 0005-isaac-scene-timer.patch. The diag
+        # chain's real scene_end contains these hooks even with timing OFF.
+        "#define ISAAC_SCENE_TIME_BEGIN() ((void)0)\n"
+        "#define ISAAC_SCENE_TIME_END_END_SCENE() ((void)0)\n"
+        "typedef struct SceGxmContext SceGxmContext;\nstatic SceGxmContext *gxm_context;\n"
+        # Copied from vitasdk psp2/gxm.h (SceGxmErrorCode), not recalled.
+        "#define SCE_GXM_ERROR_NOT_WITHIN_SCENE 0x805B0006u\n"
+        "#define SCE_GXM_ERROR_WITHIN_SCENE 0x805B0007u\n"
+        "static int reserve_result, reserve_calls, reserve_null;\nstatic char reserve_slot;\n"
+        "typedef struct { uint32_t value; } FakeFence;\nstatic FakeFence query_fence;\n"
+        "static int end_result, end_calls, wait_calls, system_app_mode, vsync_interval;\n"
+        "static int sceGxmEndScene(SceGxmContext *c, void *unused, FakeFence *f)\n"
+        "{ (void)c; (void)unused; (void)f; end_calls++; return end_result; }\n"
+        "static int sceDisplayWaitVblankStartMulti(int n) { (void)n; wait_calls++; return 0; }\n"
+        "static int sceGxmReserveVertexDefaultUniformBuffer(SceGxmContext *c, void **out)\n"
+        "{ (void)c; reserve_calls++; *out = (reserve_result || reserve_null) ? NULL : &reserve_slot; return reserve_result; }\n"
+        "static int sceGxmReserveFragmentDefaultUniformBuffer(SceGxmContext *c, void **out)\n"
+        "{ return sceGxmReserveVertexDefaultUniformBuffer(c, out); }\n"
+        + block + end_body +
+        "#define CHECK(c) do { if (!(c)) { fprintf(stderr, \"line %d: %s\\n\", __LINE__, #c); return 1; } } while (0)\n"
+        "int main(void)\n{\n"
+        "    void *b = &b; uint32_t s[8];\n"
+        "    CHECK(!isaacSceneGuardOpen());\n"
+        "    CHECK(!isaacSceneGuardReserveVertex(&b) && b == NULL && reserve_calls == 0);\n"
+        "    b = &b; CHECK(!isaacSceneGuardReserveFragment(&b) && b == NULL && reserve_calls == 0);\n"
+        "    CHECK(vglIsaacSceneGuardChanged() == 0);\n"
+        "    isaacSceneGuardSkipClear(); CHECK(vglIsaacSceneGuardChanged() == 1);\n"
+        "    isaac_scene_guard_note_rt(0); CHECK(vglIsaacSceneGuardChanged() == 1);\n"
+        "    isaac_scene_guard_note_rt((int)0x805B0006u); CHECK(vglIsaacSceneGuardChanged() == 2);\n"
+        "    isaac_scene_guard_note_begin_scene((int)0x805B000Fu); CHECK(!isaacSceneGuardOpen());\n"
+        "    isaac_scene_guard_note_begin_scene(0); CHECK(isaacSceneGuardOpen() && vglIsaacSceneGuardChanged() == 3);\n"
+        "    CHECK(isaacSceneGuardReserveVertex(&b) && b == &reserve_slot && reserve_calls == 1);\n"
+        "    reserve_result = (int)0x805B0011u;\n"
+        "    CHECK(!isaacSceneGuardReserveFragment(&b) && b == NULL && reserve_calls == 2);\n"
+        "    isaacSceneGuardSkipDraw();\n"
+        "    vglIsaacSceneGuardSnapshot(s);\n"
+        "    CHECK(s[0] == 1 && s[1] == 1 && s[2] == 0 && s[3] == 1 && s[4] == 1 && s[5] == 1 && s[6] == 0);\n"
+        "    CHECK(s[7] == 0x805B0011u && vglIsaacSceneGuardChanged() == 5);\n"
+        "    vglIsaacSceneGuardSnapshot(s); CHECK(s[3] == 1 && vglIsaacSceneGuardChanged() == 5);\n"
+        "    reserve_result = 0; reserve_null = 1; b = &b;\n"
+        "    CHECK(!isaacSceneGuardReserveVertex(&b) && b == NULL && reserve_calls == 3);\n"
+        "    vglIsaacSceneGuardSnapshot(s); CHECK(s[3] == 2 && s[7] == 0x805B0011u);\n"
+        "    system_app_mode = 1; vsync_interval = 1;\n"
+        "    scene_end(); CHECK(!isaacSceneGuardOpen() && end_calls == 1 && query_fence.value == 1 && wait_calls == 1);\n"
+        "    scene_end(); CHECK(end_calls == 1 && query_fence.value == 1 && wait_calls == 1);\n"
+        "    vglIsaacSceneGuardSnapshot(s); CHECK(s[2] == 0 && s[6] == 1);\n"
+        "    isaac_scene_guard_note_begin_scene(0);\n"
+        # Reuse the fixture's synthetic nonzero error; no claim about which
+        # EndScene error a physical SDK will produce or how its fence behaves.
+        "    end_result = (int)0x805B0011u;\n"
+        "    uint32_t v[4];\n"
+        "    scene_end(); CHECK(!isaacSceneGuardOpen() && end_calls == 2 && query_fence.value == 2 && wait_calls == 2);\n"
+        "    vglIsaacSceneGuardRecovery(v); CHECK(v[0] == 1 && v[1] == 0 && v[2] == 0 && v[3] == 0x805B0011u);\n"
+        # The Vita (2026-09-27) showed a failed EndScene leaves the scene open
+        # inside GXM (every later BeginScene: WITHIN_SCENE). The next scene_end
+        # must retry the end, as stock vitaGL does, never skip it.
+        "    scene_end(); CHECK(!isaacSceneGuardOpen() && end_calls == 3 && query_fence.value == 3 && wait_calls == 3);\n"
+        "    vglIsaacSceneGuardRecovery(v); CHECK(v[0] == 1 && v[1] == 1 && v[2] == 0);\n"
+        "    isaac_scene_guard_note_begin_scene((int)SCE_GXM_ERROR_WITHIN_SCENE); CHECK(!isaacSceneGuardOpen());\n"
+        "    b = &b; CHECK(!isaacSceneGuardReserveVertex(&b) && b == NULL && reserve_calls == 3);\n"
+        "    end_result = 0;\n"
+        "    scene_end(); CHECK(!isaacSceneGuardOpen() && end_calls == 4 && query_fence.value == 4 && wait_calls == 4);\n"
+        "    vglIsaacSceneGuardRecovery(v); CHECK(v[0] == 0 && v[1] == 2 && v[2] == 1 && v[3] == 0x805B0011u);\n"
+        "    scene_end(); CHECK(end_calls == 4 && query_fence.value == 4 && wait_calls == 4);\n"
+        "    vglIsaacSceneGuardSnapshot(s);\n"
+        "    CHECK(s[1] == 2 && s[2] == 2 && s[6] == 2 && s[7] == SCE_GXM_ERROR_WITHIN_SCENE);\n"
+        # WITHIN_SCENE from a begin alone marks a dangling scene; an end that
+        # reports NOT_WITHIN_SCENE clears it without counting a recovery.
+        "    isaac_scene_guard_note_begin_scene((int)SCE_GXM_ERROR_WITHIN_SCENE);\n"
+        "    end_result = (int)SCE_GXM_ERROR_NOT_WITHIN_SCENE;\n"
+        "    scene_end(); CHECK(end_calls == 5 && query_fence.value == 5);\n"
+        "    vglIsaacSceneGuardRecovery(v); CHECK(v[0] == 0 && v[1] == 3 && v[2] == 1 && v[3] == SCE_GXM_ERROR_NOT_WITHIN_SCENE);\n"
+        "    scene_end(); CHECK(end_calls == 5 && query_fence.value == 5);\n"
+        # A successful begin proves GXM held no scene: dangling is cleared.
+        "    isaac_scene_guard_note_begin_scene((int)SCE_GXM_ERROR_WITHIN_SCENE);\n"
+        "    isaac_scene_guard_note_begin_scene(0); CHECK(isaacSceneGuardOpen());\n"
+        "    vglIsaacSceneGuardRecovery(v); CHECK(v[0] == 0);\n"
+        "    end_result = 0; reserve_null = 0;\n"
+        "    CHECK(isaacSceneGuardReserveFragment(&b) && b == &reserve_slot);\n"
+        "    scene_end(); CHECK(end_calls == 6); vglIsaacSceneGuardRecovery(v); CHECK(v[1] == 3 && v[2] == 1);\n"
+        "    puts(\"scene guard host: PASS\");\n    return 0;\n}\n",
+        encoding="utf-8")
+    executable = temporary / f"scene-guard-{label}-host.exe"
+    run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(program), "-o", str(executable)])
+    print(f"scene guard {label}: " + run([str(executable)]).decode("utf-8").strip())
+
+
+def prove_scene_guard(recipe: Path, temporary: Path, stock_tar: Path | None,
+                      cc: str | None = None, repository_archive: bytes | None = None) -> None:
+    """0034 lands on every supported shape, touches three files, is OFF-identical."""
+    if stock_tar:
+        assert sha256(stock_tar) == SOURCE_ARCHIVE_SHA256
+    patches = {int(p.name[:4]): p for p in recipe.glob("[0-9][0-9][0-9][0-9]-*.patch")}
+    build = (recipe / "build.sh").read_text(encoding="utf-8")
+    assert build.index('apply_source_patch "$scene_guard_patch"') > build.index(
+        'apply_source_patch "$white_census_patch"')
+    assert '[ "$patch" = "$scene_guard_patch" ]' in build
+    assert "printf 'scene_guard_patch_sha256=%s\\n'" in build
+    assert '"$scene_guard" "$scene_guard_patch_sha"' in build[
+        build.index("emit_recipe_inputs()\n{"):build.index("emit_sdk_sparse_recipe_inputs()")]
+    cmake = (recipe.parent / "CMakeLists.txt").read_text(encoding="utf-8")
+    assert SCENE_GUARD_PATCH in cmake and "ISAAC_SCENE_GUARD=${ISAAC_VITA_VITAGL_SCENE_GUARD_MODE}" in cmake
+    bare = (1, 28, 29, 30)
+    control = (1, 2, 3, 8, 4, 12, 13, 14, 15, 7, 10, 11, 16, 17, 18, 21, 24, 33, 22, 23, 26,
+               28, 29, 30)
+    diag = (1, 2, 3, 8, 4, 12, 13, 14, 15, 5, 6, 7, 10, 9, 11, 16, 17, 18, 20, 21, 24, 33,
+            22, 23, 26, 25, 27, 28, 29, 31, 32)
+    touched = {Path("source/gxm.c"), Path("source/misc.c"), Path("source/tests.c")}
+    for label, numbers in (("bare", bare), ("control", control), ("diag", diag)):
+        source = materialize_stock(temporary / ("scene-guard-" + label), stock_tar, repository_archive)
+        for n in numbers:
+            apply_patch(source, patches[n])
+        before = {p.relative_to(source): sha256(p) for p in (source / "source").rglob("*") if p.is_file()}
+        originals = {p: (source / p).read_text(encoding="utf-8") for p in touched}
+        apply_patch(source, patches[34])
+        assert {p for p, digest in before.items() if sha256(source / p) != digest} == touched
+        after = {p: (source / p).read_text(encoding="utf-8") for p in touched}
+        for p in touched:
+            # Everything the patch adds is inside HAVE_ISAAC_SCENE_GUARD: the
+            # stripped ON source is the OFF source, byte for byte.
+            assert _strip_scene_guard(after[p]) == originals[p], (label, p)
+        gxm, misc, tests = (after[Path("source/" + n)] for n in ("gxm.c", "misc.c", "tests.c"))
+        assert gxm.count("#ifdef HAVE_ISAAC_SCENE_GUARD") == 7
+        assert gxm.count("isaac_scene_guard_note_begin_scene(r);") == 2
+        assert gxm.count("isaac_scene_guard_note_rt(") == 3
+        assert gxm.count("void vglIsaacSceneGuardSnapshot(uint32_t out[8]) {") == 1
+        assert gxm.count("uint32_t vglIsaacSceneGuardChanged(void) {") == 1
+        assert gxm.count("void vglIsaacSceneGuardRecovery(uint32_t out[4]) {") == 1
+        assert gxm.count("isaac_scene_guard_note_end_scene(isaac_end_r);") == 1
+        assert "if (!isaac_scene_open && !isaac_scene_dangling) {" in gxm
+        assert gxm.index("static GLboolean isaac_scene_open") < gxm.index("void create_display_render_target(void) {")
+        assert misc.count("#ifdef HAVE_ISAAC_SCENE_GUARD") == 8
+        assert misc.count("isaacSceneGuardSkipClear();") == 2
+        assert misc.index("if (!isaacSceneGuardOpen()) {") > misc.index("\tscene_reset();")
+        assert tests.count("#ifdef HAVE_ISAAC_SCENE_GUARD") == 5
+        assert tests.count("isaacSceneGuardReserveVertex(&vertex_buffer);") == 2
+        assert tests.count("isaacSceneGuardSkipDraw();") == 2
+        for header in ("vitaGL.h", "shared.h"):
+            assert "SceneGuard" not in (source / "source" / header).read_text(encoding="utf-8")
+        print(f"scene guard {label}: 0034 applied on {len(numbers)} patches, only gxm.c/misc.c/tests.c changed, "
+              f"OFF-stripped source identical; gxm={sha256(source / 'source/gxm.c')}")
+        if cc:
+            _check_scene_guard_host(temporary, gxm, cc, label)
+
+
 def prove_metadata_once(recipe: Path, temporary: Path, stock_tar: Path | None,
                         cc: str | None = None, repository_archive: bytes | None = None) -> None:
     """Regenerate the two supported recipes; exercise the actual staging block."""
@@ -1993,7 +2179,8 @@ def apply_patch(source: Path, patch: Path) -> None:
     ]
     if patch.name in ("0016-isaac-laser-light-halo-clip.patch",
                       "0017-isaac-laser-light-nearest.patch", ATLAS_NEAREST_PATCH,
-                      "0025-isaac-sdk-sparse-profile.patch"):
+                      "0025-isaac-sdk-sparse-profile.patch", SCENE_GUARD_PATCH,
+                      "0035-isaac-rgb-subupload.patch"):
         command.append("--unidiff-zero")
     run(command + ["--check", str(patch)], cwd=source)
     run(command + [str(patch)], cwd=source)
@@ -2717,6 +2904,117 @@ int main(void) {
     print(run([str(executable)]).decode("utf-8").strip() + "; opt-in/neutral guards PASS")
 
 
+INTENSITY_PATCH = "0037-isaac-intensity-texture.patch"
+# The three chains 0037 must land on: bare stock shape, recipe B ("control",
+# 0034+0035 included) and the diagnostic chain.  test_intensity_texture.py
+# executes the patched bodies on exactly these.
+INTENSITY_CHAINS = {
+    "bare": (1, 28, 29, 30),
+    "control": (1, 2, 3, 8, 4, 12, 13, 14, 15, 7, 10, 11, 16, 17, 18, 21, 24, 33, 22, 23, 26,
+                28, 29, 30, 34, 35),
+    "diagnostic": (1, 2, 3, 8, 4, 12, 13, 14, 15, 5, 6, 7, 10, 9, 11, 16, 17, 18, 20, 21, 24, 33,
+                   22, 23, 26, 25, 27, 28, 29, 31, 32, 34, 35),
+}
+INTENSITY_GUARD = "#ifdef HAVE_ISAAC_INTENSITY_TEXTURE"
+# (file, owner function signature fragment) for every guarded block 0037 adds.
+INTENSITY_HOOKS = {
+    "textures.c": ("int unpack_row_len = 0;", "void _glTexParameterx(texture *tex,",
+                   "void _glTexParameteri(texture *tex,", "void _glTexImage2D_FlatIMPL(texture *tex,",
+                   "void _glTexSubImage2D(texture *tex,", "void glGenTextures(GLsizei n, GLuint *res)"),
+    "shared.h": ("void _glFramebufferTexture2D(framebuffer *fb,",),
+    "utils/gpu_utils.h": (None, "void gpu_free_texture_data(texture *tex)"),
+}
+
+
+def _strip_intensity(text: str) -> str:
+    """Pure-Python unifdef of HAVE_ISAAC_INTENSITY_TEXTURE (no #else in 0037)."""
+    out: list[str] = []
+    depth = 0
+    for line in text.split("\n"):
+        if depth == 0:
+            if line == INTENSITY_GUARD:
+                depth = 1
+            else:
+                out.append(line)
+        else:
+            assert not line.startswith("#else"), line
+            if line.startswith("#if"):
+                depth += 1
+            elif line.startswith("#endif"):
+                depth -= 1
+    assert depth == 0
+    return "\n".join(out)
+
+
+def _apply_zero(source: Path, patch: Path, check_only: bool = False) -> bool:
+    command = ["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "apply", "--unidiff-zero"]
+    probe = subprocess.run(command + ["--check", str(patch)], cwd=source, capture_output=True)
+    if probe.returncode or check_only:
+        return probe.returncode == 0
+    run(command + [str(patch)], cwd=source)
+    return True
+
+
+def prove_intensity_texture(recipe: Path, temporary: Path, stock_tar: Path | None,
+                            repository_archive: bytes | None = None,
+                            before_patches: tuple[Path, ...] = ()) -> None:
+    """0037 lands on every supported chain, after any 0036 in the recipe (or
+    given), touches three files, strips to the pre-0037 bytes, and puts every
+    guarded block at the head of its owner (glGenTextures: right after the
+    stock TEX_UNUSED -> TEX_UNINITIALIZED transition)."""
+    build = (recipe / "build.sh").read_text(encoding="utf-8")
+    apply_at = build.index('apply_source_patch "$intensity_texture_patch"')
+    assert apply_at > build.index('apply_source_patch "$rgb_subupload_patch"')
+    assert build.rindex('if [ "$intensity_texture" = 1 ]; then', 0, apply_at) > build.rfind("fi\n", 0, apply_at)
+    assert '[ "$patch" = "$intensity_texture_patch" ]' in build
+    emit = build[build.index("emit_recipe_inputs()\n{"):build.index("emit_sdk_sparse_recipe_inputs()")]
+    sha_at = emit.index('"$intensity_texture_patch_sha"')
+    assert emit.count('"$intensity_texture_patch_sha"') == 1
+    assert emit.rindex('if [ "$intensity_texture" = 1 ]; then', 0, sha_at) > emit.rfind("fi\n", 0, sha_at)
+    patches = {int(q.name[:4]): q for q in recipe.glob("[0-9][0-9][0-9][0-9]-*.patch")}
+    assert patches[37].name == INTENSITY_PATCH
+    extras = tuple(sorted(recipe.glob("0036-*.patch"))) + tuple(before_patches)
+    touched = {Path("source") / f for f in INTENSITY_HOOKS}
+    for label, numbers in INTENSITY_CHAINS.items():
+        for extra in ((),) + tuple((e,) for e in extras):
+            name = label + "".join("+" + e.name[:4] for e in extra)
+            source = materialize_stock(temporary / ("intensity-" + name.replace("+", "-")), stock_tar,
+                                       repository_archive)
+            for n in numbers:
+                apply_patch(source, patches[n])
+            if extra and not _apply_zero(source, extra[0], check_only=True):
+                print(f"intensity {name}: {extra[0].name} itself does not apply on this chain; "
+                      "0037 ordering not exercised here")
+                continue
+            for e in extra:
+                _apply_zero(source, e)
+            before = {q.relative_to(source): sha256(q) for q in (source / "source").rglob("*") if q.is_file()}
+            originals = {q: (source / q).read_text(encoding="utf-8") for q in touched}
+            assert _apply_zero(source, patches[37]), name
+            assert {q for q, digest in before.items() if sha256(source / q) != digest} == touched, name
+            for q in touched:
+                after = (source / q).read_text(encoding="utf-8")
+                assert _strip_intensity(after) == originals[q], (name, q)
+                lines = after.split("\n")
+                guards = [i for i, line in enumerate(lines) if line == INTENSITY_GUARD]
+                owners = INTENSITY_HOOKS[q.relative_to("source").as_posix()]
+                assert len(guards) == len(owners), (name, q, len(guards))
+                for at, owner in zip(guards, owners):
+                    if owner is None:
+                        continue  # gpu_utils.h prototype block above its first user
+                    if owner.startswith("void glGenTextures"):
+                        assert lines[at - 1] == "\t\t\ttexture_slots[i].status = TEX_UNINITIALIZED;", name
+                        assert lines[at + 1] == "\t\t\tisaac_intensity_generated(i);", name
+                        assert owner in "\n".join(lines[at - 20:at]), name
+                    else:
+                        assert owner in lines[at - 1], (name, q, owner, lines[at - 1])
+            textures = (source / "source/textures.c").read_text(encoding="utf-8")
+            assert textures.count("isaac_intensity_generated(") == 1
+            print(f"intensity {name}: 0037 applied (zero-context) on {len(numbers) + len(extra)} patches, "
+                  "only textures.c/shared.h/utils/gpu_utils.h changed, OFF-stripped source identical, "
+                  "9 guarded blocks at their owners incl. glGenTextures name reset")
+
+
 def prove_combination(
     recipe: Path,
     temporary: Path,
@@ -2793,6 +3091,8 @@ def main() -> int:
     source.add_argument("--stock-tar", type=Path)
     source.add_argument("--stock-repo", type=Path)
     parser.add_argument("--cc", help="optionally run P8, fragment-bind and FBO-region host checks")
+    parser.add_argument("--scene-guard-only", action="store_true",
+                        help="run only the three regenerated 0034 chains and guard/scene_end host checks")
     args = parser.parse_args()
 
     vita = Path(__file__).resolve().parent
@@ -2815,6 +3115,10 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="isaac-vitagl-patch-chain-") as value:
         temporary = Path(value)
+        if args.scene_guard_only:
+            prove_scene_guard(recipe, temporary, stock_tar, args.cc, repository_archive)
+            print("Isaac exact stock vitaGL scene-guard regression: PASS")
+            return 0
         for name in EXPECTED_HASHES:
             prove_combination(
                 recipe, temporary, name, stock_tar, repository_archive
@@ -2823,12 +3127,14 @@ def main() -> int:
         prove_fbo_float_sync(recipe, temporary, stock_tar, args.cc, repository_archive)
         prove_sdk_sparse(recipe, temporary, stock_tar, args.cc, repository_archive)
         prove_metadata_once(recipe, temporary, stock_tar, args.cc, repository_archive)
+        prove_intensity_texture(recipe, temporary, stock_tar, repository_archive)
         if stock_tar is not None:
             prove_halo_profile(recipe, temporary, stock_tar, args.cc)
         prove_fbo_scissor_resize(recipe, temporary, stock_tar, args.cc, repository_archive)
         prove_fbo_scissor_replay(recipe, temporary, stock_tar, args.cc, repository_archive)
         prove_fs_probe_matrix(recipe, temporary, stock_tar, repository_archive)
         prove_staging_matrix(recipe, temporary, stock_tar, repository_archive, args.cc)
+        prove_scene_guard(recipe, temporary, stock_tar, args.cc, repository_archive)
         if args.cc:
             executable = temporary / "p8-safety-host.exe"
             run([args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror",

@@ -16,6 +16,12 @@
  * native vorbis worker).  One logger thread drains the ring strictly FIFO and
  * performs the sinks. With FILE_BATCH enabled, already queued adjacent FILE
  * records may share one file append; debug output remains one call per line.
+ * ISAAC_VITA_LOG_ASYNC_PRINTF_FILE additionally routes bounded printf records
+ * through that same FILE+debug sink, without filtering a family or changing
+ * their bytes/order. It enables file-based profiling when Cat-A-Log's reverse
+ * TCP route is unavailable. It is diagnostic I/O, not an FPS improvement.
+ * Unexpected overlong printf keeps its original exact debug output, with a
+ * durable network_only=1 receipt instead of a silently truncated file record.
  * A full ring drops the line and
  * counts it; the logger thread reports "[kage-vita] log-async dropped=N" when
  * the count changes, at most once per ISAAC_VITA_LOG_ASYNC_DROP_REPORT_US

@@ -53,9 +53,20 @@ def verify_build_gate() -> None:
         r'option\(' + KNOB + r'\s+"[^"]*"\s+(ON|OFF)\)', cmake)
     if option is None or option.group(1) != "OFF":
         fail(f"CMake option {KNOB} must exist and default OFF")
-    if len(re.findall(r"COMPILE_DEFINITIONS\s+" + KNOB + r"=1\)", cmake)) != 1:
+    # ISAAC_VITA_LUA_BINDING_REPLAY (RENDER60 S8) adds one reader of the
+    # knob: its replay TU pins the typed endpoint a slot is bound to.  That
+    # application names only host_vita_lua_binding_replay.c, so the runtime
+    # owners stay exactly the two below and guest.c / the generated units
+    # never see the knob.
+    replay_reader = re.compile(
+        r"set_property\(SOURCE\s+"
+        r"\"\$\{ISAAC_RUNTIME\}/host_vita_lua_binding_replay\.c\"\s+"
+        r"APPEND PROPERTY COMPILE_DEFINITIONS\s+" + KNOB + r"=1\)")
+    applied = len(re.findall(r"COMPILE_DEFINITIONS\s+" + KNOB + r"=1\)", cmake))
+    readers = len(replay_reader.findall(cmake))
+    if readers > 1 or applied - readers != 1:
         fail(f"{KNOB}=1 must be applied exactly once (both owners in one "
-             "set_property)")
+             "set_property), plus at most the binding-replay reader")
     owners = re.search(
         r"set_property\(SOURCE\s+\"\$\{ISAAC_RUNTIME\}/host_vita_lua\.c\"\s+"
         r"\"\$\{ISAAC_RUNTIME\}/host_vita_import_id\.c\"\s+APPEND PROPERTY "

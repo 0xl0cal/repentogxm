@@ -9,13 +9,26 @@
    coverage ids, ZERO in-TU callers (so --wrap catches every one of the
    917 + 65 direct sites and the guest_table.c dispatch slot), the
    GUEST_IMPORT_CALL multiset of each body (the algorithm the seam replays);
+   the class keys pushed before the 917 + 65 calls (76 distinct), each in its
+   own slot of the direct seam's class memo;
 3. a 32-bit MSVC host oracle (raw lua_State/userdata pointers cross the
    bridge; the bodies address the PE's IAT/.rdata pages absolutely, so the
    oracle maps those pages at their guest addresses): the generated bodies
    extracted from the corpus + the production bridge host_vita_lua.c + the
    seam + pristine Lua 5.3.3, translated body vs __wrap_ on one CPU and one
-   Lua state -- plain and VERIFY builds;
-4. optional --arm-cc leg: eboot flags, -Werror, nm contract.
+   Lua state -- plain and VERIFY builds, and the same two with
+   ISAAC_VITA_LUA_GETCLASS_DIRECT ("direct", "direct-verify").  Lua is
+   compiled with lgc.c's luaC_step renamed so the oracle sees every GC point,
+   and with a constant luai_makeseed so two fresh states hash strings alike;
+   the oracle compares Lua-state snapshots (string cache, GC debt, total
+   bytes, live and dead stack slots) and GC transcripts on fresh states in a
+   deterministic arena (translated vs API path vs wrap);
+4. CMake wiring of ISAAC_VITA_LUA_GETCLASS_DIRECT (default OFF, FATAL without
+   NATIVE_GETCLASS, definition on host_vita_lua_getclass.c only);
+5. optional --arm-cc leg: eboot flags, -Werror, nm contract (both seams;
+   API, VERIFY, direct and direct+VERIFY objects).  --arm-only runs 4 and 5
+   without the PE, the corpus pins or the host oracle (a masked build-host
+   corpus fails the caller pins, the ARM leg does not read the corpus).
 """
 
 from __future__ import annotations
@@ -198,6 +211,56 @@ def verify_generated(generated: Path) -> tuple[str, str]:
     return bodies[GETCLASS], bodies[GETEXACT]
 
 
+CLASS_MEMO_INDEX = ("static unsigned lgc_class_memo_index(uint32_t class_key)\n{\n"
+                    "    return (unsigned)(class_key ^ (class_key >> 8)) & (LGC_MEMO_SLOTS - 1U);\n}\n")
+CLASS_KEYS, CLASS_KEY_RANGE = 76, (0x988066a6, 0x98806984)
+PUSH_COMMENT = re.compile(r"/\* [0-9a-f]{8}  push (\S+) \*/")
+
+
+def verify_class_keys(generated: Path) -> None:
+    """The direct seam's class memo is indexed by a hash of the class key (the
+    address of a LuaBridge ClassInfo static).  Re-derive the key set from the
+    corpus -- the immediate pushed right before each translated call -- and
+    require the C expression to give every key its own slot."""
+    source = (RUNTIME / "host_vita_lua_getclass.c").read_text()
+    require(source.count(CLASS_MEMO_INDEX) == 1, "lgc_class_memo_index changed: update CLASS_MEMO_INDEX and re-check")
+    require(source.count("#define LGC_MEMO_SLOTS 256U\n") == 1, "LGC_MEMO_SLOTS is not 256U")
+    require(source.count("&s_class_memo[lgc_class_memo_index(class_key)]") == 1,
+            "the class memo is not indexed by lgc_class_memo_index")
+    keys = {GETCLASS: Counter(), GETEXACT: Counter()}
+    for unit in sorted(generated.glob("guest_*.c")):
+        lines = unit.read_text(errors="replace").splitlines()
+        for at, line in enumerate(lines):
+            for symbol in (GETCLASS, GETEXACT):
+                if f"{symbol}(c);" not in line or line.lstrip().startswith(f"void {symbol}"):
+                    continue
+                pushed = None
+                for back in range(at - 1, max(at - 12, -1), -1):
+                    found = PUSH_COMMENT.search(lines[back])
+                    if found:
+                        pushed = found.group(1)
+                        break
+                require(pushed is not None and re.fullmatch(r"0x[0-9a-f]+", pushed),
+                        f"{unit.name}:{at + 1}: no immediate class key pushed before {symbol} ({pushed})")
+                keys[symbol][int(pushed, 16)] += 1
+    require(sum(keys[GETCLASS].values()) == GETCLASS_SITES and sum(keys[GETEXACT].values()) == GETEXACT_SITES,
+            f"class keys found at {sum(keys[GETCLASS].values())}/{sum(keys[GETEXACT].values())} sites")
+    union = set(keys[GETCLASS]) | set(keys[GETEXACT])
+    require(len(union) == CLASS_KEYS and (min(union), max(union)) == CLASS_KEY_RANGE,
+            f"{len(union)} class keys 0x{min(union):08x}..0x{max(union):08x}")
+
+    def spread(index) -> tuple[int, int]:      # (slots used, keys that share a slot)
+        slots = Counter(index(key) for key in union)
+        return len(slots), sum(n for n in slots.values() if n > 1)
+    new_slots, new_shared = spread(lambda v: (v ^ (v >> 8)) & 255)
+    old_slots, old_shared = spread(lambda v: ((v >> 3) ^ (v >> 11)) & 255)
+    require(new_shared == 0, f"{new_shared} of {len(union)} class keys share a class memo slot")
+    print(f"class memo: {len(union)} class keys 0x{min(union):08x}..0x{max(union):08x} pushed at "
+          f"{GETCLASS_SITES}/{GETEXACT_SITES} sites ({len(keys[GETCLASS])}/{len(keys[GETEXACT])} distinct); "
+          f"(v ^ v>>8) & 255: {new_slots} slots, 0 keys share one "
+          f"(the heap-pointer hash: {old_slots} slots, {old_shared} keys share one)")
+
+
 # --- 3. host oracle ---------------------------------------------------------------
 
 def run_capture(command: str, cwd: Path) -> str:
@@ -219,8 +282,20 @@ def build_oracle(vcvars: Path, lua_source: Path, lua_sources: list[Path], build:
     includes = [f"/I{quote(lua_source / 'src')}", f"/I{quote(RUNTIME)}"]
     common = ["cl", "/nologo", "/std:c11", "/O2", "/D_CRT_SECURE_NO_WARNINGS", *includes]
     vc = f"call {quote(vcvars)} x86 >nul && "
+    # Oracle-only Lua build settings (the pinned sources are untouched):
+    # a constant string-hash seed (lstate.c mixes time(NULL) into it by
+    # default), so the GC transcripts' fresh states lay out tables alike; and
+    # lgc.c's luaC_step renamed, so every other luaC_step reference resolves
+    # to the oracle's GC-point recorder, which calls the real one.
+    determinism = build / "lgc_oracle_lua_seed.h"
+    determinism.write_text("/* written by recomp/test_vita_lua_getclass.py */\n"
+                           "#define luai_makeseed() 0x2f6b3a1du\n", encoding="utf-8")
+    lua_common = [*common, "/W3", f"/FI{quote(determinism)}"]
+    lgc_sources = [p for p in lua_sources if p.name == "lgc.c"]
+    require(len(lgc_sources) == 1, "pristine Lua lacks lgc.c")
     steps = [
-        " ".join([*common, "/W3", "/c", *[quote(p) for p in lua_sources]]),
+        " ".join([*lua_common, "/c", *[quote(p) for p in lua_sources if p.name != "lgc.c"]]),
+        " ".join([*lua_common, "/DluaC_step=isaac_oracle_luaC_step_real", "/c", quote(lgc_sources[0])]),
         # the corpus TU: raw generated stack (GUEST_GENERATED_STACK_GUARD=0) exactly like the eboot's units
         " ".join([*common, "/W3", *GUEST_DEFS, "/DGUEST_GENERATED_STACK_GUARD=0", "/c", quote(generated)]),
         # the production bridge with the knob
@@ -228,7 +303,9 @@ def build_oracle(vcvars: Path, lua_source: Path, lua_sources: list[Path], build:
                   quote(RUNTIME / "host_vita_lua.c")]),
     ]
     variants = {}
-    for tag, extra in (("plain", []), ("verify", ["/DISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY=1"])):
+    verify, direct = "/DISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY=1", "/DISAAC_VITA_LUA_GETCLASS_DIRECT=1"
+    for tag, extra in (("plain", []), ("verify", [verify]), ("direct", [direct]),
+                       ("direct-verify", [direct, verify])):
         for source in ("host_vita_lua_getclass.c", "host_vita_lua_getclass_guest_oracle.c"):
             steps.append(" ".join([*common, "/W4", "/WX", "/wd4310", *GUEST_DEFS, *SEAM_DEFS, *extra, "/c",
                                    quote(RUNTIME / source), f"/Fo{quote(build / f'{tag}_{source[:-2]}.obj')}"]))
@@ -245,14 +322,78 @@ def build_oracle(vcvars: Path, lua_source: Path, lua_sources: list[Path], build:
     return variants
 
 
+ORACLE_LINES = {
+    # the state comparisons run without VERIFY (its re-runs push twice)
+    "plain": ["  exact : 24 cases x 3 paths:", "  trans : wrap == wrap:", "  trans : translated == wrap by meaning"],
+    "verify": [],
+    "direct": ["  exact : 24 cases x 3 paths:", "  trans : direct == api:", "  trans : translated == api by meaning",
+               "memo coverage:"],
+    "direct-verify": ["memo coverage:", "registry[tmp] = nil: memo hit reads nil"],
+}
+
+
 def run_oracle(exe: Path, tag: str) -> None:
     out = run_capture(quote(exe), exe.parent)
     require("native getclass guest oracle: PASS" in out, f"{tag} oracle failed:\n{out}")
+    for line in ORACLE_LINES[tag]:
+        require(line in out, f"{tag} oracle did not report {line!r}:\n{out}")
     print(f"host oracle [{tag}]:")
     print("  " + out.strip().replace("\n", "\n  "))
 
 
-# --- 4. ARM cross-compile (optional) ---------------------------------------------
+# --- 4. CMake wiring of ISAAC_VITA_LUA_GETCLASS_DIRECT -------------------------------
+
+VITA_CMAKE = ROOT / "vita" / "CMakeLists.txt"
+DIRECT_FATAL = "ISAAC_VITA_LUA_GETCLASS_DIRECT requires ISAAC_VITA_LUA_NATIVE_GETCLASS=ON"
+
+
+def check_direct_wiring(work: Path) -> None:
+    import shutil
+    text = VITA_CMAKE.read_bytes().decode("utf-8")
+    start = "option(ISAAC_VITA_LUA_GETCLASS_DIRECT\n"
+    require(text.count(start) == 1, "ISAAC_VITA_LUA_GETCLASS_DIRECT option missing or duplicated")
+    begin = text.index(start)
+    block = text[begin:text.index("endif()\n", begin) + len("endif()\n")]
+    option = re.search(r'option\(ISAAC_VITA_LUA_GETCLASS_DIRECT\n\s+"(?:[^"\\]|\\.)*" (ON|OFF)\)', block)
+    require(option is not None and option.group(1) == "OFF", "ISAAC_VITA_LUA_GETCLASS_DIRECT must default OFF")
+    require(DIRECT_FATAL in block, "the NATIVE_GETCLASS FATAL is missing")
+    # the definition: once, on host_vita_lua_getclass.c only, inside the native seam block
+    wiring_start = "      if(ISAAC_VITA_LUA_GETCLASS_DIRECT)\n"
+    require(text.count(wiring_start) == 1, "the GETCLASS_DIRECT definition block is missing or duplicated")
+    at = text.index(wiring_start)
+    wiring = text[at:text.index("      endif()\n", at)]
+    require(re.findall(r'"([^"]+)"', wiring) == ["${ISAAC_RUNTIME}/host_vita_lua_getclass.c"],
+            f"the GETCLASS_DIRECT definition names another unit:\n{wiring}")
+    require(text.count("ISAAC_VITA_LUA_GETCLASS_DIRECT=1") == 1 and "ISAAC_VITA_LUA_GETCLASS_DIRECT=1" in wiring,
+            "ISAAC_VITA_LUA_GETCLASS_DIRECT=1 applied outside its block")
+    seam = text.index('      list(APPEND ISAAC_VITA_RUNTIME_SOURCES\n        "${ISAAC_RUNTIME}/host_vita_lua_getclass.c")')
+    require(seam < at < text.index("-Wl,--wrap=sub_003f8e30", at),
+            "the GETCLASS_DIRECT definition is not inside the native getClass block")
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        print("CMake wiring (GETCLASS_DIRECT): static pins OK; cmake not on PATH, option/FATAL run skipped")
+        return
+    probe = block + 'message(STATUS "LGCD=${ISAAC_VITA_LUA_GETCLASS_DIRECT}")\n'
+    script = work / "wiring-getclass-direct.cmake"
+    script.write_bytes(probe.encode())
+    cases = (("default", {}, None, "LGCD=OFF"),
+             ("on", {"ISAAC_VITA_LUA_GETCLASS_DIRECT": "ON", "ISAAC_VITA_LUA_NATIVE_GETCLASS": "ON"}, None, "LGCD=ON"),
+             ("no-native", {"ISAAC_VITA_LUA_GETCLASS_DIRECT": "ON"}, DIRECT_FATAL, None),
+             ("native-off", {"ISAAC_VITA_LUA_GETCLASS_DIRECT": "ON", "ISAAC_VITA_LUA_NATIVE_GETCLASS": "OFF"},
+              DIRECT_FATAL, None))
+    for name, defs, fatal, status in cases:
+        completed = subprocess.run([cmake, *[f"-D{k}={v}" for k, v in defs.items()], "-P", str(script)],
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out = " ".join(completed.stdout.split())   # cmake wraps message() text
+        if fatal:
+            require(completed.returncode != 0 and fatal in out, f"wiring[{name}]: expected FATAL:\n{out}")
+        else:
+            require(completed.returncode == 0 and status in out, f"wiring[{name}]: expected {status}:\n{out}")
+    print("CMake wiring (GETCLASS_DIRECT): default OFF, FATAL without NATIVE_GETCLASS (2 cases), "
+          "definition on host_vita_lua_getclass.c only, inside the native seam block")
+
+
+# --- 5. ARM cross-compile (optional) ---------------------------------------------
 
 def arm_cross(arm_cc: str, lua_source: Path, work: Path) -> None:
     import shlex
@@ -267,7 +408,13 @@ def arm_cross(arm_cc: str, lua_source: Path, work: Path) -> None:
              ["-DISAAC_VITA_LUA_NATIVE_GETCLASS_WRAP=1", '-DISAAC_VITA_LUA_NATIVE_GETCLASS_BUILD_ID="test"']),
             ("seam_verify", RUNTIME / "host_vita_lua_getclass.c",
              ["-DISAAC_VITA_LUA_NATIVE_GETCLASS_WRAP=1", "-DISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY=1"]),
-            ("bridge", RUNTIME / "host_vita_lua.c", [])]
+            ("bridge", RUNTIME / "host_vita_lua.c", []),
+            ("seam_direct", RUNTIME / "host_vita_lua_getclass.c",
+             ["-DISAAC_VITA_LUA_NATIVE_GETCLASS_WRAP=1", "-DISAAC_VITA_LUA_GETCLASS_DIRECT=1",
+              '-DISAAC_VITA_LUA_NATIVE_GETCLASS_BUILD_ID="test"']),
+            ("seam_direct_verify", RUNTIME / "host_vita_lua_getclass.c",
+             ["-DISAAC_VITA_LUA_NATIVE_GETCLASS_WRAP=1", "-DISAAC_VITA_LUA_GETCLASS_DIRECT=1",
+              "-DISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY=1"])]
     objects = []
     for name, source, flags in plan:
         obj = work / f"arm_{name}.o"
@@ -279,7 +426,19 @@ def arm_cross(arm_cc: str, lua_source: Path, work: Path) -> None:
                  r"\bU __real_sub_003f8c80\b", r"\bT isaac_vita_lua_seam_enter\b", r"\bT isaac_vita_lua_seam_leave\b",
                  r"\bT isaac_vita_lua_getclass_try\b", r"\bT isaac_vita_lua_getexact_try\b"):
         require(re.search(want, symbols, re.M), f"nm contract: {want} missing")
-    print("ARM cross-compile (eboot flags, -Werror): OK; nm contract OK (__wrap_/__real_ x2, seam_enter/leave)")
+    # the direct seam: the same wraps, the direct tries, and Lua internals
+    # (lua_rawgetp/lua_pushstring/lua_rawget remain referenced by the API
+    # tries, which the eboot's --gc-sections drops when nothing calls them)
+    direct = inflate.run([nm, str(objects[3])])
+    for want in (r"\bT __wrap_sub_003f8e30\b", r"\bT __wrap_sub_003f8c80\b", r"\bU __real_sub_003f8e30\b",
+                 r"\bU __real_sub_003f8c80\b", r"\bT isaac_vita_lua_getclass_direct_try\b",
+                 r"\bT isaac_vita_lua_getexact_direct_try\b", r"\bU luaH_get\b", r"\bU luaH_getshortstr\b",
+                 r"\bU luaS_new\b", r"\bU luaC_step\b", r"\bU luaO_nilobject_\b"):
+        require(re.search(want, direct, re.M), f"nm contract (direct): {want} missing")
+    require(not re.search(r"\bT isaac_vita_lua_getclass_direct_try\b", symbols, re.M),
+            "the OFF seam object carries the direct path")
+    print("ARM cross-compile (eboot flags, -Werror; API, VERIFY, direct, direct+VERIFY): OK; nm contract OK "
+          "(__wrap_/__real_ x2, seam_enter/leave; direct: direct tries, luaH_get/luaH_getshortstr/luaS_new/luaC_step)")
 
 
 # --- main ------------------------------------------------------------------------
@@ -294,16 +453,27 @@ def default_pe() -> Path | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pe", type=Path, default=default_pe(), help="frozen isaac-ng.exe.unpacked.exe")
-    parser.add_argument("--generated", type=Path, required=True, help="directory with guest_*.c / guest_table.c")
+    parser.add_argument("--generated", type=Path, help="directory with guest_*.c / guest_table.c")
     parser.add_argument("--lua-source", type=Path, help="pristine lua-5.3.3 (or ISAAC_LUA53_SOURCE_DIR)")
     parser.add_argument("--arm-cc")
     parser.add_argument("--keep", type=Path, help="work directory to keep (default: temp)")
     parser.add_argument("--skip-oracle", action="store_true")
+    parser.add_argument("--arm-only", action="store_true",
+                        help="only the CMake wiring and the --arm-cc leg (no PE, corpus or host oracle); "
+                             "the corpus pins hold only for the unmasked corpus, the ARM leg needs none")
     args = parser.parse_args()
 
-    require(args.pe is not None and args.pe.is_file(), "pass --pe <isaac-ng.exe.unpacked.exe>")
-    verify_pe(args.pe)
-    getclass_body, getexact_body = verify_generated(args.generated)
+    if args.arm_only:
+        require(args.arm_cc is not None, "--arm-only needs --arm-cc")
+        args.skip_oracle = True
+        getclass_body = getexact_body = None
+        print("frozen PE / generated corpus pins: skipped (--arm-only)")
+    else:
+        require(args.generated is not None, "pass --generated <corpus>/generated")
+        require(args.pe is not None and args.pe.is_file(), "pass --pe <isaac-ng.exe.unpacked.exe>")
+        verify_pe(args.pe)
+        getclass_body, getexact_body = verify_generated(args.generated)
+        verify_class_keys(args.generated)
     lua_source = lua_runtime.discover_source(args.lua_source)
     lua_sources = lua_runtime.validate_source(lua_source, lua_runtime.records())
     lua_sources = [p for p in lua_sources if p.name not in ("lua.c", "luac.c")]
@@ -316,6 +486,7 @@ def main() -> int:
         tmp = tempfile.TemporaryDirectory(prefix="isaac-lua-getclass-")
         work = Path(tmp.name)
     try:
+        check_direct_wiring(work)
         if not args.skip_oracle:
             vcvars = lua_runtime.find_vcvars()
             variants = build_oracle(vcvars, lua_source, lua_sources, work, getclass_body, getexact_body)

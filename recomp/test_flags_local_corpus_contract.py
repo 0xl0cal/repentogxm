@@ -67,6 +67,12 @@ FORBIDDEN_FLAG_TEXT = (
 )
 FLAG_CALL_RE = re.compile(r"\b(cc|fl)_[a-z]+\(c\)")
 TAIL_RE = re.compile(r"^(.*)guest_call\(c, .*\); return;", re.M)
+# GUEST_GPR_FLUSH_MASK=1 corpora (gpr_flush_mask.py) spell some FLUSH
+# statements `GUEST_GPR_FLUSH_MASK(c, 0xMMU);`.  This contract is about where
+# the publications sit, so each mask is read as the FLUSH it replaces; that a
+# mask skips only fields that already hold their local is proven by
+# test_gpr_flush_mask_proof.py.  Identity on an unmasked corpus.
+FLUSH_MASK_RE = re.compile(r"\bGUEST_GPR_FLUSH_MASK\(c, 0x[0-9a-f]{2}U\);")
 
 # --- general registers ----------------------------------------------------
 # Deliberately re-stated here rather than imported from gpr_locals.py: the
@@ -412,6 +418,7 @@ def main() -> int:
     problems: list[str] = []
     for path in units:
         source = path.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+        source = FLUSH_MASK_RE.sub("GUEST_GPR_FLUSH(c);", source)
         for match in BODY_RE.finditer(source):
             name, body = match.group(1), match.group(2)
             stats["functions"] += 1

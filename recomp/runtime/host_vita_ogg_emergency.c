@@ -15,6 +15,9 @@
 #include "host_vita_ogg_emergency.h"
 #include "kage_vita_texture_memory.h"
 #include "platform.h"
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+#include "host_vita_heap_free_prefilter.h"
+#endif
 
 #if !defined(ISAAC_VITA_OGG_EMERGENCY_ORACLE) && UINTPTR_MAX != UINT32_MAX
 #error OGG emergency slot requires a 32-bit identity-mapped Vita address space
@@ -49,7 +52,15 @@ _Static_assert(ISAAC_VITA_OGG_OPEN_ALLOCATION_RETURN_RVA !=
                "OGG Open owner must remain uniquely scoped");
 
 static ogg_emergency_state s_state = { .uid = -1 };
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+/* The imported free's range prefilter reads this record.  `base` IS
+ * the published base (one object, not a copy); `end` is stored before
+ * it is published (host_vita_heap_free_prefilter.h). */
+isaac_vita_heap_free_range isaac_vita_ogg_emergency_free_range;
+#define s_published_base (isaac_vita_ogg_emergency_free_range.base)
+#else
 static atomic_uintptr_t s_published_base = ATOMIC_VAR_INIT((uintptr_t)0U);
+#endif
 static atomic_flag s_state_lock = ATOMIC_FLAG_INIT;
 
 static int ogg_emergency_try_lock(void)
@@ -166,6 +177,12 @@ static int ogg_emergency_reserve_locked(
         ogg_emergency_range_is_safe(
             (uintptr_t)base, guest_stack_floor, guest_stack_ceiling)) {
         s_state.uid = uid;
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+        atomic_store_explicit(
+            &isaac_vita_ogg_emergency_free_range.end,
+            (uintptr_t)base + ISAAC_VITA_OGG_OPEN_BACKING_BYTES,
+            memory_order_relaxed);
+#endif
         atomic_store_explicit(
             &s_published_base, (uintptr_t)base, memory_order_release);
         isaac_vita_log(
@@ -428,6 +445,11 @@ int isaac_vita_ogg_emergency_oracle_reset(void)
     s_state.uid = -1;
     atomic_store_explicit(
         &s_published_base, (uintptr_t)0U, memory_order_release);
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+    atomic_store_explicit(
+        &isaac_vita_ogg_emergency_free_range.end,
+        (uintptr_t)0U, memory_order_relaxed);
+#endif
     ogg_emergency_unlock();
     return result;
 }

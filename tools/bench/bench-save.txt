@@ -1,0 +1,100 @@
+# bench v2: input-free Downpour benchmark for repro_console (main.lua here),
+# P1-P5 on Downpour I, then dry phases P6-P8 on Basement I (no water).
+# "bench_run.py prepare" writes it, with a per-run "@marker NONCE <hex>" after @continue, as
+# ux0:/data/isaacr001/data/repro_console/save2.dat -- File 2 only; the eboot forces save slot 2
+# (launch-args.txt --vita-save-slot=2), File 1's save1.dat is never written.  Phases are delimited
+# by room changes (native roomlog markers): "@marker Pn" names the phase that starts at the next
+# room change and ends at the room change after the next marker.  Every phase starts with a
+# real room change.  The last line removes this file from the console.
+@continue
+# @seed sets the start seed in place (Seeds:SetStartSeed), no restart: a --set-stage boot starts
+# every run, restarts included, through Game::StartDebug, which rolls a random seed.
+# "stage 1c" right after it rebuilds Downpour I from the new seed's stage seed.  Both run from
+# MC_POST_UPDATE one second in ("seed" from MC_POST_GAME_STARTED did nothing on the device, smoke1).
+@wait 30
+@seed 20261017
+stage 1c
+debug 3
+giveitem c118
+giveitem c245
+giveitem c2
+giveitem c153
+giveitem c10
+giveitem c73
+giveitem c8
+giveitem c67
+@marker BENCH START
+@wait 30
+@room 1
+@wait 30
+@marker P1 start-idle
+@room start
+@wait 600
+@marker P2 fight-maxroom
+@room max
+@wait 600
+@marker P3 spawn-heavy
+@room 2
+@wait 15
+spawn 27.1
+spawn 27.1
+spawn 209.0
+spawn 209.0
+spawn 210.0
+spawn 57.0
+spawn 58.0
+spawn 56.0
+spawn 39.1
+spawn 60.1
+@wait 600
+@marker P4 transitions
+@room 1
+@wait 90
+@room 3
+@wait 90
+@room 4
+@wait 90
+@room 5
+@wait 90
+@room 6
+@wait 90
+@room 1
+@wait 90
+@marker P5 end-idle
+@room start
+@wait 300
+# Dry section: the same fights without water, on Basement I of the same
+# start seed with the same item build (the items survive "stage"; "debug 3" toggles, so it is not
+# repeated).  "DRY START" + "@room 3" end P5 with the very command and room that ended it before
+# the dry section existed, so P1-P5 keep their windows and their Downpour rooms; "stage 1" then
+# builds Basement I from the start seed's stage seed (bench_run.py checks the Level::Init).
+@marker DRY START
+@room 3
+@wait 30
+stage 1
+@wait 30
+@room 1
+@wait 30
+@marker P6 dry-start-idle
+@room start
+@wait 300
+@marker P7 dry-fight-maxroom
+@room max
+@wait 600
+@marker P8 dry-spawn-heavy
+@room 2
+@wait 15
+spawn 27.1
+spawn 27.1
+spawn 209.0
+spawn 209.0
+spawn 210.0
+spawn 57.0
+spawn 58.0
+spawn 56.0
+spawn 39.1
+spawn 60.1
+@wait 600
+@marker BENCH DONE
+@room 3
+@remove

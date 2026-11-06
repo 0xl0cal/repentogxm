@@ -293,10 +293,38 @@ cmake_fixture_args=(
 "$cmake_cmd" "${cmake_fixture_args[@]}" \
     -B "$work/cmake-overflow-off" \
     > "$work/cmake-overflow-off.log" 2>&1
+# Pool-size knob at its 24 MiB-class value on the full hybrid graph.
+"$cmake_cmd" "${cmake_fixture_args[@]}" \
+    -B "$work/cmake-overflow-24m" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON \
+    -DISAAC_VITA_ROOM_ENTRY_SLAB=ON \
+    -DISAAC_VITA_ROOM_ENTRY_HYBRID=ON \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000 \
+    > "$work/cmake-overflow-24m.log" 2>&1
 if ! grep -Fxq \
         'ISAAC_VITA_HEAP_OVERFLOW_MSPACE:BOOL=OFF' \
         "$work/cmake-overflow-off/CMakeCache.txt"; then
     echo "raw CMake overflow option did not default to OFF" >&2
+    exit 1
+fi
+if ! grep -Fxq \
+        'ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES:STRING=0x007d5000' \
+        "$work/cmake-overflow-off/CMakeCache.txt" || \
+   ! grep -Fxq \
+        'ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES:STRING=0x007d5000' \
+        "$work/cmake-hybrid-on/CMakeCache.txt" || \
+   ! grep -Fxq \
+        'ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES:STRING=0x017fd000' \
+        "$work/cmake-overflow-24m/CMakeCache.txt"; then
+    echo "raw CMake overflow pool-size knob/default drifted" >&2
+    exit 1
+fi
+if ! grep -Fq 'overflow mspace 0x007d5000 bytes (8212480), retained +4 KiB' \
+        "$work/cmake-hybrid-on.log" || \
+   ! grep -Fq 'overflow mspace 0x017fd000 bytes (25153536), retained +4 KiB' \
+        "$work/cmake-overflow-24m.log" || \
+   grep -Fq 'overflow mspace 0x' "$work/cmake-overflow-off.log"; then
+    echo "raw CMake overflow pool-size status receipt drifted" >&2
     exit 1
 fi
 if ! grep -Fxq 'ISAAC_VITA_ROOM_ENTRY_SLAB:BOOL=OFF' \
@@ -325,7 +353,8 @@ python3 - \
     "$work/cmake-hybrid-on/compile_commands.json" \
     "$work/cmake-room-on/compile_commands.json" \
     "$work/cmake-overflow-on/compile_commands.json" \
-    "$work/cmake-overflow-off/compile_commands.json" <<'PY'
+    "$work/cmake-overflow-off/compile_commands.json" \
+    "$work/cmake-overflow-24m/compile_commands.json" <<'PY'
 import json
 import pathlib
 import shlex
@@ -372,10 +401,22 @@ def require_scope(records, definition, expected):
             f"CMake scope/value for {definition}: owners={owners}, "
             f"invalid={invalid}, expected={expected}")
 
+def require_scope_value(records, definition, expected, token):
+    expected_token = f"-D{definition}={token}"
+    uses = definition_uses(records, definition)
+    owners = {source for source, _ in uses}
+    invalid = [(source, argument) for source, argument in uses
+               if argument != expected_token]
+    if owners != expected or invalid:
+        raise SystemExit(
+            f"CMake scope/value for {definition}: owners={owners}, "
+            f"invalid={invalid}, expected={expected} token={expected_token}")
+
 hybrid_on = load(sys.argv[2])
 room_on = load(sys.argv[3])
 overflow_only = load(sys.argv[4])
 off = load(sys.argv[5])
+overflow_24m = load(sys.argv[6])
 contracts = {
     "ISAAC_VITA_HEAP_OVERFLOW_MSPACE": {heap, entry},
     "ISAAC_VITA_HEAP_RANGE_LEASE": {heap},
@@ -433,6 +474,20 @@ for definition in (
         "ISAAC_VITA_HEAP_LEDGER_MEMBLOCK",
         "ISAAC_VITA_HEAP_LEDGER_BACKSHIFT"):
     require_scope(off, definition, {heap})
+# Pool-size knob: the default emits no definition anywhere (compile commands
+# byte-identical to the pre-knob tree); the 24 MiB-class value reaches
+# exactly the five units that see the pool constants and nothing else.
+knob = "ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES"
+for fixture in (hybrid_on, room_on, overflow_only, off):
+    require_scope(fixture, knob, set())
+require_scope_value(
+    overflow_24m, knob, {heap, entry, raw, room, external}, "0x017fd000U")
+for definition, expected in contracts.items():
+    require_scope(overflow_24m, definition, expected)
+require_scope(overflow_24m, "ISAAC_VITA_ROOM_ENTRY_SLAB", {heap})
+require_scope(overflow_24m, "ISAAC_VITA_ROOM_ENTRY_HYBRID", {heap, room})
+if {source for source, _ in overflow_24m} != hybrid_sources:
+    raise SystemExit("pool-size knob changed the hybrid ON source graph")
 PY
 
 expect_cmake_reject() {
@@ -458,6 +513,58 @@ expect_cmake_reject heap79 -DISAAC_VITA_HEAP_MB=79
 expect_cmake_reject ledger-off -DISAAC_VITA_HEAP_LEDGER_MEMBLOCK=OFF
 expect_cmake_reject backshift-off -DISAAC_VITA_HEAP_LEDGER_BACKSHIFT=OFF
 expect_cmake_reject scaffold -DISAAC_VITA_SCAFFOLD_ONLY=ON
+
+expect_cmake_reject_bytes() {
+    tag=$1
+    needle=$2
+    shift 2
+    build_dir="$work/cmake-reject-$tag"
+    if "$cmake_cmd" "${cmake_fixture_args[@]}" \
+            -B "$build_dir" "$@" \
+            > "$build_dir.log" 2>&1; then
+        echo "CMake accepted invalid overflow pool size: $tag" >&2
+        exit 1
+    fi
+    # CMake wraps FATAL_ERROR text at about 80 columns; match on one line.
+    if ! tr -s '[:space:]' ' ' < "$build_dir.log" | grep -Fq "$needle"; then
+        cat "$build_dir.log" >&2
+        echo "CMake rejected $tag for an unexpected reason" >&2
+        exit 1
+    fi
+    if grep -Fq "ISAAC_VITA_HEAP_OVERFLOW_MSPACE requires translated runtime" \
+            "$build_dir.log"; then
+        echo "CMake rejected $tag with the feature-dependency reason" >&2
+        exit 1
+    fi
+}
+expect_cmake_reject_bytes bytes-lowbit \
+    "must have 0x1000 as its lowest set bit" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x007d4000
+expect_cmake_reject_bytes bytes-pow2 \
+    "must have 0x1000 as its lowest set bit" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x00800000
+expect_cmake_reject_bytes bytes-digits \
+    "must be 0x followed by exactly 8 hex digits" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x7d5000
+expect_cmake_reject_bytes bytes-range \
+    "must lie in 0x007d5000..0x03ffd000" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x03fff000
+expect_cmake_reject_bytes bytes-off \
+    "needs ISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE=OFF \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000
+
+# Knob validator module on its own: production text pins (one cache entry,
+# one validation call, one source-scoped definition on the five owners) and
+# the accept/reject vectors through cmake -P probes.
+"$cmake_cmd" \
+    "-DISAAC_HEAP_BYTES_CMAKE_ROOT=$root" \
+    "-DISAAC_HEAP_BYTES_CMAKE_OUT=$work/cmake-heap-bytes" \
+    -P "$root/vita/test_heap_overflow_mspace_bytes_cmake.cmake"
 
 if "$cmake_cmd" "${cmake_fixture_args[@]}" \
         -B "$work/cmake-reject-room-without-overflow" \
@@ -704,6 +811,68 @@ for compiler_index in 0 1; do
     fi
 done
 
+# Pool-size knob at its 24 MiB-class value: the same real router fixture with
+# -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U on every unit that sees
+# the pool constants (the oracle's fake kernel and mspace scale with the
+# macro; failures are induced by flags, so no allocation count changes).
+host_flags_24m=(
+    -std=gnu11 -O1 -g -Wall -Wextra -Werror
+    -fno-omit-frame-pointer -fno-pie
+    -ffunction-sections -fdata-sections
+    -fsanitize=address,undefined
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U
+)
+"$host_gcc" "${host_flags_24m[@]}" "${host_defines[@]}" \
+    "${host_interpose[@]}" -I"$fake_include" -I"$root/runtime" \
+    -c "$root/runtime/host_vita_heap.c" \
+    -o "$work/heap-router-24m.o"
+"$host_gcc" "${host_flags_24m[@]}" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_TESTING=1 \
+    -I"$fake_include" -I"$root/runtime" \
+    -c "$root/runtime/host_vita_heap_overflow_mspace.c" \
+    -o "$work/overflow-mspace-24m.o"
+"$host_gcc" "${host_flags_24m[@]}" \
+    -DISAAC_VITA_ROOM_ENTRY_SLAB_TESTING=1 \
+    -DISAAC_VITA_ROOM_ENTRY_HYBRID=1 \
+    -DISAAC_VITA_ROOM_ENTRY_EXTERNAL_TESTING=1 \
+    -I"$fake_include" -I"$root/runtime" \
+    -c "$root/runtime/host_vita_room_entry_slab.c" \
+    -o "$work/room-entry-slab-24m.o"
+"$host_gcc" "${host_flags_24m[@]}" \
+    -DISAAC_VITA_ROOM_ENTRY_EXTERNAL_TESTING=1 \
+    -I"$fake_include" -I"$root/runtime" \
+    -c "$root/runtime/host_vita_room_entry_external.c" \
+    -o "$work/room-entry-external-24m.o"
+"$host_gcc" "${host_flags_24m[@]}" \
+    -I"$fake_include" -I"$root/runtime" \
+    -c "$root/runtime/host_vita_heap_ledger_memblock.c" \
+    -o "$work/heap-ledger-24m.o"
+"$host_gcc" "${host_flags_24m[@]}" "${host_defines[@]}" \
+    -I"$fake_include" -I"$root/runtime" \
+    -c "$root/runtime/host_vita_heap_overflow_router_oracle.c" \
+    -o "$work/router-oracle-24m.o"
+"$host_gcc" -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -no-pie \
+    "$work/heap-router-24m.o" "$work/overflow-mspace-24m.o" \
+    "$work/room-entry-slab-24m.o" \
+    "$work/room-entry-external-24m.o" \
+    "$work/heap-ledger-24m.o" \
+    "$work/router-oracle-24m.o" \
+    -Wl,--wrap=isaac_vita_heap_overflow_mspace_snapshot_get \
+    -Wl,--gc-sections -o "$work/router-oracle-24m"
+"$work/router-oracle-24m" > "$work/router-oracle-24m.log"
+"$work/router-oracle-24m" --terminal-observer
+cat "$work/router-oracle-24m.log"
+if ! grep -Fq \
+        'phase=fill live=393216 capacity=524288 load=3/4' \
+        "$work/router-oracle-24m.log" || \
+   ! grep -Fq \
+        'phase=cleanup live=0 capacity=524288 load=3/4' \
+        "$work/router-oracle-24m.log"; then
+    echo "fixed ledger probe/lock receipt missing for the 24 MiB-class pool" >&2
+    exit 1
+fi
+
 arm_flags=(
     -std=gnu11 -O2 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=softfp -mthumb
     -fno-strict-aliasing -ffunction-sections -fdata-sections
@@ -771,13 +940,33 @@ _Static_assert(ISAAC_VITA_GUEST_HEAP_LEDGER_ENTRY_TABLE_BYTES ==
 _Static_assert(ISAAC_VITA_GUEST_HEAP_LEDGER_REQUEST_BYTES == 0x00491000U &&
                    ISAAC_VITA_GUEST_HEAP_LEDGER_RETAINED_BYTES == 0x00492000U,
                "ARM ledger USER_RW receipt drifted");
-_Static_assert(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x007d5000U &&
+_Static_assert((ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES &
+                (~ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES + 1U)) == 0x00001000U &&
                    ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES ==
-                       0x007d6000U,
+                       ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES + 0x00001000U,
+               "ARM overflow mspace retained span no longer derives from the pool size");
+_Static_assert(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES ==
+                   ISAAC_VITA_GUEST_HEAP_LEDGER_REQUEST_BYTES +
+                       ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES &&
+                   ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES ==
+                       ISAAC_VITA_GUEST_HEAP_LEDGER_RETAINED_BYTES +
+                           ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES,
+               "ARM combined USER_RW budget no longer derives from the pool size");
+#if ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x007d5000U
+_Static_assert(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES == 0x007d6000U,
                "ARM overflow mspace receipt drifted");
 _Static_assert(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES == 0x00c66000U &&
                    ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES == 0x00c68000U,
                "ARM combined USER_RW receipt drifted");
+#elif ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x017fd000U
+_Static_assert(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES == 0x017fe000U,
+               "ARM 24 MiB-class overflow mspace receipt drifted");
+_Static_assert(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES == 0x01c8e000U &&
+                   ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES == 0x01c90000U,
+               "ARM 24 MiB-class combined USER_RW receipt drifted");
+#else
+#error "ARM contract: overflow pool size has no pinned receipt"
+#endif
 _Static_assert(ISAAC_VITA_ROOM_ENTRY_EXTERNAL_REQUEST_BYTES == 0x00101000U &&
                    ISAAC_VITA_ROOM_ENTRY_EXTERNAL_USABLE_BYTES == 0x00100000U &&
                    ISAAC_VITA_ROOM_ENTRY_EXTERNAL_RETAINED_BYTES == 0x00102000U &&
@@ -813,6 +1002,35 @@ EOF
     "$work/room-entry-slab.arm.o" "$work/room-entry-external.arm.o" \
     -Wl,--gc-sections -lSceLibKernel_stub -lSceSysmem_stub \
     -o "$work/vita-heap-overflow-router.elf"
+
+# Pool-size knob on ARM: every static assert of the owner units and of the
+# contract above holds at the 24 MiB-class value (compile only, each unit
+# with exactly its default flags plus the knob; the linked ELF above keeps the
+# default objects).  The router's boot-time snapshot check and the mspace
+# request embed the size, so those two objects must differ from the default.
+"$cc" "${arm_flags[@]}" "${arm_defines[@]}" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U -I"$root/runtime" \
+    -c "$root/runtime/host_vita_heap.c" -o "$work/heap-router.arm-24m.o"
+"$cc" "${arm_flags[@]}" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U -I"$root/runtime" \
+    -c "$root/runtime/host_vita_heap_overflow_mspace.c" \
+    -o "$work/overflow-mspace.arm-24m.o"
+"$cc" "${arm_flags[@]}" -DISAAC_VITA_ROOM_ENTRY_HYBRID=1 \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U -I"$root/runtime" \
+    -c "$root/runtime/host_vita_room_entry_slab.c" \
+    -o "$work/room-entry-slab.arm-24m.o"
+"$cc" "${arm_flags[@]}" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U -I"$root/runtime" \
+    -c "$root/runtime/host_vita_room_entry_external.c" \
+    -o "$work/room-entry-external.arm-24m.o"
+"$cc" "${arm_flags[@]}" "${arm_defines[@]}" \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U -I"$root/runtime" \
+    -c "$work/arm-contract.c" -o "$work/arm-contract-24m.o"
+if cmp -s "$work/heap-router.arm.o" "$work/heap-router.arm-24m.o" || \
+   cmp -s "$work/overflow-mspace.arm.o" "$work/overflow-mspace.arm-24m.o"; then
+    echo "pool-size knob did not reach the ARM heap router/overflow objects" >&2
+    exit 1
+fi
 
 "$readelf" -h "$work/vita-heap-overflow-router.elf" \
     > "$work/router.elf.header"
@@ -909,6 +1127,8 @@ sha256sum \
     "$root/runtime/host_vita_room_entry_external_oracle.c" \
     "$root/runtime/host_vita_room_entry_hybrid_oracle.c" \
     "$root/vita/CMakeLists.txt" \
+    "$root/vita/heap_overflow_mspace_bytes.cmake" \
+    "$root/vita/test_heap_overflow_mspace_bytes_cmake.cmake" \
     "$root/../tools/build_vita.py" \
     "$root/vita/test_heap_overflow_router.sh" \
     "$work/heap-router.arm.o" \

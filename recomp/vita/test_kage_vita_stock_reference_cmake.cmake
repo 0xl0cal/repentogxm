@@ -237,6 +237,21 @@ foreach(_needle IN ITEMS
     "ISAAC_COLOROFFSET_GPU_OPTIMIZATIONS=\${ISAAC_VITA_COLOROFFSET_GPU_OPTIMIZATIONS_MODE}"
     "Building pinned stock vitaGL 73dd57a with gpu-draw="
     "kage_vita_phase_profile.c"
+    "option(ISAAC_VITA_VITAGL_SCENE_GUARD"
+    "ISAAC_VITA_VITAGL_SCENE_GUARD requires ISAAC_VITA_VITAGL_STOCK_REFERENCE=ON"
+    "ISAAC_SCENE_GUARD=\${ISAAC_VITA_VITAGL_SCENE_GUARD_MODE}"
+    "isaac-vitagl-scene-guard.mode"
+    "\${ISAAC_VITA_VITAGL_SCENE_GUARD_MODE_FILE}"
+    "0034-isaac-scene-guard.patch"
+    "ISAAC_VITA_VITAGL_SCENE_GUARD=1"
+    "option(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE"
+    "ISAAC_VITA_VITAGL_INTENSITY_TEXTURE requires KAGE=ON and VITAGL_STOCK_REFERENCE=ON"
+    "ISAAC_INTENSITY_TEXTURE=\${ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE}"
+    "isaac-vitagl-intensity-texture.mode"
+    "\${ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE_FILE}"
+    "vitagl-stock-reference/0037-isaac-intensity-texture.patch"
+    "vitagl-stock-reference/isaac_intensity_texture.h"
+    "intensity texture=on (0037-isaac-intensity-texture.patch)"
     "ISAAC_VITA_PHASE_PROFILE_BUILD_ID"
     "kage_vita_fullspeed_scheduler.c"
     "ISAAC_VITA_GUEST_LOOKUP_CACHE=1"
@@ -255,6 +270,23 @@ endif()
 if(NOT _production_text MATCHES
     "option\\(ISAAC_VITA_LASER_P8_SWIZZLE[\r\n ]+\"[^\"]+\" OFF\\)")
   message(FATAL_ERROR "laser P8 swizzle is not default OFF")
+endif()
+if(NOT _production_text MATCHES
+    "option\\(ISAAC_VITA_VITAGL_SCENE_GUARD[\r\n ]+\"[^\"]+\" OFF\\)")
+  message(FATAL_ERROR "vitaGL scene guard is not default OFF")
+endif()
+if(NOT _production_text MATCHES
+    "option\\(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE[\r\n ]+\"[^\"]+\" OFF\\)")
+  message(FATAL_ERROR "vitaGL intensity texture storage is not default OFF")
+endif()
+# Exactly one runtime TU sees the knob, and only from inside its own ON block:
+# gl_vita_backend.c copies the 0037 counters into native.log.
+string(REGEX MATCHALL "COMPILE_DEFINITIONS[^)]*ISAAC_VITA_VITAGL_INTENSITY_TEXTURE"
+       _intensity_runtime_defs "${_production_text}")
+list(LENGTH _intensity_runtime_defs _intensity_runtime_def_count)
+if(NOT _intensity_runtime_def_count EQUAL 1 OR NOT _production_text MATCHES
+    "if\\(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE\\)[\r\n]+([ ]+#[^\r\n]*[\r\n]+)*[ ]+set_property\\(SOURCE \"\\\${ISAAC_RUNTIME}/gl_vita_backend\\.c\"[\r\n]+[ ]+APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_VITAGL_INTENSITY_TEXTURE=1\\)")
+  message(FATAL_ERROR "vitaGL intensity texture reaches a runtime TU other than gl_vita_backend.c, or outside its ON block")
 endif()
 if(NOT _production_text MATCHES
     "option\\(ISAAC_VITA_LASER_LIGHT_NEAREST[\r\n ]+\"[^\"]+\" OFF\\)")

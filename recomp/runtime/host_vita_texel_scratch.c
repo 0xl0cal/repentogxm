@@ -17,6 +17,9 @@
 #include "host_vita_texel_scratch.h"
 #include "kage_vita_texture_memory.h"
 #include "platform.h"
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+#include "host_vita_heap_free_prefilter.h"
+#endif
 #if defined(ISAAC_VITA_PNG_PREMULTIPLY_NATIVE)
 #include "host_vita_png_premultiply.h"
 #endif
@@ -74,7 +77,15 @@ _Static_assert(KAGE_VITA_TEXEL_GUEST_IMAGE_BASE <
                "texel scratch frozen image interval is invalid");
 
 static texel_scratch_state s_state = { .uid = -1 };
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+/* The imported free's range prefilter reads this record.  `base` IS
+ * the published base (one object, not a copy); `end` is stored before
+ * it is published (host_vita_heap_free_prefilter.h). */
+isaac_vita_heap_free_range isaac_vita_texel_scratch_free_range;
+#define s_published_base (isaac_vita_texel_scratch_free_range.base)
+#else
 static atomic_uintptr_t s_published_base = ATOMIC_VAR_INIT((uintptr_t)0U);
+#endif
 static atomic_flag s_state_lock = ATOMIC_FLAG_INIT;
 
 static int texel_scratch_owner_is_transient(uint32_t owner_return_rva)
@@ -205,6 +216,12 @@ static int texel_scratch_reserve_locked(
         s_state.uid = uid;
         s_state.guest_stack_floor = guest_stack_floor;
         s_state.guest_stack_ceiling = guest_stack_ceiling;
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+        atomic_store_explicit(
+            &isaac_vita_texel_scratch_free_range.end,
+            (uintptr_t)base + KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES,
+            memory_order_relaxed);
+#endif
         atomic_store_explicit(
             &s_published_base, (uintptr_t)base, memory_order_release);
         isaac_vita_log(
@@ -236,6 +253,34 @@ static int texel_scratch_reserve_locked(
         decision, (uint32_t)free_result,
         "texel scratch memblock rollback failed");
 }
+
+#if defined(ISAAC_VITA_TEXEL_SCRATCH_32M) || \
+    defined(ISAAC_VITA_TEXEL_SCRATCH_ORACLE)
+/* Early reserve for the 32 MiB font capacity (entry_vita.c, before vitaGL).
+ * Without ISAAC_VITA_TEXEL_SCRATCH_32M the production object keeps only the
+ * lazy reservation inside isaac_vita_texel_scratch_malloc; the oracle builds
+ * always compile this entry so both capacities cover the reserve contract. */
+int isaac_vita_texel_scratch_reserve(
+    uint32_t guest_stack_floor, uint32_t guest_stack_ceiling)
+{
+    isaac_vita_texel_scratch_decision decision;
+    uintptr_t base;
+    int result = 0;
+
+    if (guest_stack_floor >= guest_stack_ceiling || !texel_scratch_try_lock())
+        return 0;
+    texel_scratch_clear_decision(&decision);
+    base = atomic_load_explicit(&s_published_base, memory_order_relaxed);
+    if (!s_state.live &&
+        (!base || texel_scratch_range_is_safe(
+                      base, guest_stack_floor, guest_stack_ceiling))) {
+        result = texel_scratch_reserve_locked(
+            guest_stack_floor, guest_stack_ceiling, &decision);
+    }
+    texel_scratch_unlock();
+    return result > 0;
+}
+#endif
 
 int isaac_vita_texel_scratch_malloc(
     uint32_t owner_return_rva, size_t size,
@@ -566,6 +611,11 @@ int isaac_vita_texel_scratch_oracle_reset(void)
     s_state.uid = -1;
     atomic_store_explicit(
         &s_published_base, (uintptr_t)0U, memory_order_release);
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+    atomic_store_explicit(
+        &isaac_vita_texel_scratch_free_range.end,
+        (uintptr_t)0U, memory_order_relaxed);
+#endif
     texel_scratch_unlock();
     return result;
 }

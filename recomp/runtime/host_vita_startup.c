@@ -6,8 +6,14 @@
 #include "host_vita_startup.h"
 #include "host_vita_import_id.h"
 #include "platform.h"
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+#include "host_vita_access_cache.h"
+#endif
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
 #include "host_vita_async_write.h"
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+#include "host_vita_game_log.h"
 #endif
 
 typedef void (*vita_startup_import_fn)(CPU *__restrict);
@@ -389,6 +395,10 @@ static void vita_startup_GetFileAttributesA(CPU *__restrict c)
     /* Attribute probes must observe a save whose image is still queued. */
     isaac_vita_async_write_sync_path(native_path);
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* Attribute probes observe every byte the lane has accepted. */
+    isaac_vita_game_log_sync_path(native_path, ISAAC_VITA_GAME_LOG_SYNC_ATTRIB);
+#endif
     if (stat(native_path, &information) != 0) {
         int native_error = errno;
         if (native_error == ENOENT) {
@@ -432,6 +442,9 @@ static void vita_startup_CreateDirectoryA(CPU *__restrict c)
             c, path, native_path, sizeof native_path))
         return;
     if (mkdir(native_path, 0777) == 0) {
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+        isaac_vita_access_cache_note_create(native_path);
+#endif
         c->eax = 1U;
     } else {
         int native_error = errno;

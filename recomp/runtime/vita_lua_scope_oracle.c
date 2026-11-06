@@ -38,6 +38,7 @@
  *   - native getClass/getExact seam owner protocol: root, repeated nested
  *     re-entry, foreign owner (including a real second thread), nested leave
  *     retaining the owner, root release, owner change and null legacy input. */
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -315,14 +316,14 @@ static void bind_cpu(CPU *c, uint32_t *stack)
     c->ebp = c->esp;
 }
 
-static int invoke_import(CPU *c, uint32_t index,
-                         const uint32_t *arguments, uint32_t count)
+static int invoke_import_at(CPU *c, uint32_t index, const uint32_t *arguments,
+                            uint32_t count, uint32_t return_word)
 {
     uint32_t saved = c->esp;
     uint32_t i;
     for (i = count; i != 0U; --i)
         gpush(c, arguments[i - 1U]);
-    gpush(c, IMPORT_RETURN + index);
+    gpush(c, return_word);
     if (!isaac_vita_lua_import_indexed(c, index, NULL)) {
         guest_fault(c, index, "oracle Lua import index was rejected");
         return 0;
@@ -334,6 +335,12 @@ static int invoke_import(CPU *c, uint32_t index,
         return 0;
     }
     return guest_stack_adjust(c, count * 4U, index);
+}
+
+static int invoke_import(CPU *c, uint32_t index,
+                         const uint32_t *arguments, uint32_t count)
+{
+    return invoke_import_at(c, index, arguments, count, IMPORT_RETURN + index);
 }
 
 static int import_pushinteger(CPU *c, uint32_t state, int64_t value)
@@ -834,6 +841,71 @@ static int check_seam_scope(void)
     return 0;
 }
 
+#if defined(ISAAC_VITA_LUA_CALL_ERROR_CATCH)
+static unsigned s_logged;
+static char s_last_log[512];
+
+void isaac_vita_log(const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(s_last_log, sizeof s_last_log, format, arguments);
+    va_end(arguments);
+    ++s_logged;
+}
+
+static int pcall_at(CPU *c, uint32_t state, const char *chunk,
+                    uint32_t return_word)
+{
+    lua_State *L = (lua_State *)(uintptr_t)state;
+    uint32_t arguments[6] = { 0U, 0U, 1U, 0U, 0U, 0U };
+    arguments[0] = state;
+    if (luaL_loadbuffer(L, chunk, strlen(chunk), "=catch") != LUA_OK)
+        return -100;
+    if (!invoke_import_at(c, LUA_IMPORT_PCALLK, arguments, 6U, return_word))
+        return -101;
+    return (int)c->eax;
+}
+
+/* ISAAC_VITA_LUA_CALL_ERROR_CATCH: a failing call returning to a LuaBridge
+ * throwing site (0x0040ef41, the callback invoker 0x40eef0) answers LUA_OK
+ * with exactly one nil and logs the message once; the same failure returning
+ * to the self-handling site 0x40b3df (return 0x0040b3e5) or to a word outside
+ * the table keeps its status and error object; a successful call at the
+ * throwing site is untouched. */
+static int check_call_error_catch(CPU *c, uint32_t state)
+{
+    lua_State *L = (lua_State *)(uintptr_t)state;
+    int top = lua_gettop(L);
+    unsigned logged = s_logged;
+    static const uint32_t keep[] = {
+        0x0040b3e5U, (uint32_t)IMPORT_RETURN + (uint32_t)LUA_IMPORT_PCALLK };
+    size_t i;
+
+    if (pcall_at(c, state, "error('catch boom')", 0x0040ef41U) != LUA_OK ||
+        lua_gettop(L) != top + 1 || !lua_isnil(L, -1) ||
+        s_logged != logged + 1U || !strstr(s_last_log, "catch boom"))
+        return fail("throwing-site Lua error was not caught as one nil");
+    lua_settop(L, top);
+    for (i = 0; i < sizeof keep / sizeof keep[0]; ++i) {
+        if (pcall_at(c, state, "error('catch boom')", keep[i]) != LUA_ERRRUN ||
+            lua_gettop(L) != top + 1 || lua_type(L, -1) != LUA_TSTRING ||
+            !strstr(lua_tostring(L, -1), "catch boom") ||
+            s_logged != logged + 1U)
+            return fail("non-throwing site lost its Lua error");
+        lua_settop(L, top);
+    }
+    if (pcall_at(c, state, "return 7", 0x0040ef41U) != LUA_OK ||
+        lua_gettop(L) != top + 1 || lua_tointeger(L, -1) != 7 ||
+        s_logged != logged + 1U)
+        return fail("successful call at a throwing site was altered");
+    lua_settop(L, top);
+    if (c->fault || c->esp != c->stack_ceiling)
+        return fail("call-error catch left a fault or an unbalanced stack");
+    return 0;
+}
+#endif
+
 int main(void)
 {
     lua_State *L;
@@ -900,6 +972,10 @@ int main(void)
         if (check_no_scope(L))
             return 1;
     }
+#if defined(ISAAC_VITA_LUA_CALL_ERROR_CATCH)
+    if (check_call_error_catch(&s_cpu_a, s_state))
+        return 1;
+#endif
 
     if (s_nested_calls != 7U * ROUNDS || s_argerr_calls != ROUNDS ||
         s_argerr_max_calls != ROUNDS || s_fault_calls != 2U * ROUNDS ||

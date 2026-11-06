@@ -41,6 +41,7 @@ def build_options(audio: bool) -> dict[str, object]:
         "png_native_unfilter": True,
         "texture_churn_profile": False,
         "game_log_batch": True,
+        "game_log_async": False,
         "continue_overlay": False,
         "texel_oom_diagnostic": True,
         "texel_scratch": True,

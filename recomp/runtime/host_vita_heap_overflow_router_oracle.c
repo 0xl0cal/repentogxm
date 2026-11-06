@@ -754,10 +754,25 @@ static int test_ranges_and_setup(void)
     CHECK(ISAAC_VITA_GUEST_HEAP_LEDGER_USABLE_BYTES == 0x00490000U);
     CHECK(ISAAC_VITA_GUEST_HEAP_LEDGER_REQUEST_BYTES == 0x00491000U);
     CHECK(ISAAC_VITA_GUEST_HEAP_LEDGER_RETAINED_BYTES == 0x00492000U);
-    CHECK(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x007d5000U);
+    CHECK(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES ==
+          ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES + 0x00001000U);
+    CHECK(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES ==
+          ISAAC_VITA_GUEST_HEAP_LEDGER_REQUEST_BYTES +
+              ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES);
+    CHECK(ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES ==
+          ISAAC_VITA_GUEST_HEAP_LEDGER_RETAINED_BYTES +
+              ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES);
+#if ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x007d5000U
     CHECK(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES == 0x007d6000U);
     CHECK(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES == 0x00c66000U);
     CHECK(ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES == 0x00c68000U);
+#elif ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x017fd000U
+    CHECK(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES == 0x017fe000U);
+    CHECK(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES == 0x01c8e000U);
+    CHECK(ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES == 0x01c90000U);
+#else
+#error "overflow router oracle: pool size has no pinned receipt"
+#endif
     CHECK(isaac_vita_heap_ledger_memblock_layout(0x00490000U, &request) &&
           request == 0x00491000U);
     CHECK(isaac_vita_guest_heap_test_forbidden_ranges(
@@ -769,6 +784,16 @@ static int test_ranges_and_setup(void)
           ranges.fixed_image.end == 0x9885f000U &&
           ranges.guest_stack.begin == 0x85000000U &&
           ranges.guest_stack.end == 0x85400000U);
+    /* ISAAC_VITA_GUEST_STACK_MEMBLOCK: the stack in its own USER_RW block,
+     * outside the retained newlib span and below the fixed image (floor and
+     * ceiling keep their 4 KiB margins), is accepted as-is; only a fixed-image
+     * overlap rejects (checked further down). */
+    CHECK(isaac_vita_guest_heap_test_forbidden_ranges(
+              0x82ad1560U, 0x05100000U,
+              0x90001000U, 0x903ff000U, &ranges));
+    CHECK(ranges.retained_newlib.end == 0x87cd2000U &&
+          ranges.guest_stack.begin == 0x90001000U &&
+          ranges.guest_stack.end == 0x903ff000U);
     CHECK(!isaac_vita_guest_heap_test_forbidden_ranges(
               0x82ad1560U, 0x15000000U,
               0x85000000U, 0x85400000U, &ranges));
@@ -838,6 +863,85 @@ static int test_ranges_and_setup(void)
           storage.block_bytes == ORACLE_HOST_LEDGER_REQUEST_BYTES &&
           isaac_vita_guest_heap_test_fixed_capacity());
     CHECK(!isaac_vita_guest_heap_terminal());
+    CHECK(oracle_reset());
+    return 0;
+}
+
+static int test_zero_size_native_oom(void)
+{
+    isaac_vita_guest_heap_test_result result;
+    isaac_vita_guest_heap_telemetry_snapshot snapshot;
+    isaac_vita_guest_heap_floor_lifetime_snapshot floor;
+    void *first;
+    void *second;
+    unsigned char *replacement;
+    uintptr_t allocation_base = 0U;
+    const char *reason = NULL;
+    size_t native_calls = s_native_malloc_calls;
+    size_t pool_calls = s_mspace_malloc_calls;
+    int valid_owner = 0;
+
+    CHECK(oracle_init());
+    CHECK(isaac_vita_guest_heap_test_floor_lifetime_bootstrap(
+              ISAAC_VITA_FLOOR_LIFETIME_PHASE_LEVEL_INIT));
+    s_fail_native_malloc = 1U;
+    first = isaac_vita_guest_heap_test_malloc_ex(0U, &result, &reason);
+    CHECK(first && result == ISAAC_VITA_GUEST_HEAP_TEST_OK &&
+          isaac_vita_guest_heap_owns(first) &&
+          isaac_vita_heap_overflow_mspace_contains(first) &&
+          oracle_mspace_find(first)->size == 1U &&
+          s_native_malloc_calls == native_calls + 1U &&
+          s_mspace_malloc_calls == pool_calls + 1U);
+    /* Guest realloc(NULL,0) uses the same malloc boundary, unlike raw realloc. */
+    s_fail_native_malloc = 1U;
+    second = isaac_vita_guest_heap_test_realloc_ex(
+        NULL, 0U, &valid_owner, &result);
+    CHECK(second && second != first && valid_owner &&
+          result == ISAAC_VITA_GUEST_HEAP_TEST_OK &&
+          isaac_vita_guest_heap_owns(second) &&
+          oracle_mspace_find(second)->size == 1U &&
+          s_native_malloc_calls == native_calls + 2U &&
+          s_mspace_malloc_calls == pool_calls + 2U);
+    CHECK(isaac_vita_guest_heap_test_live_count() == 2U &&
+          isaac_vita_guest_heap_telemetry_snapshot_get(&snapshot) &&
+          oracle_telemetry_invariants(&snapshot) &&
+          snapshot.owned_live_count == 2U && snapshot.raw_live_count == 2U &&
+          snapshot.owned_requested_bytes == 0U &&
+          snapshot.peak_requested_bytes == 0U &&
+          snapshot.pool_allocations == 2U && snapshot.pool_frees == 0U &&
+          snapshot.native_failures == 2U && snapshot.pool_failures == 0U &&
+          !snapshot.terminal);
+    CHECK(isaac_vita_guest_heap_floor_lifetime_snapshot_get(&floor) &&
+          floor.total_count == 2U && floor.total_requested_bytes == 0U &&
+          floor.current_count == 2U && floor.current_requested_bytes == 0U);
+    /* One backing byte does not enlarge either exact logical allocation. */
+    CHECK(!isaac_vita_guest_heap_lease_containing(first, 1U, &allocation_base) &&
+          !isaac_vita_guest_heap_lease_containing(second, 1U, &allocation_base));
+    CHECK(isaac_vita_guest_heap_test_free_ex(second, &result) &&
+          result == ISAAC_VITA_GUEST_HEAP_TEST_OK);
+    replacement = isaac_vita_guest_heap_test_realloc_ex(
+        first, 64U, &valid_owner, &result);
+    CHECK(replacement && valid_owner &&
+          result == ISAAC_VITA_GUEST_HEAP_TEST_OK &&
+          isaac_vita_heap_overflow_mspace_contains(replacement) &&
+          isaac_vita_guest_heap_telemetry_snapshot_get(&snapshot) &&
+          oracle_telemetry_invariants(&snapshot) &&
+          snapshot.owned_live_count == 1U &&
+          snapshot.owned_requested_bytes == 64U);
+    memset(replacement, 0x39, 64U);
+    CHECK(!isaac_vita_guest_heap_test_realloc_ex(
+              replacement, 0U, &valid_owner, &result) &&
+          valid_owner && result == ISAAC_VITA_GUEST_HEAP_TEST_OK &&
+          isaac_vita_guest_heap_test_live_count() == 0U);
+    CHECK(isaac_vita_guest_heap_telemetry_snapshot_get(&snapshot) &&
+          oracle_telemetry_invariants(&snapshot) &&
+          snapshot.owned_live_count == 0U && snapshot.raw_live_count == 0U &&
+          snapshot.owned_requested_bytes == 0U &&
+          snapshot.pool_allocations == 2U && snapshot.pool_frees == 2U &&
+          snapshot.pool_reallocations == 1U && snapshot.pool_failures == 0U);
+    CHECK(isaac_vita_guest_heap_floor_lifetime_snapshot_get(&floor) &&
+          floor.total_count == 0U && floor.total_requested_bytes == 0U &&
+          floor.current_count == 0U && floor.current_requested_bytes == 0U);
     CHECK(oracle_reset());
     return 0;
 }
@@ -2574,6 +2678,7 @@ int main(int argc, char **argv)
     }
     CHECK(argc == 1);
     CHECK(test_ranges_and_setup() == 0);
+    CHECK(test_zero_size_native_oom() == 0);
     CHECK(test_room_entry_integrated_routes() == 0);
     CHECK(test_room_entry_external_integrated_routes() == 0);
     CHECK(test_floor_lifetime_slab_move_categories() == 0);

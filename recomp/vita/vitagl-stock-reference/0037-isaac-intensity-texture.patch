@@ -1,0 +1,64 @@
+diff --git a/source/textures.c b/source/textures.c
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -86,1 +86,4 @@
+ int unpack_row_len = 0; // Current setting for GL_UNPACK_ROW_LENGTH
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++#include "isaac_intensity_texture.h"
++#endif
+@@ -88,1 +91,5 @@
+ static inline __attribute__((always_inline)) void _glTexParameterx(texture *tex, GLenum target, GLenum pname, GLfixed param) {
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++	GLenum intensity_error = isaacIntensityPrepare(tex, 1);
++	if (intensity_error) { SET_GL_ERROR(intensity_error) }
++#endif
+@@ -282,1 +289,5 @@
+ static inline __attribute__((always_inline)) void _glTexParameteri(texture *tex, GLenum target, GLenum pname, GLint param) {
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++	GLenum intensity_error = isaac_intensity_parameter(tex, pname, param);
++	if (intensity_error) { SET_GL_ERROR(intensity_error) }
++#endif
+@@ -590,1 +601,9 @@
+ static inline __attribute__((always_inline)) void _glTexImage2D_FlatIMPL(texture *tex, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *data) {
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++	if (isaac_intensity_try_upload(tex, level, internalFormat, width, height,
++			format, type, data, unpack_row_len)) return;
++	if (isaac_intensity_redefine(tex, level, internalFormat, width, height,
++			format, type, data, unpack_row_len)) return;
++	GLenum intensity_error = isaacIntensityPrepare(tex, 1);
++	if (intensity_error) { SET_GL_ERROR(intensity_error) }
++#endif
+@@ -947,1 +964,5 @@
+ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++	GLenum intensity_error = isaacIntensityPrepare(tex, 1);
++	if (intensity_error) { SET_GL_ERROR(intensity_error) }
++#endif
+@@ -1731,1 +1752,4 @@
+ 			texture_slots[i].status = TEX_UNINITIALIZED;
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++			isaac_intensity_generated(i);
++#endif
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1327,1 +1327,7 @@
+ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(framebuffer *fb, GLenum attachment, texture *tex, GLuint tex_id) {
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++	if (tex_id) {
++		GLenum intensity_error = isaacIntensityPrepare(tex, 1);
++		if (intensity_error) { SET_GL_ERROR(intensity_error) }
++	}
++#endif
+diff --git a/source/utils/gpu_utils.h b/source/utils/gpu_utils.h
+--- a/source/utils/gpu_utils.h
++++ b/source/utils/gpu_utils.h
+@@ -154,1 +154,8 @@
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++void isaacIntensityRelease(texture *tex);
++GLenum isaacIntensityPrepare(texture *tex, int exclude);
++#endif
+ static inline __attribute__((always_inline)) void gpu_free_texture_data(texture *tex) {
++#ifdef HAVE_ISAAC_INTENSITY_TEXTURE
++	isaacIntensityRelease(tex);
++#endif

@@ -9,6 +9,9 @@
 #include "gl_bridge.h"
 #include "gl_vita_backend.h"
 #include "gl_vita_backend_test_vitagl.h"
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+#include "gl_record_backend.h"
+#endif
 
 #if UINTPTR_MAX != UINT32_MAX
 # error gl_vita_backend_oracle requires a 32-bit address space
@@ -34,6 +37,7 @@
 #define ORACLE_GL_LINEAR              0x00002601u
 #define ORACLE_GL_ALPHA               0x00001906u
 #define ORACLE_GL_RED                 0x00001903u
+#define ORACLE_GL_RGB                 0x00001907u
 #define ORACLE_GL_RGBA                0x00001908u
 #define ORACLE_GL_ABGR_EXT            0x00008000u
 #define ORACLE_GL_UNSIGNED_BYTE       0x00001401u
@@ -50,6 +54,36 @@
  * scales the default framebuffer's values. */
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720) || defined(ISAAC_VITA_FBO_RASTER_SCALE)
 # define ORACLE_LOGICAL_VIEWPORT 1
+#endif
+/* ISAAC_VITA_DISPLAY_CENTER_Y (issue #5, 5.8b) shadows the guest viewport the
+ * same way and adds the 960x544 raster's centring rows to framebuffer 0's
+ * native Y origin only; ORACLE_FB0_Y spells that expectation. */
+#if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+# if !defined(ORACLE_LOGICAL_VIEWPORT)
+#  define ORACLE_LOGICAL_VIEWPORT 1
+# endif
+# define ORACLE_FB0_Y(y) ((y) + 2)
+#else
+# define ORACLE_FB0_Y(y) (y)
+#endif
+#if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+/* Its once-per-boot receipt.  The sinks owned by another policy (readback,
+ * depth carry) hand it here first so their own line counts stay exact. */
+# define ORACLE_DISPLAY_CENTER_Y_PREFIX "KAGE VITA DISPLAY CENTER Y: "
+static unsigned s_display_center_y_log_calls;
+static char s_display_center_y_log[160];
+
+static int oracle_display_center_y_take(
+    const char *format, va_list arguments)
+{
+    if (strncmp(format, ORACLE_DISPLAY_CENTER_Y_PREFIX,
+                sizeof ORACLE_DISPLAY_CENTER_Y_PREFIX - 1u) != 0)
+        return 0;
+    ++s_display_center_y_log_calls;
+    vsnprintf(s_display_center_y_log, sizeof s_display_center_y_log,
+              format, arguments);
+    return 1;
+}
 #endif
 #define ORACLE_TOKEN_BIND_RBO  0x7e9bfd5cu
 #define ORACLE_TOKEN_CLEAR_DEPTH 0x7e6b0830u
@@ -130,6 +164,18 @@ uint64_t sceKernelGetProcessTimeWide(void)
     return s_gl_time_clock;
 }
 #endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX) && \
+    !defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE) && \
+    !defined(ISAAC_VITA_GL_TIME_PROFILE)
+/* Monotonic stub for the readback finish bracket: 5 us per call. */
+static uint64_t s_readback_clock;
+
+uint64_t sceKernelGetProcessTimeWide(void)
+{
+    s_readback_clock += 5u;
+    return s_readback_clock;
+}
+#endif
 static unsigned s_native_delete_calls;
 static unsigned s_native_clear_depth_calls;
 static unsigned s_native_clear_calls;
@@ -138,6 +184,71 @@ static unsigned s_native_clear_color_calls;
 static GLfloat s_native_clear_color[4];
 static unsigned s_native_enable_calls;
 static GLdouble s_native_clear_depth;
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+/* Issue #15: the facade additionally models what pinned vitaGL 73dd57a does
+ * with depth across GXM scenes (source read, not guessed):
+ *  - glBindFramebuffer only stores the write target;
+ *  - _glFramebufferTexture2D with a non-zero texture on the in-use
+ *    framebuffer sets dirty_framebuffer (shared.h);
+ *  - the next clear or draw runs scene_reset, which opens a new scene when
+ *    the target changed or is dirty (gxm.c), and every scene starts at the
+ *    depth surface's background 1.0: vglDepthStencilSurfaceInit stores
+ *    s[3] = 0x3F800000 and STORE_DEPTH_STENCIL is off, so nothing loads;
+ *  - a clear with GL_DEPTH_BUFFER_BIT sets the scene's depth to the native
+ *    clear depth.
+ * Isaac's state is fixed at init (0x965190): GL_DEPTH_TEST on, glDepthFunc
+ * (GL_GREATER), and its quads land at about 0.5005 (hardware-confirmed,
+ * on 2026-08-28).  A draw "passes" when that depth is GREATER
+ * than the depth the scene started or was cleared with; depth written by
+ * earlier draws is deliberately not modelled. */
+# define ORACLE_DEPTH_MODEL_FRAGMENT 0.5005
+static GLuint s_model_active_fb;
+static GLuint s_model_in_use_fb;
+static int s_model_scene_open;
+static int s_model_dirty;
+static GLdouble s_model_clear_depth;
+static GLdouble s_model_scene_depth;
+static unsigned s_model_scenes;
+static int s_model_last_draw_passed;
+static unsigned s_model_draws;
+static unsigned s_model_draws_passed;
+
+static void oracle_model_reset(void)
+{
+    s_model_active_fb = 0u;
+    s_model_in_use_fb = 0u;
+    s_model_scene_open = 0;
+    s_model_dirty = 0;
+    s_model_clear_depth = 1.0;
+    s_model_scene_depth = 1.0;
+    s_model_scenes = 0u;
+    s_model_last_draw_passed = -1;
+    s_model_draws = 0u;
+    s_model_draws_passed = 0u;
+}
+
+static void oracle_model_scene_reset(void)
+{
+    if (!s_model_scene_open || s_model_in_use_fb != s_model_active_fb ||
+            s_model_dirty) {
+        s_model_scene_open = 1;
+        s_model_dirty = 0;
+        s_model_in_use_fb = s_model_active_fb;
+        s_model_scene_depth = 1.0;
+        ++s_model_scenes;
+    }
+}
+
+static void oracle_model_draw(void)
+{
+    oracle_model_scene_reset();
+    s_model_last_draw_passed =
+        ORACLE_DEPTH_MODEL_FRAGMENT > s_model_scene_depth;
+    ++s_model_draws;
+    if (s_model_last_draw_passed)
+        ++s_model_draws_passed;
+}
+#endif
 static unsigned s_native_bind_framebuffer_calls;
 static GLenum s_native_bind_framebuffer_target;
 static GLuint s_native_bind_framebuffer_name;
@@ -412,6 +523,58 @@ void isaac_vita_log(const char *format, ...)
 }
 #endif
 
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY) && \
+    !defined(ISAAC_VITA_FBO_RASTER_SCALE) && \
+    !defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
+/* The depth carry logs replays 1, 2, 4...; keep the formatted line. */
+#define ORACLE_DEPTH_CARRY_LOG 1
+static unsigned s_depth_carry_log_calls;
+static char s_depth_carry_log[160];
+# if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+#  define ORACLE_DISPLAY_CENTER_Y_FILTERED 1
+# endif
+
+void isaac_vita_log(const char *format, ...)
+{
+    va_list arguments;
+
+# if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+    va_start(arguments, format);
+    if (oracle_display_center_y_take(format, arguments)) {
+        va_end(arguments);
+        return;
+    }
+    va_end(arguments);
+# endif
+    ++s_depth_carry_log_calls;
+    va_start(arguments, format);
+    vsnprintf(s_depth_carry_log, sizeof s_depth_carry_log, format, arguments);
+    va_end(arguments);
+}
+#endif
+
+#if defined(ISAAC_VITA_DISPLAY_CENTER_Y) && \
+    !defined(ISAAC_VITA_FXRAY_ALPHA_MASK) && \
+    !defined(ISAAC_VITA_FBO_RASTER_SCALE) && \
+    !defined(ISAAC_VITA_FBO_DEPTH_CARRY) && \
+    !defined(ISAAC_VITA_FBO_READBACK_FIX) && \
+    !defined(ISAAC_VITA_GL_FILL_CENSUS_DUMP)
+/* The display centring is the only logger here; any other line is foreign
+ * and fails the run. */
+#define ORACLE_DISPLAY_CENTER_Y_LOG 1
+static unsigned s_display_center_y_foreign_calls;
+
+void isaac_vita_log(const char *format, ...)
+{
+    va_list arguments;
+
+    va_start(arguments, format);
+    if (!oracle_display_center_y_take(format, arguments))
+        ++s_display_center_y_foreign_calls;
+    va_end(arguments);
+}
+#endif
+
 void isaac_gl_vita_oracle_rt_fault(uint32_t result, const char *message)
 {
     ++s_rt_fault_calls;
@@ -432,6 +595,146 @@ static void oracle_rt_reset(void)
 }
 
 void oracle_glNoop(void) {}
+
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+/* Readback sync: the GXM context vitaGL would own, a drain counter, and a
+ * recording glReadPixels that notes how many drains preceded it and hands
+ * back a fixed texel for the backend's detail line. */
+static int s_gxm_context_storage;
+SceGxmContext *gxm_context = (SceGxmContext *)&s_gxm_context_storage;
+static unsigned s_gxm_finish_calls;
+static unsigned s_native_read_pixels_calls;
+static unsigned s_native_read_pixels_finishes;
+
+void sceGxmFinish(SceGxmContext *context)
+{
+    if (context == gxm_context)
+        ++s_gxm_finish_calls;
+}
+
+void oracle_glReadPixels(
+    GLint x, GLint y, GLsizei width, GLsizei height,
+    GLenum format, GLenum type, void *pixels)
+{
+    (void)x;
+    (void)y;
+    (void)format;
+    (void)type;
+    ++s_native_read_pixels_calls;
+    s_native_read_pixels_finishes = s_gxm_finish_calls;
+    if (pixels && width == 1 && height == 1) {
+        uint8_t *texel = (uint8_t *)pixels;
+
+        texel[0] = 0x12u;
+        texel[1] = 0x34u;
+        texel[2] = 0x56u;
+        texel[3] = 0x78u;
+    }
+}
+
+/* The attached texture the detail path inspects: an 8x4 linear RGBA8
+ * surface (stride VGL_ALIGN(8, 8) * 4 = 32 bytes, one row per array row)
+ * whose content the test sets; the accessor records the texture bound when
+ * it was called so the test can prove the backend bound the attachment and
+ * restored the previous binding. */
+static int s_readback_gxm_storage;
+static uint32_t s_readback_texels[4][8];
+static unsigned s_readback_accessor_calls;
+static unsigned s_readback_accessor_finishes;
+static GLuint s_readback_accessor_binding;
+
+SceGxmTexture *vglGetGxmTexture(GLenum target)
+{
+    (void)target;
+    ++s_readback_accessor_calls;
+    s_readback_accessor_finishes = s_gxm_finish_calls;
+    s_readback_accessor_binding = s_native_bound_texture_2d;
+    return (SceGxmTexture *)&s_readback_gxm_storage;
+}
+
+void *vglGetTexDataPointer(GLenum target)
+{
+    (void)target;
+    return s_readback_texels;
+}
+
+uint32_t sceGxmTextureGetFormat(const SceGxmTexture *texture)
+{
+    (void)texture;
+    return SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR;
+}
+
+uint32_t sceGxmTextureGetType(const SceGxmTexture *texture)
+{
+    (void)texture;
+    return 0x60000000u;     /* linear layout */
+}
+
+unsigned int sceGxmTextureGetWidth(const SceGxmTexture *texture)
+{
+    (void)texture;
+    return 8u;
+}
+
+unsigned int sceGxmTextureGetHeight(const SceGxmTexture *texture)
+{
+    (void)texture;
+    return 4u;
+}
+
+unsigned int sceGxmTextureGetStride(const SceGxmTexture *texture)
+{
+    (void)texture;
+    return 32u;
+}
+
+void *sceGxmTextureGetData(const SceGxmTexture *texture)
+{
+    (void)texture;
+    return s_readback_texels;
+}
+
+# if !defined(ISAAC_VITA_FXRAY_ALPHA_MASK) && \
+    !defined(ISAAC_VITA_FBO_RASTER_SCALE) && \
+    !defined(ISAAC_VITA_GL_FILL_CENSUS_DUMP)
+#define ORACLE_READBACK_LOG_CAPACITY 32u
+static unsigned s_readback_log_calls;
+static char s_readback_logs[ORACLE_READBACK_LOG_CAPACITY][256];
+#  if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+#   define ORACLE_DISPLAY_CENTER_Y_FILTERED 1
+#  endif
+
+void isaac_vita_log(const char *format, ...)
+{
+    va_list arguments;
+    unsigned slot = s_readback_log_calls;
+
+#  if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+    va_start(arguments, format);
+    if (oracle_display_center_y_take(format, arguments)) {
+        va_end(arguments);
+        return;
+    }
+    va_end(arguments);
+#  endif
+    ++s_readback_log_calls;
+    if (slot >= ORACLE_READBACK_LOG_CAPACITY)
+        return;
+    va_start(arguments, format);
+    (void)vsnprintf(
+        s_readback_logs[slot], sizeof s_readback_logs[slot], format,
+        arguments);
+    va_end(arguments);
+    s_readback_logs[slot][sizeof s_readback_logs[slot] - 1u] = '\0';
+}
+
+static int oracle_readback_log_starts(unsigned slot, const char *prefix)
+{
+    return slot < ORACLE_READBACK_LOG_CAPACITY &&
+        strncmp(s_readback_logs[slot], prefix, strlen(prefix)) == 0;
+}
+# endif
+#endif
 GLuint oracle_glReturnUint(void) { return 1u; }
 GLint oracle_glReturnInt(void) { return 0; }
 const GLubyte *oracle_glReturnString(void)
@@ -565,6 +868,9 @@ void oracle_glClearDepth(GLdouble depth)
 {
     ++s_native_clear_depth_calls;
     s_native_clear_depth = depth;
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+    s_model_clear_depth = depth;
+#endif
 }
 
 void oracle_glClear(GLbitfield mask)
@@ -575,6 +881,11 @@ void oracle_glClear(GLbitfield mask)
 #endif
     ++s_native_clear_calls;
     s_native_clear_mask = mask;
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+    oracle_model_scene_reset();
+    if (mask & 0x00000100u)
+        s_model_scene_depth = s_model_clear_depth;
+#endif
 }
 
 void oracle_glClearColor(
@@ -604,6 +915,10 @@ void oracle_glBindFramebuffer(GLenum target, GLuint framebuffer)
     ++s_native_bind_framebuffer_calls;
     s_native_bind_framebuffer_target = target;
     s_native_bind_framebuffer_name = framebuffer;
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+    if (target == ORACLE_GL_FRAMEBUFFER || target == 0x00008ca9u)
+        s_model_active_fb = framebuffer;
+#endif
     if (s_gl_event_count < sizeof s_gl_events / sizeof s_gl_events[0])
         s_gl_events[s_gl_event_count++] = ORACLE_GL_EVENT_BIND_FRAMEBUFFER;
 }
@@ -633,6 +948,11 @@ void oracle_glFramebufferTexture2D(
     (void)level;
     ++s_native_framebuffer_texture_calls;
     s_native_framebuffer_texture_name = texture;
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+    if (texture != 0u && s_model_scene_open &&
+            s_model_in_use_fb == s_model_active_fb)
+        s_model_dirty = 1;
+#endif
 }
 
 void oracle_glTexImage2D(
@@ -872,6 +1192,9 @@ void oracle_glDrawElements(
     s_native_attrib_observed = s_native_attrib_mask;
 #endif
     ++s_native_draw_elements_calls;
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+    oracle_model_draw();
+#endif
     s_native_draw_mode = mode;
     ORACLE_DIRECT_TRACE("d%x,%d,%x,%lx;", (unsigned)mode, (int)count,
                         (unsigned)type, (unsigned long)(uintptr_t)indices);
@@ -888,6 +1211,10 @@ GLboolean vglIsaacDrawCanonicalQuads(GLsizei count)
     s_native_canonical_attrib_observed = s_native_attrib_mask;
 #endif
     ++s_native_canonical_quad_calls;
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+    if (s_native_canonical_quad_result)
+        oracle_model_draw();
+#endif
     s_native_canonical_quad_count = count;
     return s_native_canonical_quad_result;
 }
@@ -935,6 +1262,10 @@ static int oracle_dispatch_with_return(
     gpush(cpu, return_word);
     if (!guest_gl_dispatch(cpu, token))
         return 0;
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    /* Eager boundary: every check below observes the replayed native calls. */
+    isaac_gl_record_drain();
+#endif
     return cpu->esp == stack_top;
 }
 
@@ -2453,7 +2784,9 @@ static int oracle_test_texture_churn(CPU *cpu, uint32_t stack_top)
 }
 #endif
 
-#if defined(ISAAC_VITA_FBO_CLEAR_ELISION) || defined(ISAAC_VITA_FBO_RASTER_SCALE)
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION) || \
+    defined(ISAAC_VITA_FBO_RASTER_SCALE) || \
+    defined(ISAAC_VITA_FBO_READBACK_FIX)
 #define ORACLE_TOKEN_CLEAR 0x7e194b2bu
 #define ORACLE_TOKEN_CLEAR_COLOR 0x7e9e5cb0u
 #define ORACLE_TOKEN_ENABLE 0x7ed43cfdu
@@ -2478,6 +2811,7 @@ static int oracle_fbo_clear(CPU *cpu, uint32_t stack_top, uint32_t mask)
         cpu, stack_top, ORACLE_TOKEN_CLEAR, arguments, 1u);
 }
 
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION) || defined(ISAAC_VITA_FBO_RASTER_SCALE)
 static int oracle_fbo_clear_color(
     CPU *cpu, uint32_t stack_top,
     float red, float green, float blue, float alpha)
@@ -2507,6 +2841,7 @@ static int oracle_fbo_clear_depth(
     return oracle_dispatch(
         cpu, stack_top, ORACLE_TOKEN_CLEAR_DEPTH, arguments, 2u);
 }
+#endif
 #endif
 
 static int oracle_fbo_attach(
@@ -2553,6 +2888,7 @@ static int oracle_fbo_draw(CPU *cpu, uint32_t stack_top)
         cpu, stack_top, ORACLE_TOKEN_DRAW_ELEMENTS, arguments, 4u);
 }
 
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION) || defined(ISAAC_VITA_FBO_RASTER_SCALE)
 static int oracle_fbo_enable(CPU *cpu, uint32_t stack_top, uint32_t cap)
 {
     uint32_t arguments[1];
@@ -2599,25 +2935,39 @@ static int oracle_fbo_active_texture(
 }
 #endif
 #endif
+#endif
 
-#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
-static int oracle_fbo_read_pixels(CPU *cpu, uint32_t stack_top)
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION) || defined(ISAAC_VITA_FBO_READBACK_FIX)
+/* Destination of the last glReadPixels (up to 2x2 RGBA), pre-filled with
+ * 0xa5 so the test sees whether anything was written. */
+static uint8_t s_oracle_read_texel[16];
+
+static int oracle_fbo_read_pixels_shape(
+    CPU *cpu, uint32_t stack_top, uint32_t x, uint32_t y,
+    uint32_t width, uint32_t height, uint32_t format)
 {
-    static uint8_t pixels[4];
     uint32_t arguments[7];
 
-    arguments[0] = 0u;
-    arguments[1] = 0u;
-    arguments[2] = 1u;
-    arguments[3] = 1u;
-    arguments[4] = ORACLE_GL_RGBA;
+    memset(s_oracle_read_texel, 0xa5, sizeof s_oracle_read_texel);
+    arguments[0] = x;
+    arguments[1] = y;
+    arguments[2] = width;
+    arguments[3] = height;
+    arguments[4] = format;
     arguments[5] = ORACLE_GL_UNSIGNED_BYTE;
-    arguments[6] = (uint32_t)(uintptr_t)pixels;
+    arguments[6] = (uint32_t)(uintptr_t)s_oracle_read_texel;
     return oracle_dispatch(
         cpu, stack_top, ORACLE_TOKEN_READ_PIXELS, arguments, 7u);
 }
 
-#if !defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
+static int oracle_fbo_read_pixels(CPU *cpu, uint32_t stack_top)
+{
+    return oracle_fbo_read_pixels_shape(
+        cpu, stack_top, 0u, 0u, 1u, 1u, ORACLE_GL_RGBA);
+}
+
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION) && \
+    !defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP)
 /* Colour renderbuffers only matter to the colour-note path of the plain
  * elision test. */
 static int oracle_fbo_attach_renderbuffer(
@@ -2633,6 +2983,171 @@ static int oracle_fbo_attach_renderbuffer(
         cpu, stack_top, ORACLE_TOKEN_FRAMEBUFFER_RENDERBUFFER, arguments, 4u);
 }
 #endif
+#endif
+
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+/* Offscreen readback: a native draw or clear on a tracked colour texture
+ * makes the next read of that texture drain the GXM context once, before
+ * the read; reads of settled textures and display reads never drain.  A
+ * write through a framebuffer without a known colour texture drains the
+ * next offscreen read whatever it targets, once.  Offscreen RGBA/UNSIGNED_BYTE
+ * reads inside a linear RGBA8 attachment are served from the texture memory
+ * at the unflipped rows (no native read); other shapes take the native
+ * read.  The receipt and the detail lines carry exactly these counts. */
+static int oracle_test_fbo_readback_sync(CPU *cpu, uint32_t stack_top)
+{
+    unsigned finishes;
+    unsigned reads;
+
+    gl_vita_backend_uninstall();
+    CHECK(gl_vita_backend_install());
+    s_readback_log_calls = 0u;
+    finishes = s_gxm_finish_calls;
+    reads = s_native_read_pixels_calls;
+    /* The attached texture: three non-zero texels; (0, 0) is what the
+     * game's read at (0, 0) must return (bytes 12 34 56 78), row 3 is
+     * what stock vitaGL would have copied (height-1-0). */
+    memset(s_readback_texels, 0, sizeof s_readback_texels);
+    s_readback_texels[0][0] = 0x78563412u;
+    s_readback_texels[1][3] = 0x11223344u;
+    s_readback_texels[3][0] = 0xdeadbeefu;
+    s_readback_accessor_calls = 0u;
+    s_native_bound_texture_2d = 3u;
+
+    /* Fresh target: nothing written, no drain (read 1); the texels come
+     * from the texture memory (row 0), not from the native read. */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_attach(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 5u));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_native_read_pixels_calls == reads);
+    CHECK(s_gxm_finish_calls == finishes);
+    CHECK(s_oracle_read_texel[0] == 0x12u && s_oracle_read_texel[1] == 0x34u &&
+          s_oracle_read_texel[2] == 0x56u && s_oracle_read_texel[3] == 0x78u);
+    CHECK(s_oracle_read_texel[4] == 0xa5u);
+    /* The copy and the detail path each bound the attachment for the
+     * accessors and put the previous binding back. */
+    CHECK(s_readback_accessor_calls == 2u);
+    CHECK(s_readback_accessor_binding == 5u);
+    CHECK(s_native_bound_texture_2d == 3u);
+
+    /* Draw, then read: one drain issued before the native read (2); the
+     * second read of the settled texture is free (3). */
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 1u);
+    /* The drain preceded the copy's look at the texture. */
+    CHECK(s_readback_accessor_finishes == finishes + 1u);
+    CHECK(s_oracle_read_texel[0] == 0x12u && s_oracle_read_texel[3] == 0x78u);
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 1u);
+
+    /* A native colour clear is a write too (4). */
+    CHECK(oracle_fbo_clear(cpu, stack_top, ORACLE_GL_COLOR_BUFFER_BIT));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 2u);
+
+    /* Another target with its own texture: writing 6 leaves 5 settled (5);
+     * reading 6 drains (6). */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 8u));
+    CHECK(oracle_fbo_attach(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 6u));
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 2u);
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 8u));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 3u);
+
+    /* Untracked write (framebuffer 9 has no colour texture): the next
+     * offscreen read of any target drains once (7), then settles (8). */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 9u));
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 4u);
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 4u);
+    /* Reading the untracked target itself: free while nothing was written
+     * (9), one drain after a write (10). */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 9u));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 4u);
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 5u);
+
+    /* Display reads are counted, never drained here (stock vitaGL syncs the
+     * in-use framebuffer itself). */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 0u));
+    CHECK(oracle_fbo_draw(cpu, stack_top));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    CHECK(s_gxm_finish_calls == finishes + 5u);
+    /* Eight offscreen reads were copied; the two reads of framebuffer 9
+     * (no colour texture to copy from) and the display read went native. */
+    CHECK(s_native_read_pixels_calls == reads + 3u);
+    CHECK(s_oracle_read_texel[0] == 0x12u && s_oracle_read_texel[3] == 0x78u);
+
+    /* Shapes the copy declines take the native read: another format
+     * (before any look at the texture), a rectangle outside the texture
+     * (after one).  Both settled, no drain. */
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_read_pixels_shape(
+        cpu, stack_top, 0u, 0u, 1u, 1u, ORACLE_GL_RGB));
+    CHECK(s_native_read_pixels_calls == reads + 4u);
+    CHECK(s_readback_accessor_calls == 16u);
+    CHECK(oracle_fbo_read_pixels_shape(
+        cpu, stack_top, 8u, 0u, 1u, 1u, ORACLE_GL_RGBA));
+    CHECK(s_native_read_pixels_calls == reads + 5u);
+    CHECK(s_readback_accessor_calls == 17u);
+    CHECK(s_gxm_finish_calls == finishes + 5u);
+
+    /* Eight detail lines (the first eight offscreen reads) and the exit
+     * receipt; the stub clock advances 5 us per call, one bracket per
+     * drain. */
+    gl_vita_backend_uninstall();
+    CHECK(s_readback_log_calls == 25u);
+    CHECK(s_readback_accessor_calls == 17u);
+    CHECK(strcmp(s_readback_logs[0],
+                 "[kage-vita] fbo-readback: fb=7 tex=5 at=0,0 1x1 "
+                 "sync=0 wait_us=0 rgba=12345678 copy=1") == 0);
+    /* Fresh texture: no note yet.  The data pointers are the oracle's own
+     * addresses, so the line is checked around them. */
+    CHECK(oracle_readback_log_starts(1u,
+        "[kage-vita] fbo-readback-tex: tex=5 fmt=0c000000 type=60000000 "
+        "8x4 stride=32 data="));
+    CHECK(strstr(s_readback_logs[1], " last_fb=0 writes=0 age=0") != NULL);
+    CHECK(strcmp(s_readback_logs[2],
+                 "[kage-vita] fbo-readback-mem: census=1 nonzero=3/32 "
+                 "rows=3/4 first=0,0 last_row=3 at=78563412 "
+                 "flip=deadbeef") == 0);
+    CHECK(strcmp(s_readback_logs[3],
+                 "[kage-vita] fbo-readback: fb=7 tex=5 at=0,0 1x1 "
+                 "sync=1 wait_us=5 rgba=12345678 copy=1") == 0);
+    /* One draw noted through framebuffer 7; the drain that preceded this
+     * read bumped the generation once past the note. */
+    CHECK(strstr(s_readback_logs[4], " last_fb=7 writes=1 age=1") != NULL);
+    CHECK(strstr(s_readback_logs[10], " last_fb=7 writes=2 age=1") != NULL);
+    CHECK(strcmp(s_readback_logs[15],
+                 "[kage-vita] fbo-readback: fb=8 tex=6 at=0,0 1x1 "
+                 "sync=1 wait_us=5 rgba=12345678 copy=1") == 0);
+    CHECK(oracle_readback_log_starts(16u,
+        "[kage-vita] fbo-readback-tex: tex=6 fmt=0c000000 type=60000000 "
+        "8x4 stride=32 data="));
+    CHECK(strstr(s_readback_logs[16], " last_fb=8 writes=1 age=1") != NULL);
+    CHECK(strcmp(s_readback_logs[18],
+                 "[kage-vita] fbo-readback: fb=7 tex=5 at=0,0 1x1 "
+                 "sync=1 wait_us=5 rgba=12345678 copy=1") == 0);
+    CHECK(strcmp(s_readback_logs[24],
+                 "KAGE VITA FBO READBACK: reads=12 display=1 finishes=5 "
+                 "unknown=2 settled=7 skipped=0 copied=8 wait_us=25 "
+                 "max_us=5") == 0);
+    /* A fresh install starts from zero: its uninstall logs nothing. */
+    CHECK(gl_vita_backend_install());
+    gl_vita_backend_uninstall();
+    CHECK(s_readback_log_calls == 25u);
+    CHECK(gl_vita_backend_install());
+    return 0;
+}
 #endif
 
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION) && \
@@ -4421,7 +4936,267 @@ static int oracle_test_fill_census(CPU *cpu, uint32_t stack_top)
 }
 #endif
 
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+/* Issue #15: the exact GL sequences of Isaac's nested passes, driven through
+ * the guest boundary against the vitaGL scene/depth model above.
+ *
+ * KAGE pass primitives (frozen PE, original VAs):
+ *  push(surface)  0x65b570 + SetRenderTarget 0x964db0 (glBindFramebuffer of
+ *                 the one manager FBO, glFramebufferTexture2D of the surface)
+ *                 + Manager::Clear 0x964f50 (glClear COLOR|DEPTH)
+ *  end+pop(outer) Manager pass end 0x960eb0 (glClear DEPTH on the surface)
+ *                 + pop 0x65b650 -> SetRenderTarget(outer)
+ * Room::Render then composites Dizzy (0x7cd9dc..) and Mirror (0x7cde59..)
+ * into the outer surface with no clear; its shockwave pop (0x7cd04d) clears
+ * at 0x7cd05c before compositing. */
+# define DC_TOKEN_CLEAR 0x7e194b2bu
+# define DC_TOKEN_FRAMEBUFFER_RENDERBUFFER 0x7e8a2af9u
+# define DC_COLOR_BIT 0x00004000u
+# define DC_DEPTH_BIT 0x00000100u
+# define DC_COLOR_ATTACHMENT0 0x00008ce0u
+# define DC_DEPTH_ATTACHMENT 0x00008d00u
+# define DC_MANAGER_FBO 7u
+# define DC_RENDER_SURFACE 5u
+# define DC_DIZZY_SURFACE 6u
+# define DC_MIRROR_SURFACE 8u
+# if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+#  define DC_CARRY 1
+# else
+#  define DC_CARRY 0
+# endif
+
+static int dc_clear(CPU *cpu, uint32_t stack_top, uint32_t mask)
+{
+    uint32_t arguments[1];
+
+    arguments[0] = mask;
+    return oracle_dispatch(cpu, stack_top, DC_TOKEN_CLEAR, arguments, 1u);
+}
+
+static int dc_clear_depth(CPU *cpu, uint32_t stack_top, double depth)
+{
+    uint32_t arguments[2];
+    uint64_t bits;
+
+    memcpy(&bits, &depth, sizeof bits);
+    arguments[0] = (uint32_t)bits;
+    arguments[1] = (uint32_t)(bits >> 32);
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_CLEAR_DEPTH, arguments, 2u);
+}
+
+static int dc_attach(CPU *cpu, uint32_t stack_top, uint32_t texture)
+{
+    uint32_t arguments[5];
+
+    arguments[0] = ORACLE_GL_FRAMEBUFFER;
+    arguments[1] = DC_COLOR_ATTACHMENT0;
+    arguments[2] = ORACLE_GL_TEXTURE_2D;
+    arguments[3] = texture;
+    arguments[4] = 0u;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_FRAMEBUFFER_TEXTURE, arguments, 5u);
+}
+
+static int dc_attach_depth(CPU *cpu, uint32_t stack_top, uint32_t rbo)
+{
+    uint32_t arguments[4];
+
+    arguments[0] = ORACLE_GL_FRAMEBUFFER;
+    arguments[1] = DC_DEPTH_ATTACHMENT;
+    arguments[2] = ORACLE_GL_RENDERBUFFER;
+    arguments[3] = rbo;
+    return oracle_dispatch(
+        cpu, stack_top, DC_TOKEN_FRAMEBUFFER_RENDERBUFFER, arguments, 4u);
+}
+
+static int dc_draw(CPU *cpu, uint32_t stack_top)
+{
+    uint32_t arguments[4];
+
+    arguments[0] = ORACLE_GL_TRIANGLES;
+    arguments[1] = 6u;
+    arguments[2] = ORACLE_GL_UNSIGNED_SHORT;
+    arguments[3] = 0x1000u;
+    return oracle_dispatch(
+        cpu, stack_top, ORACLE_TOKEN_DRAW_ELEMENTS, arguments, 4u);
+}
+
+static int dc_push(CPU *cpu, uint32_t stack_top, uint32_t surface)
+{
+    return oracle_bind_framebuffer(
+               cpu, stack_top, ORACLE_GL_FRAMEBUFFER, DC_MANAGER_FBO) &&
+           dc_attach(cpu, stack_top, surface) &&
+           dc_clear(cpu, stack_top, DC_COLOR_BIT | DC_DEPTH_BIT);
+}
+
+static int dc_end_pop(CPU *cpu, uint32_t stack_top, uint32_t outer)
+{
+    return dc_clear(cpu, stack_top, DC_DEPTH_BIT) &&
+           oracle_bind_framebuffer(
+               cpu, stack_top, ORACLE_GL_FRAMEBUFFER, DC_MANAGER_FBO) &&
+           dc_attach(cpu, stack_top, outer);
+}
+
+static uint32_t dc_replays(void)
+{
+# if DC_CARRY
+    return gl_vita_backend_depth_carry_replays();
+# else
+    return 0u;
+# endif
+}
+
+static int oracle_test_depth_scene(CPU *cpu, uint32_t stack_top)
+{
+    unsigned clears;
+    uint32_t replays;
+    unsigned log_checks = 0u;
+
+    gl_vita_backend_uninstall();
+    CHECK(gl_vita_backend_install());
+    oracle_model_reset();
+    /* Renderer init 0x965190: glClearDepth(-1000.0) -> clamped 0. */
+    CHECK(dc_clear_depth(cpu, stack_top, -1000.0));
+    CHECK(s_model_clear_depth == 0.0);
+    printf("depth-scene oracle: %u replays before the issue-15 sequences\n",
+           (unsigned)dc_replays());
+
+    /* A: Wavy Cap.  Game::Render pushes the Render Surface, Room::Render
+     * the Dizzy Overlay Surface; the world lands in Dizzy. */
+    CHECK(dc_push(cpu, stack_top, DC_RENDER_SURFACE));
+    CHECK(dc_push(cpu, stack_top, DC_DIZZY_SURFACE));
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(s_model_last_draw_passed == 1);
+    CHECK(dc_end_pop(cpu, stack_top, DC_RENDER_SURFACE));
+    clears = s_native_clear_calls;
+    replays = dc_replays();
+    CHECK(dc_draw(cpu, stack_top));                 /* Dizzy composite */
+    CHECK(s_model_last_draw_passed == DC_CARRY);
+    CHECK(s_native_clear_calls == clears + (unsigned)DC_CARRY);
+    CHECK(dc_replays() == replays + (uint32_t)DC_CARRY);
+# if DC_CARRY
+    CHECK(s_native_clear_mask == DC_DEPTH_BIT);
+    CHECK(s_native_clear_depth == 0.0);
+# endif
+# if defined(ORACLE_DEPTH_CARRY_LOG)
+    if (replays == 0u) {
+        CHECK(s_depth_carry_log_calls == 1u);
+        ++log_checks;
+        CHECK(strcmp(s_depth_carry_log,
+                     "[kage-vita] fbo-depth-carry: replay n=1 fb=7 "
+                     "depth_bits=0000000000000000") == 0);
+    }
+# endif
+    /* Same scene: nothing more is replayed. */
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(s_model_last_draw_passed == DC_CARRY);
+    CHECK(s_native_clear_calls == clears + (unsigned)DC_CARRY);
+
+    /* B: Mirror World (+ Wavy Cap).  Mirror is pushed first (0x7cae4a),
+     * Dizzy inside it; Dizzy composites into Mirror, Mirror into Render. */
+    CHECK(dc_push(cpu, stack_top, DC_RENDER_SURFACE));
+    CHECK(dc_push(cpu, stack_top, DC_MIRROR_SURFACE));
+    CHECK(dc_push(cpu, stack_top, DC_DIZZY_SURFACE));
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(s_model_last_draw_passed == 1);
+    replays = dc_replays();
+    CHECK(dc_end_pop(cpu, stack_top, DC_MIRROR_SURFACE));
+    CHECK(dc_draw(cpu, stack_top));                 /* Dizzy -> Mirror */
+    CHECK(s_model_last_draw_passed == DC_CARRY);
+    CHECK(dc_end_pop(cpu, stack_top, DC_RENDER_SURFACE));
+    CHECK(dc_draw(cpu, stack_top));                 /* Mirror -> Render */
+    CHECK(s_model_last_draw_passed == DC_CARRY);
+    CHECK(dc_replays() == replays + 2u * (uint32_t)DC_CARRY);
+# if defined(ORACLE_DEPTH_CARRY_LOG)
+    if (replays == 1u) {
+        /* Replays 2 and 3: only the power of two logs. */
+        CHECK(s_depth_carry_log_calls == 2u);
+        ++log_checks;
+        CHECK(strcmp(s_depth_carry_log,
+                     "[kage-vita] fbo-depth-carry: replay n=2 fb=7 "
+                     "depth_bits=0000000000000000") == 0);
+    }
+# endif
+
+    /* C: control, the shockwave shape: a clear after the pop already gives
+     * the new scene its depth, so both builds pass and nothing replays. */
+    CHECK(dc_push(cpu, stack_top, DC_RENDER_SURFACE));
+    CHECK(dc_push(cpu, stack_top, DC_DIZZY_SURFACE));
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(dc_end_pop(cpu, stack_top, DC_RENDER_SURFACE));
+    CHECK(dc_clear(cpu, stack_top, DC_COLOR_BIT | DC_DEPTH_BIT));
+    replays = dc_replays();
+    clears = s_native_clear_calls;
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(s_model_last_draw_passed == 1);
+    CHECK(dc_replays() == replays);
+    CHECK(s_native_clear_calls == clears);
+
+    /* D: no fake knowledge.  Draws then a re-attach without a depth clear:
+     * the desktop depth is whatever the draws wrote, so nothing is replayed
+     * and the model rejects exactly as stock vitaGL does. */
+    CHECK(dc_push(cpu, stack_top, DC_RENDER_SURFACE));
+    CHECK(dc_push(cpu, stack_top, DC_DIZZY_SURFACE));
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(dc_attach(cpu, stack_top, DC_RENDER_SURFACE));
+    replays = dc_replays();
+    clears = s_native_clear_calls;
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(s_model_last_draw_passed == 0);
+    CHECK(dc_replays() == replays);
+    CHECK(s_native_clear_calls == clears);
+
+    /* E: another framebuffer's clear/draw ends the carried scene even with
+     * no re-attach; the replay uses the depth the target was cleared to and
+     * restores the guest's later clear depth. */
+    CHECK(dc_push(cpu, stack_top, DC_DIZZY_SURFACE));
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(dc_clear(cpu, stack_top, DC_DEPTH_BIT));
+    CHECK(dc_clear_depth(cpu, stack_top, 0.75));
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 0u));
+    CHECK(dc_clear(cpu, stack_top, DC_COLOR_BIT));
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(oracle_bind_framebuffer(
+        cpu, stack_top, ORACLE_GL_FRAMEBUFFER, DC_MANAGER_FBO));
+    replays = dc_replays();
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(s_model_last_draw_passed == DC_CARRY);
+    CHECK(dc_replays() == replays + (uint32_t)DC_CARRY);
+    CHECK(s_native_clear_depth == 0.75);
+    CHECK(s_model_clear_depth == 0.75);
+    CHECK(dc_clear_depth(cpu, stack_top, -1000.0));
+
+    /* F: a depth attachment change forgets the knowledge. */
+    CHECK(dc_push(cpu, stack_top, DC_DIZZY_SURFACE));
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(dc_clear(cpu, stack_top, DC_DEPTH_BIT));
+    CHECK(dc_attach_depth(cpu, stack_top, 0u));
+    CHECK(dc_attach(cpu, stack_top, DC_RENDER_SURFACE));
+    replays = dc_replays();
+    CHECK(dc_draw(cpu, stack_top));
+    CHECK(s_model_last_draw_passed == 0);
+    CHECK(dc_replays() == replays);
+
+# if defined(ORACLE_DEPTH_CARRY_LOG) && !defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    /* Nothing earlier replays in this mode: the receipts were checked. */
+    CHECK(log_checks == 2u);
+# else
+    (void)log_checks;
+# endif
+    gl_vita_backend_uninstall();
+    CHECK(gl_vita_backend_install());
+    return 0;
+}
+#endif
+
+#if defined(ISAAC_GL_RECORD_SCENARIO)
+/* The layer-2 scenario owns main; this suite is layer 1 (record-eager). */
+int oracle_full_suite_main(void);
+int oracle_full_suite_main(void)
+#else
 int main(void)
+#endif
 {
     static const char *const missing[11] = {
         "glClampColorARB",
@@ -4621,25 +5396,35 @@ int main(void)
 #endif
 
     viewport_calls_before = s_native_viewport_calls;
+#if defined(ORACLE_DISPLAY_CENTER_Y_LOG)
+    /* The install-time replay is not a guest request: no receipt yet. */
+    CHECK(s_display_center_y_log_calls == 0u);
+#endif
     CHECK(oracle_set_viewport(&cpu, stack_top, 0, 0, 960, 540));
     CHECK(s_native_viewport_calls == viewport_calls_before + 1u);
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720)
     CHECK(oracle_last_viewport_is(0, 1, 720, 405));
 #else
-    CHECK(oracle_last_viewport_is(0, 0, 960, 540));
+    CHECK(oracle_last_viewport_is(0, ORACLE_FB0_Y(0), 960, 540));
+#endif
+#if defined(ORACLE_DISPLAY_CENTER_Y_LOG)
+    CHECK(s_display_center_y_log_calls == 1u);
+    CHECK(strcmp(s_display_center_y_log,
+                 "KAGE VITA DISPLAY CENTER Y: rows=2 fb0 guest=0,0,960,540 "
+                 "native=0,2,960,540") == 0);
 #endif
 
     CHECK(oracle_set_viewport(&cpu, stack_top, 1, 2, 5, 7));
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720)
     CHECK(oracle_last_viewport_is(0, 2, 4, 5));
 #else
-    CHECK(oracle_last_viewport_is(1, 2, 5, 7));
+    CHECK(oracle_last_viewport_is(1, ORACLE_FB0_Y(2), 5, 7));
 #endif
     CHECK(oracle_set_viewport(&cpu, stack_top, -1, -2, 3, 5));
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720)
     CHECK(oracle_last_viewport_is(-1, -1, 2, 4));
 #else
-    CHECK(oracle_last_viewport_is(-1, -2, 3, 5));
+    CHECK(oracle_last_viewport_is(-1, ORACLE_FB0_Y(-2), 3, 5));
 #endif
 
     /* READ_FRAMEBUFFER never changes the draw target and therefore never
@@ -4684,7 +5469,7 @@ int main(void)
 # if defined(ISAAC_VITA_DISPLAY_RASTER_720)
     CHECK(oracle_last_viewport_is(0, 2, 4, 5));
 # else
-    CHECK(oracle_last_viewport_is(1, 2, 5, 7));
+    CHECK(oracle_last_viewport_is(1, ORACLE_FB0_Y(2), 5, 7));
 # endif
     CHECK(s_gl_event_count == 2u &&
           s_gl_events[0] == ORACLE_GL_EVENT_BIND_FRAMEBUFFER &&
@@ -4719,14 +5504,15 @@ int main(void)
 # if defined(ISAAC_VITA_DISPLAY_RASTER_720)
     CHECK(oracle_last_viewport_is(0, 2, 4, 5));
 # else
-    CHECK(oracle_last_viewport_is(1, 2, 5, 7));
+    CHECK(oracle_last_viewport_is(1, ORACLE_FB0_Y(2), 5, 7));
 # endif
 #else
     CHECK(s_native_viewport_calls == viewport_calls_before);
 #endif
 
     /* Extreme signed origins and a maximal valid width prove the promoted
-     * edge arithmetic cannot wrap. */
+     * edge arithmetic cannot wrap (DISPLAY_CENTER_Y saturates the default
+     * framebuffer's INT32_MAX origin instead of adding its rows). */
     CHECK(oracle_set_viewport(
         &cpu, stack_top, INT32_MIN, INT32_MAX, INT32_MAX, 0));
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720)
@@ -4742,6 +5528,17 @@ int main(void)
     CHECK(viewport_redzone[2] == INT32_MAX);
     CHECK(viewport_redzone[3] == INT32_MAX);
     CHECK(viewport_redzone[4] == 0);
+#if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+    /* One below the saturation edge still gains both rows exactly. */
+    CHECK(oracle_set_viewport(
+        &cpu, stack_top, 3, INT32_MAX - 2, 4, 5));
+    CHECK(oracle_last_viewport_is(3, INT32_MAX, 4, 5));
+    CHECK(oracle_set_viewport(
+        &cpu, stack_top, INT32_MIN, INT32_MAX, INT32_MAX, 0));
+#endif
+#if defined(ORACLE_DISPLAY_CENTER_Y_LOG)
+    CHECK(s_display_center_y_log_calls == 1u);
+#endif
 
     /* Invalid sizes reach native GL unchanged and do not mutate the virtual
      * logical viewport that a later query/rebind will replay. */
@@ -4763,7 +5560,7 @@ int main(void)
 # if defined(ISAAC_VITA_DISPLAY_RASTER_720)
     CHECK(oracle_last_viewport_is(0, 1, 720, 405));
 # else
-    CHECK(oracle_last_viewport_is(0, 0, 960, 540));
+    CHECK(oracle_last_viewport_is(0, ORACLE_FB0_Y(0), 960, 540));
 # endif
     CHECK(viewport_redzone[1] == 0 && viewport_redzone[2] == 0);
     CHECK(viewport_redzone[3] == 960 && viewport_redzone[4] == 540);
@@ -4929,8 +5726,19 @@ int main(void)
 #if defined(ISAAC_VITA_FBO_RASTER_SCALE)
     CHECK(oracle_test_fbo_raster_scale(&cpu, stack_top) == 0);
 #endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+    CHECK(oracle_test_fbo_readback_sync(&cpu, stack_top) == 0);
+#endif
 #if defined(ISAAC_VITA_GL_FILL_CENSUS)
     CHECK(oracle_test_fill_census(&cpu, stack_top) == 0);
+#endif
+#if defined(ORACLE_DEPTH_SCENE_MODEL)
+    CHECK(oracle_test_depth_scene(&cpu, stack_top) == 0);
+    puts(DC_CARRY ?
+        "Vita GL depth-scene oracle: PASS (FBO_DEPTH_CARRY: Dizzy/Mirror "
+        "composites survive vitaGL's per-scene depth reset)" :
+        "Vita GL depth-scene oracle: PASS (stock: Dizzy/Mirror composites "
+        "rejected by GL_GREATER against vitaGL's background depth 1.0)");
 #endif
 
 #if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
@@ -4965,12 +5773,44 @@ int main(void)
     CHECK(g_isaac_vita_gl_wrapper_time.draw_canonical == 0u);
     CHECK(g_isaac_vita_gl_wrapper_time.bad_clock == 0u);
 #endif
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    {
+        /* Prove the recorder carried this run (not a silent passthrough). */
+        uint32_t record_stats[8];
+        isaac_gl_record_oracle_stats(record_stats);
+        CHECK(record_stats[0] > 0u && record_stats[2] == 0u);
+        printf("GL recorder engaged: records=%u copied=%u syncs=%u cold_loc=%u memo=%u\n",
+               (unsigned)record_stats[0], (unsigned)record_stats[1],
+               (unsigned)record_stats[3], (unsigned)record_stats[4],
+               (unsigned)record_stats[5]);
+    }
+#endif
     gl_vita_backend_uninstall();
     CHECK(!gl_vita_backend_installed());
     CHECK(gl_vita_backend_resolved_count() == 0u);
     CHECK(gl_vita_backend_missing_count() == 73u);
+#if defined(ORACLE_DISPLAY_CENTER_Y_LOG)
+    CHECK(s_display_center_y_foreign_calls == 0u);
+#endif
+#if defined(ISAAC_VITA_DISPLAY_CENTER_Y) && \
+    !defined(ORACLE_DISPLAY_CENTER_Y_LOG) && \
+    !defined(ORACLE_DISPLAY_CENTER_Y_FILTERED)
+    /* Another policy's sink owns isaac_vita_log in this mode. */
+    (void)oracle_display_center_y_take;
+#endif
+#if defined(ORACLE_DISPLAY_CENTER_Y_LOG) || \
+    defined(ORACLE_DISPLAY_CENTER_Y_FILTERED)
+    /* Once per boot: every install/uninstall cycle above shares one line. */
+    CHECK(s_display_center_y_log_calls == 1u);
+    CHECK(strncmp(s_display_center_y_log,
+                  ORACLE_DISPLAY_CENTER_Y_PREFIX "rows=2 fb0 guest=",
+                  sizeof ORACLE_DISPLAY_CENTER_Y_PREFIX "rows=2 fb0 guest=" - 1u) == 0);
+    printf("display centre receipt: %s\n", s_display_center_y_log);
+#endif
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720)
     puts("Vita GL boundary oracle: PASS (720x408 default-FBO raster; logical viewport query/replay; signed edge scaling; RBO/clamp contracts)");
+#elif defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+    puts("Vita GL boundary oracle: PASS (960x544 default-FBO centred +2 rows; logical viewport query/replay; FBO viewports exact; saturating origin; RBO/clamp contracts)");
 #else
     puts("Vita GL boundary oracle: PASS (display raster OFF exact passthrough; RBO/clamp contracts)");
 #endif

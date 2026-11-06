@@ -48,6 +48,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from gpr_locals import legacy_text                            # noqa: E402
+import gpr_flush_mask                                         # noqa: E402
 
 BODY_RE = re.compile(
     r"^void ((?:sub|guest_original)_[0-9a-f]{8})\(CPU \*__restrict c\)\n\{\n(.*?)^\}\n",
@@ -271,6 +272,10 @@ def main() -> int:
     problems = []
     for path in units:
         source = path.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+        # A GUEST_GPR_FLUSH_MASK=1 corpus spells some FLUSH statements as
+        # masks; read each as the FLUSH it replaces (exactness of the masks:
+        # test_gpr_flush_mask_proof.py).  Identity on an unmasked corpus.
+        source = gpr_flush_mask.legacy_text(source)
         if "GUEST_LEAF_INLINE" in legacy_text(source):
             problems.append("%s: legacy_text does not collapse every site"
                             % path.name)

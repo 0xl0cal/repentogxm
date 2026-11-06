@@ -65,6 +65,28 @@ routing_common="-std=gnu11 -O2 -Wall -Wextra -Werror \
     -o "$work/anm2-scratch-routing-oracle"
 "$work/anm2-scratch-routing-oracle"
 
+# Same routing with the 32 MiB font texel capacity: the ANM2 pools and the
+# larger texel block must still be disjoint, and only the texel owner and the
+# fixture describing its backing are recompiled.
+"$host_cc" $routing_common -DISAAC_VITA_TEXEL_SCRATCH_ORACLE=1 \
+    -DISAAC_VITA_TEXEL_SCRATCH_32M=1 \
+    -c "$root/runtime/host_vita_texel_scratch.c" \
+    -o "$work/texel-scratch-32m.routing-state.o"
+"$host_cc" $routing_common -DISAAC_VITA_ANM2_SCRATCH_ORACLE=1 \
+    -DISAAC_VITA_TEXEL_SCRATCH_ORACLE=1 \
+    -DISAAC_VITA_TEXEL_SCRATCH_32M=1 \
+    -c "$root/runtime/host_vita_anm2_scratch_routing_oracle.c" \
+    -o "$work/anm2-scratch-32m.routing-oracle.o"
+"$host_cc" -pthread \
+    "$work/host-vita-heap.routing.o" \
+    "$work/guest.routing.o" \
+    "$work/anm2-scratch.routing-state.o" \
+    "$work/texel-scratch-32m.routing-state.o" \
+    "$work/anm2-scratch-32m.routing-oracle.o" \
+    -Wl,--gc-sections \
+    -o "$work/anm2-scratch-32m-routing-oracle"
+"$work/anm2-scratch-32m-routing-oracle"
+
 # The behavioral routing executable must resolve the heap owner's REQUIRED1
 # stack edges from the actual production runtime, not from oracle stubs.
 "$host_nm" --defined-only "$work/guest.routing.o" \

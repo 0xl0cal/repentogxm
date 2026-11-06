@@ -4,6 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if defined(ISAAC_VITA_SHADER_SAMPLER_FASTPATH) && ISAAC_VITA_SHADER_SAMPLER_FASTPATH
+struct guest_gl_backend;
+int gl_vita_backend_sampler_is_native(const struct guest_gl_backend *backend);
+#endif
+
 #if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE) && \
     !defined(ISAAC_VITA_PHASE_PROFILE)
 #error "texture-churn profile requires the aggregate phase profile"
@@ -131,7 +136,7 @@ uint32_t gl_vita_backend_attrib_pending(void);
  * that invalidate the shim location cache: glAttachShader, glCompileShader,
  * glCreateProgram, glDeleteProgram, glDeleteShader, glLinkProgram,
  * glShaderSource and every backend install/uninstall.  A memo entry filled
- * under generation G is valid while the word still reads G. */
+ * under generation G is valid while the word reads G (threads: header end). */
 extern uint32_t g_isaac_vita_gl_location_generation;
 # if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY)
 /* VERIFY only: a memo hit whose remembered location differed from the
@@ -310,7 +315,7 @@ static inline void isaac_vita_gl_time_add(
 #endif
 
 #if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB)
-/* ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB (wf/cpu-render-20260906): the sdk32
+/* ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB: the sdk32
  * scheme (isaac_sdk_sparse_profile.h) applied to the two Shader attribute
  * replays of ISAAC_VITA_SHADER_ATTRIB_FASTPATH.  CMake hands the define to
  * host_vita_shader_attrib_fastpath.c and kage_vita_phase_profile.c only when
@@ -356,7 +361,7 @@ void isaac_vita_attrib_replay_sparse_take(
 # if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE) && ISAAC_VITA_GL_TIME_SDK_SPARSE
 #  error "ISAAC_VITA_GL_WRAPPER_TIME needs the broad ph120.gt buckets, not GL_TIME_SDK_SPARSE"
 # endif
-/* ISAAC_VITA_GL_WRAPPER_TIME (wf/cpu-render-20260906): wall time of every
+/* ISAAC_VITA_GL_WRAPPER_TIME: wall time of every
  * GL shim wrapper the guest reaches, from the moment gl_bridge.c hands the
  * CPU to the generated adapter (guest_gl_run_owned) until the adapter
  * returns, on the same sceKernelGetProcessTimeWide clock as ph120.gt and
@@ -564,6 +569,12 @@ void gl_vita_backend_phase_profile_window_boundary(void);
  * a depth/stencil clear still owed to an offscreen target is dropped exactly
  * as stock vitaGL would have lost it. */
 void gl_vita_backend_fbo_present(void);
+#endif
+
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+/* Number of depth-only clears replayed into a new vitaGL scene so far (issue
+ * #15 receipt; process lifetime, not reset by install/uninstall). */
+uint32_t gl_vita_backend_depth_carry_replays(void);
 #endif
 
 #if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE) || \
@@ -959,5 +970,50 @@ void gl_vita_backend_first_frame_queue_end(void);
 void gl_vita_backend_first_frame_snapshot(
     IsaacVitaFirstFrameSnapshot *snapshot);
 #endif
+
+/* Cross-thread contract of g_isaac_vita_gl_location_generation
+ * (ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO; RENDER60 S2).  Comment only; it
+ * sits at the end of the header so no declaration above moves.
+ *
+ * Writer.  Only GL_VITA_LOCATION_GENERATION_BUMP (gl_vita_backend.c), reached
+ * through gl_vita_location_cache_invalidate (the seven program-state wrappers
+ * vita_glAttachShader, vita_glCompileShader, vita_glCreateProgram,
+ * vita_glDeleteProgram, vita_glDeleteShader, vita_glLinkProgram,
+ * vita_glShaderSource) and gl_vita_location_cache_reset
+ * (gl_vita_backend_install/_uninstall).  They run where the typed backend
+ * runs: with ISAAC_VITA_GL_THREAD_RECORD + ISAAC_VITA_GL_THREAD_WORKER on the
+ * recorder's render (consumer) thread, which replays the typed records, and
+ * install/uninstall re-enter themselves there through the synchronous
+ * isaac_gl_record_worker_call; without the worker, on the one GL thread.
+ *
+ * Reader.  The game (producer) thread, once per handled Shader::EnableAttribs/
+ * DisableAttribs replay, with a plain load in ATTRIB_MEMO_BEGIN
+ * (host_vita_shader_attrib_fastpath.c).
+ *
+ * Ordering.  Every write happens inside a record the game thread waits for
+ * before it can replay again.  The seven mutators are FENCE records of the
+ * typed surface (recomp/vita/gl_record_surface.py): record_glX enqueues and
+ * calls record_sync, which returns only after the consumer ran the record
+ * and published done_pos past it (gl_record_ring.c
+ * isaac_gl_record_spsc_consume_one: spsc_publish, a release store on the
+ * Vita, an Interlocked full barrier on the host) and the producer loaded
+ * that position (isaac_gl_record_spsc_reached: spsc_load, acquire).
+ * install/uninstall closures wait the same way (worker_call -> record_wait).
+ * So each bump happens-before the next replay's load, the load never races a
+ * store, and an entry filled under the old value can no longer hit.  Nothing
+ * else writes the word, and nothing that writes it is ever posted
+ * asynchronously (isaac_gl_record_worker_post carries only the present
+ * closure).
+ *
+ * Pins (recomp/test_vita_shader_attrib_fastpath.py): FENCES equals the seven
+ * mutators and is disjoint from FIRE; every FENCE body resets the producer
+ * location cache, enqueues and syncs; the invalidate callers are exactly the
+ * seven wrappers and the reset callers exactly install/uninstall (nine bump
+ * sites); install/uninstall reach the consumer only through worker_call; no
+ * raw vitaGL program mutator is called outside its wrapper.  The recorder
+ * oracle flavours run the memo behind the real recorder and consumer thread,
+ * and the async-fence mutant (the void FENCES emitted as FIRE) must fail.
+ * A second writer (MEMO_VERIFY together with GL_LOCATION_CACHE_VERIFY on the
+ * shared loc(...,m) counter) is refused by CMake. */
 
 #endif

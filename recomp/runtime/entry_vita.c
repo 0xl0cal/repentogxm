@@ -7,6 +7,9 @@
 #endif
 
 #include "guest.h"
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+#include "guest_stack_memblock.h"
+#endif
 #include "host_vita_console.h"
 #include "host_vita_com.h"
 #include "host_vita_crt.h"
@@ -22,12 +25,24 @@
 #include "host_vita_startup.h"
 #include "host_vita_steam.h"
 #include "host_vita_sync.h"
+#if defined(ISAAC_VITA_TEXEL_SCRATCH_32M)
+#include "host_vita_texel_scratch.h"
+#endif
 #include "kage_vita_io_profile.h"
 #include "manual_kage.h"
 #include "platform.h"
 #include "vita_boot_imports.h"
 #if defined(ISAAC_VITA_LOG_ASYNC)
 #include "host_vita_log_async.h"
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+#include "host_vita_game_log.h"
+#endif
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+#include "host_vita_runtime_settings.h"
+#endif
+#if defined(ISAAC_VITA_TROPHIES)
+#include "host_vita_trophies.h"
 #endif
 #if defined(ISAAC_VITA_HEAP_CENSUS)
 /* Only the census hook is used here; this owner is deliberately outside the
@@ -53,6 +68,18 @@
 
 #if ISAAC_VITA_AUDIO
 #include "host_vita_audio.h"
+#endif
+#if defined(ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN) && !ISAAC_VITA_AUDIO
+#error ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN requires ISAAC_VITA_AUDIO=1
+#endif
+/* ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN: on an abort stop (the guest did not
+ * reach exit/_exit) the common tail must not join the OpenAL pthreads; see
+ * isaac_vita_audio_abort_skip_teardown.  Absent, every stop keeps the full
+ * teardown and this unit is byte-identical. */
+#if ISAAC_VITA_AUDIO && defined(ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN)
+#define ISAAC_VITA_ABORT_SKIP_AUDIO 1
+#else
+#define ISAAC_VITA_ABORT_SKIP_AUDIO 0
 #endif
 #if defined(ISAAC_VITA_NATIVE_PNG)
 #include "host_vita_native_png.h"
@@ -222,6 +249,11 @@ int isaac_vita_run_first_fault(const char *pe_path)
     int boundary_shape_matches = 0;
     int stopped;
     int result = 2;
+#if ISAAC_VITA_ABORT_SKIP_AUDIO
+    /* 1 only when the guest ended through exit/_exit (Exit game).  Every
+     * other way to reach done: is an abort stop. */
+    int guest_exited = 0;
+#endif
 
     guest_cpu_init(&cpu);
     g_host_import_calls = 0U;
@@ -237,6 +269,12 @@ int isaac_vita_run_first_fault(const char *pe_path)
         isaac_vita_log("guest setup FAILED: null PE path");
         goto done;
     }
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+    /* port.ini once, before module discovery and the first input sample:
+     * the consumer tables it pushes are immutable when the guest starts.
+     * Never fails; the receipt line follows "guest boundary begin". */
+    isaac_vita_runtime_settings_load();
+#endif
 
     guest_register_all_imports();
     if (guest_image_load(pe_path) != 0) {
@@ -250,9 +288,44 @@ int isaac_vita_run_first_fault(const char *pe_path)
     }
 #endif
     if (guest_stack_init(&cpu) != 0) {
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+        {
+            guest_stack_memblock_snapshot stack_block;
+
+            if (guest_stack_memblock_snapshot_get(&stack_block))
+                isaac_vita_log(
+                    "guest stack reserve: status=%s path=memblock "
+                    "uid=0x%08x get=0x%08x base=0x%08x rollback=0x%08x",
+                    guest_stack_memblock_status_text(stack_block.status),
+                    (unsigned)stack_block.uid,
+                    (unsigned)stack_block.get_result,
+                    (unsigned)stack_block.base,
+                    (unsigned)stack_block.rollback_result);
+        }
+#endif
         isaac_vita_log("guest setup FAILED: 4 MiB guest stack allocation");
         goto done;
     }
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+    {
+        /* Boot receipt of the dedicated USER_RW stack block.  vita3k_retained
+         * is the span Vita3K's allocator keeps (request + one quantum, see
+         * guest_stack_memblock.h); hardware retention is unmeasured.  The
+         * final "guest stack: floor=..." line below keeps its frozen format. */
+        guest_stack_memblock_snapshot stack_block;
+
+        if (guest_stack_memblock_snapshot_get(&stack_block))
+            isaac_vita_log(
+                "guest stack reserve: status=ready path=memblock uid=0x%08x "
+                "base=0x%08x request=%u vita3k_retained=%u floor=%08x "
+                "ceiling=%08x capacity=%u",
+                (unsigned)stack_block.uid, (unsigned)stack_block.base,
+                (unsigned)stack_block.request_bytes,
+                (unsigned)GUEST_STACK_MEMBLOCK_RETAINED_BYTES,
+                (unsigned)cpu.stack_floor, (unsigned)cpu.stack_ceiling,
+                (unsigned)guest_stack_capacity(&cpu));
+    }
+#endif
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (!isaac_vita_guest_heap_init(cpu.stack_floor, cpu.stack_ceiling)) {
         isaac_vita_log(
@@ -310,6 +383,28 @@ int isaac_vita_run_first_fault(const char *pe_path)
     isaac_vita_log("native PNG scratch reserve before vitaGL: ready=%d",
                    isaac_vita_native_png_reserve());
 #endif
+#if defined(ISAAC_VITA_TEXEL_SCRATCH_32M)
+    /* Chinese fonts need up to 32 MiB of transient RGBA backing. Reserving
+     * that after vglInit cannot fit in its 32 MiB leftover window alongside
+     * ANM2 and other services. Reserve it first; vitaGL sizes its pool from
+     * what remains (0x02001000 bytes less than with the lazy 0x00bd6000
+     * block, which used to live inside the leftover window).  This acquires
+     * no guest lease and keeps malloc fallback.  Without the option the
+     * texel scratch keeps its lazy post-vglInit reservation. */
+    isaac_vita_log("texel scratch reserve before vitaGL: ready=%d",
+                   isaac_vita_texel_scratch_reserve(
+                       cpu.stack_floor, cpu.stack_ceiling));
+#endif
+#if defined(ISAAC_VITA_TROPHIES)
+    /* Trophy Stage A (recomp/vita/TROPHIES.md), same contract as the
+     * reserves above: the NP module and the worker's 64 KiB stack come out
+     * before vglInit* sizes its pool, so they never compete for the
+     * post-init window.  No trophy context yet (two at most, each needs a
+     * setup dialog: Stage B).  The guest does not exist yet, so reading
+     * trophy-import.req, the saves and trophy-pending.bin cannot race a
+     * game write.  Never fails the boot. */
+    isaac_vita_trophies_boot();
+#endif
     guest_register_all();
     if (guest_coverage_init_from_env() != 0) {
         isaac_vita_log("guest setup FAILED: coverage boundary: %s",
@@ -337,6 +432,9 @@ int isaac_vita_run_first_fault(const char *pe_path)
             cpu.exit_api ? cpu.exit_api : "<unknown>",
             (int)cpu.exit_code);
         result = (int)cpu.exit_code;
+#if ISAAC_VITA_ABORT_SKIP_AUDIO
+        guest_exited = 1;
+#endif
         goto done;
     }
     if (stopped != GUEST_RUN_RETURNED || s_tls_attach_status != 0) {
@@ -381,6 +479,9 @@ int isaac_vita_run_first_fault(const char *pe_path)
                        cpu.exit_api ? cpu.exit_api : "<unknown>",
                        (int)cpu.exit_code);
         result = (int)cpu.exit_code;
+#if ISAAC_VITA_ABORT_SKIP_AUDIO
+        guest_exited = 1;
+#endif
         goto done;
     }
 
@@ -497,6 +598,12 @@ int isaac_vita_run_first_fault(const char *pe_path)
     }
 
 done:
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* First on every controlled end (exit, _exit, guest stop, fault): the
+     * game's log.txt bytes reach the card before anything else tears down,
+     * then the lane worker is joined and one summary receipt is logged. */
+    isaac_vita_game_log_shutdown();
+#endif
 #if ISAAC_VITA_KAGE
     /* The loading-complete path normally closes this startup-only profile.
      * Any earlier controlled guest fault reaches this common tail instead;
@@ -526,7 +633,20 @@ done:
         /* alcDestroyContext reaches the Vita backend stop path, which sets
          * its kill flag and joins the mixer thread.  This must precede every
          * guest or process-memory release below. */
+#if ISAAC_VITA_ABORT_SKIP_AUDIO
+        /* Abort stop: those joins wait for pthread exits that need a calloc
+         * the exhausted heap cannot serve (NULL cancelLock, data abort in
+         * pthread_mutex_unlock; the player saw C2-12828-1 instead of the
+         * controlled stop and the log lost this tail).  Leave the OpenAL
+         * owner to sceKernelExitProcess; only the clean exit/_exit path keeps
+         * the full teardown. */
+        if (!guest_exited)
+            audio_shutdown_status = isaac_vita_audio_abort_skip_teardown();
+        else
+            audio_shutdown_status = isaac_vita_audio_shutdown_active();
+#else
         audio_shutdown_status = isaac_vita_audio_shutdown_active();
+#endif
         if (audio_shutdown_status == ISAAC_VITA_AUDIO_SHUTDOWN_COMPLETE) {
             isaac_vita_log("KAGE VITA AUDIO SHUTDOWN: complete");
         } else if (audio_shutdown_status ==
@@ -535,6 +655,14 @@ done:
                 "KAGE VITA AUDIO SHUTDOWN: incomplete "
                 "(device close failed; owner retained)");
         }
+#if ISAAC_VITA_ABORT_SKIP_AUDIO
+        else if (audio_shutdown_status == ISAAC_VITA_AUDIO_SHUTDOWN_SKIPPED) {
+            /* The run kind and fault are already in the guest stop: line. */
+            isaac_vita_log(
+                "KAGE VITA AUDIO SHUTDOWN: skipped (abort stop; "
+                "OpenAL owner left to process exit)");
+        }
+#endif
         isaac_vita_audio_log_final();
     }
 #endif
@@ -555,6 +683,18 @@ done:
     isaac_vita_fios_cache_shutdown();
 #endif
     guest_coverage_shutdown();
+#if defined(ISAAC_VITA_GUEST_SAMPLER)
+    /* The sampler thread (core 1) and, under ISAAC_VITA_LUA_RECEIPT, the Lua
+     * beat thread raw-load [esp, ceiling) of this CPU's stack gated only by
+     * cpu.stack_floor/ceiling.  Unbind both before guest_stack_free: with
+     * the dedicated guest stack memblock the free unmaps the range and a
+     * sample in flight would abort the process here, before the handoff and
+     * the log flush below (under newlib the same late read was benign). */
+    kage_vita_guest_sampler_stop();
+#endif
+#if ISAAC_VITA_KAGE && defined(ISAAC_VITA_LUA) && defined(ISAAC_VITA_LUA_RECEIPT)
+    isaac_vita_lua_beat_stop();
+#endif
     if (cpu.stack_owner || cpu.stack_floor || cpu.stack_ceiling ||
         cpu.stack_fault_kind != GUEST_STACK_FAULT_NONE) {
         isaac_vita_log(

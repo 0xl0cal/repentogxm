@@ -13,6 +13,12 @@
 
 #include "guest.h"
 #include "host_vita_native_vorbis.h"
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+#include "host_vita_heap_stage.h"
+#endif
+#if defined(ISAAC_VITA_OGG_READAHEAD)
+#include "host_vita_ogg_readahead.h"
+#endif
 
 void isaac_vita_log(const char *format, ...);
 
@@ -445,6 +451,99 @@ typedef struct nv_mirror {
 } nv_mirror;
 
 static nv_mirror s_mirrors[ISAAC_NV_MIRRORS_MAX];
+
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH)
+/* A dense copy of every slot's (guest_alloc_buffer, guest_alloc_len), written
+ * at their only writer, nv_bind_identity.  The free observer tests it first,
+ * so an unrelated free no longer touches one multi-KiB nv_mirror cache line
+ * per slot; a hit still runs the original active + range test on the slot. */
+static struct { uint32_t buffer, length; } s_nv_free_watch[ISAAC_NV_MIRRORS_MAX];
+# define NV_FREE_WATCH_BIND(m)                                              \
+    s_nv_free_watch[(m) - s_mirrors].buffer = (m)->guest_alloc_buffer;      \
+    s_nv_free_watch[(m) - s_mirrors].length = (m)->guest_alloc_len;
+# define NV_FREE_WATCH_SKIP(i, address)                                     \
+    if (s_nv_free_watch[i].buffer != (address) &&                           \
+            (address) - s_nv_free_watch[i].buffer >= s_nv_free_watch[i].length) \
+        continue;
+#else
+# define NV_FREE_WATCH_BIND(m)
+# define NV_FREE_WATCH_SKIP(i, address)
+#endif
+
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+#if !defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH)
+#error ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK requires ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH
+#endif
+_Static_assert(ISAAC_NV_MIRRORS_MAX <= 32,
+               "the free-watch live mask holds one bit per mirror");
+/* Bit i is set for every slot that may be active: it is set in
+ * nv_bind_identity, before that slot's active=1 release store, and cleared
+ * after every active=0 store.  Both writers hold the slot's busy word (the
+ * poisoned-quiesce clear excepted: the worker holds busy there and a poisoned
+ * slot is never bound again), so set and clear of one slot never race, and
+ * different slots meet only in atomic RMWs on this word.  active => bit at
+ * every point, so the free observer scanning only set bits visits a superset
+ * of the slots its `if (!m->active) continue;` would keep, in the same
+ * ascending order. */
+static uint32_t s_nv_free_watch_live;
+# define NV_FREE_WATCH_LIVE_SET(m)                                          \
+    (void)__atomic_fetch_or(&s_nv_free_watch_live,                          \
+                            1U << (uint32_t)((m) - s_mirrors),              \
+                            __ATOMIC_RELAXED);
+# define NV_FREE_WATCH_LIVE_CLEAR(m)                                        \
+    (void)__atomic_fetch_and(&s_nv_free_watch_live,                         \
+                             ~(1U << (uint32_t)((m) - s_mirrors)),          \
+                             __ATOMIC_RELAXED);
+#else
+# define NV_FREE_WATCH_LIVE_SET(m)
+# define NV_FREE_WATCH_LIVE_CLEAR(m)
+#endif
+
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK) && \
+    (defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE) || \
+     defined(ISAAC_VITA_NATIVE_VORBIS_ORACLE))
+/* Free observer census (profiling / oracle builds only; unsynchronized like
+ * the heap stage counters): calls, sum and max of live bits per call, then
+ * calls with 0, 1, 2 and 3+ live bits.  The heap's ph120.hv reads it through
+ * a weak reference. */
+#define NV_FREE_WATCH_CENSUS 7U
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+_Static_assert(NV_FREE_WATCH_CENSUS == ISAAC_VITA_HEAP_NV_CENSUS,
+               "ph120.hv nv census layout");
+#endif
+static uint32_t s_nv_free_watch_census[NV_FREE_WATCH_CENSUS];
+#if defined(ISAAC_VITA_NATIVE_VORBIS_ORACLE)
+static uint32_t s_nv_free_watch_violations;
+#endif
+static void nv_free_watch_census_sample(uint32_t live)
+{
+    const uint32_t k = (uint32_t)__builtin_popcount(live);
+
+    ++s_nv_free_watch_census[0];
+    s_nv_free_watch_census[1] += k;
+    if (k > s_nv_free_watch_census[2])
+        s_nv_free_watch_census[2] = k;
+    ++s_nv_free_watch_census[3U + (k < 3U ? k : 3U)];
+#if defined(ISAAC_VITA_NATIVE_VORBIS_ORACLE)
+    {
+        uint32_t i;
+
+        /* active => bit, checked at every observer entry of the oracle */
+        for (i = 0U; i < ISAAC_NV_MIRRORS_MAX; ++i)
+            if (s_mirrors[i].active && !(live & (1U << i)))
+                ++s_nv_free_watch_violations;
+    }
+#endif
+}
+void isaac_nv_free_watch_census_take(uint32_t out[7])
+{
+    memcpy(out, s_nv_free_watch_census, sizeof s_nv_free_watch_census);
+    memset(s_nv_free_watch_census, 0, sizeof s_nv_free_watch_census);
+}
+# define NV_FREE_WATCH_COST_SAMPLE(live) nv_free_watch_census_sample(live);
+#else
+# define NV_FREE_WATCH_COST_SAMPLE(live)
+#endif
 
 typedef struct nv_stats {
     uint32_t mirrors_created;
@@ -1038,7 +1137,17 @@ static uint32_t nv_guest_vcall(CPU *__restrict c, uint32_t object,
         gpush(c, args[i]);
     gpush(c, site);
     c->ecx = object;
+#if defined(ISAAC_VITA_OGG_READAHEAD)
+    /* The CRT registers descriptors read inside this window only; a guest
+     * exception that skips the reset leaves it set until the next call
+     * returns here (exact either way, see host_vita_ogg_readahead.c). */
+    isaac_vita_ogg_ra_context = 1;
+#endif
     guest_call(c, target);
+#if defined(ISAAC_VITA_OGG_READAHEAD)
+    isaac_vita_ogg_ra_context = 0;
+    isaac_vita_ogg_ra_report_if_due();
+#endif
     if (c->esp != saved_esp) {
         /* Not the frozen convention: restore and refuse further I/O. */
         c->esp = saved_esp;
@@ -1405,6 +1514,7 @@ static int nv_quiesce(nv_mirror *m)
     if (!nv_acquire_wait(m, ISAAC_NV_ACQUIRE_TIMEOUT_US * 2U, &waited)) {
         m->poisoned = 1U;
         nv_store_rel(&m->active, 0U);
+        NV_FREE_WATCH_LIVE_CLEAR(m)
         isaac_vita_log(
             "KAGE VITA NATIVE VORBIS ERR: id=%u f=%08x worker held the "
             "mirror for %u us; slot poisoned", (unsigned)m->id,
@@ -1445,6 +1555,7 @@ static void nv_retire(nv_mirror *m, const char *reason)
     if (!nv_quiesce(m))
         return;
     nv_store_rel(&m->active, 0U);
+    NV_FREE_WATCH_LIVE_CLEAR(m)
     m->guest_f = 0U;
     m->mode = NV_MODE_NONE;
     nv_ring_reset(&m->ogg);
@@ -1515,6 +1626,8 @@ static void nv_bind_identity(nv_mirror *m, uint32_t f, const stb_vorbis *g)
     m->guest_stream = (uint32_t)(uintptr_t)g->f;
     m->guest_alloc_buffer = (uint32_t)(uintptr_t)g->alloc.alloc_buffer;
     m->guest_alloc_len = (uint32_t)g->alloc.alloc_buffer_length_in_bytes;
+    NV_FREE_WATCH_BIND(m)
+    NV_FREE_WATCH_LIVE_SET(m)
     m->snap_serial = g->serial;
     m->snap_codebooks = (uint32_t)(uintptr_t)g->codebooks;
     m->snap_sample_rate = g->sample_rate;
@@ -1609,6 +1722,7 @@ static nv_mirror *nv_start(CPU *__restrict c, nv_mirror *m, uint32_t f,
             ++s_stats.clone_rejected;
         *reason = nv_clone_reason(rc);
         nv_store_rel(&m->active, 0U);
+        NV_FREE_WATCH_LIVE_CLEAR(m)
         m->guest_f = 0U;
         m->mode = NV_MODE_NONE;
         nv_release(m);
@@ -1621,6 +1735,7 @@ static nv_mirror *nv_start(CPU *__restrict c, nv_mirror *m, uint32_t f,
             ++s_stats.clone_rejected;
         *reason = "frame-too-large";
         nv_store_rel(&m->active, 0U);
+        NV_FREE_WATCH_LIVE_CLEAR(m)
         m->guest_f = 0U;
         m->mode = NV_MODE_NONE;
         nv_release(m);
@@ -1656,6 +1771,7 @@ static nv_mirror *nv_start(CPU *__restrict c, nv_mirror *m, uint32_t f,
                 !nv_ring_alloc(&m->pcm, ISAAC_NV_PCM_RING_BYTES)) {
             *reason = "memory";
             nv_store_rel(&m->active, 0U);
+            NV_FREE_WATCH_LIVE_CLEAR(m)
             m->guest_f = 0U;
             m->mode = NV_MODE_NONE;
             nv_release(m);
@@ -1666,6 +1782,7 @@ static nv_mirror *nv_start(CPU *__restrict c, nv_mirror *m, uint32_t f,
         if (!nv_guest_tell(c, m, &pos)) {
             *reason = "tell";
             nv_store_rel(&m->active, 0U);
+            NV_FREE_WATCH_LIVE_CLEAR(m)
             m->guest_f = 0U;
             m->mode = NV_MODE_NONE;
             nv_release(m);
@@ -2170,6 +2287,7 @@ static nv_mirror *nv_resolve(CPU *__restrict c, uint32_t f, int channels,
             if (stale) {
                 nv_log_close(m, "reopened");
                 nv_store_rel(&m->active, 0U);
+                NV_FREE_WATCH_LIVE_CLEAR(m)
                 m->guest_f = 0U;
                 m->mode = NV_MODE_NONE;
                 nv_ring_reset(&m->ogg);
@@ -2397,10 +2515,23 @@ void isaac_nv_guest_buffer_freed(void *pointer)
 {
     uint32_t address = (uint32_t)(uintptr_t)pointer;
     uint32_t i;
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+    uint32_t live;
+#endif
 
     if (!address)
         return;
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+    /* One load; then the set bits in ascending slot order, as the full scan
+     * would visit them (`continue` advances to the next set bit). */
+    live = __atomic_load_n(&s_nv_free_watch_live, __ATOMIC_RELAXED);
+    NV_FREE_WATCH_COST_SAMPLE(live)
+    for (; live && (i = (uint32_t)__builtin_ctz(live), 1);
+         live &= live - 1U) {
+#else
     for (i = 0U; i < ISAAC_NV_MIRRORS_MAX; ++i) {
+#endif
+        NV_FREE_WATCH_SKIP(i, address)
         nv_mirror *m = &s_mirrors[i];
 
         if (!m->active)
@@ -2671,4 +2802,26 @@ void isaac_nv_oracle_worker_stop(void)
     nv_store_rel(&s_worker_stop, 0U);
     s_worker_start_attempted = 0U;
 }
+
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+uint32_t isaac_nv_oracle_free_watch_live(void)
+{
+    return __atomic_load_n(&s_nv_free_watch_live, __ATOMIC_RELAXED);
+}
+
+uint32_t isaac_nv_oracle_active_bits(void)
+{
+    uint32_t i, bits = 0U;
+
+    for (i = 0U; i < ISAAC_NV_MIRRORS_MAX; ++i)
+        if (s_mirrors[i].active)
+            bits |= 1U << i;
+    return bits;
+}
+
+uint32_t isaac_nv_oracle_free_watch_violations(void)
+{
+    return s_nv_free_watch_violations;
+}
+#endif
 #endif

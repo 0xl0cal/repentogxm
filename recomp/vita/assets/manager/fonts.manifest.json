@@ -1,0 +1,27 @@
+{
+  "files": {
+    "font-body-16.imf": {
+      "sha256": "4884abfea56c80f0a15902c49bb95d54a8a3bdba4e4082d62496e5b9df6d9f2c",
+      "size": 27788
+    },
+    "font-small-12.imf": {
+      "sha256": "f07c26c4c8f554d6ffcf637fdbd138a4298bb6d45821693759382e7444ae7d93",
+      "size": 18316
+    },
+    "font-title-24.imf": {
+      "sha256": "83c97069baba2f4ae197462861d53cfb543c961d7ff275ef44be00a864cf31e6",
+      "size": 57484
+    }
+  },
+  "generator": "tools/manager_font_bake.py",
+  "glyph_count": 183,
+  "toolchain": {
+    "freetype": "2.14.3",
+    "license_sha256": "d75938dec098f06f0ac3c00853065d94f020be1c3c62ef1dc2975ba15b4d9b0e",
+    "pillow": "12.3.0",
+    "ttf_sha256": {
+      "DejaVuSans-Bold.ttf": "b184b89e3c1075f22f6b71575b6fc20d4972b3cfd3b23322ca6fd596dcaef167",
+      "DejaVuSans.ttf": "3fdf69cabf06049ea70a00b5919340e2ce1e6d02b0cc3c4b44fb6801bd1e0d22"
+    }
+  }
+}

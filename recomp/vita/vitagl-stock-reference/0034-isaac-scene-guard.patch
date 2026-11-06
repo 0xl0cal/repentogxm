@@ -1,0 +1,349 @@
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -70,2 +70,138 @@
+ SceGxmContext *gxm_context; // sceGxm context instance
++#ifdef HAVE_ISAAC_SCENE_GUARD
++/* Isaac 0034 scene guard. Stock vitaGL ignores the return of setup_render_target and
++ * sceGxmBeginScene in scene_reset; when either fails (sceGxmCreateRenderTarget out of
++ * driver memory under pressure) no scene is open, sceGxmReserve*DefaultUniformBuffer
++ * fails with NOT_WITHIN_SCENE and glClear/update_scissor_test write the clear uniforms
++ * through an uninitialised stack pointer (Vita C2-12828-1 data abort). Track whether a
++ * scene is open, fail those writes closed and count what was skipped; the counters are
++ * exported for the consumer's receipt line. Nothing here is declared in vitaGL.h.
++ * A failed sceGxmEndScene does not close the scene: on the Vita (2026-09-27, Chinese font
++ * pages under VRAM pressure) one EndScene failed and every later sceGxmBeginScene returned
++ * SCE_GXM_ERROR_WITHIN_SCENE. Stock vitaGL heals on its own because scene_reset calls
++ * scene_end, i.e. retries the end, before every begin; the guard must not skip that retry,
++ * or the display never gets another scene. Such a scene is tracked as dangling until an
++ * end succeeds or GXM reports NOT_WITHIN_SCENE. */
++static GLboolean isaac_scene_open = GL_FALSE; // The last sceGxmBeginScene succeeded and no sceGxmEndScene followed
++static GLboolean isaac_scene_dangling = GL_FALSE; // GXM still holds a scene the guard does not own (failed end, or begin said WITHIN_SCENE)
++static uint32_t isaac_scene_guard_rt_fail = 0; // setup_render_target failures (display and FBO)
++static uint32_t isaac_scene_guard_begin_fail = 0; // sceGxmBeginScene failures
++static uint32_t isaac_scene_guard_end_fail = 0; // sceGxmEndScene failures
++static uint32_t isaac_scene_guard_reserve_fail = 0; // default uniform buffer reserve failures inside an open scene
++static uint32_t isaac_scene_guard_skipped_clear = 0; // glClear passes skipped (no scene or reserve failed)
++static uint32_t isaac_scene_guard_skipped_draw = 0; // scissor mask draws skipped (no scene or reserve failed)
++static uint32_t isaac_scene_guard_skipped_end = 0; // scene_end calls skipped because no scene was open
++static uint32_t isaac_scene_guard_end_retry = 0; // scene_end calls that tried to end a dangling scene
++static uint32_t isaac_scene_guard_recovered = 0; // dangling scenes a retried sceGxmEndScene closed
++static uint32_t isaac_scene_guard_last_end_err = 0; // last non-zero sceGxmEndScene error (last_err is overwritten by later begins)
++static uint32_t isaac_scene_guard_last_err = 0; // last non-zero sceGxm error seen by the guard
++static uint32_t isaac_scene_guard_events = 0; // bumped on every counter change
++
++static void isaac_scene_guard_note_rt(int r) {
++	if (r) {
++		isaac_scene_guard_rt_fail++;
++		isaac_scene_guard_last_err = (uint32_t)r;
++		isaac_scene_guard_events++;
++	}
++}
++
++static void isaac_scene_guard_note_begin_scene(int r) {
++	isaac_scene_open = r ? GL_FALSE : GL_TRUE;
++	if (!r) {
++		isaac_scene_dangling = GL_FALSE; // GXM accepted a new scene, so none was left open
++	} else {
++		isaac_scene_guard_begin_fail++;
++		isaac_scene_guard_last_err = (uint32_t)r;
++		isaac_scene_guard_events++;
++		// GXM still holds an older scene: the next scene_end must end it
++		if ((uint32_t)r == (uint32_t)SCE_GXM_ERROR_WITHIN_SCENE)
++			isaac_scene_dangling = GL_TRUE;
++	}
++}
++
++static void isaac_scene_guard_note_end_scene(int r) {
++	GLboolean retried = isaac_scene_dangling;
++	isaac_scene_open = GL_FALSE;
++	if (retried)
++		isaac_scene_guard_end_retry++;
++	if (!r || (uint32_t)r == (uint32_t)SCE_GXM_ERROR_NOT_WITHIN_SCENE) {
++		if (retried && !r)
++			isaac_scene_guard_recovered++;
++		isaac_scene_dangling = GL_FALSE;
++	} else {
++		isaac_scene_dangling = GL_TRUE; // Still open inside GXM: the next scene_end retries, as stock does
++	}
++	if (r) {
++		isaac_scene_guard_end_fail++;
++		isaac_scene_guard_last_err = (uint32_t)r;
++		isaac_scene_guard_last_end_err = (uint32_t)r;
++	}
++	if (r || retried)
++		isaac_scene_guard_events++;
++}
++
++static GLboolean isaac_scene_guard_reserved(int r, void **buffer) {
++	if (r || !*buffer) {
++		*buffer = NULL;
++		isaac_scene_guard_reserve_fail++;
++		if (r)
++			isaac_scene_guard_last_err = (uint32_t)r;
++		isaac_scene_guard_events++;
++		return GL_FALSE;
++	}
++	return GL_TRUE;
++}
++
++// Cross-file helpers for misc.c (glClear) and tests.c (update_scissor_test); declared there, not in shared.h
++GLboolean isaacSceneGuardOpen(void) {
++	return isaac_scene_open;
++}
++
++GLboolean isaacSceneGuardReserveVertex(void **buffer) {
++	*buffer = NULL;
++	if (!isaac_scene_open)
++		return GL_FALSE;
++	return isaac_scene_guard_reserved(sceGxmReserveVertexDefaultUniformBuffer(gxm_context, buffer), buffer);
++}
++
++GLboolean isaacSceneGuardReserveFragment(void **buffer) {
++	*buffer = NULL;
++	if (!isaac_scene_open)
++		return GL_FALSE;
++	return isaac_scene_guard_reserved(sceGxmReserveFragmentDefaultUniformBuffer(gxm_context, buffer), buffer);
++}
++
++void isaacSceneGuardSkipClear(void) {
++	isaac_scene_guard_skipped_clear++;
++	isaac_scene_guard_events++;
++}
++
++void isaacSceneGuardSkipDraw(void) {
++	isaac_scene_guard_skipped_draw++;
++	isaac_scene_guard_events++;
++}
++
++// Consumer exports (declared by the consumer, not in vitaGL.h): non-destructive snapshot and change edge
++void vglIsaacSceneGuardSnapshot(uint32_t out[8]) {
++	out[0] = isaac_scene_guard_rt_fail;
++	out[1] = isaac_scene_guard_begin_fail;
++	out[2] = isaac_scene_guard_end_fail;
++	out[3] = isaac_scene_guard_reserve_fail;
++	out[4] = isaac_scene_guard_skipped_clear;
++	out[5] = isaac_scene_guard_skipped_draw;
++	out[6] = isaac_scene_guard_skipped_end;
++	out[7] = isaac_scene_guard_last_err;
++}
++
++void vglIsaacSceneGuardRecovery(uint32_t out[4]) {
++	out[0] = isaac_scene_dangling ? 1u : 0u;
++	out[1] = isaac_scene_guard_end_retry;
++	out[2] = isaac_scene_guard_recovered;
++	out[3] = isaac_scene_guard_last_end_err;
++}
++
++uint32_t vglIsaacSceneGuardChanged(void) {
++	return isaac_scene_guard_events;
++}
++#endif
+ GLenum vgl_error = GL_NO_ERROR; // Error returned by glGetError
+@@ -435,4 +571,8 @@
+ void create_display_render_target(void) {
+ 	// Creating render target for the display
+-	setup_render_target(&gxm_render_target, DISPLAY_WIDTH, DISPLAY_HEIGHT, gxm_display_rt_size);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	isaac_scene_guard_note_rt(setup_render_target(&gxm_render_target, DISPLAY_WIDTH, DISPLAY_HEIGHT, gxm_display_rt_size));
++#else
++	setup_render_target(&gxm_render_target, DISPLAY_WIDTH, DISPLAY_HEIGHT, gxm_display_rt_size);
++#endif
+ }
+@@ -564,3 +704,11 @@
+ static inline __attribute__((always_inline)) void scene_end(void) {
+ 	// Ends current gxm scene
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	// No scene is open (the last scene_reset failed to begin one) and none is dangling: nothing to end, and the query fence must not advance
++	if (!isaac_scene_open && !isaac_scene_dangling) {
++		isaac_scene_guard_skipped_end++;
++		isaac_scene_guard_events++;
++		return;
++	}
++#endif
+ 	query_fence.value++;
+@@ -567,1 +715,8 @@
+-	sceGxmEndScene(gxm_context, NULL, &query_fence);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	{
++		int isaac_end_r = sceGxmEndScene(gxm_context, NULL, &query_fence);
++		isaac_scene_guard_note_end_scene(isaac_end_r);
++	}
++#else
++	sceGxmEndScene(gxm_context, NULL, &query_fence);
++#endif
+@@ -620,5 +775,8 @@
+ 			if (r) {
+ 				vgl_log("%s:%d Scene reset failed due to sceGxmBeginScene erroring (%s) on display.\n", __FILE__, __LINE__, get_gxm_error_literal(r));
+ 			}
+ #endif
++#ifdef HAVE_ISAAC_SCENE_GUARD
++			isaac_scene_guard_note_begin_scene(r);
++#endif
+ 		} else {
+@@ -649,4 +807,7 @@
+ 					vgl_log("%s:%d Failed to create a rendertarget of size %dx%d for framebuffer 0x%08X (%s).\n", __FILE__, __LINE__, active_write_fb->width, active_write_fb->height, active_write_fb, get_gxm_error_literal(r));
+ 				}
+ #endif
++#ifdef HAVE_ISAAC_SCENE_GUARD
++				isaac_scene_guard_note_rt(r);
++#endif
+ #endif
+@@ -676,4 +837,7 @@
+ 			if (r)
+ 				vgl_log("%s:%d Scene reset failed due to sceGxmBeginScene erroring (%s) on framebuffer 0x%08X.\n", __FILE__, __LINE__, get_gxm_error_literal(r), active_write_fb);
+ #endif
++#ifdef HAVE_ISAAC_SCENE_GUARD
++			isaac_scene_guard_note_begin_scene(r);
++#endif
+ 		}
+diff --git a/source/misc.c b/source/misc.c
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -640,2 +640,9 @@
+-void glClear(GLbitfield mask) {
++#ifdef HAVE_ISAAC_SCENE_GUARD
++// Isaac 0034 scene guard (defined in gxm.c): clear uniforms and the clear draw only inside an open scene
++GLboolean isaacSceneGuardOpen(void);
++GLboolean isaacSceneGuardReserveVertex(void **buffer);
++GLboolean isaacSceneGuardReserveFragment(void **buffer);
++void isaacSceneGuardSkipClear(void);
++#endif
++void glClear(GLbitfield mask) {
+ 	THREAD_SAFE()
+@@ -648,3 +655,10 @@
+ 	scene_reset();
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	// No scene is open (sceGxmBeginScene or the rendertarget creation failed): the clear uniforms would be written through an uninitialised pointer, skip the clear
++	if (!isaacSceneGuardOpen()) {
++		isaacSceneGuardSkipClear();
++		return;
++	}
++#endif
+ 
+ 	// Invalidating viewport and culling
+@@ -654,1 +668,6 @@
+-	void *fbuffer, *vbuffer;
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	void *fbuffer = NULL, *vbuffer = NULL;
++	GLboolean isaac_clear_reserved = GL_TRUE; // Both default uniform buffers reserved; otherwise no uniform write and no draw
++#else
++	void *fbuffer, *vbuffer;
++#endif
+@@ -673,1 +692,6 @@
+-	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vbuffer);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	if (!isaacSceneGuardReserveVertex(&vbuffer))
++		isaac_clear_reserved = GL_FALSE;
++#else
++	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vbuffer);
++#endif
+@@ -674,2 +698,9 @@
+-	sceGxmSetUniformDataF(vbuffer, clear_position, 0, 4, &clear_vertices->x);
+-	sceGxmSetUniformDataF(vbuffer, clear_depth, 0, 1, &clear_depth_value);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	if (isaac_clear_reserved) {
++		sceGxmSetUniformDataF(vbuffer, clear_position, 0, 4, &clear_vertices->x);
++		sceGxmSetUniformDataF(vbuffer, clear_depth, 0, 1, &clear_depth_value);
++	}
++#else
++	sceGxmSetUniformDataF(vbuffer, clear_position, 0, 4, &clear_vertices->x);
++	sceGxmSetUniformDataF(vbuffer, clear_depth, 0, 1, &clear_depth_value);
++#endif
+@@ -677,1 +708,6 @@
+-	sceGxmReserveFragmentDefaultUniformBuffer(gxm_context, &fbuffer);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	if (!isaacSceneGuardReserveFragment(&fbuffer))
++		isaac_clear_reserved = GL_FALSE;
++#else
++	sceGxmReserveFragmentDefaultUniformBuffer(gxm_context, &fbuffer);
++#endif
+@@ -678,1 +714,6 @@
+-	sceGxmSetUniformDataF(fbuffer, clear_color, 0, 4, &clear_rgba_val.r);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	if (isaac_clear_reserved)
++		sceGxmSetUniformDataF(fbuffer, clear_color, 0, 4, &clear_rgba_val.r);
++#else
++	sceGxmSetUniformDataF(fbuffer, clear_color, 0, 4, &clear_rgba_val.r);
++#endif
+@@ -717,1 +758,8 @@
+-	sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	if (isaac_clear_reserved)
++		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++	else
++		isaacSceneGuardSkipClear(); // A reserve failed inside the open scene: drop the clear rather than draw it with stale uniforms
++#else
++	sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++#endif
+diff --git a/source/tests.c b/source/tests.c
+--- a/source/tests.c
++++ b/source/tests.c
+@@ -253,2 +253,7 @@
+-void update_scissor_test() {
++#ifdef HAVE_ISAAC_SCENE_GUARD
++// Isaac 0034 scene guard (defined in gxm.c): the stencil mask uniforms and draws only inside an open scene
++GLboolean isaacSceneGuardReserveVertex(void **buffer);
++void isaacSceneGuardSkipDraw(void);
++#endif
++void update_scissor_test() {
+ 	const float scissor_depth = 1.0f;
+@@ -296,4 +301,13 @@
+-		void *vertex_buffer;
+-		sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer);
+-		sceGxmSetUniformDataF(vertex_buffer, clear_position, 0, 4, &clear_vertices->x);
+-		sceGxmSetUniformDataF(vertex_buffer, clear_depth, 0, 1, &scissor_depth);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++		void *vertex_buffer = NULL;
++		GLboolean isaac_mask_reserved = isaacSceneGuardReserveVertex(&vertex_buffer);
++		if (isaac_mask_reserved) {
++			sceGxmSetUniformDataF(vertex_buffer, clear_position, 0, 4, &clear_vertices->x);
++			sceGxmSetUniformDataF(vertex_buffer, clear_depth, 0, 1, &scissor_depth);
++		}
++#else
++		void *vertex_buffer;
++		sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer);
++		sceGxmSetUniformDataF(vertex_buffer, clear_position, 0, 4, &clear_vertices->x);
++		sceGxmSetUniformDataF(vertex_buffer, clear_depth, 0, 1, &scissor_depth);
++#endif
+@@ -314,2 +328,9 @@
+-		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++		if (isaac_mask_reserved)
++			sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++		else
++			isaacSceneGuardSkipDraw();
++#else
++		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++#endif
+ 	}
+@@ -331,4 +352,13 @@
+-	void *vertex_buffer;
+-	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer);
+-	sceGxmSetUniformDataF(vertex_buffer, clear_position, 0, 4, scissor_test_state ? &scissor_test_vertices->x : &clear_vertices->x);
+-	sceGxmSetUniformDataF(vertex_buffer, clear_depth, 0, 1, &scissor_depth);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	void *vertex_buffer = NULL;
++	GLboolean isaac_region_reserved = isaacSceneGuardReserveVertex(&vertex_buffer);
++	if (isaac_region_reserved) {
++		sceGxmSetUniformDataF(vertex_buffer, clear_position, 0, 4, scissor_test_state ? &scissor_test_vertices->x : &clear_vertices->x);
++		sceGxmSetUniformDataF(vertex_buffer, clear_depth, 0, 1, &scissor_depth);
++	}
++#else
++	void *vertex_buffer;
++	sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &vertex_buffer);
++	sceGxmSetUniformDataF(vertex_buffer, clear_position, 0, 4, scissor_test_state ? &scissor_test_vertices->x : &clear_vertices->x);
++	sceGxmSetUniformDataF(vertex_buffer, clear_depth, 0, 1, &scissor_depth);
++#endif
+@@ -336,3 +366,10 @@
+-	sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++#ifdef HAVE_ISAAC_SCENE_GUARD
++	if (isaac_region_reserved)
++		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++	else
++		isaacSceneGuardSkipDraw();
++#else
++	sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, SCE_GXM_INDEX_FORMAT_U16, depth_clear_indices, 4);
++#endif
+ 
+ 	// Restoring viewport and culling

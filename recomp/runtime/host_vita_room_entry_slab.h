@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "host_vita_heap_overflow_mspace.h"
+
 #define ISAAC_VITA_ROOM_ENTRY_OWNER_RETURN_RVA          0x003e5adeU
 #define ISAAC_VITA_ROOM_ENTRY_NORMAL_FREE_RETURN_RVA    0x003e3806U
 #define ISAAC_VITA_ROOM_ENTRY_STAGE_FREE_RETURN_RVA     0x003e3b66U
@@ -27,7 +29,9 @@
 #define ISAAC_VITA_ROOM_ENTRY_SLAB_MAX_SLOTS \
     ISAAC_VITA_ROOM_ENTRY_SLAB_RAW_MAX_SLOTS
 #define ISAAC_VITA_ROOM_ENTRY_SLAB_RAW_MAX_BACKING_BYTES 0x00600000U
-#define ISAAC_VITA_ROOM_ENTRY_SLAB_NOMINAL_RAW_REMAINDER 0x001d5000U
+#define ISAAC_VITA_ROOM_ENTRY_SLAB_NOMINAL_RAW_REMAINDER \
+    (ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES - \
+     ISAAC_VITA_ROOM_ENTRY_SLAB_RAW_MAX_BACKING_BYTES)
 
 /* Floor-lifetime birth token shared with the generic allocation ledger.
  * Bits 0..1 are the exact birth phase and bit 2 says that the allocation

@@ -2,7 +2,7 @@
 
 This repository does not contain *The Binding of Isaac: Repentance* executable,
 generated guest code or gameplay data. Users must provide their own legally
-obtained PC copy. Five pinned Vita presentation images remain under
+obtained PC copy. Nine pinned Vita presentation images remain under
 `recomp/vita/assets/sce_sys/`; their inclusion is separate from the user-supplied
 runtime resources.
 
@@ -198,14 +198,50 @@ procedural loading screen drawn by code is the fallback.
 
 Source: <https://steamcommunity.com/sharedfiles/filedetails/?id=2575911103>
 
+### DejaVu fonts (Manager UI2 atlases)
+
+`recomp/vita/assets/manager/font-title-24.imf` (DejaVu Sans Bold, 24 px),
+`font-body-16.imf` (DejaVu Sans, 16 px) and `font-small-12.imf` (DejaVu Sans,
+12 px) are 8-bit alpha glyph atlases of 183 code points (ASCII, Cyrillic and a
+few symbols) rasterised from the DejaVu TrueType fonts by
+`tools/manager_font_bake.py`; `fonts.manifest.json` next to them records the
+generator, the SHA-256 of both TTF inputs and of the licence, and the
+Pillow/FreeType versions, and `tools/test_manager_font_bake.py` re-bakes and
+compares them. No TTF file is tracked. The bake runs on a PC with Pillow
+(FreeType) and fontTools (MIT); by default it reads the DejaVu copy bundled with
+matplotlib. None of these PC packages ships on the Vita.
+
+DejaVu fonts are derived from Bitstream Vera. Copyright (c) 2003 by Bitstream,
+Inc. All Rights Reserved; Bitstream Vera is a trademark of Bitstream, Inc.
+Glyphs imported from Arev fonts are Copyright (c) 2006 by Tavmjong Bah. DejaVu
+changes are in the public domain. The licence permits use, modification and
+redistribution provided the copyright and permission notices are kept and a
+modified font is not distributed under the "Bitstream", "Vera", "Arev" or
+"Tavmjong Bah" names. The full text is retained in
+[`recomp/vita/third_party/dejavu/LICENSE`](recomp/vita/third_party/dejavu/LICENSE)
+and packaged as `app0:/licenses/dejavu.txt` together with the atlases, which are
+in the VPK only when `ISAAC_VITA_MANAGER_UI2=ON`.
+
+Source: <https://dejavu-fonts.github.io/>
+
 ## Runtime and build dependencies
 
 ### Vita presentation artwork
 
-The tracked `icon0.png`, `pic0.png`, `bg0.png`, `nicalis.png` and `startup.png`
-are presentation assets from the Isaac/Nicalis Vita package lineage. They are
-kept byte-pinned for the VPK build. Their names and hashes are not a
-claim of ownership or a blanket redistribution licence.
+Nine byte-pinned PNGs under `recomp/vita/assets/sce_sys/` are packaged for the
+LiveArea; `livearea/contents/template.xml` lays them out. All of them show
+Isaac/Nicalis game artwork:
+
+- `livearea/contents/bg0.png` and `livearea/contents/nicalis.png` are
+  presentation assets from the Isaac/Nicalis Vita package lineage;
+- `icon0.png`, `pic0.png`, `livearea/contents/startup.png` and the four title
+  strips `livearea/contents/1.png`-`4.png` come from the community LiveArea
+  contributed by GitHub user Lordchickenblaster in GitHub issue #9 (the
+  Repentance title logo, key art and Isaac's face).
+
+`recomp/vita/test_livearea_package.py` pins every image and the template.
+Their names, hashes and the contributor credit are not a claim of ownership or
+a blanket redistribution licence for the game artwork.
 
 ### vitaGL and shader stack
 

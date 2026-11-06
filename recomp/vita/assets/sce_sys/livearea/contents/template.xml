@@ -1,36 +1,46 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<livearea style="psmobile" format-ver="01.00" content-rev="3">
+<?xml version="1.0" encoding="utf-8"?>
+<livearea style="ad2" format-ver="01.00" content-rev="4">
   <livearea-background>
     <image>bg0.png</image>
   </livearea-background>
   <gate>
     <startup-image>startup.png</startup-image>
   </gate>
-  <frame id="frame1">
+  <frame id="frame4" multi="0" autoflip="1">
     <liveitem>
-      <text valign="bottom" align="left" text-align="left" text-valign="bottom" line-space="3" ellipsis="on">
-        <str color="#ffffff" size="34" bold="on" shadow="on">THE BINDING OF ISAAC</str>
-      </text>
+      <target>psla:play</target>
+      <image y="0" width="532" height="68">1.png</image>
+    </liveitem>
+  </frame>
+  <frame id="frame5" multi="0" autoflip="1">
+    <liveitem>
+      <target>psla:play</target>
+      <image y="0" width="532" height="68">2.png</image>
+    </liveitem>
+  </frame>
+  <frame id="frame6" multi="0" autoflip="1">
+    <liveitem>
+      <target>psla:play</target>
+      <image y="0" width="532" height="68">3.png</image>
+    </liveitem>
+  </frame>
+  <frame id="frame7" multi="0" autoflip="1">
+    <liveitem>
+      <target>psla:play</target>
+      <image y="0" width="532" height="68">4.png</image>
     </liveitem>
   </frame>
   <frame id="frame2">
     <liveitem>
-      <text valign="top" align="left" text-align="left" text-valign="top" line-space="2" ellipsis="on">
-        <str color="#cc1b19" size="42" bold="on" shadow="on">REPENTANCE</str>
+      <target>psla:-manager</target>
+      <text align="center" text-align="left" word-wrap="off" ellipsis="on">
+        <str size="18" color="#ffffff" shadow="on">SAVE / MOD MANAGER</str>
       </text>
     </liveitem>
   </frame>
   <frame id="frame3">
     <liveitem>
-      <image align="left" valign="center" width="196" height="28">nicalis.png</image>
-    </liveitem>
-  </frame>
-  <frame id="frame4">
-    <liveitem>
-      <target>psla:-manager</target>
-      <text align="left" text-align="left" word-wrap="off" ellipsis="on">
-        <str size="18" color="#ffffff" shadow="on">SAVE / MOD MANAGER</str>
-      </text>
+      <image align="center" valign="center" width="196" height="28">nicalis.png</image>
     </liveitem>
   </frame>
 </livearea>

@@ -38,9 +38,12 @@ def main() -> int:
         # same on the 720 raster.  fbo-vr-observe/fbo-vr-on: the
         # ISAAC_VITA_STOCK_FBO_VALID_REGION=1/2 knob on top of rt-scenes=8
         # (0009 mode hook called once with 0/1, banner prints
-        # fbo-valid-region=observe/on).
+        # fbo-valid-region=observe/on).  scene-guard: the
+        # ISAAC_VITA_VITAGL_SCENE_GUARD knob (0034 hooks: startup receipt at
+        # the cold initialize, bounded counter receipt after a swap on which
+        # the change edge moved: first eight changes, then every 256th).
         for mode in ("off", "on", "fbo-rt", "fbo-rt-720",
-                     "fbo-vr-observe", "fbo-vr-on"):
+                     "fbo-vr-observe", "fbo-vr-on", "scene-guard"):
             executable = Path(value) / (
                 f"stock-vitagl-oracle-{mode}.exe" if os.name == "nt" else
                 f"stock-vitagl-oracle-{mode}"
@@ -64,6 +67,8 @@ def main() -> int:
                 command.insert(7, "-DISAAC_VITA_STOCK_FBO_VALID_REGION=1")
             elif mode == "fbo-vr-on":
                 command.insert(7, "-DISAAC_VITA_STOCK_FBO_VALID_REGION=2")
+            elif mode == "scene-guard":
+                command.insert(7, "-DISAAC_VITA_VITAGL_SCENE_GUARD=1")
             subprocess.run(command, check=True)
             completed = subprocess.run(
                 [str(executable)], check=True, text=True,
@@ -82,6 +87,8 @@ def main() -> int:
                 expected += "; fbo valid-region=observe"
             elif mode == "fbo-vr-on":
                 expected += "; fbo valid-region=on"
+            elif mode == "scene-guard":
+                expected += "; scene guard=on"
             expected += ")"
             if expected not in completed.stdout:
                 raise AssertionError(

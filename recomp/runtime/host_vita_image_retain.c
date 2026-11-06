@@ -18,6 +18,20 @@
 
 #if !defined(ISAAC_VITA_IMAGE_RETAIN_ORACLE)
 #include <vitaGL.h>
+# if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+#  include <psp2/kernel/processmgr.h>
+# endif
+#endif
+
+#if defined(ISAAC_VITA_IMAGE_RETAIN_GHOST)
+# if ISAAC_VITA_IMAGE_RETAIN_BUDGET_MB != 0
+#  error ISAAC_VITA_IMAGE_RETAIN_GHOST measures the OFF behaviour: BUDGET_MB must be 0
+# endif
+# if !defined(ISAAC_VITA_IMAGE_RETAIN_ORACLE)
+#  include <psp2/kernel/processmgr.h>
+#  include <psp2/kernel/sysmem.h>
+# endif
+static isaac_irg s_irg;
 #endif
 
 /* recomp/vita/platform.h; declared here so the host oracle can stub it. */
@@ -84,15 +98,88 @@ static struct {
 #if defined(ISAAC_VITA_IMAGE_RETAIN_ORACLE)
 static uint32_t ir_free_ram(void)  { return isaac_ir_oracle_free_ram(); }
 static uint32_t ir_free_vram(void) { return isaac_ir_oracle_free_vram(); }
+# if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+static uint32_t ir_free_phycont(void) { return isaac_ir_oracle_free_phycont(); }
+# endif
+#else
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+/* vitaGL belongs to the GL render thread: its published copy (<= 1 frame). */
+#include "kage_vita_backend.h"
+static uint32_t ir_free_ram(void)
+{ return kage_vita_backend_vgl_mem(KAGE_VITA_VGL_SNAPSHOT_RAM_FREE); }
+static uint32_t ir_free_vram(void)
+{ return kage_vita_backend_vgl_mem(KAGE_VITA_VGL_SNAPSHOT_VRAM_FREE); }
+# if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+/* Same published copy for PHYCONT (the slot the ghost sampler below reads);
+ * vglMemFree may only run on the render thread under the worker. */
+static uint32_t ir_free_phycont(void)
+{ return kage_vita_backend_vgl_mem(KAGE_VITA_VGL_SNAPSHOT_PHYCONT_FREE); }
+# endif
 #else
 static uint32_t ir_free_ram(void)  { return (uint32_t)vglMemFree(VGL_MEM_RAM); }
 static uint32_t ir_free_vram(void) { return (uint32_t)vglMemFree(VGL_MEM_VRAM); }
+# if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+/* vitaGL 73dd57a allocates textures VRAM -> RAM -> PHYCONT, so a free PHYCONT
+ * byte is as usable for the next room's sheets as a RAM one.  Ordinal after
+ * RAM = VGL_MEM_PHYCONT, derived as host_vita_debug_overlay.c does. */
+_Static_assert(VGL_MEM_VRAM + 1 == VGL_MEM_RAM && VGL_MEM_RAM + 2 == VGL_MEM_BUDGET,
+               "vitaGL memory-domain ABI changed");
+static uint32_t ir_free_phycont(void)
+{
+    return (uint32_t)vglMemFree((vglMemType)(VGL_MEM_RAM + 1));
+}
+# endif
+#endif
 #endif
 
+#if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+/* One vglMemFree is a sceClibMspaceMallocStats walk: the ghost build measured
+ * 1.3-1.6 ms for four free-memory queries, 3.8 ms each during a 456-offer
+ * floor exit (p2b-native.log ph120.irm).  Three walks per candidate would add
+ * ~0.5 s to a floor exit, so a reading is reused for IR_FREE_CACHE_US.
+ * Retaining allocates nothing, so a live re-read inside a burst of offers
+ * returns the same value; what a reused reading misses is a foreign upload
+ * or free inside the window.  Our own eviction (an unused sheet's texture is
+ * freed at once) invalidates it, so headroom_release still sees recovery.
+ * shortcut: up to IR_FREE_CACHE_US of foreign uploads (at most one sheet at
+ * ~40 ms/MiB decode) are not seen; shorten the window if ph120.irm shows
+ * transients deeper than the 16 MiB headroom. */
+#define IR_FREE_CACHE_US 4000U
+static struct {
+    uint64_t at_us;
+    uint64_t bytes;
+    uint8_t  valid;
+    uint32_t samples;
+    uint32_t hits;
+} s_ir_free;
+
+# if defined(ISAAC_VITA_IMAGE_RETAIN_ORACLE)
+static uint64_t ir_now_us(void) { return isaac_ir_oracle_now_us(); }
+# else
+static uint64_t ir_now_us(void) { return sceKernelGetProcessTimeWide(); }
+# endif
+
+static uint64_t ir_free_bytes(void)
+{
+    uint64_t now = ir_now_us();
+
+    if (s_ir_free.valid && now - s_ir_free.at_us < IR_FREE_CACHE_US) {
+        ++s_ir_free.hits;
+        return s_ir_free.bytes;
+    }
+    s_ir_free.bytes = (uint64_t)ir_free_ram() + (uint64_t)ir_free_vram() +
+                      (uint64_t)ir_free_phycont();
+    s_ir_free.at_us = now;
+    s_ir_free.valid = 1U;
+    ++s_ir_free.samples;
+    return s_ir_free.bytes;
+}
+#else
 static uint64_t ir_free_bytes(void)
 {
     return (uint64_t)ir_free_ram() + (uint64_t)ir_free_vram();
 }
+#endif
 
 /* The control block's embedded lock: this = ctrl + 8, vtable at [this].
  * Returns the vtable only when it is the frozen Mutex class (the one whose
@@ -444,6 +531,9 @@ static int ir_evict_one(CPU *__restrict c, uint32_t image, uint32_t ctrl,
         return 0;
     }
     s_ir.in_evict = 0U;
+#if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+    s_ir_free.valid = 0U;                  /* the sheet's texture may be free now */
+#endif
     ++s_ir.st.evicted;
     s_ir.st.evicted_bytes += bytes;
     if (reason == IR_REASON_BUDGET)
@@ -614,6 +704,14 @@ void isaac_vita_image_retain_arm(void)
             (unsigned)s_ir.vt_mutex, ISAAC_VITA_IMAGE_RETAIN_BUILD_ID);
         return;
     }
+#if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+    memset(&s_ir_free, 0, sizeof s_ir_free);
+    isaac_vita_log(
+        "KAGE VITA IMAGE RETAIN HEADROOM: phycont=1 ram=%u vram=%u phycont_free=%u "
+        "headroom=%u",
+        (unsigned)ir_free_ram(), (unsigned)ir_free_vram(),
+        (unsigned)ir_free_phycont(), (unsigned)s_ir.headroom_bytes);
+#endif
     s_ir.armed = 1U;
     isaac_vita_log(
         "KAGE VITA IMAGE RETAIN ARM: armed=1 budget=%u headroom=%u records=%u "
@@ -677,6 +775,11 @@ void isaac_vita_image_retain_report(const char *why)
         (unsigned)s_ir.st.fault, (unsigned)s_ir.st.held_keep,
         (unsigned)s_ir.st.orphan, (unsigned)s_ir.st.deferred,
         (unsigned)ISAAC_IR_RECORDS, tag);
+#if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+    isaac_vita_log(
+        "KAGE VITA IMAGE RETAIN HEADROOM: samples=%u cached=%u why=%s",
+        (unsigned)s_ir_free.samples, (unsigned)s_ir_free.hits, tag);
+#endif
 }
 
 void isaac_vita_image_retain_window(isaac_ir_window *out)
@@ -692,6 +795,63 @@ void isaac_vita_image_retain_window(isaac_ir_window *out)
     out->vf_ram = s_ir.armed ? ir_free_ram() : 0U;
     out->vf_vram = s_ir.armed ? ir_free_vram() : 0U;
 }
+
+#if defined(ISAAC_VITA_IMAGE_RETAIN_GHOST)
+/* Load's strcmp key, hashed; bounded like any guest string read here. */
+static uint32_t ir_name_hash(uint32_t image)
+{
+    uint32_t name = ld32(image + ISAAC_IR_IMG_NAME);
+    uint32_t h = IRG_FNV1A_INIT;
+    uint32_t i;
+
+    for (i = 0U; i < 260U; ++i) {
+        uint8_t ch = (uint8_t)ld8(name + i);
+
+        if (ch == 0U)
+            break;
+        h = irg_fnv1a_step(h, ch);
+    }
+    return h;
+}
+
+void isaac_vita_image_retain_ghost_sample(void)
+{
+# if !defined(ISAAC_VITA_IMAGE_RETAIN_ORACLE)
+    SceKernelFreeMemorySizeInfo info;
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    /* The render thread's copy, refreshed after every swap. */
+    uint32_t ram = ir_free_ram();
+    uint32_t vram = ir_free_vram();
+    uint32_t phy = kage_vita_backend_vgl_mem(KAGE_VITA_VGL_SNAPSHOT_PHYCONT_FREE);
+#else
+    uint32_t ram = (uint32_t)vglMemFree(VGL_MEM_RAM);
+    uint32_t vram = (uint32_t)vglMemFree(VGL_MEM_VRAM);
+    /* vitaGL's ordinal after RAM is PHYCONT in the pinned header (see
+     * host_vita_debug_overlay.c). */
+    uint32_t phy = (uint32_t)vglMemFree((vglMemType)(VGL_MEM_RAM + 1));
+#endif
+    uint64_t t1;
+
+    memset(&info, 0, sizeof info);
+    info.size = sizeof info;
+    if (sceKernelGetFreeMemorySize(&info) < 0)
+        info.size_user = 0;
+    t1 = sceKernelGetProcessTimeWide();
+    irg_mem_note(&s_irg.mem, ram, vram, phy, (uint32_t)info.size_user,
+                 t1 > t0 ? (uint32_t)(t1 - t0) : 0U);
+# endif
+}
+
+void isaac_vita_image_retain_ghost_take(isaac_irg_stats *st, isaac_irg_mem *mem)
+{
+    if (st)
+        *st = s_irg.st;
+    if (mem)
+        *mem = s_irg.mem;
+    memset(&s_irg.mem, 0, sizeof s_irg.mem);
+}
+#endif
 
 /* --------------------------------------------------------------- wrapper --- */
 
@@ -849,6 +1009,10 @@ static void ir_wrap(CPU *__restrict c, void (*real)(CPU *__restrict))
     if (vtable == 0U || s_ir.budget_bytes == 0U) {
         /* Unknown lock shape, or the stage-2a measurement / kill switch
          * (budget 0): count the candidate, behave exactly like OFF. */
+#if defined(ISAAC_VITA_IMAGE_RETAIN_GHOST)
+        irg_offer(&s_irg, ir_name_hash(image), bytes);
+        isaac_vita_image_retain_ghost_sample();
+#endif
         ++s_ir.st.passthrough;
         real(c);
         return;

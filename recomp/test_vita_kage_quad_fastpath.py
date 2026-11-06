@@ -25,9 +25,11 @@
    handled shapes incl. the unbatched select paths, ring/dirty growth and
    fresh ring records, 160 LCG-generated numeric cases incl. NaN/inf/-0/huge
    coordinates and every format layout, every decline reason, null-pointer
-   probes, post-select fault probes).  Two flavours: the production build
-   and the OBSERVE build, which must count exactly the same verdicts while
-   the translated body runs.
+   probes, post-select fault probes).  Flavours: the production build, the
+   OBSERVE build, which must count exactly the same verdicts while the
+   translated body runs, and the ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE build
+   against the real batch lookup (sub_005603f0 + sub_00567620) with and
+   without the vanilla/KAGE seams.
 5. Build gate: the CMake options are default OFF; the fast path requires
    ISAAC_VITA_TRANSLATED_CPU and ISAAC_VITA_FLOOR_THUNK_FASTPATH, OBSERVE
    requires the fast path; single owner lists for every definition.
@@ -73,6 +75,21 @@ MARKER = "Authenticated Image::PushQuad host fast path"
 BODIES = ["sub_0055f990", "sub_0055ee80", "sub_00561e20", "sub_0055e590",
           "sub_005ec3b2", "sub_005607a0", "sub_00561ff0", "sub_0055ed30",
           "sub_00562030", "sub_00026fb0"]
+# ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE: the select's batch lookup (whose hit
+# path the replay answers), the id-vector compare it calls and the batch
+# constructor of its create path - linked once, as the real lookup of the
+# "select" oracle flavours.  {rva: (end_rva, body_sha256)} of the bodies the
+# replay depends on; the pair-vector growth it enters must keep `ret 8`.
+LOOKUP_BODIES = ["sub_005603f0", "sub_00567620", "sub_0055ecf0"]
+LOOKUP_PINS = {
+    0x005603F0: (0x00560793,
+                 "079d909bcd63172553e8fc4f525d112454482b4bb65f8943943c520afbbe63dd"),
+    0x00567620: (0x0056769A,
+                 "97aed03b56eb7a82c5a27de81d4dfc2c662fb900d2af552079ca9fba08afc9bf"),
+}
+PAIRS_GROW_RET = 0x0008DA47
+VANILLA_GUARD = ("#if defined(__vita__) && "
+                 "defined(ISAAC_VITA_VANILLA_KAGE_BUNDLE)")
 # .rdata words the body reads (RVA, expected float) plus the u32->f64 table.
 CONSTANTS = [
     (0x0076A18C, 0.0), (0x0076A480, 0.5), (0x0076A214, 0.01),
@@ -102,10 +119,36 @@ ORACLE_RESULT_OBSERVE = (
     "declined=32; culled=0; snapped=296; floors=1240; getters=458; "
     "unbatched=226; ring-growths=114; dirty-growths=34; faults=8; probes=20"
 )
+# The native select runs against the real batch lookup (no fault probes:
+# the real lookup cannot return a null or hollow batch), once per spelling
+# of the generated 005608ea/005604ae seams (ISAAC_VITA_VANILLA_KAGE_BUNDLE,
+# ON in the shipped configuration).  The lookup line counts the translated
+# lookups (reference + replay misses) and the replay's native hits.
+ORACLE_RESULT_SELECT = (
+    "Vita kage quad fast path oracle: PASS; cases=840; handled=808; "
+    "declined=32; culled=38; snapped=500; floors=2096; getters=674; "
+    "unbatched=438; ring-growths=532; dirty-growths=32; faults=0; probes=20"
+)
+ORACLE_LOOKUP_SELECT = (
+    "Vita kage quad real lookup: translated lookups=694; native hits=194; "
+    "length faults=12"
+)
+ORACLE_RESULT_SELECT_VANILLA = ORACLE_RESULT_SELECT.replace(
+    "ring-growths=532", "ring-growths=530")
+ORACLE_LOOKUP_SELECT_VANILLA = ORACLE_LOOKUP_SELECT
+SELECT_DEFINES = ["/DISAAC_VITA_KAGE_QUAD_SELECT_NATIVE=1",
+                  "/DORACLE_REAL_BATCH_LOOKUP=1"]
+# flavour: (oracle defines, result line, vanilla seams, real lookup line)
 ORACLE_FLAVOURS = {
-    "base": ([], ORACLE_RESULT),
+    "base": ([], ORACLE_RESULT, False, None),
     "observe": (["/DISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE=1"],
-                ORACLE_RESULT_OBSERVE),
+                ORACLE_RESULT_OBSERVE, False, None),
+    "select": (SELECT_DEFINES, ORACLE_RESULT_SELECT, False,
+               ORACLE_LOOKUP_SELECT),
+    "select-vanilla": (SELECT_DEFINES +
+                       ["/DISAAC_VITA_KAGE_QUAD_SELECT_VANILLA_SEAM=1"],
+                       ORACLE_RESULT_SELECT_VANILLA, True,
+                       ORACLE_LOOKUP_SELECT_VANILLA),
 }
 
 COMMON = [
@@ -216,6 +259,13 @@ def verify_frozen_inputs(pe_path: Path, gen_all) -> bytes:
         else:
             require(tail[-3:] == b"\xc2\x04\x00",
                     f"tail callee {callee:#x} does not end in ret 4")
+    for callee, (end, sha) in LOOKUP_PINS.items():
+        body = read(callee, end - callee)
+        require(hashlib.sha256(body).hexdigest() == sha and
+                body[-3:] == b"\xc2\x04\x00",
+                f"select-native callee body changed at {callee:#x}")
+    require(read(PAIRS_GROW_RET, 3) == b"\xc2\x08\x00",
+            "pair-vector growth no longer returns with ret 8")
     table = read(TABLE_RVA, TABLE_BYTES)
     require(hashlib.sha256(table).hexdigest() ==
             gen_all.VITA_KAGE_QUAD_FASTPATH_SIZE_TABLE_SHA256,
@@ -274,7 +324,27 @@ def verify_frozen_inputs(pe_path: Path, gen_all) -> bytes:
                         ("C_BLEND_PREMULTIPLIED", BLEND_DESCRIPTORS[1][0]),
                         ("C_BLEND_TRANSLUCENT", BLEND_DESCRIPTORS[2][0]),
                         ("G_RESET_OFFSET_X", 0x00802FEC),
-                        ("G_RESET_OFFSET_Y", 0x00802FF0)):
+                        ("G_RESET_OFFSET_Y", 0x00802FF0),
+                        # SELECT_NATIVE: call/return words read from the PE
+                        # bytes (FF 50 38 / E8 rel32 / FF D0 at site).
+                        ("LOOKUP_RVA", 0x005603F0),
+                        ("PAIRS_GROW_RVA", 0x0008D900),
+                        ("RET_SET_BLEND", 0x005608A8),
+                        ("RET_LOOKUP_TRANSLUCENT", 0x005608B7),
+                        ("RET_LOOKUP_CUSTOM", 0x005608D4),
+                        ("RET_LOOKUP_DEFAULT", 0x00560954),
+                        ("RET_PAIRS_GROW", 0x00560949),
+                        ("RET_SELECT_WIDTH", 0x0056096C),
+                        ("RET_SELECT_HEIGHT", 0x00560999),
+                        ("G_BATCH_GROUP", 0x007C7A44),
+                        ("G_GROUP_0", 0x007C7A70),
+                        ("G_GROUP_1", 0x007C7A9C),
+                        ("G_GROUP_2", 0x007C7AC8),
+                        ("G_PAIRS", 0x007E7D28),
+                        ("G_PAIRS_END", 0x007E7D2C),
+                        ("G_PAIRS_CAP", 0x007E7D30),
+                        ("G_PREV_BATCH", 0x007E7D34),
+                        ("G_PREV_IMAGE", 0x007E7D38)):
         require(f"#define ISAAC_VITA_KAGE_QUAD_{name} " in header and
                 re.search(rf"ISAAC_VITA_KAGE_QUAD_{name}\s+0x{value:08X}u",
                           header) is not None,
@@ -376,7 +446,7 @@ BODY_RE = re.compile(
 
 
 def extract_bodies(generated_dir: Path) -> tuple[Path, dict[str, str]]:
-    owners: dict[str, list[Path]] = {name: [] for name in BODIES}
+    owners: dict[str, list[Path]] = {name: [] for name in BODIES + LOOKUP_BODIES}
     bodies: dict[str, str] = {}
     marker_units: list[Path] = []
     for unit in sorted(generated_dir.glob("guest_[0-9][0-9][0-9][0-9].c")):
@@ -401,8 +471,13 @@ def extract_bodies(generated_dir: Path) -> tuple[Path, dict[str, str]]:
     require(text.count(HELPER + "(") == 2, f"{HELPER}: spelled twice")
     require(text.count(GUARD) == 2, f"guard lines in owner: {text.count(GUARD)}")
     check_body_shape(bodies["sub_0055f990"], 0x98000000)
-    for name in BODIES[1:]:
+    for name in BODIES[1:] + LOOKUP_BODIES:
         require(GUARD not in bodies[name], f"{name}: unexpected seam")
+    # The two vanilla/KAGE seams the native select mirrors (005608ea) or
+    # leaves to the translated lookup (005604ae).
+    for name in ("sub_005607a0", "sub_005603f0"):
+        require(bodies[name].count(VANILLA_GUARD) == 1,
+                f"{name}: vanilla/KAGE seam missing or duplicated")
     # The frozen thunk shape: one guest_call on the IAT slot word (no floor
     # seam in this corpus; with GUEST_FLOOR_THUNK_FASTPATH=1 the seam adds the
     # direct helper, whose receipts the replay reproduces either way).
@@ -414,8 +489,48 @@ def extract_bodies(generated_dir: Path) -> tuple[Path, dict[str, str]]:
 
 # ---- 4. oracle -----------------------------------------------------------------
 
+def vanilla_text(body: str) -> str:
+    """The vanilla/KAGE seam guard as an oracle switch (the bodies are not
+    built with __vita__)."""
+    return body.replace(VANILLA_GUARD,
+                        "#if defined(ORACLE_VANILLA_KAGE_BUNDLE)")
+
+
+def vanilla_defines(vanilla: bool) -> list[str]:
+    return ["/DORACLE_VANILLA_KAGE_BUNDLE=1"] if vanilla else []
+
+
+def build_lookup_bodies(env, compiler: str, work: Path,
+                        bodies: dict[str, str], vanilla: bool) -> list[str]:
+    """The real batch lookup (as real_sub_005603f0), its id compare and the
+    batch constructor, once (GPR locals): every variant calls them."""
+    source = ["/* Generated by test_vita_kage_quad_fastpath.py from the",
+              " * frozen corpus units; the only edit is the seam guard. */",
+              '#include "guest.h"',
+              "/* Stand-ins of the oracle (the lookup's miss-path callees). */"]
+    for name in ("sub_0031ed10", "sub_005eacf8", "sub_005eb09c",
+                 "sub_002798a0", "sub_005ec358", "sub_0059a5e0",
+                 "sub_005ec14c", "sub_000be2b0"):
+        source.append(f"void {name}(CPU *__restrict c);")
+    for name in LOOKUP_BODIES:
+        source.append(f"void {name}(CPU *__restrict c);")
+    source.append("")
+    for name in LOOKUP_BODIES:
+        source.append(vanilla_text(bodies[name]))
+    tag = "vanilla" if vanilla else "plain"
+    lookup_c = work / f"kage_quad_lookup_{tag}.c"
+    lookup_c.write_text("\n".join(source), encoding="utf-8", newline="\n")
+    obj = work / f"kage_quad_lookup_{tag}.obj"
+    run([compiler, "/nologo", "/W3", "/O2", "/std:c11", "/wd4310", "/wd4996",
+         "/DGUEST_IMAGE_BASE=0x98000000u", "/DGUEST_GPR_LOCAL=1",
+         "/Dsub_005603f0=real_sub_005603f0"] + BODY_DEFINES +
+        vanilla_defines(vanilla) +
+        ["/I", str(RUNTIME), "/c", str(lookup_c), "/Fo:" + str(obj)], env)
+    return [str(obj)]
+
+
 def build_bodies(env, compiler: str, work: Path,
-                 bodies: dict[str, str]) -> list[str]:
+                 bodies: dict[str, str], vanilla: bool = False) -> list[str]:
     """The four link-time variants of the ten translated bodies."""
     source = ["/* Generated by test_vita_kage_quad_fastpath.py from the",
               " * frozen corpus units; the only edit is the seam guard. */",
@@ -433,9 +548,10 @@ def build_bodies(env, compiler: str, work: Path,
         source.append(f"void {name}(CPU *__restrict c);")
     source.append("")
     for name in BODIES:
-        body = bodies[name]
+        body = vanilla_text(bodies[name])
         source.append(body.replace(GUARD, "#if defined(ORACLE_KAGE_QUAD_SEAM)"))
-    bodies_c = work / "kage_quad_bodies.c"
+    tag_suffix = "_vanilla" if vanilla else ""
+    bodies_c = work / f"kage_quad_bodies{tag_suffix}.c"
     bodies_c.write_text("\n".join(source), encoding="utf-8", newline="\n")
 
     def renames(prefix: str) -> list[str]:
@@ -450,11 +566,11 @@ def build_bodies(env, compiler: str, work: Path,
     }
     objects = []
     for tag, extra in variants.items():
-        obj = work / f"kage_quad_bodies_{tag}.obj"
+        obj = work / f"kage_quad_bodies_{tag}{tag_suffix}.obj"
         run([compiler, "/nologo", "/W3", "/O2", "/std:c11", "/wd4310",
              "/wd4996", "/DGUEST_IMAGE_BASE=0x98000000u"] + BODY_DEFINES +
-            extra + ["/I", str(RUNTIME), "/c", str(bodies_c),
-                     "/Fo:" + str(obj)], env)
+            vanilla_defines(vanilla) + extra +
+            ["/I", str(RUNTIME), "/c", str(bodies_c), "/Fo:" + str(obj)], env)
         objects.append(str(obj))
     return objects
 
@@ -479,19 +595,29 @@ def build_and_run_oracle(env, compiler: str, work: Path, objects: list[str],
 
 def run_oracle_flavours(env, compiler: str, work: Path,
                         bodies: dict[str, str], blob: bytes) -> list[str]:
-    objects = build_bodies(env, compiler, work, bodies)
+    objects = {vanilla: build_bodies(env, compiler, work, bodies, vanilla)
+               for vanilla in (False, True)}
     results = []
-    for flavour, (extra_defines, expected) in ORACLE_FLAVOURS.items():
-        out = build_and_run_oracle(env, compiler, work, objects, blob,
+    for flavour, (extra_defines, expected, vanilla, lookup_expected) in \
+            ORACLE_FLAVOURS.items():
+        linked = list(objects[vanilla])
+        if lookup_expected is not None:
+            linked += build_lookup_bodies(env, compiler, work, bodies,
+                                          vanilla)
+        out = build_and_run_oracle(env, compiler, work, linked, blob,
                                    flavour, extra_defines)
         lines = out.strip().splitlines()
         result = lines[-1] if lines else ""
+        lookup = lines[-2] if len(lines) > 1 else ""
         failures = [line for line in lines if line.startswith("FAIL")]
-        if failures or result != expected:
+        if failures or result != expected or (
+                lookup_expected is not None and lookup != lookup_expected):
             print(out[-8000:])
             raise AssertionError(
-                f"oracle result changed ({flavour}): {result!r}")
+                f"oracle result changed ({flavour}): {result!r} {lookup!r}")
         results.append(f"[{flavour}] {result}")
+        if lookup_expected is not None:
+            results.append(f"[{flavour}] {lookup}")
     return results
 
 
@@ -499,8 +625,22 @@ def run_oracle_flavours(env, compiler: str, work: Path,
 
 def verify_build_gate() -> None:
     cmake = VITA_CMAKE.read_text(encoding="utf-8")
+    require("ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE requires "
+            "ISAAC_VITA_KAGE_QUAD_FASTPATH\")" in cmake and
+            "ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE replays the select; "
+            "ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE never replays" in cmake,
+            "native select prerequisite gates missing")
+    require(cmake.count("ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE=1") == 1 and
+            cmake.count("ISAAC_VITA_KAGE_QUAD_SELECT_VANILLA_SEAM=1") == 1 and
+            re.search(
+                r"if\(ISAAC_VITA_VANILLA_KAGE_BUNDLE\)\s*set_property\(SOURCE\s+"
+                r"\"\$\{ISAAC_RUNTIME\}/host_vita_kage_quad_fastpath\.c\"\s+"
+                r"APPEND PROPERTY COMPILE_DEFINITIONS\s+"
+                r"ISAAC_VITA_KAGE_QUAD_SELECT_VANILLA_SEAM=1\)", cmake)
+            is not None, "native select owner list drifted")
     for option in ("ISAAC_VITA_KAGE_QUAD_FASTPATH",
-                   "ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE"):
+                   "ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE",
+                   "ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE"):
         require(re.search(
             r"option\(" + option + r"\s+\"[^\"]+\"\s+OFF\)", cmake) is not None,
             f"{option} is not default OFF")
@@ -682,7 +822,7 @@ def main() -> int:
     for result in results:
         print(result)
     print("Vita kage quad fast path: PASS; roots=1; owner-unit seams=1; "
-          f"oracle flavours={len(results)}")
+          f"oracle flavours={len(ORACLE_FLAVOURS)}")
     return 0
 
 

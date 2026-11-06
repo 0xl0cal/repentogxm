@@ -14,6 +14,9 @@
 
 #include "gl_bridge.h"
 #include "gl_vita_backend.h"
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+#include "gl_record_backend.h"
+#endif
 #include "guest_coverage_generated.h"
 #include "kage_vita_backend.h"
 #include "manual_kage_vita_vsync.h"
@@ -89,6 +92,24 @@ int guest_kage_pc_handoff_ready(void)
     return kage_vita_backend_ready();
 }
 
+#if defined(ISAAC_VITA_INTRO_PLAY) && ISAAC_VITA_INTRO_PLAY
+/* ISAAC_VITA_INTRO_PLAY (issue #14): never force ACTION_MENUCONFIRM into the
+ * Intro.  The seam's other conditions stay in the generated text; returning
+ * zero leaves the result of the game's own IsActionTriggered call untouched.
+ * The first call is the first cutscene update after boot, i.e. the Intro. */
+int guest_kage_intro_skip_ready(void)
+{
+    static int s_intro_receipt;
+    const int autoskip = 0;
+    if (!s_intro_receipt) {
+        s_intro_receipt = 1;
+        isaac_vita_log("KAGE VITA INTRO: autoskip=%d backend_ready=%d",
+                       autoskip, kage_vita_backend_ready());
+    }
+    return autoskip;
+}
+#endif
+
 int guest_kage_vsync_policy_allows(uint32_t refresh_hz)
 {
     uint32_t remainder;
@@ -128,19 +149,68 @@ static uint32_t render_target_extent(uint32_t requested)
     return extent;
 }
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+/* Native render-target calls run on the GL render thread, one S closure each
+ * (load-time only), in the original order.  The renderbuffer registry and
+ * guest faults stay on this (producer) thread. */
+enum { MK_BIND_FB, MK_DELETE_FB, MK_DELETE_RB, MK_GEN_FB, MK_GEN_RB,
+       MK_BIND_RB, MK_STORAGE, MK_ATTACH_RB };
+typedef struct MkGl { int op; GLuint name; GLuint *out; GLsizei w, h; } MkGl;
+static void mk_gl_closure(void *context)
+{
+    MkGl *g = (MkGl *)context;
+    switch (g->op) {
+    case MK_BIND_FB: glBindFramebuffer((GLenum)KAGE_GL_FRAMEBUFFER, g->name); break;
+    case MK_DELETE_FB: glDeleteFramebuffers(1, &g->name); break;
+    case MK_DELETE_RB: glDeleteRenderbuffers(1, &g->name); break;
+    case MK_GEN_FB: glGenFramebuffers(1, g->out); break;
+    case MK_GEN_RB: glGenRenderbuffers(1, g->out); break;
+    case MK_BIND_RB: glBindRenderbuffer((GLenum)KAGE_GL_RENDERBUFFER, g->name); break;
+    case MK_STORAGE:
+        glRenderbufferStorage((GLenum)KAGE_GL_RENDERBUFFER,
+            (GLenum)KAGE_GL_DEPTH_COMPONENT24, g->w, g->h);
+        break;
+    case MK_ATTACH_RB:
+        glFramebufferRenderbuffer((GLenum)KAGE_GL_FRAMEBUFFER,
+            (GLenum)KAGE_GL_DEPTH_ATTACHMENT, (GLenum)KAGE_GL_RENDERBUFFER, g->name);
+        break;
+    }
+}
+static void mk_gl(int op, GLuint name, GLuint *out, GLsizei w, GLsizei h)
+{
+    MkGl g;
+    g.op = op; g.name = name; g.out = out; g.w = w; g.h = h;
+    isaac_gl_record_worker_call(mk_gl_closure, &g);
+}
+#endif
 static void destroy_render_targets(uint32_t manager)
 {
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    isaac_gl_record_external_begin();
+#endif
     GLuint framebuffer = (GLuint)ld32(manager + KAGE_FRAMEBUFFER_OFFSET);
     GLuint renderbuffer = (GLuint)ld32(manager + KAGE_RENDERBUFFER_OFFSET);
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    mk_gl(MK_BIND_FB, 0u, NULL, 0, 0);
+#else
     glBindFramebuffer((GLenum)KAGE_GL_FRAMEBUFFER, 0u);
+#endif
 #if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
     gl_vita_backend_first_frame_set_manager_framebuffer(0u);
 #endif
     if (framebuffer)
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+        mk_gl(MK_DELETE_FB, framebuffer, NULL, 0, 0);
+#else
         glDeleteFramebuffers(1, &framebuffer);
+#endif
     if (renderbuffer) {
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+        mk_gl(MK_DELETE_RB, renderbuffer, NULL, 0, 0);
+#else
         glDeleteRenderbuffers(1, &renderbuffer);
+#endif
         gl_vita_backend_unregister_renderbuffer((uint32_t)renderbuffer);
     }
     st32(manager + KAGE_FRAMEBUFFER_OFFSET, 0u);
@@ -157,16 +227,28 @@ static int initialize_render_targets(CPU *__restrict c, uint32_t rva,
     uint32_t render_height = render_target_extent(height);
 
     destroy_render_targets(manager);
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    mk_gl(MK_GEN_FB, 0u, &framebuffer, 0, 0);
+#else
     glGenFramebuffers(1, &framebuffer);
+#endif
     if (!framebuffer) {
         guest_fault(c, rva,
                     "KAGE Vita backend: glGenFramebuffers returned zero");
         return 0;
     }
     st32(manager + KAGE_FRAMEBUFFER_OFFSET, (uint32_t)framebuffer);
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    mk_gl(MK_BIND_FB, framebuffer, NULL, 0, 0);
+#else
     glBindFramebuffer((GLenum)KAGE_GL_FRAMEBUFFER, framebuffer);
+#endif
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    mk_gl(MK_GEN_RB, 0u, &renderbuffer, 0, 0);
+#else
     glGenRenderbuffers(1, &renderbuffer);
+#endif
     if (!renderbuffer) {
         destroy_render_targets(manager);
         guest_fault(c, rva,
@@ -174,12 +256,17 @@ static int initialize_render_targets(CPU *__restrict c, uint32_t rva,
         return 0;
     }
     st32(manager + KAGE_RENDERBUFFER_OFFSET, (uint32_t)renderbuffer);
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    mk_gl(MK_BIND_RB, renderbuffer, NULL, 0, 0);
+    mk_gl(MK_STORAGE, 0u, NULL, (GLsizei)render_width, (GLsizei)render_height);
+#else
     glBindRenderbuffer((GLenum)KAGE_GL_RENDERBUFFER, renderbuffer);
     glRenderbufferStorage(
         (GLenum)KAGE_GL_RENDERBUFFER,
         (GLenum)KAGE_GL_DEPTH_COMPONENT24,
         (GLsizei)render_width,
         (GLsizei)render_height);
+#endif
     if (!gl_vita_backend_register_renderbuffer(
             (uint32_t)renderbuffer, KAGE_GL_DEPTH_COMPONENT24,
             (int32_t)render_width, (int32_t)render_height)) {
@@ -187,12 +274,17 @@ static int initialize_render_targets(CPU *__restrict c, uint32_t rva,
         guest_fault(c, rva, gl_vita_backend_last_error());
         return 0;
     }
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    mk_gl(MK_ATTACH_RB, renderbuffer, NULL, 0, 0);
+    mk_gl(MK_BIND_FB, 0u, NULL, 0, 0);
+#else
     glFramebufferRenderbuffer(
         (GLenum)KAGE_GL_FRAMEBUFFER,
         (GLenum)KAGE_GL_DEPTH_ATTACHMENT,
         (GLenum)KAGE_GL_RENDERBUFFER,
         renderbuffer);
     glBindFramebuffer((GLenum)KAGE_GL_FRAMEBUFFER, 0u);
+#endif
 #if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
     gl_vita_backend_first_frame_set_manager_framebuffer(
         (uint32_t)framebuffer);

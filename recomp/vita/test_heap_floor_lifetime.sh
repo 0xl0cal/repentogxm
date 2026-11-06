@@ -89,9 +89,10 @@ constants = {
     "ISAAC_VITA_GUEST_HEAP_LEDGER_USABLE_BYTES": "0x00490000U",
     "ISAAC_VITA_GUEST_HEAP_LEDGER_REQUEST_BYTES": "0x00491000U",
     "ISAAC_VITA_GUEST_HEAP_LEDGER_RETAINED_BYTES": "0x00492000U",
-    "ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES": "0x00c66000U",
-    "ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES": "0x00c68000U",
 }
+# The combined ledger+pool budgets derive from the pool-size knob
+# (ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES) as multi-line expressions; they
+# are pinned by the compiled contract after this block.
 for name, value in constants.items():
     match = re.search(r"(?m)^#define\s+%s\s+(\S+)\s*$" %
                       re.escape(name), header)
@@ -197,6 +198,42 @@ if len(worst.encode("ascii")) != 356 or len(worst.encode("ascii")) >= 384:
     raise SystemExit("floorlife logger bound drifted: %d" % len(worst))
 print("floor-lifetime source/format gate: PASS")
 PY
+
+# Combined USER_RW budget: derived from the pool-size knob and pinned at the
+# default and at the 24 MiB-class value (the textual regex above cannot read
+# a multi-line macro).
+cat > "$work/total-budget-contract.c" <<'EOF'
+#include "host_vita_heap.h"
+_Static_assert(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES ==
+                   ISAAC_VITA_GUEST_HEAP_LEDGER_REQUEST_BYTES +
+                       ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES &&
+               ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES ==
+                   ISAAC_VITA_GUEST_HEAP_LEDGER_RETAINED_BYTES +
+                       ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES,
+               "combined USER_RW budget no longer derives from the pool size");
+#if ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x007d5000U
+_Static_assert(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES == 0x00c66000U &&
+               ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES == 0x00c68000U,
+               "default combined USER_RW receipt drifted");
+#elif ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x017fd000U
+_Static_assert(ISAAC_VITA_GUEST_HEAP_TOTAL_REQUEST_BYTES == 0x01c8e000U &&
+               ISAAC_VITA_GUEST_HEAP_TOTAL_RETAINED_BYTES == 0x01c90000U,
+               "24 MiB-class combined USER_RW receipt drifted");
+#else
+#error "combined USER_RW budget: overflow pool size has no pinned receipt"
+#endif
+int main(void) { return 0; }
+EOF
+for compiler in "$host_gcc" "$host_clang"; do
+    "$compiler" -std=gnu11 -O2 -Wall -Wextra -Werror \
+        -DISAAC_VITA_HEAP_OVERFLOW_MSPACE=1 -I"$root/runtime" \
+        "$work/total-budget-contract.c" -o "$work/total-budget-contract"
+    "$compiler" -std=gnu11 -O2 -Wall -Wextra -Werror \
+        -DISAAC_VITA_HEAP_OVERFLOW_MSPACE=1 \
+        -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U \
+        -I"$root/runtime" \
+        "$work/total-budget-contract.c" -o "$work/total-budget-contract-24m"
+done
 
 export ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:allocator_may_return_null=1'
 export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'

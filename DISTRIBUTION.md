@@ -21,10 +21,16 @@ licence (GPL-2.0-or-later, see LICENSE) is in place. Set it back to
 
 `.gitignore` already excludes these; do not force-add them:
 
-- the PC executable, resources, saves, keys and Workshop content; the five
-  LiveArea images under `recomp/vita/assets/sce_sys/` are the only tracked
-  artwork;
-- translated game code (`guest_####.c`) and other generated sources;
+- the PC executable, resources, saves, keys and Workshop content; the nine
+  LiveArea images under `recomp/vita/assets/sce_sys/` (two from the
+  Isaac/Nicalis Vita package lineage, seven from the community LiveArea of
+  GitHub issue #9, all showing game artwork; see THIRD_PARTY.md) are the only
+  tracked artwork, and the DejaVu-derived Manager font atlases
+  `recomp/vita/assets/manager/*.imf` are the only tracked generated binaries;
+- translated game code (`guest_####.c`) and other generated sources,
+  including the Lua binding replay headers
+  (`host_vita_lua_binding_mirror.h`, `host_vita_lua_binding_table.h`), which
+  configure writes into the build directory from your PE and corpus;
 - build outputs: ELF, VELF, SELF, `eboot.bin`, VPK, SFO, static archives;
 - Sony SUPRX/SPRX/SKPRX modules, firmware, SDK binaries, console keys;
 - logs, dumps, screenshots and other local diagnostics.

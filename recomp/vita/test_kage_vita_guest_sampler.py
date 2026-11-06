@@ -27,6 +27,7 @@ oracles).
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -45,16 +46,41 @@ def compiler() -> str:
 
 
 def function_body(source: str, signature: str) -> str:
+    """The body text from the opening brace to its matching close.  Braces in
+    an #else/#elif arm are not counted (only the first arm of a conditional
+    is, as if every #if were true): vita_lua_call_guest closes the same block
+    in both arms of ISAAC_VITA_LUA_SCOPE_FASTPATH."""
     start = source.index(signature)
     opening = source.index("{", start)
     depth = 0
-    for index in range(opening, len(source)):
-        if source[index] == "{":
-            depth += 1
-        elif source[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return source[opening:index + 1]
+    skipping: list[bool] = []   # per open conditional: inside a later arm?
+    offset = source.rfind("\n", 0, opening) + 1
+    first = True
+    for line in source[offset:].splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            words = stripped[1:].split(None, 1)
+            word = words[0] if words else ""
+            if word in ("if", "ifdef", "ifndef"):
+                skipping.append(False)
+            elif word in ("else", "elif") and skipping:
+                skipping[-1] = True
+            elif word == "endif" and skipping:
+                skipping.pop()
+            offset += len(line)
+            first = False
+            continue
+        begin = opening - offset if first else 0
+        first = False
+        if not any(skipping):
+            for index in range(begin, len(line)):
+                if line[index] == "{":
+                    depth += 1
+                elif line[index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return source[opening:offset + index + 1]
+        offset += len(line)
     raise AssertionError(f"unterminated function: {signature}")
 
 
@@ -204,10 +230,37 @@ def verify_source_contract(root: Path) -> None:
     if header.index("KAGE_VITA_GUEST_SAMPLER_OTH,") > header.index(
             "KAGE_VITA_GUEST_SAMPLER_PACE,"):
         raise AssertionError("PACE must follow OTH so older bucket indices hold")
+    # Stop protocol (entry tail before guest_stack_free): the sample publishes
+    # busy before it loads the CPU, the stop nulls the CPU before it spins on
+    # busy, both SEQ_CST, so one side always sees the other.
+    sample_body = function_body(sampler, "static void kvgs_sample(")
+    busy_store = "__atomic_store_n(&s_busy, 1U, __ATOMIC_SEQ_CST);"
+    cpu_load = "c = __atomic_load_n(&s_cpu, __ATOMIC_SEQ_CST);"
+    if sample_body.count(busy_store) != 1 or sample_body.count(cpu_load) != 1 or \
+            not sample_body.index(busy_store) < sample_body.index(cpu_load):
+        raise AssertionError("kvgs_sample must publish busy before it loads the CPU")
+    stop = function_body(sampler, "void kage_vita_guest_sampler_stop(")
+    cpu_null = "__atomic_store_n(&s_cpu, (CPU *)0, __ATOMIC_SEQ_CST);"
+    busy_load = "__atomic_load_n(&s_busy, __ATOMIC_SEQ_CST)"
+    if stop.count(cpu_null) != 1 or busy_load not in stop or \
+            "KVGS_REPORT_SPIN" not in stop or \
+            not stop.index(cpu_null) < stop.index(busy_load):
+        raise AssertionError(
+            "kage_vita_guest_sampler_stop must null the CPU, then spin (bounded) on busy")
+    if "void kage_vita_guest_sampler_stop(void);" not in header:
+        raise AssertionError("sampler header does not export the stop")
 
     cmake = (root / "vita" / "CMakeLists.txt").read_text(encoding="utf-8")
-    block = re.search(
-        r"      if\(ISAAC_VITA_GUEST_SAMPLER\)\n(.*?)\n      endif\(\)", cmake, re.S)
+    # Several sources gain the macro in their own 6-space blocks; the owner
+    # block is the one that adds the sampler TU to the runtime sources.
+    block = None
+    for found in re.finditer(
+            r"      if\(ISAAC_VITA_GUEST_SAMPLER\)\n(.*?)\n      endif\(\)", cmake,
+            re.S):
+        if ('list(APPEND ISAAC_VITA_RUNTIME_SOURCES\n'
+                '          "${ISAAC_RUNTIME}/kage_vita_guest_sampler.c")') in found[1]:
+            block = found
+            break
     if block is None:
         raise AssertionError("ISAAC_VITA_GUEST_SAMPLER block not found in CMake")
     for owner in ("guest.c", "kage_vita_fullspeed_scheduler.c",
@@ -215,9 +268,15 @@ def verify_source_contract(root: Path) -> None:
                   "entry_vita.c", "host_vita_lua.c"):
         if f'"${{ISAAC_RUNTIME}}/{owner}"' not in block[1]:
             raise AssertionError(f"sampler macro does not reach {owner}")
-    census = re.search(
-        r"      if\(ISAAC_VITA_PROFILE_IMPORT_KINDS\)\n(.*?)\n      endif\(\)",
-        cmake, re.S)
+    # The owner block is the one that defines the census on guest.c (seam
+    # helpers mirror the macro in blocks of their own).
+    census = None
+    for found in re.finditer(
+            r"      if\(ISAAC_VITA_PROFILE_IMPORT_KINDS\)\n(.*?)\n      endif\(\)",
+            cmake, re.S):
+        if '"${ISAAC_RUNTIME}/guest.c"' in found[1]:
+            census = found
+            break
     if census is None:
         raise AssertionError("ISAAC_VITA_PROFILE_IMPORT_KINDS block not found")
     for owner in ("guest.c", "host_vita_import_id.c",
@@ -246,6 +305,201 @@ def verify_source_contract(root: Path) -> None:
     if ("if(ISAAC_VITA_PROFILE_FUNCTION_ENTRIES AND NOT "
             "ISAAC_VITA_PROFILE_IMPORT_KINDS)") not in cmake:
         raise AssertionError("FUNCTION_ENTRIES without the census is not rejected")
+    verify_residual_contract(root, cmake)
+
+
+def verify_residual_contract(root: Path, cmake: str) -> None:
+    """ISAAC_VITA_GUEST_SAMPLER_RESIDUAL and _PROFILE_FUNCTION_ENTRY_CENSUS
+    (sprite-chain residual measurement): both default OFF, refused without their parents,
+    the residual define reaches the sampler TU only, the census is
+    target-wide from a configure-time id header."""
+    for name in ("ISAAC_VITA_GUEST_SAMPLER_RESIDUAL",
+                 "ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS"):
+        if not re.search(r"option\(" + name + r'\n\s+"[^"]*"\s+OFF\)', cmake):
+            raise AssertionError(f"{name} is not a default-OFF option")
+    for fatal in (
+            "if(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL AND NOT "
+            "ISAAC_VITA_GUEST_SAMPLER_CHAIN)",
+            "if(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS AND NOT "
+            "ISAAC_VITA_GUEST_SAMPLER)",
+            "if(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS AND\n"
+            "   ISAAC_VITA_KAGE_REFCOUNT_SEAM_VERIFY)"):
+        if cmake.count(fatal) != 1:
+            raise AssertionError(f"missing FATAL gate: {fatal}")
+    if cmake.count("ISAAC_VITA_GUEST_SAMPLER_RESIDUAL=1") != 1:
+        raise AssertionError("residual define is not set exactly once")
+    residual = re.search(
+        r"        if\(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL\)\n(.*?)\n        endif\(\)",
+        cmake, re.S)
+    if residual is None or re.findall(r'"\$\{ISAAC_RUNTIME\}/([^"]+)"',
+                                      residual[1]) != ["kage_vita_guest_sampler.c",
+                                                       "host_vita_lua.c"]:
+        raise AssertionError(
+            "residual define must reach exactly the sampler TU and the Lua bridge")
+    census = re.search(
+        r"  if\(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS\)\n(.*?)\n  endif\(\)",
+        cmake, re.S)
+    if census is None:
+        raise AssertionError("entry census block not found")
+    for needle in ("vita_render_watch.py", "kage_vita_render_watch.h",
+                   '--coverage "${ISAAC_GENERATED_DIR}/guest_coverage.json"',
+                   "isaac-generated-overrides/entry-census",
+                   "target_include_directories(isaac_first_arm_fault PRIVATE",
+                   "ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS=1)",
+                   "CMAKE_CONFIGURE_DEPENDS", "message(FATAL_ERROR"):
+        if needle not in census[1]:
+            raise AssertionError(f"entry census block lacks {needle!r}")
+    if not re.search(r'CMAKE_CONFIGURE_DEPENDS[^)]*"\$\{ISAAC_GENERATED_DIR\}/guest_coverage\.json"',
+                     census[1]):
+        raise AssertionError("the census ids do not re-run when guest_coverage.json changes "
+                             "(CMAKE_CONFIGURE_DEPENDS)")
+    if cmake.count("ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS=1") != 1:
+        raise AssertionError("census define escaped its target-wide block")
+    guest_h = (root / "runtime" / "guest.h").read_text(encoding="utf-8")
+    if guest_h.count('# include "guest_entry_census.h"') != 1:
+        raise AssertionError("guest.h does not route the census hook")
+    census_h = (root / "runtime" / "guest_entry_census.h").read_text(
+        encoding="utf-8")
+    if "#error" in census_h:
+        raise AssertionError(
+            "guest_entry_census.h must not test source-scoped macros "
+            "(generated units never see ISAAC_VITA_GUEST_SAMPLER)")
+    verify_residual_publication(root)
+
+
+def verify_residual_publication(root: Path) -> None:
+    """The Lua bridge publishes the guest address of every live
+    VITA_LUA_CALLBACK_RETURN word right after pushing it and clears it when
+    the frame ends (frame pop, CPU abort; the allocator restores the enclosing
+    value), all under ISAAC_VITA_GUEST_SAMPLER_RESIDUAL; the sampler links a
+    boundary word only at a published address."""
+    lua = (root / "runtime" / "host_vita_lua.c").read_text(encoding="utf-8")
+    fence = "#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)"
+    hunks = re.findall(re.escape(fence) + r"\n(.*?)#endif", lua, re.S)
+    if lua.count(fence) != 6 or len(hunks) != 6:
+        raise AssertionError(f"Lua bridge residual hunks: {lua.count(fence)} (expected 6)")
+    for hunk in hunks:
+        if "g_kage_vita_guest_sampler_lua_" not in hunk and \
+                "KAGE_VITA_GUEST_SAMPLER_LUA_CFUNCTION_SLOTS" not in hunk:
+            raise AssertionError(f"unexpected Lua residual hunk: {hunk!r}")
+    publish = "g_kage_vita_guest_sampler_lua_cfunction[slot] = c->esp;"
+    call_guest = function_body(lua, "static int vita_lua_call_guest(")
+    if call_guest.count(publish) != 1 or not (
+            call_guest.index("gpush(c, VITA_LUA_CALLBACK_RETURN);") <
+            call_guest.index(publish) < call_guest.index("guest_call(c, target);")):
+        raise AssertionError("C-function boundary is not published between its push and guest_call")
+    pop = function_body(lua, "static void vita_lua_callback_frame_pop(")
+    if pop.count("g_kage_vita_guest_sampler_lua_cfunction[slot] = 0U;") != 1:
+        raise AssertionError("frame pop does not clear the published boundary")
+    abort = function_body(lua, "void isaac_vita_lua_abort_cpu(")
+    if abort.count("g_kage_vita_guest_sampler_lua_cfunction[i] = 0U;") != 1:
+        raise AssertionError("CPU abort does not clear the published boundaries")
+    # the definition, not the forward declaration (`new_size);`)
+    alloc = function_body(lua, "static void *vita_lua_guest_allocator(void *opaque, void *pointer,"
+                               "\n                                      size_t old_size, size_t new_size)\n{")
+    save = "g_kage_vita_guest_sampler_lua_allocator = c->esp;"
+    restore = "g_kage_vita_guest_sampler_lua_allocator = sampler_enclosing_allocator;"
+    if alloc.count(save) != 1 or alloc.count(restore) != 1 or not (
+            alloc.index("gpush(c, VITA_LUA_CALLBACK_RETURN);") < alloc.index(save) <
+            alloc.index("guest_call(c, allocator->target);") < alloc.index(restore) <
+            alloc.index("if (c->fault || c->esp != saved_esp - 16U)")):
+        raise AssertionError("allocator boundary is not published around its guest_call")
+    if lua.count("VITA_LUA_CALLBACK_RETURN);") != 2:
+        raise AssertionError("a third boundary push needs its own publication")
+    sampler = (root / "runtime" / "kage_vita_guest_sampler.c").read_text(encoding="utf-8")
+    chain = function_body(sampler, "static void kvgs_chain(")
+    if chain.count("kvgs_lua_live(address)") != 1 or "++buffer->lua_stale;" not in chain:
+        raise AssertionError("the chain walk does not test boundary liveness")
+    sample = function_body(sampler, "static void kvgs_sample(")
+    if sample.count("kvgs_lua_live(address)") != 1 or "lua_below = 1;" not in sample:
+        raise AssertionError("the innermost scan does not test boundary liveness")
+
+
+
+def coverage_fixture(directory: Path, vita: Path, stale: bool) -> None:
+    """A synthetic corpus id space for the census oracle: the watch list plus
+    the oracle's own functions and an unwatched id 0, the ids header generated
+    by vita_render_watch.py (as CMake does), and a guest_coverage_generated.h
+    whose sorted-RVA hash matches it or, stale, does not."""
+    sys.path.insert(0, str(vita))
+    try:
+        import vita_render_watch as watch
+    finally:
+        sys.path.pop(0)
+    rvas = set(watch.read_watch(vita.parent / "runtime" /
+                                "kage_vita_render_watch.h"))
+    rvas |= {0x00001000, 0x000023f0, 0x002dbe30, 0x002dbe40, 0x004b0010,
+             0x005a0de0, 0x00100000}
+    ordered = sorted(rvas)
+    digest = watch.rows_sha256(ordered)
+    coverage = {
+        "function_count": len(ordered),
+        "function_rvas_sha256": digest,
+        "generation_id": "gen:sampler-oracle",
+        "functions": [{"id": i, "rva": rva} for i, rva in enumerate(ordered)],
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "guest_coverage.json").write_text(
+        __import__("json").dumps(coverage), encoding="utf-8")
+    run([sys.executable, str(vita / "vita_render_watch.py"),
+         "--watch", str(vita.parent / "runtime" / "kage_vita_render_watch.h"),
+         "--coverage", str(directory / "guest_coverage.json"),
+         "--output", str(directory / "guest_entry_census_ids.h")])
+    corpus = "f" * 64 if stale else digest
+    (directory / "guest_coverage_generated.h").write_text(
+        "#ifndef GUEST_COVERAGE_GENERATED_H\n"
+        "#define GUEST_COVERAGE_GENERATED_H\n"
+        f"#define GUEST_COVERAGE_FUNCTION_COUNT {len(ordered)}U\n"
+        f'#define GUEST_COVERAGE_FUNCTION_RVAS_SHA256 "{corpus}"\n'
+        "#endif\n", encoding="utf-8", newline="\n")
+
+
+FROZEN_RECORDS = ("ph120.hotr", "ph120.hotu", "ph120.hotw", "ph120.hotl",
+                  "ph120.hcl")
+
+
+def record_items(lines, window: int) -> dict:
+    """(record, phase) -> the window's header lines plus list items (top=/w=/o=),
+    so a record split over several lines compares with the same record on one."""
+    out: dict = {}
+    for line in lines:
+        m = re.search(r"\] (ph120\.\w+) bid=sampler:oracle win=(\d+) ", line)
+        if not m or m.group(1) not in FROZEN_RECORDS or int(m.group(2)) != window:
+            continue
+        phase = re.search(r"\bphase=(\S+)", line)
+        items = out.setdefault((m.group(1), phase.group(1) if phase else ""), set())
+        listed = re.search(r" (?:top|w|o)=(\S*)$", line)
+        if listed:
+            items.add("header " + line[:listed.start()].split("] ", 1)[1])
+            items.update(filter(None, listed.group(1).split(",")))
+        else:
+            items.add("line " + line.split("] ", 1)[1])
+    return out
+
+
+def check_bench_frozen_lines(repo: Path, residual_stdout: str) -> None:
+    """tools/bench/bench_run_test.py feeds the analyzer frozen copies
+    of scenario 8 (window 10) and 8c (window 11).  Their hotr/hotu/hotw/hotl/hcl
+    records must be this oracle's, item for item, or the analyzer test runs on
+    stale lines (a watch-list change moved hcl watch= from 52 to 64).  The bench
+    test's ph120.fe lines are hand-made: the oracle's fe records are scenario 9's."""
+    spec = importlib.util.spec_from_file_location(
+        "bench_run_test_frozen", repo / "tools" / "bench" / "bench_run_test.py")
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    oracle = residual_stdout.splitlines()
+    for name, window in (("RESIDUAL_LINES", 10), ("RESIDUAL_STALE_LINES", 11)):
+        frozen = record_items(getattr(bench, name), window)
+        live = record_items(oracle, window)
+        if not frozen or frozen != live:
+            diff = {k: (sorted(frozen.get(k, set()) - live.get(k, set())),
+                        sorted(live.get(k, set()) - frozen.get(k, set())))
+                    for k in sorted(set(frozen) | set(live))
+                    if frozen.get(k) != live.get(k)}
+            raise AssertionError(
+                f"bench_run_test.py {name} is not the oracle's window {window} "
+                f"(frozen-only, oracle-only): {diff}")
+    print("bench_run_test.py frozen scenario 8/8c lines = oracle windows 10/11")
 
 
 def run(command: list[str]) -> str:
@@ -282,6 +536,115 @@ def main() -> int:
             "-o", str(exe),
         ])
         stdout = run([str(exe)])
+        # ISAAC_VITA_GUEST_SAMPLER_CHAIN: same scenarios (self/caller/hs
+        # records unchanged) plus scenario 6, the inclusive chain view.
+        chain_exe = Path(value) / ("sampler-chain.exe" if os.name == "nt"
+                                   else "sampler-chain")
+        run([
+            cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-DGUEST_IMAGE_BASE=0x98000000u",
+            "-DISAAC_KAGE_VITA_GUEST_SAMPLER_ORACLE=1",
+            "-DISAAC_VITA_GUEST_SAMPLER=1",
+            "-DISAAC_VITA_GUEST_SAMPLER_CHAIN=1",
+            "-DISAAC_VITA_FULLSPEED_SCHEDULER=1",
+            "-DISAAC_VITA_PROFILE_IMPORT_KINDS=1",
+            '-DISAAC_VITA_FULLSPEED_SCHEDULER_BUILD_ID="sampler:oracle"',
+            f"-I{runtime}", f"-I{vita}",
+            str(runtime / "kage_vita_guest_sampler.c"),
+            str(runtime / "kage_vita_fullspeed_scheduler.c"),
+            str(runtime / "kage_vita_guest_sampler_oracle.c"),
+            "-o", str(chain_exe),
+        ])
+        chain_stdout = run([str(chain_exe)])
+        # ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL (profile-only): swp samples
+        # are the native present, named "present" without a stack scan.
+        present_exe = Path(value) / ("sampler-present.exe" if os.name == "nt"
+                                     else "sampler-present")
+        run([
+            cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-DGUEST_IMAGE_BASE=0x98000000u",
+            "-DISAAC_KAGE_VITA_GUEST_SAMPLER_ORACLE=1",
+            "-DISAAC_VITA_GUEST_SAMPLER=1",
+            "-DISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL=1",
+            "-DISAAC_VITA_FULLSPEED_SCHEDULER=1",
+            "-DISAAC_VITA_PROFILE_IMPORT_KINDS=1",
+            '-DISAAC_VITA_FULLSPEED_SCHEDULER_BUILD_ID="sampler:oracle"',
+            f"-I{runtime}", f"-I{vita}",
+            str(runtime / "kage_vita_guest_sampler.c"),
+            str(runtime / "kage_vita_fullspeed_scheduler.c"),
+            str(runtime / "kage_vita_guest_sampler_oracle.c"),
+            "-o", str(present_exe),
+        ])
+        present_stdout = run([str(present_exe)])
+        # ISAAC_VITA_GUEST_SAMPLER_RESIDUAL + _PROFILE_FUNCTION_ENTRY_CENSUS
+        # (profile-only): scenarios 1-6 unchanged, 8 (residual records), 9
+        # (ph120.fe through guest.h's hook and a generated id header).  Then
+        # the census alone against a stale id space.
+        flavours = {}
+        for name, stale, defines in (
+                ("residual", False, ["-DISAAC_VITA_GUEST_SAMPLER_CHAIN=1",
+                                     "-DISAAC_VITA_GUEST_SAMPLER_RESIDUAL=1",
+                                     "-DISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS=1"]),
+                ("census-stale", True, ["-DISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS=1",
+                                        "-DORACLE_CENSUS_STALE=1"])):
+            fixture = Path(value) / f"{name}-ids"
+            coverage_fixture(fixture, vita, stale)
+            flavour_exe = Path(value) / (f"sampler-{name}.exe" if os.name == "nt"
+                                         else f"sampler-{name}")
+            run([
+                cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                "-DGUEST_IMAGE_BASE=0x98000000u",
+                "-DISAAC_KAGE_VITA_GUEST_SAMPLER_ORACLE=1",
+                "-DISAAC_VITA_GUEST_SAMPLER=1",
+                *defines,
+                "-DISAAC_VITA_FULLSPEED_SCHEDULER=1",
+                "-DISAAC_VITA_PROFILE_IMPORT_KINDS=1",
+                '-DISAAC_VITA_FULLSPEED_SCHEDULER_BUILD_ID="sampler:oracle"',
+                f"-I{runtime}", f"-I{vita}", f"-I{fixture}",
+                str(runtime / "kage_vita_guest_sampler.c"),
+                str(runtime / "kage_vita_fullspeed_scheduler.c"),
+                str(runtime / "kage_vita_guest_sampler_oracle.c"),
+                "-o", str(flavour_exe),
+            ])
+            flavours[name] = run([str(flavour_exe)])
+    residual_stdout = flavours["residual"]
+    for needle in ("scenario 6: chain view", "scenario 8: residual",
+                   "scenario 8b:", "scenario 8c: stale boundary words",
+                   "ph120.hotr bid=sampler:oracle win=11 loops=1320 phase=rnd "
+                   "samples=4 top=48bc50:2,800000:1,1c0eef0:1\n",
+                   "ph120.hcl bid=sampler:oracle win=11 lb=2 lbm=0 lbs=0 lbx=3 ",
+                   "scenario 9: entry census per phase",
+                   "Vita guest sampler host oracle: PASS"):
+        if needle not in residual_stdout:
+            raise AssertionError(f"residual oracle lacks {needle!r}:\n{residual_stdout}")
+    check_bench_frozen_lines(root.parent, residual_stdout)
+    for needle in ("scenario 9: stale id space prints ids=STALE only",
+                   "Vita guest sampler host oracle: PASS"):
+        if needle not in flavours["census-stale"]:
+            raise AssertionError(
+                f"stale census oracle lacks {needle!r}:\n{flavours['census-stale']}")
+    for record in ("ph120.hotw", "ph120.hotl", "ph120.hotu", "ph120.hcl",
+                   "ph120.fe"):
+        for flavour, text in (("default", stdout), ("chain", chain_stdout),
+                              ("present", present_stdout)):
+            if record in text:
+                raise AssertionError(f"{record} leaks into the {flavour} sampler")
+    if "ph120.hotw" in flavours["census-stale"]:
+        raise AssertionError("residual records leak into the census-only sampler")
+    for needle in ("phase=swp samples=3 top=present:3", "scenario 7: swp samples named present",
+                   "Vita guest sampler host oracle: PASS"):
+        if needle not in present_stdout:
+            raise AssertionError(f"present-label oracle lacks {needle!r}:\n{present_stdout}")
+    if "present:" in stdout or "present:" in chain_stdout:
+        raise AssertionError("present label leaks into the default sampler")
+    for needle in ("ph120.hci bid=sampler:oracle win=8 n=8 links=11 ind=1 "
+                   "thunk=2 skip=2 full=0 indrej=2 us=8,1",
+                   "scenario 6: chain view",
+                   "Vita guest sampler host oracle: PASS"):
+        if needle not in chain_stdout:
+            raise AssertionError(f"chain oracle lacks {needle!r}:\n{chain_stdout}")
+    if "ph120.hoti" in stdout or "ph120.hci" in stdout:
+        raise AssertionError("chain records leak into the default sampler")
     for needle in (
         "phase=rnd samples=3 top=5a0de0:3",
         "phase=rnd samples=7 top=ext:4,562e00:2,ind:1",
@@ -290,6 +653,9 @@ def main() -> int:
         "nomark=0 badesp=0 full=0 words=201 deep=1",
         "total=0 nomark=1 badesp=0 full=0 words=256 deep=0",
         "phase=pace samples=",
+        "win=7 loops=840 phase=rnd samples=1 top=4b0010:1",
+        "scenario 5: stop unbinds the CPU: one sample before it, no stack "
+        "read and no sample (not even badesp) after it, report still prints",
         "Vita guest sampler host oracle: PASS",
     ):
         if needle not in stdout:

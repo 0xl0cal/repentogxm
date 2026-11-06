@@ -15,6 +15,9 @@
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
 #include "host_vita_crt.h"
 #endif
+#if defined(ISAAC_VITA_LUA_LOADFILE_RETRY)
+#include "host_vita_lua_loadfile.h"
+#endif
 #if defined(ISAAC_VITA_IMAGE_RETAIN)
 #include "host_vita_image_retain.h"
 #endif
@@ -553,13 +556,36 @@ static void kage_loading_display_callback(void *framebuffer_pointer)
                            KAGE_LOADING_BORDER);
 }
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+#include "gl_record_backend.h"
+static void kage_loading_swap_closure(void *unused)
+{
+    (void)unused;
+    gl_vita_backend_attrib_sync();
+    vglSwapBuffers(GL_FALSE);
+}
+static void kage_loading_callback_on_closure(void *unused)
+{
+    (void)unused;
+    vglSetDisplayCallback(kage_loading_display_callback);
+}
+static void kage_loading_callback_off_closure(void *result)
+{
+    vglSetDisplayCallback(NULL);
+    *(int *)result = sceGxmDisplayQueueFinish();
+}
+#endif
 static void kage_loading_swap(uint32_t completed_calls)
 {
     (void)completed_calls;
     KAGE_VITA_STALL_TRACE_SYNC(
         KAGE_VITA_STALL_SYNC_LOADING_SWAP_ENTER, completed_calls);
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    isaac_gl_record_worker_call(kage_loading_swap_closure, NULL);
+#else
     gl_vita_backend_attrib_sync();
     vglSwapBuffers(GL_FALSE);
+#endif
     KAGE_VITA_STALL_TRACE_SYNC(
         KAGE_VITA_STALL_SYNC_LOADING_SWAP_RETURN, completed_calls);
 }
@@ -590,7 +616,11 @@ void kage_vita_loading_start(void)
         s_stage, s_animation_frame, 0u));
     kage_vita_io_profile_begin();
 #if ISAAC_KAGE_VITA_LOADING_PRESENTATION
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    isaac_gl_record_worker_call(kage_loading_callback_on_closure, NULL);
+#else
     vglSetDisplayCallback(kage_loading_display_callback);
+#endif
     kage_loading_swap(0u);
     s_loading_swaps = 1u;
 #endif
@@ -743,8 +773,12 @@ void kage_vita_loading_finish(void)
     kage_loading_snapshot_store(kage_loading_snapshot(
         KAGE_VITA_LOADING_GAME, s_animation_frame, elapsed_seconds));
 #if ISAAC_KAGE_VITA_LOADING_PRESENTATION
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    isaac_gl_record_worker_call(kage_loading_callback_off_closure, &queue_finish_result);
+#else
     vglSetDisplayCallback(NULL);
     queue_finish_result = sceGxmDisplayQueueFinish();
+#endif
 #endif
     kage_loading_snapshot_store(0u);
     kage_loading_control_unlock();
@@ -777,6 +811,9 @@ void kage_vita_loading_finish(void)
     kage_vita_io_profile_report("loading-complete");
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     isaac_vita_crt_seek_shadow_report("loading-complete");
+#endif
+#if defined(ISAAC_VITA_LUA_LOADFILE_RETRY)
+    isaac_vita_lua_loadfile_report("loading-complete");
 #endif
 #if defined(ISAAC_VITA_IMAGE_RETAIN)
     /* Arm sprite-sheet retention only once the loading thread is done, so boot

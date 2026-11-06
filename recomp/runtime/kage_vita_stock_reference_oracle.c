@@ -32,7 +32,7 @@ static unsigned s_wait_calls;
 static GLboolean s_last_wait = GL_TRUE;
 static unsigned s_loading_start_calls;
 static unsigned s_loading_finish_calls;
-static char s_logs[2048];
+static char s_logs[8192];
 static size_t s_log_length;
 
 #define CHECK(condition) do { \
@@ -108,6 +108,50 @@ uint8_t vglIsaacSetupFboValidRegion(uint8_t apply)
 #if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
 # define ORACLE_VALID_REGION_WORD \
     ((ISAAC_VITA_STOCK_FBO_VALID_REGION) == 2 ? "on" : "observe")
+#endif
+
+#if defined(ISAAC_VITA_VITAGL_SCENE_GUARD)
+/* 0034 hook stand-ins: the counters the consumer snapshots (non-destructive)
+ * and the change edge it compares; isaac_vita_log lands in the same log. */
+static uint32_t s_scene_guard_counters[8];
+static uint32_t s_scene_guard_events;
+static unsigned s_scene_guard_snapshot_calls;
+void vglIsaacSceneGuardSnapshot(uint32_t out[8])
+{
+    ++s_scene_guard_snapshot_calls;
+    memcpy(out, s_scene_guard_counters, sizeof s_scene_guard_counters);
+}
+
+static uint32_t s_scene_guard_recovery[4];
+static unsigned s_scene_guard_recovery_calls;
+void vglIsaacSceneGuardRecovery(uint32_t out[4])
+{
+    ++s_scene_guard_recovery_calls;
+    memcpy(out, s_scene_guard_recovery, sizeof s_scene_guard_recovery);
+}
+
+uint32_t vglIsaacSceneGuardChanged(void) { return s_scene_guard_events; }
+
+void isaac_vita_log(const char *format, ...)
+{
+    va_list arguments;
+    size_t available = sizeof s_logs - s_log_length;
+    int result;
+
+    va_start(arguments, format);
+    result = vsnprintf(s_logs + s_log_length, available, format, arguments);
+    va_end(arguments);
+    if (result > 0 && available != 0u) {
+        size_t written = (size_t)result;
+        if (written >= available)
+            written = available - 1u;
+        s_log_length += written;
+    }
+    if (s_log_length + 1u < sizeof s_logs) {
+        s_logs[s_log_length++] = '\n';
+        s_logs[s_log_length] = '\0';
+    }
+}
 #endif
 
 GLboolean vglInitExtended(
@@ -288,6 +332,54 @@ int main(void)
     CHECK(s_surface_status_calls == 0u);
     CHECK(s_loading_finish_calls == 1u);
     CHECK(strstr(s_logs, "first present complete") != NULL);
+#if defined(ISAAC_VITA_VITAGL_SCENE_GUARD)
+    /* Startup receipt once at the cold initialize; no counter receipt while
+     * the change edge stands still. */
+    CHECK(strstr(s_logs, "KAGE VITA SCENE GUARD: on\n") != NULL);
+    CHECK(s_scene_guard_snapshot_calls == 0u);
+    CHECK(strstr(s_logs, "KAGE VITA SCENE GUARD: rt_fail=") == NULL);
+    /* One failed FBO scene: rt and begin failures, three skipped clears, two
+     * skipped mask draws, one skipped scene_end, last error OUT_OF_MEMORY. */
+    s_scene_guard_counters[0] = 1u;
+    s_scene_guard_counters[1] = 1u;
+    s_scene_guard_counters[4] = 3u;
+    s_scene_guard_counters[5] = 2u;
+    s_scene_guard_counters[6] = 1u;
+    s_scene_guard_counters[7] = 0x805B0006u;
+    /* Recovery words in their own order: a scene still dangling, five retried
+     * ends, four recovered, the last EndScene error (synthetic value). */
+    s_scene_guard_recovery[0] = 1u;
+    s_scene_guard_recovery[1] = 5u;
+    s_scene_guard_recovery[2] = 4u;
+    s_scene_guard_recovery[3] = 0x805B0011u;
+    s_scene_guard_events = 8u;
+    CHECK(kage_vita_backend_present());
+    CHECK(s_scene_guard_snapshot_calls == 1u);
+    CHECK(s_scene_guard_recovery_calls == 1u);
+    CHECK(strstr(s_logs,
+        "KAGE VITA SCENE GUARD: rt_fail=1 begin_fail=1 end_fail=0 "
+        "reserve_fail=0 skipped(clear,draw)=3,2 last_err=0x805b0006 "
+        "skipped_end=1 dangling=1 end_retry=5 recovered=4 "
+        "end_err=0x805b0011 changes=1\n") != NULL);
+    /* Unchanged edge: no second receipt. */
+    CHECK(kage_vita_backend_present());
+    CHECK(s_scene_guard_snapshot_calls == 1u);
+    /* Bounded: changes 2..8 are logged, 9..255 are not, 256 is. */
+    {
+        unsigned change;
+
+        for (change = 2u; change <= 256u; ++change) {
+            s_scene_guard_events += 3u;
+            CHECK(kage_vita_backend_present());
+            CHECK(s_scene_guard_snapshot_calls ==
+                  (change <= 8u ? change : (change < 256u ? 8u : 9u)));
+        }
+    }
+    CHECK(strstr(s_logs, "end_err=0x805b0011 changes=8\n") != NULL);
+    CHECK(strstr(s_logs, "end_err=0x805b0011 changes=9\n") == NULL);
+    CHECK(strstr(s_logs, "end_err=0x805b0011 changes=256\n") != NULL);
+    CHECK(s_scene_guard_recovery_calls == s_scene_guard_snapshot_calls);
+#endif
 
     kage_vita_backend_deactivate();
     CHECK(!kage_vita_backend_ready());
@@ -325,6 +417,9 @@ int main(void)
 #endif
 #if defined(ISAAC_VITA_STOCK_FBO_VALID_REGION)
     printf("; fbo valid-region=%s", ORACLE_VALID_REGION_WORD);
+#endif
+#if defined(ISAAC_VITA_VITAGL_SCENE_GUARD)
+    printf("; scene guard=on");
 #endif
     puts(")");
     return 0;

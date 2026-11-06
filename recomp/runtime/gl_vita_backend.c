@@ -5,6 +5,14 @@
  * as untyped native proc addresses to translated x86 code. */
 #include "gl_vita_backend.h"
 #include "kage_vita_deep_profile.h"
+#if defined(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD) && ISAAC_VITA_VITAGL_RGB_SUBUPLOAD
+/* Private 0035 archive endpoint; snapshots report what actually executed. */
+void vglIsaacRgbSubuploadSnapshot(uint32_t out[6]);
+void isaac_vita_log(const char *format, ...);
+#endif
+#if defined(ISAAC_VITA_THEORA_CADENCE_PROFILE) && ISAAC_VITA_THEORA_CADENCE_PROFILE
+#include "host_vita_theora_upload_profile.h"
+#endif
 #if defined(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE) && \
     ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE && \
     !defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
@@ -19,6 +27,15 @@
 #endif
 
 #include "gl_bridge.h"
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+#include "gl_record_backend.h"
+/* The batch calls these wrappers directly; behind a recorder that would
+ * bypass the ring and reorder commands.  Sampler replay declines by itself
+ * (its predicate sees the recorder table) and keeps the translated path. */
+# if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+#  error "GL_THREAD_RECORD is incompatible with SHADER_ATTRIB_DIRECT_STATE"
+# endif
+#endif
 #include "kage_vita_canonical_quads.h"
 
 #if defined(ISAAC_VITA_COLOROFFSET_GPU_OPTIMIZATIONS)
@@ -35,10 +52,18 @@
 # include "gl_vita_first_frame_oracle_vitagl.h"
 #elif defined(ISAAC_GL_VITA_BACKEND_ORACLE)
 # include "gl_vita_backend_test_vitagl.h"
+# if defined(ISAAC_GL_RECORD_SCENARIO)
+#  include "gl_record_scenario_vitagl.h"
+# endif
 # if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE) || \
     defined(ISAAC_VITA_GL_TIME_PROFILE)
 uint64_t sceKernelGetProcessTimeWide(void);
 # endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+/* The readback finish bracket; a compatible redeclaration when another
+ * profile above already declared the clock. */
+uint64_t sceKernelGetProcessTimeWide(void);
+#endif
 #else
 # include <psp2/kernel/processmgr.h>
 # include <vitaGL.h>
@@ -48,6 +73,55 @@ uint64_t sceKernelGetProcessTimeWide(void);
 #include "kage_vita_backend.h"
 #include "kage_vita_loading.h"
 #include "kage_vita_world_seam_diag.h"
+
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+/* Only the registry wrappers stay on the producer. Their native boundary is
+ * queued; these captured endpoints bypass it on replay/Gen cleanup. */
+static void record_raw_rbo_bind(uint32_t target, uint32_t name)
+{ glBindRenderbuffer((GLenum)target, (GLuint)name); }
+static void record_raw_rbo_store(uint32_t target, uint32_t format, int32_t w, int32_t h)
+{ glRenderbufferStorage((GLenum)target, (GLenum)format, (GLsizei)w, (GLsizei)h); }
+static void record_raw_rbo_delete(int32_t count, uint32_t names)
+{ glDeleteRenderbuffers((GLsizei)count, (const GLuint *)(uintptr_t)names); }
+static void record_raw_rbo_gen(int32_t count, uint32_t names)
+{ glGenRenderbuffers((GLsizei)count, (GLuint *)(uintptr_t)names); }
+static void record_raw_attrib_pointer(uint32_t index, int32_t size, uint32_t type,
+    uint8_t normalized, int32_t stride, uint32_t pointer)
+{
+    glVertexAttribPointer((GLuint)index, (GLint)size, (GLenum)type,
+        (GLboolean)normalized, (GLsizei)stride, (const void *)(uintptr_t)pointer);
+}
+static void record_raw_draw(uint32_t mode, int32_t count, uint32_t type, uint32_t indices)
+{
+    glDrawElements((GLenum)mode, (GLsizei)count, (GLenum)type,
+        (const void *)(uintptr_t)indices);
+}
+#if defined(ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY)
+static int record_raw_canonical(int32_t count)
+{ return vglIsaacDrawCanonicalQuads((GLsizei)count) ? 1 : 0; }
+#endif
+static const IsaacGlRecordRboNative s_record_rbo_native = {
+    record_raw_rbo_bind, record_raw_rbo_store, record_raw_rbo_delete, record_raw_rbo_gen,
+    record_raw_attrib_pointer, record_raw_draw,
+#if defined(ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY)
+    record_raw_canonical
+#else
+    NULL
+#endif
+};
+#undef glDrawElements
+#undef vglIsaacDrawCanonicalQuads
+#define glDrawElements(m,c,t,i) isaac_gl_record_native_draw((uint32_t)(m),(int32_t)(c),(uint32_t)(t),(uint32_t)(uintptr_t)(i))
+#define vglIsaacDrawCanonicalQuads(c) ((GLboolean)isaac_gl_record_native_canonical((int32_t)(c)))
+#undef glBindRenderbuffer
+#undef glRenderbufferStorage
+#undef glDeleteRenderbuffers
+#undef glGenRenderbuffers
+#define glBindRenderbuffer(t,n) isaac_gl_record_rbo_bind((uint32_t)(t),(uint32_t)(n))
+#define glRenderbufferStorage(t,f,w,h) isaac_gl_record_rbo_store((uint32_t)(t),(uint32_t)(f),(int32_t)(w),(int32_t)(h))
+#define glDeleteRenderbuffers(n,p) isaac_gl_record_rbo_delete((int32_t)(n),(uint32_t)(uintptr_t)(p))
+#define glGenRenderbuffers(n,p) isaac_gl_record_rbo_gen((int32_t)(n),(uint32_t)(uintptr_t)(p))
+#endif
 
 #define GL_VITA_RESOLVED_COUNT 62u
 #define GL_VITA_MISSING_COUNT  11u
@@ -547,6 +621,26 @@ _Static_assert(sizeof(gl_vita_fxray_record) % 8u == 0u,
  * logical 960x540 request, so the guest viewport is shadowed and replayed. */
 # define GL_VITA_LOGICAL_VIEWPORT 1
 #endif
+#if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+/* GitHub issue #5 item 5.8b.  kage_vita_backend.c centres the logical
+ * 960x540 image in the 960x544 panel only once, at init (glViewport(0,
+ * KAGE_VITA_VIEWPORT_Y, ...)); the guest's own default-framebuffer
+ * glViewport(0, 0, 960, 540) replaces that, so the image ends up bottom
+ * anchored: rows 0-3 black, content in rows 4-543 (device screenshots
+ * 2026-09-19 215219, 2026-09-20 033419, 2026-10-26 124241).  Shadow the
+ * guest viewport like the scaled-raster A/Bs (replayed per draw target,
+ * GL_VIEWPORT queries answered from the logical values) and add the init
+ * offset to the default framebuffer's Y origin only. */
+# if defined(ISAAC_VITA_DISPLAY_RASTER_720)
+#  error "ISAAC_VITA_DISPLAY_CENTER_Y centres the native 960x544 raster; a scaled ISAAC_VITA_DISPLAY_RASTER already centres its own viewport"
+# endif
+# if !defined(GL_VITA_LOGICAL_VIEWPORT)
+#  define GL_VITA_LOGICAL_VIEWPORT 1
+# endif
+/* Copied from kage_vita_backend.c:97 KAGE_VITA_VIEWPORT_Y (the native
+ * raster's (544 - 540) / 2). */
+# define GL_VITA_DISPLAY_CENTER_Y_ROWS 2
+#endif
 #if defined(GL_VITA_LOGICAL_VIEWPORT) || defined(ISAAC_VITA_FBO_CLEAR_ELISION)
 /* Every offscreen-target policy needs the guest's draw-framebuffer binding. */
 # define GL_VITA_DRAW_FRAMEBUFFER_SHADOW 1
@@ -554,9 +648,23 @@ _Static_assert(sizeof(gl_vita_fxray_record) % 8u == 0u,
 #if defined(ISAAC_VITA_FBO_RASTER_SCALE) || defined(ISAAC_VITA_FBO_CLEAR_ELISION)
 # define GL_VITA_FBO_TABLE 1
 #endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+/* The readback sync keys its notes on the draw-framebuffer shadow and the
+ * FBO table's colour attachments. */
+# if !defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+#  define GL_VITA_DRAW_FRAMEBUFFER_SHADOW 1
+# endif
+# if !defined(GL_VITA_FBO_TABLE)
+#  define GL_VITA_FBO_TABLE 1
+# endif
+#endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP) && \
         !defined(ISAAC_VITA_FBO_CLEAR_ELISION)
 # error "ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP requires ISAAC_VITA_FBO_CLEAR_ELISION"
+#endif
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY) && \
+        !defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+# define GL_VITA_DRAW_FRAMEBUFFER_SHADOW 1
 #endif
 #if defined(GL_VITA_LOGICAL_VIEWPORT)
 typedef struct gl_vita_logical_viewport {
@@ -701,12 +809,12 @@ typedef struct gl_vita_location_cache_key {
 } gl_vita_location_cache_key;
 
 #if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
-/* ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO (gl_vita_backend.h legend): one
- * monotonic word the replay memo compares against.  It rides the two
- * location-cache entry points below so the memo cannot outlive a mutation
- * the shim cache would not survive either; the wrap-around skips zero (the
- * memo's "never filled" marker).  Independent of ISAAC_VITA_GL_LOCATION_CACHE:
- * without that option the entry points are these bumps and nothing else. */
+/* ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO: the word the replay memo compares
+ * against (legend and cross-thread contract: gl_vita_backend.h).  Bumped only
+ * by the two location-cache entry points below, so the memo cannot outlive a
+ * mutation the shim cache would not survive either, and only on the thread
+ * that runs this TU's GL calls; the wrap-around skips zero (the memo's "never
+ * filled" marker).  Without ISAAC_VITA_GL_LOCATION_CACHE they are just bumps. */
 uint32_t g_isaac_vita_gl_location_generation = 1u;
 # define GL_VITA_LOCATION_GENERATION_BUMP() \
     do { \
@@ -4492,6 +4600,416 @@ static void gl_vita_fbo_shadow_reset(void)
 }
 #endif
 
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+/* Offscreen readback synchronisation (GitHub issue #10).  The game tints
+ * the "dirt"/"Hole" layer under burrowing enemies with a colour it reads
+ * back from its pre-rendered Floor Surface: bind the manager framebuffer,
+ * attach the surface texture, glReadPixels(x, y, 1, 1, RGBA, UNSIGNED_BYTE),
+ * no draw in between.  Stock vitaGL copies the texture memory on the CPU and
+ * waits for the GPU only when the framebuffer being read is the one whose
+ * GXM scene is open (framebuffers.c:677, in_use_framebuffer ==
+ * active_read_fb); a scene is opened by a clear or a draw, never by a bind
+ * or an attach, so this read never waits and can return texels the GPU has
+ * not written yet: zeros, a black hole.  PC drivers make every readback a
+ * full sync.
+ *
+ * Device result (int2f/int2g, 2026-09-17): the drain alone does not fix it;
+ * the read lands on the wrong row (see gl_vita_readback_copy below), so
+ * the offscreen read is served from the texture memory after the drain.
+ *
+ * Drain: before the read of an offscreen target, sceGxmFinish the one
+ * GXM context when the attached colour texture was written (native draw or
+ * clear) since the last finish.  Raw sceGxmFinish rather than glFinish: it
+ * waits for every submitted scene (the surface's own scene was ended when
+ * the game switched targets) and leaves vitaGL's scene state alone; glFinish
+ * would scene_reset onto the read framebuffer, opening an empty scene on it
+ * for each of the game's five samples and disturbing the owed-clear model of
+ * ISAAC_VITA_FBO_CLEAR_ELISION.  Bookkeeping is a texture -> generation note
+ * table; a finish bumps the generation, which settles every note at once, so
+ * a surface costs one GPU drain per render, not per read.  Writes whose
+ * colour texture the FBO table does not know (renderbuffer colour, non-2D or
+ * non-level-0 attachment, table overflow) settle only by a finish and force
+ * one on the next offscreen read.  The game binds GL_FRAMEBUFFER for the
+ * read (never GL_READ_FRAMEBUFFER alone), so the draw shadow is the read
+ * target. */
+# define GL_VITA_READBACK_NOTES         32u
+# define GL_VITA_READBACK_RECEIPT_EVERY 256u
+# define GL_VITA_READBACK_DETAIL_LINES  8u
+
+typedef struct gl_vita_readback_note {
+    guest_gl_uint texture;      /* 0 = free slot */
+    uint32_t generation;        /* generation of the last native write */
+    guest_gl_uint framebuffer;  /* draw framebuffer of that write */
+    uint32_t writes;            /* native writes noted on this texture */
+} gl_vita_readback_note;
+
+typedef struct gl_vita_readback_state {
+    gl_vita_readback_note notes[GL_VITA_READBACK_NOTES];
+    uint32_t generation;        /* current; bumped by every finish, never 0 */
+    uint32_t write_generation;  /* generation of the last offscreen write */
+    uint32_t unknown_generation;/* last write through an untracked target */
+    uint32_t reads;             /* offscreen glReadPixels */
+    uint32_t display_reads;     /* framebuffer 0: counted, stock sync only */
+    uint32_t finishes;          /* sceGxmFinish issued */
+    uint32_t unknown;           /* finishes forced by untracked writes */
+    uint32_t settled;           /* offscreen reads that needed no finish */
+    uint32_t skipped;           /* finish wanted, no GXM context yet */
+    uint32_t copied;            /* offscreen reads served from the texture */
+    uint32_t detail;            /* detail lines logged so far */
+    uint32_t wait_us;           /* saturating sum of the finish waits */
+    uint32_t max_us;
+} gl_vita_readback_state;
+
+static gl_vita_readback_state s_readback;
+
+void isaac_vita_log(const char *format, ...);
+
+/* vitaGL's one GXM context (gxm.c:370, shared.h); not part of vitaGL.h. */
+extern SceGxmContext *gxm_context;
+
+static void gl_vita_readback_reset(void)
+{
+    memset(&s_readback, 0, sizeof s_readback);
+    s_readback.generation = 1u;
+}
+
+/* Note of |texture|; with texture 0 the first free slot (or NULL). */
+static gl_vita_readback_note *gl_vita_readback_find(guest_gl_uint texture)
+{
+    uint32_t index;
+
+    for (index = 0u; index < GL_VITA_READBACK_NOTES; ++index)
+        if (s_readback.notes[index].texture == texture)
+            return &s_readback.notes[index];
+    return NULL;
+}
+
+/* A native clear or draw reached vitaGL on the current draw framebuffer. */
+static void gl_vita_readback_note_write(void)
+{
+    const gl_vita_fbo_record *record;
+    gl_vita_readback_note *note;
+    guest_gl_uint texture;
+
+    if (s_draw_framebuffer == 0u)
+        return;     /* the game never reads the display back */
+    s_readback.write_generation = s_readback.generation;
+    record = gl_vita_fbo_find(s_draw_framebuffer);
+    texture = record ? record->color_texture : 0u;
+    note = texture ? gl_vita_readback_find(texture) : NULL;
+    if (!note && texture)
+        note = gl_vita_readback_find(0u);
+    if (!note) {
+        s_readback.unknown_generation = s_readback.generation;
+        return;
+    }
+    if (note->texture != texture) {
+        note->texture = texture;
+        note->writes = 0u;
+    }
+    note->generation = s_readback.generation;
+    note->framebuffer = s_draw_framebuffer;
+    ++note->writes;
+}
+
+/* Before the native read of offscreen |framebuffer|: drain the GPU when the
+ * target may still have pending writes.  Returns 1 after a finish (with the
+ * wait in |waited_us|), 0 when the texture was already settled. */
+static int gl_vita_readback_sync(guest_gl_uint framebuffer, uint32_t *waited_us)
+{
+    const gl_vita_fbo_record *record = gl_vita_fbo_find(framebuffer);
+    guest_gl_uint texture = record ? record->color_texture : 0u;
+    const gl_vita_readback_note *note =
+        texture ? gl_vita_readback_find(texture) : NULL;
+    uint32_t generation = s_readback.generation;
+    uint64_t began;
+    uint64_t waited;
+    uint32_t waited32;
+    int untracked;
+
+    if (note && note->generation == generation) {
+        untracked = 0;  /* tracked texture written since the last finish */
+    } else if (s_readback.unknown_generation == generation) {
+        untracked = 1;  /* an untracked write may have hit this texture */
+    } else if (!texture && s_readback.write_generation == generation) {
+        untracked = 1;  /* unknown read target: any write may be it */
+    } else {
+        ++s_readback.settled;
+        return 0;
+    }
+    if (!gxm_context) {
+        ++s_readback.skipped;
+        return 0;
+    }
+    began = sceKernelGetProcessTimeWide();
+    sceGxmFinish(gxm_context);
+    waited = sceKernelGetProcessTimeWide() - began;
+    waited32 = waited > UINT32_MAX ? UINT32_MAX : (uint32_t)waited;
+    ++s_readback.finishes;
+    if (untracked)
+        ++s_readback.unknown;
+    s_readback.wait_us = s_readback.wait_us > UINT32_MAX - waited32 ?
+        UINT32_MAX : s_readback.wait_us + waited32;
+    if (waited32 > s_readback.max_us)
+        s_readback.max_us = waited32;
+    /* Everything submitted so far is complete: one bump settles all notes. */
+    if (++s_readback.generation == 0u)
+        s_readback.generation = 1u;
+    *waited_us = waited32;
+    return 1;
+}
+
+/* The mechanism (int2g census on the device, 2026-09-17): the Floor Surface
+ * is a 784x472 linear RGBA8 texture whose 1x1 room occupies memory rows
+ * 52..233; the game reads row y (the row it drew: at=(221,143) holds the
+ * floor colour ff364173) while stock vitaGL reads row height-1-y = 328,
+ * empty padding, zeros.  Stock glReadPixels applies the display's row flip
+ * (framebuffers.c: `fb->height - (height + y)`) to a framebuffer texture
+ * that vitaGL renders already flipped (HAVE_UNFLIPPED_FBOS is not defined),
+ * so every offscreen read is a mirror image of the render; rooms large
+ * enough to fill the surface read real texels, hence "sometimes normal".
+ * Not a race: the int2f drain fired and the texel stayed zero.
+ *
+ * Fix: serve the game's read from the attached texture's memory at the rows
+ * it drew (gl_vita_readback_copy), after the drain when the texture was
+ * written since the last one.  The descriptor comes through vitaGL's
+ * exported accessors, which act on the texture bound to the active unit:
+ * bind it, take the two pointers, restore the previous binding (the fxray
+ * deopt pattern; no draw sits in between). */
+# define GL_VITA_READBACK_GXM_LINEAR         0x60000000u
+# define GL_VITA_READBACK_GXM_LINEAR_STRIDED 0xC0000000u
+# define GL_VITA_READBACK_CENSUS_MAX_EDGE    4096u
+
+typedef struct gl_vita_readback_view {
+    const uint8_t *data;        /* vglGetTexDataPointer */
+    const void *gxm_data;       /* sceGxmTextureGetData */
+    uint32_t format;
+    uint32_t type;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;            /* bytes per row; 0 = not a linear layout */
+} gl_vita_readback_view;
+
+static void gl_vita_readback_texture_view(
+    guest_gl_uint texture, gl_vita_readback_view *view)
+{
+    GLint previous = 0;
+    SceGxmTexture *gxm;
+
+    memset(view, 0, sizeof *view);
+    glGetIntegerv(GL_VITA_TEXTURE_BINDING_2D, &previous);
+    if ((guest_gl_uint)(GLuint)previous != texture)
+        glBindTexture(GL_VITA_TEXTURE_2D, (GLuint)texture);
+    gxm = vglGetGxmTexture(GL_VITA_TEXTURE_2D);
+    view->data = (const uint8_t *)vglGetTexDataPointer(GL_VITA_TEXTURE_2D);
+    if ((guest_gl_uint)(GLuint)previous != texture)
+        glBindTexture(GL_VITA_TEXTURE_2D, (GLuint)previous);
+    if (!gxm)
+        return;
+    view->format = (uint32_t)sceGxmTextureGetFormat(gxm);
+    view->type = (uint32_t)sceGxmTextureGetType(gxm);
+    view->width = (uint32_t)sceGxmTextureGetWidth(gxm);
+    view->height = (uint32_t)sceGxmTextureGetHeight(gxm);
+    view->gxm_data = sceGxmTextureGetData(gxm);
+    if (view->type == GL_VITA_READBACK_GXM_LINEAR)
+        view->stride = ((view->width + 7u) & ~7u) * 4u;  /* VGL_ALIGN(w, 8) * 4 */
+    else if (view->type == GL_VITA_READBACK_GXM_LINEAR_STRIDED)
+        view->stride = (uint32_t)sceGxmTextureGetStride(gxm);
+}
+
+/* The game's read served from the texture memory itself, unflipped: output
+ * row r = texture row y + r (rows of width*4 bytes, no pack padding for
+ * RGBA8).  Only the game's shape qualifies: an offscreen target with a
+ * tabled level-0 2D colour texture, RGBA/UNSIGNED_BYTE, a linear
+ * U8U8U8U8_ABGR texture (what vitaGL makes of GL_RGBA/GL_UNSIGNED_BYTE;
+ * byte order R G B A, the format stock's own fast path memcpys) and a
+ * rectangle inside it.  Anything else returns 0 and takes the native read. */
+static int gl_vita_readback_copy(
+    guest_gl_int x, guest_gl_int y,
+    guest_gl_sizei width, guest_gl_sizei height,
+    guest_gl_enum format, guest_gl_enum type, guest_gl_addr pixels)
+{
+    const gl_vita_fbo_record *record;
+    gl_vita_readback_view view;
+    uint8_t *destination;
+    uint32_t row;
+
+    if (s_draw_framebuffer == 0u || pixels == 0u ||
+            format != GL_VITA_RGBA || type != GL_VITA_UNSIGNED_BYTE ||
+            x < 0 || y < 0 || width <= 0 || height <= 0)
+        return 0;
+    record = gl_vita_fbo_find(s_draw_framebuffer);
+    if (!record || !record->color_texture)
+        return 0;
+    gl_vita_readback_texture_view(record->color_texture, &view);
+    if (!view.data || view.stride == 0u ||
+            view.type != GL_VITA_READBACK_GXM_LINEAR ||
+            view.format != (uint32_t)SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR ||
+            (uint32_t)x >= view.width ||
+            (uint32_t)width > view.width - (uint32_t)x ||
+            (uint32_t)y >= view.height ||
+            (uint32_t)height > view.height - (uint32_t)y)
+        return 0;
+    destination = (uint8_t *)(uintptr_t)pixels;
+    for (row = 0u; row < (uint32_t)height; ++row)
+        memcpy(destination + (size_t)row * (size_t)width * 4u,
+               view.data + (size_t)((uint32_t)y + row) * view.stride +
+                   (size_t)x * 4u,
+               (size_t)width * 4u);
+    ++s_readback.copied;
+    return 1;
+}
+
+/* The attached texture in detail: its descriptor and a CPU census of its
+ * linear memory (non-zero texels and rows, the first and last non-zero
+ * rows, the texel at the read position taken literally and at the row
+ * stock vitaGL would copy).  Diagnostic only: the census walks the whole
+ * texture for each detail line. */
+static void gl_vita_readback_detail_texture(
+    guest_gl_uint texture, guest_gl_int x, guest_gl_int y)
+{
+    const gl_vita_readback_note *note = gl_vita_readback_find(texture);
+    gl_vita_readback_view view;
+    uint32_t nonzero = 0u;
+    uint32_t nonzero_rows = 0u;
+    uint32_t first_row = 0u;
+    uint32_t first_col = 0u;
+    uint32_t last_row = 0u;
+    uint32_t at_texel = 0u;
+    uint32_t flip_texel = 0u;
+    int census = 0;
+    int seen = 0;
+
+    gl_vita_readback_texture_view(texture, &view);
+    if (view.data && view.width && view.height &&
+            view.width <= GL_VITA_READBACK_CENSUS_MAX_EDGE &&
+            view.height <= GL_VITA_READBACK_CENSUS_MAX_EDGE &&
+            view.stride >= view.width * 4u) {
+        uint32_t row;
+
+        census = 1;
+        for (row = 0u; row < view.height; ++row) {
+            const uint8_t *line = view.data + (size_t)row * view.stride;
+            uint32_t row_nonzero = 0u;
+            uint32_t col;
+
+            for (col = 0u; col < view.width; ++col) {
+                uint32_t texel;
+
+                memcpy(&texel, line + (size_t)col * 4u, sizeof texel);
+                if (!texel)
+                    continue;
+                if (!seen) {
+                    seen = 1;
+                    first_row = row;
+                    first_col = col;
+                }
+                ++row_nonzero;
+            }
+            if (row_nonzero) {
+                ++nonzero_rows;
+                nonzero += row_nonzero;
+                last_row = row;
+            }
+        }
+        if (x >= 0 && (uint32_t)x < view.width &&
+                y >= 0 && (uint32_t)y < view.height) {
+            memcpy(&at_texel,
+                   view.data + (size_t)y * view.stride + (size_t)x * 4u,
+                   sizeof at_texel);
+            memcpy(&flip_texel,
+                   view.data +
+                       (size_t)(view.height - 1u - (uint32_t)y) * view.stride +
+                       (size_t)x * 4u,
+                   sizeof flip_texel);
+        }
+    }
+    isaac_vita_log(
+        "[kage-vita] fbo-readback-tex: tex=%u fmt=%08x type=%08x %ux%u "
+        "stride=%u data=%08x gxm_data=%08x last_fb=%u writes=%u age=%u",
+        (unsigned)texture, (unsigned)view.format, (unsigned)view.type,
+        (unsigned)view.width, (unsigned)view.height, (unsigned)view.stride,
+        (unsigned)(uintptr_t)view.data, (unsigned)(uintptr_t)view.gxm_data,
+        (unsigned)(note ? note->framebuffer : 0u),
+        (unsigned)(note ? note->writes : 0u),
+        (unsigned)(note ? s_readback.generation - note->generation : 0u));
+    isaac_vita_log(
+        "[kage-vita] fbo-readback-mem: census=%d nonzero=%u/%u rows=%u/%u "
+        "first=%u,%u last_row=%u at=%08x flip=%08x",
+        census, (unsigned)nonzero, (unsigned)(view.width * view.height),
+        (unsigned)nonzero_rows, (unsigned)view.height,
+        (unsigned)first_col, (unsigned)first_row, (unsigned)last_row,
+        (unsigned)at_texel, (unsigned)flip_texel);
+}
+
+static void gl_vita_readback_receipt(void)
+{
+    isaac_vita_log(
+        "KAGE VITA FBO READBACK: reads=%u display=%u finishes=%u unknown=%u "
+        "settled=%u skipped=%u copied=%u wait_us=%u max_us=%u",
+        (unsigned)s_readback.reads, (unsigned)s_readback.display_reads,
+        (unsigned)s_readback.finishes, (unsigned)s_readback.unknown,
+        (unsigned)s_readback.settled, (unsigned)s_readback.skipped,
+        (unsigned)s_readback.copied,
+        (unsigned)s_readback.wait_us, (unsigned)s_readback.max_us);
+}
+
+static int gl_vita_readback_before(uint32_t *waited_us)
+{
+    *waited_us = 0u;
+    if (s_draw_framebuffer == 0u) {
+        ++s_readback.display_reads;
+        return 0;
+    }
+    ++s_readback.reads;
+    return gl_vita_readback_sync(s_draw_framebuffer, waited_us);
+}
+
+/* After the native read: the first offscreen reads in detail (with the
+ * texel of a 1x1 RGBA/UNSIGNED_BYTE read, the game's shape, plus the
+ * attached texture's descriptor and memory census), then a receipt every
+ * GL_VITA_READBACK_RECEIPT_EVERY offscreen reads. */
+static void gl_vita_readback_after(
+    guest_gl_int x, guest_gl_int y,
+    guest_gl_sizei width, guest_gl_sizei height,
+    guest_gl_enum format, guest_gl_enum type, guest_gl_addr pixels,
+    int synced, int copied, uint32_t waited_us)
+{
+    if (s_draw_framebuffer == 0u)
+        return;
+    if (s_readback.detail < GL_VITA_READBACK_DETAIL_LINES) {
+        const gl_vita_fbo_record *record =
+            gl_vita_fbo_find(s_draw_framebuffer);
+        unsigned texture = (unsigned)(record ? record->color_texture : 0u);
+
+        ++s_readback.detail;
+        if (width == 1 && height == 1 && format == GL_VITA_RGBA &&
+                type == GL_VITA_UNSIGNED_BYTE && pixels != 0u) {
+            const uint8_t *texel = (const uint8_t *)(uintptr_t)pixels;
+
+            isaac_vita_log(
+                "[kage-vita] fbo-readback: fb=%u tex=%u at=%d,%d %dx%d "
+                "sync=%d wait_us=%u rgba=%02x%02x%02x%02x copy=%d",
+                (unsigned)s_draw_framebuffer, texture, (int)x, (int)y,
+                (int)width, (int)height, synced, (unsigned)waited_us,
+                (unsigned)texel[0], (unsigned)texel[1],
+                (unsigned)texel[2], (unsigned)texel[3], copied);
+        } else {
+            isaac_vita_log(
+                "[kage-vita] fbo-readback: fb=%u tex=%u at=%d,%d %dx%d "
+                "sync=%d wait_us=%u rgba=- copy=%d",
+                (unsigned)s_draw_framebuffer, texture, (int)x, (int)y,
+                (int)width, (int)height, synced, (unsigned)waited_us,
+                copied);
+        }
+        if (texture)
+            gl_vita_readback_detail_texture((guest_gl_uint)texture, x, y);
+    }
+    if (s_readback.reads % GL_VITA_READBACK_RECEIPT_EVERY == 0u)
+        gl_vita_readback_receipt();
+}
+#endif
+
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720)
 /* Raster geometry: the build passes HEIGHT/NUM/DEN (720x408 at 3/4 or 480x272
  * at 1/2); the bare legacy gate (host oracles) means 720x408.  The default
@@ -4524,6 +5042,42 @@ static int64_t gl_vita_scale_edge(int64_t edge)
 }
 #endif
 
+#if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+void isaac_vita_log(const char *format, ...);
+
+static uint8_t s_display_center_y_logged;
+
+/* Default framebuffer only: the guest's logical viewport moved up by the
+ * centring rows (GL's origin is the bottom row).  The origin is promoted so
+ * a guest Y near INT32_MAX saturates instead of overflowing; X, width and
+ * height pass through exactly.  One receipt, at the first replay after the
+ * backend is installed (the install-time reset itself is not a guest
+ * request). */
+static void gl_vita_display_center_y_viewport(void)
+{
+    int64_t bottom = (int64_t)s_logical_viewport.y +
+        GL_VITA_DISPLAY_CENTER_Y_ROWS;
+
+    if (bottom > INT32_MAX)
+        bottom = INT32_MAX;
+    glViewport(
+        (GLint)s_logical_viewport.x, (GLint)bottom,
+        (GLsizei)s_logical_viewport.width,
+        (GLsizei)s_logical_viewport.height);
+    if (s_installed && !s_display_center_y_logged) {
+        s_display_center_y_logged = 1u;
+        isaac_vita_log(
+            "KAGE VITA DISPLAY CENTER Y: rows=%d fb0 guest=%d,%d,%d,%d "
+            "native=%d,%d,%d,%d",
+            GL_VITA_DISPLAY_CENTER_Y_ROWS,
+            (int)s_logical_viewport.x, (int)s_logical_viewport.y,
+            (int)s_logical_viewport.width, (int)s_logical_viewport.height,
+            (int)s_logical_viewport.x, (int)bottom,
+            (int)s_logical_viewport.width, (int)s_logical_viewport.height);
+    }
+}
+#endif
+
 #if defined(GL_VITA_LOGICAL_VIEWPORT)
 static void gl_vita_apply_logical_viewport(void)
 {
@@ -4545,6 +5099,10 @@ static void gl_vita_apply_logical_viewport(void)
         glViewport(
             (GLint)left, (GLint)(bottom + GL_VITA_DISPLAY_RASTER_VIEWPORT_Y),
             (GLsizei)(right - left), (GLsizei)(top - bottom));
+        return;
+#endif
+#if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
+        gl_vita_display_center_y_viewport();
         return;
 #endif
     }
@@ -4859,6 +5417,135 @@ static void gl_vita_fxray_reset(void)
 }
 #endif
 
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+/* GitHub issue #15 (Wavy Cap / Downpour Mirror World black screen).
+ *
+ * KAGE owns one manager framebuffer and swaps its colour attachment per
+ * pass; its depth renderbuffer stays attached.  On desktop GL that depth
+ * buffer persists across the swaps.  Isaac clears depth to 0 (its -1000.0,
+ * clamped) and tests GL_GREATER; KAGE::Graphics::Manager's pass end
+ * (0x960eb0) clears depth before popping back to the outer surface, and
+ * Room::Render's Dizzy (0x7cd9dc) and Mirror (0x7cde59) pops then composite
+ * into the outer surface WITHOUT a clear, relying on that persisted 0.
+ *
+ * Pinned vitaGL 73dd57a instead opens a new GXM scene on every colour
+ * re-attach (shared.h _glFramebufferTexture2D sets dirty_framebuffer) and,
+ * built without STORE_DEPTH_STENCIL, starts each scene at the depth
+ * surface's background 1.0 (utils/gxm_utils.h vglDepthStencilSurfaceInit,
+ * s[3] = 0x3F800000).  Every composite fragment then fails GL_GREATER and
+ * the outer surface keeps its transparent-black clear.  Passes that clear
+ * after their pop (the shockwave pop at 0x7cd057, the frame clear at
+ * 0x6cec29 before Room::Render) are unaffected, which is why ordinary rooms
+ * render.
+ *
+ * The carry restores the desktop contract only where it is known exactly:
+ * while the last depth-affecting guest operation on an offscreen framebuffer
+ * is a depth clear, a draw on that framebuffer after a possible scene
+ * boundary is preceded by one native depth-only clear to the same value.
+ * A draw writes depth, so after it the desktop content is unknown and
+ * nothing is replayed (stock behaviour). */
+# define GL_VITA_CARRY_COLOR_BIT    0x00004000u
+# define GL_VITA_CARRY_DEPTH_BIT    0x00000100u
+# define GL_VITA_CARRY_STENCIL_BIT  0x00000400u
+
+void isaac_vita_log(const char *format, ...);
+
+static guest_gl_uint s_depth_carry_framebuffer;   /* 0 = nothing known */
+static uint64_t s_depth_carry_bits;               /* depth it was cleared to */
+static uint8_t s_depth_carry_stale;               /* scene may have ended */
+static uint64_t s_depth_carry_clear_bits;         /* guest clear depth now */
+static uint32_t s_depth_carry_replays;
+
+uint32_t gl_vita_backend_depth_carry_replays(void)
+{
+    return s_depth_carry_replays;
+}
+
+static void gl_vita_depth_carry_reset(void)
+{
+    double depth = 1.0;   /* GL default clear depth */
+
+    s_depth_carry_framebuffer = 0u;
+    s_depth_carry_bits = 0u;
+    s_depth_carry_stale = 0u;
+    memcpy(&s_depth_carry_clear_bits, &depth, sizeof depth);
+}
+
+/* Guest glClear, before any elision decision: what the desktop depth buffer
+ * of the draw framebuffer holds afterwards.  vitaGL rejects a mask with any
+ * other bit and clears nothing, so such a request changes no knowledge. */
+static void gl_vita_depth_carry_note_clear(guest_gl_bitfield mask)
+{
+    if (mask & ~(GL_VITA_CARRY_COLOR_BIT | GL_VITA_CARRY_DEPTH_BIT |
+                 GL_VITA_CARRY_STENCIL_BIT))
+        return;
+    if (s_draw_framebuffer != 0u && (mask & GL_VITA_CARRY_DEPTH_BIT)) {
+        s_depth_carry_framebuffer = s_draw_framebuffer;
+        s_depth_carry_bits = s_depth_carry_clear_bits;
+        s_depth_carry_stale = 0u;
+    } else if (s_depth_carry_framebuffer &&
+            s_draw_framebuffer != s_depth_carry_framebuffer) {
+        /* A clear elsewhere makes vitaGL end the carried target's scene. */
+        s_depth_carry_stale = 1u;
+    }
+}
+
+/* Immediately before the native draw (after any owed clear of the same
+ * target was settled).  A redundant replay in a scene that never ended is a
+ * pixel no-op: the depth surface already holds the replayed value. */
+static void gl_vita_depth_carry_before_draw(void)
+{
+    if (!s_depth_carry_framebuffer)
+        return;
+    if (s_draw_framebuffer != s_depth_carry_framebuffer) {
+        s_depth_carry_stale = 1u;
+        return;
+    }
+    if (s_depth_carry_stale) {
+        int retarget = s_depth_carry_bits != s_depth_carry_clear_bits;
+        double depth;
+
+        if (retarget) {
+            memcpy(&depth, &s_depth_carry_bits, sizeof depth);
+            glClearDepth((GLdouble)depth);
+        }
+        GL_VITA_PHASE_COUNT(clear);
+        glClear((GLbitfield)GL_VITA_CARRY_DEPTH_BIT);
+        if (retarget) {
+            memcpy(&depth, &s_depth_carry_clear_bits, sizeof depth);
+            glClearDepth((GLdouble)depth);
+        }
+        ++s_depth_carry_replays;
+        if ((s_depth_carry_replays & (s_depth_carry_replays - 1u)) == 0u) {
+            /* Receipt at replay 1, 2, 4, 8...: proves the path runs and how
+             * often without a per-frame line.  Raw double bits: the Vita
+             * logger's float formatting is not relied on (0 ->
+             * 0000000000000000, 1.0 -> 3ff0000000000000). */
+            isaac_vita_log(
+                "[kage-vita] fbo-depth-carry: replay n=%u fb=%u "
+                "depth_bits=%08x%08x",
+                (unsigned)s_depth_carry_replays,
+                (unsigned)s_depth_carry_framebuffer,
+                (unsigned)(s_depth_carry_bits >> 32),
+                (unsigned)s_depth_carry_bits);
+        }
+    }
+    s_depth_carry_framebuffer = 0u;
+    s_depth_carry_stale = 0u;
+}
+
+/* A non-zero colour attachment on the draw framebuffer opens a new vitaGL
+ * scene at its next clear or draw. */
+static void gl_vita_depth_carry_note_attach(
+    guest_gl_enum target, guest_gl_uint texture)
+{
+    if ((target == GL_VITA_FRAMEBUFFER || target == GL_VITA_DRAW_FRAMEBUFFER) &&
+            texture != 0u && s_depth_carry_framebuffer &&
+            s_draw_framebuffer == s_depth_carry_framebuffer)
+        s_depth_carry_stale = 1u;
+}
+#endif
+
 static void vita_glActiveTexture(guest_gl_enum texture)
 {
     kage_vita_world_seam_diag_note_active_texture(texture);
@@ -5078,6 +5765,9 @@ static void vita_glClear(guest_gl_bitfield mask)
     KAGE_VITA_DEEP_SCOPE(KVD_GL_CLEAR);
     gl_vita_backend_attrib_sync();
     kage_vita_world_seam_diag_note_clear(mask);
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+    gl_vita_depth_carry_note_clear(mask);
+#endif
 #if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
     gl_vita_first_frame_increment(
         s_first_frame.current_guest_fbo ?
@@ -5098,6 +5788,9 @@ static void vita_glClear(guest_gl_bitfield mask)
     GL_VITA_TIME_BEGIN();
     glClear((GLbitfield)mask);
     GL_VITA_TIME_END(clear);
+#endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+    gl_vita_readback_note_write();
 #endif
 #if defined(ISAAC_VITA_GL_FILL_CENSUS)
     /* After the elision decision: only clears vitaGL received are counted. */
@@ -5140,6 +5833,9 @@ static void vita_glClearDepth(guest_gl_double depth)
         clamped_depth = 1.0;
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     memcpy(&s_fbo_clear_depth_bits, &clamped_depth, sizeof clamped_depth);
+#endif
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+    memcpy(&s_depth_carry_clear_bits, &clamped_depth, sizeof clamped_depth);
 #endif
     GL_VITA_TIME_BEGIN();
     glClearDepth(clamped_depth);
@@ -5207,6 +5903,10 @@ static void vita_glDeleteFramebuffers(
 # endif
 # if defined(GL_VITA_FBO_TABLE)
             gl_vita_fbo_forget(deleted);
+# endif
+# if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+            if (deleted && deleted == s_depth_carry_framebuffer)
+                s_depth_carry_framebuffer = 0u;
 # endif
 # if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
             if (deleted && deleted == s_fbo_owed_framebuffer)
@@ -5504,6 +6204,12 @@ static void vita_glDrawElements(
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     gl_vita_fbo_note_draw();
 #endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+    gl_vita_readback_note_write();
+#endif
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+    gl_vita_depth_carry_before_draw();
+#endif
 #if defined(ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY)
     switch (canonical) {
     case KAGE_VITA_CANONICAL_QUAD_OK: {
@@ -5664,6 +6370,59 @@ static void vita_glGenRenderbuffers(
     }
 }
 
+#if defined(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE) && ISAAC_VITA_VITAGL_INTENSITY_TEXTURE
+/* Private 0037 archive endpoint (isaac_intensity_texture.h, word layout
+ * there). vitaGL prints its "Isaac intensity:" lines only to the Cat-A-Log
+ * tty, which can drop lines; this copies its counters into native.log. One
+ * "armed" line at the first change, then one line per change of word 0 (the
+ * number of tty lines), read after each texture call that can print one.
+ * The GL owner thread runs both sides: no lock. */
+#define GL_VITA_INTENSITY_WORDS 25u
+uint32_t vglIsaacIntensitySnapshot(
+    uint32_t seen, uint32_t out[GL_VITA_INTENSITY_WORDS]);
+void isaac_vita_log(const char *format, ...);
+
+static void gl_vita_intensity_receipt(void)
+{
+    static const char *const phases[] = {
+        "none", "armed", "upload", "upload-failed", "skip", "reject",
+        "deopt", "deopt-failed", "redefine-rejected" };
+    static const char *const shapes[] = {
+        "", ":512x512", ":2048x1024", ":2048x2048", ":4096x2048" };
+    static const char *const details[] = {
+        "", ":U8_RRRR", ":A8L8", ":excluded", ":attached", ":overridden",
+        ":mips", ":layout", ":live" };
+    static uint32_t seen;
+    uint32_t w[GL_VITA_INTENSITY_WORDS];
+    const uint32_t gen = vglIsaacIntensitySnapshot(seen, w);
+    uint32_t phase, shape, detail;
+
+    if (gen == seen)
+        return;
+    if (!seen)
+        isaac_vita_log("KAGE VITA INTENSITY: armed patch=0037 "
+                       "order=512x512/2048x1024/2048x2048/4096x2048 "
+                       "words=%u", (unsigned)GL_VITA_INTENSITY_WORDS);
+    seen = gen;
+    phase = w[1] >> 16;
+    shape = (w[1] >> 8) & 255u;
+    detail = w[1] & 255u;
+    isaac_vita_log(
+        "KAGE VITA INTENSITY: gen=%u last=%s%s%s up=%u/%u/%u/%u "
+        "fail=%u/%u/%u/%u skip=%u/%u/%u/%u rej=%u/%u/%u/%u u8=%u "
+        "a8l8=%u deopt=%u dfail=%u redef=%u live=%u/%u",
+        (unsigned)gen,
+        phase < sizeof phases / sizeof phases[0] ? phases[phase] : "?",
+        shape < sizeof shapes / sizeof shapes[0] ? shapes[shape] : ":?",
+        detail < sizeof details / sizeof details[0] ? details[detail] : ":?",
+        (unsigned)w[2], (unsigned)w[3], (unsigned)w[4], (unsigned)w[5],
+        (unsigned)w[6], (unsigned)w[7], (unsigned)w[8], (unsigned)w[9],
+        (unsigned)w[10], (unsigned)w[11], (unsigned)w[12], (unsigned)w[13],
+        (unsigned)w[14], (unsigned)w[15], (unsigned)w[16], (unsigned)w[17],
+        (unsigned)w[18], (unsigned)w[19], (unsigned)w[20], (unsigned)w[21],
+        (unsigned)w[22], (unsigned)w[23], (unsigned)w[24]);
+}
+#endif
 static void vita_glFramebufferTexture2D(
     guest_gl_enum target, guest_gl_enum attachment,
     guest_gl_enum texture_target, guest_gl_uint texture,
@@ -5734,9 +6493,15 @@ static void vita_glFramebufferTexture2D(
         (GLenum)target, (GLenum)attachment, (GLenum)texture_target,
         (GLuint)texture, (GLint)level);
     GL_VITA_TIME_END(bind_fb);
+#if defined(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE) && ISAAC_VITA_VITAGL_INTENSITY_TEXTURE
+    gl_vita_intensity_receipt();
+#endif
 #if defined(GL_VITA_FBO_TABLE)
     gl_vita_fbo_note_texture_attachment(
         target, attachment, texture_target, texture, level);
+#endif
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+    gl_vita_depth_carry_note_attach(target, texture);
 #endif
 }
 
@@ -6056,6 +6821,12 @@ static void vita_glReadPixels(
     guest_gl_enum format, guest_gl_enum type,
     guest_gl_addr pixels)
 {
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+    int readback_synced;
+    int readback_copied;
+    uint32_t readback_wait_us;
+#endif
+
     gl_vita_backend_attrib_sync();
 #if defined(ISAAC_VITA_GL_FILL_CENSUS)
     gl_vita_fill_note_read_pixels();
@@ -6075,9 +6846,20 @@ static void vita_glReadPixels(
             (unsigned)s_draw_framebuffer);
     }
 #endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+    readback_synced = gl_vita_readback_before(&readback_wait_us);
+    readback_copied = gl_vita_readback_copy(
+        x, y, width, height, format, type, pixels);
+    if (!readback_copied)
+#endif
     glReadPixels((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height,
                  (GLenum)format, (GLenum)type,
                  (void *)(uintptr_t)pixels);
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+    gl_vita_readback_after(x, y, width, height, format, type, pixels,
+                           readback_synced, readback_copied,
+                           readback_wait_us);
+#endif
 }
 
 static void vita_glRenderbufferStorage(
@@ -6111,6 +6893,11 @@ static void vita_glFramebufferRenderbuffer(
         (GLenum)renderbuffer_target, (GLuint)renderbuffer);
 #if defined(GL_VITA_FBO_TABLE)
     gl_vita_fbo_note_renderbuffer_attachment(target, attachment, renderbuffer);
+#endif
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+    /* Another depth buffer (or none): the desktop content is unknown. */
+    if (s_draw_framebuffer == s_depth_carry_framebuffer)
+        s_depth_carry_framebuffer = 0u;
 #endif
 }
 
@@ -6233,13 +7020,53 @@ static void vita_glTexImage2D(
     if (!fxray_uploaded)
 #endif
     {
+#if defined(ISAAC_VITA_GL_TEXTURE_UPLOAD_LOG)
+        /* Diagnostic knob: large uploads (fonts, backdrops) with the vitaGL
+         * pool levels around the call.  Stock vitaGL raises no GL error when
+         * gpu_alloc_texture cannot get the block; the texture just stays
+         * invalid, so "free after == free before" is the failure signature
+         * and the duration shows its garbage-collector retries (~1 s each). */
+        const uint32_t upload_bytes =
+            (uint32_t)native_width * (uint32_t)native_height * 4u;
+        const int upload_logged = upload_bytes >= (1u << 20);
+        size_t up_vram0 = 0, up_ram0 = 0, up_phy0 = 0;
+        uint64_t up_t0 = 0;
+
+        if (upload_logged) {
+            up_vram0 = vglMemFree(VGL_MEM_VRAM);
+            up_ram0 = vglMemFree(VGL_MEM_RAM);
+            up_phy0 = vglMemFree((vglMemType)(VGL_MEM_RAM + 1));
+            up_t0 = sceKernelGetProcessTimeWide();
+        }
+#endif
         GL_VITA_TIME_BEGIN();
         glTexImage2D(
             (GLenum)target, (GLint)level, (GLint)internal_format,
             (GLsizei)native_width, (GLsizei)native_height, (GLint)border,
             (GLenum)format, (GLenum)type, (const void *)(uintptr_t)pixels);
         GL_VITA_TIME_END(tex_upload);
+#if defined(ISAAC_VITA_GL_TEXTURE_UPLOAD_LOG)
+        if (upload_logged) {
+            const uint64_t up_t1 = sceKernelGetProcessTimeWide();
+            const unsigned up_err = (unsigned)glGetError();
+
+            isaac_vita_log(
+                "KAGE VITA TEX UPLOAD: %ux%u ifmt=0x%x fmt=0x%x type=0x%x "
+                "bytes=%u vram=%u->%u ram=%u->%u phy=%u->%u err=0x%x us=%u",
+                (unsigned)native_width, (unsigned)native_height,
+                (unsigned)internal_format, (unsigned)format, (unsigned)type,
+                (unsigned)upload_bytes,
+                (unsigned)up_vram0, (unsigned)vglMemFree(VGL_MEM_VRAM),
+                (unsigned)up_ram0, (unsigned)vglMemFree(VGL_MEM_RAM),
+                (unsigned)up_phy0,
+                (unsigned)vglMemFree((vglMemType)(VGL_MEM_RAM + 1)),
+                up_err, (unsigned)(up_t1 - up_t0));
+        }
+#endif
     }
+#if defined(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE) && ISAAC_VITA_VITAGL_INTENSITY_TEXTURE
+    gl_vita_intensity_receipt();
+#endif
 #if defined(ISAAC_VITA_FBO_RASTER_SCALE)
     if (raster_scaled) {
         GL_VITA_PHASE_COUNT(fbo_raster_textures);
@@ -6281,6 +7108,9 @@ static void vita_glTexParameteri(
     GL_VITA_TIME_BEGIN();
     glTexParameteri((GLenum)target, (GLenum)name, (GLint)parameter);
     GL_VITA_TIME_END(state);
+#if defined(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE) && ISAAC_VITA_VITAGL_INTENSITY_TEXTURE
+    gl_vita_intensity_receipt();
+#endif
 }
 
 static void vita_glTexSubImage2D(
@@ -6315,12 +7145,47 @@ static void vita_glTexSubImage2D(
     if (target == GL_VITA_TEXTURE_2D)
         gl_vita_scaled_forget(gl_vita_fbo_bound_texture(), 1);
 #endif
+#if defined(ISAAC_VITA_THEORA_CADENCE_PROFILE) && ISAAC_VITA_THEORA_CADENCE_PROFILE
+    uint64_t video_subupload_begin = isaac_vita_theora_subupload_begin(
+        (uint32_t)width, (uint32_t)height, (uint32_t)format, (uint32_t)type);
+#endif
     GL_VITA_TIME_BEGIN();
     glTexSubImage2D(
         (GLenum)target, (GLint)level, (GLint)x_offset, (GLint)y_offset,
         (GLsizei)width, (GLsizei)height, (GLenum)format, (GLenum)type,
         (const void *)(uintptr_t)pixels);
     GL_VITA_TIME_END(tex_upload);
+#if defined(ISAAC_VITA_THEORA_CADENCE_PROFILE) && ISAAC_VITA_THEORA_CADENCE_PROFILE
+    isaac_vita_theora_subupload_end(video_subupload_begin);
+    /* Read the real post-upload descriptor, outside the native upload timer.
+     * vglGetGxmTexture is a read-only bound-texture accessor for this target.
+     * Four scoped receipts distinguish format conversion from a same-format
+     * copy without guessing KAGE's Image allocation format. */
+    if (video_subupload_begin != UINT64_MAX && target == GL_VITA_TEXTURE_2D &&
+            isaac_vita_theora_subupload_layout_needed()) {
+        const SceGxmTexture *video_texture = vglGetGxmTexture((GLenum)target);
+        if (video_texture)
+            isaac_vita_theora_subupload_layout(
+                (uint32_t)sceGxmTextureGetFormat(video_texture),
+                (uint32_t)sceGxmTextureGetWidth(video_texture),
+                (uint32_t)sceGxmTextureGetHeight(video_texture),
+                (uint32_t)sceGxmTextureGetType(video_texture));
+    }
+#endif
+#if defined(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD) && ISAAC_VITA_VITAGL_RGB_SUBUPLOAD
+    {
+        uint32_t rgb_stats[6];
+        vglIsaacRgbSubuploadSnapshot(rgb_stats);
+        if (rgb_stats[0] <= 4U || (rgb_stats[0] & 63U) == 0U)
+            isaac_vita_log("KAGE VITA RGB SUBUPLOAD: entries=%u converted=%u "
+                           "cow_elided=%u bytes_elided=%08x%08x neon=%u",
+                (unsigned)rgb_stats[0], (unsigned)rgb_stats[1], (unsigned)rgb_stats[2],
+                (unsigned)rgb_stats[4], (unsigned)rgb_stats[3], (unsigned)rgb_stats[5]);
+    }
+#endif
+#if defined(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE) && ISAAC_VITA_VITAGL_INTENSITY_TEXTURE
+    gl_vita_intensity_receipt();
+#endif
 #if defined(ISAAC_VITA_IO_PROFILE)
     kage_vita_io_profile_texture_end();
 #endif
@@ -6918,12 +7783,35 @@ static void vita_glViewport(
 # include "gl_vita_backend_test_vitagl_undef.h"
 #endif
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+static int s_install_result;
+static void gl_vita_install_closure(void *unused)
+{
+    (void)unused;
+    s_install_result = gl_vita_backend_install();
+}
+static void gl_vita_uninstall_closure(void *unused)
+{
+    (void)unused;
+    gl_vita_backend_uninstall();
+}
+#endif
+
 int gl_vita_backend_install(void)
 {
     guest_gl_backend backend;
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    if (isaac_gl_record_worker_active() && !isaac_gl_record_on_render_thread()) {
+        isaac_gl_record_worker_call(gl_vita_install_closure, NULL);
+        return s_install_result;
+    }
+#endif
     if (!kage_vita_backend_ready())
         return 0;
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    isaac_gl_record_stop();
+#endif
     gl_vita_backend_attrib_sync();
     gl_vita_texture_profile_reset_all();
     gl_vita_texture_profile_calibrate_clock();
@@ -6950,6 +7838,12 @@ int gl_vita_backend_install(void)
 #endif
 #if defined(GL_VITA_FBO_TABLE)
     gl_vita_fbo_shadow_reset();
+#endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+    gl_vita_readback_reset();
+#endif
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+    gl_vita_depth_carry_reset();
 #endif
 #if defined(GL_VITA_LOGICAL_VIEWPORT)
     gl_vita_display_raster_reset();
@@ -7025,6 +7919,9 @@ int gl_vita_backend_install(void)
     backend.glUseProgram = vita_glUseProgram;
     backend.glVertexAttribPointer = vita_glVertexAttribPointer;
     backend.glViewport = vita_glViewport;
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    isaac_gl_record_wrap(&backend, &s_record_rbo_native);
+#endif
     guest_gl_install_backend(&backend);
     s_installed = 1;
     return 1;
@@ -7032,6 +7929,15 @@ int gl_vita_backend_install(void)
 
 void gl_vita_backend_uninstall(void)
 {
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    if (isaac_gl_record_worker_active() && !isaac_gl_record_on_render_thread()) {
+        isaac_gl_record_worker_call(gl_vita_uninstall_closure, NULL);
+        return;
+    }
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    isaac_gl_record_stop();
+#endif
     gl_vita_backend_attrib_sync();
 #if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
     gl_vita_fxray_deopt_all("backend-uninstall");
@@ -7058,6 +7964,14 @@ void gl_vita_backend_uninstall(void)
 #if defined(GL_VITA_FBO_TABLE)
     gl_vita_fbo_shadow_reset();
 #endif
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+    if (s_readback.reads || s_readback.display_reads)
+        gl_vita_readback_receipt();
+    gl_vita_readback_reset();
+#endif
+#if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+    gl_vita_depth_carry_reset();
+#endif
 #if defined(GL_VITA_LOGICAL_VIEWPORT)
     gl_vita_display_raster_reset();
 #endif
@@ -7068,6 +7982,17 @@ void gl_vita_backend_uninstall(void)
 }
 
 int gl_vita_backend_installed(void) { return s_installed; }
+
+#if defined(ISAAC_VITA_SHADER_SAMPLER_FASTPATH) && ISAAC_VITA_SHADER_SAMPLER_FASTPATH
+int gl_vita_backend_sampler_is_native(const guest_gl_backend *backend)
+{
+    return s_installed && backend &&
+        backend->glActiveTexture == vita_glActiveTexture &&
+        backend->glBindTexture == vita_glBindTexture &&
+        backend->glGetUniformLocation == vita_glGetUniformLocation &&
+        backend->glUniform1i == vita_glUniform1i;
+}
+#endif
 
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
 /* ---- ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE (entry points) ------------- */
@@ -7176,6 +8101,24 @@ size_t gl_vita_backend_oracle_typed_state(void *out, size_t capacity)
 # endif
 #undef GL_VITA_ATTRIB_REPLAY_PUBLISH
 /* ---- ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE end ------------------------- */
+#endif
+
+#if defined(ISAAC_GL_RECORD_SCENARIO) && \
+    !defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+/* Recorder oracle only: same byte copy as the DIRECT_STATE accessor. */
+size_t gl_vita_backend_oracle_typed_state(void *out, size_t capacity)
+{
+#if defined(ISAAC_VITA_GL_TYPED_STATE_CACHE)
+    if (capacity < sizeof s_gl_typed_state)
+        return 0u;
+    memcpy(out, &s_gl_typed_state, sizeof s_gl_typed_state);
+    return sizeof s_gl_typed_state;
+#else
+    (void)out;
+    (void)capacity;
+    return 0u;
+#endif
+}
 #endif
 
 size_t gl_vita_backend_resolved_count(void)

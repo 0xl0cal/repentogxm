@@ -1,0 +1,5 @@
+# ISAAC_VITA_LAUNCH_ARGS_FILE: appended to the guest argv (bench_run.py prepare uploads it).
+# --vita-save-slot=2 is host-only: the eboot stores save slot 2 (File 2) in the Manager before any
+# mod script runs; without it a --set-stage run uses slot 0 = File 1's mod data, so the eboot
+# refuses --set-stage without a slot token (status=no-slot, normal menu boot).
+--set-stage=1 --set-stage-type=4 --vita-save-slot=2

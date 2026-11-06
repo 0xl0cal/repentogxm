@@ -68,9 +68,68 @@ switches below:
 | `ISAAC_COLOROFFSET_STAGING_OUTLINE=1` | `ISAAC_VITA_COLOROFFSET_STAGING_OUTLINE` | Private noinline whole-copy entries; requires limits NEON, default OFF |
 | `ISAAC_COLOROFFSET_PLAIN_FP16=1` | `ISAAC_VITA_COLOROFFSET_PLAIN_FP16` | Private 0013 helper sub-mode; requires PLAIN, rejects vertex pair, default OFF |
 | `ISAAC_LASER_LIGHT_HALO_DEPTH_APPROX=1` | `ISAAC_VITA_LASER_LIGHT_HALO_DEPTH_APPROX` | Private 0016 helper sub-mode; requires HALO_CLIP, faint fringe color/depth approximation, default OFF |
+| `ISAAC_SCENE_GUARD=1` | `ISAAC_VITA_VITAGL_SCENE_GUARD` | 0034; fail closed when no GXM scene could be opened (no clear/scissor-mask uniform writes or draws), keep retrying a failed `sceGxmEndScene` like stock, counters receipt, requires stock vitaGL, default OFF |
+| `ISAAC_RGB_SUBUPLOAD=1` | `ISAAC_VITA_VITAGL_RGB_SUBUPLOAD` | 0035; exact level-zero RGB24→RGBA32 NEON rows and guarded full-overwrite COW copy elision, default OFF |
+| `ISAAC_INTENSITY_TEXTURE=1` | `ISAAC_VITA_VITAGL_INTENSITY_TEXTURE` | 0037 + `isaac_intensity_texture.h`; lossless `U8_RRRR`/`A8L8` storage for equal-channel level-0 RGBA pages of the four measured Chinese-font shapes, transactional RGBA expansion before sub-image/parameter/FBO use, exclusion per texture name (reset in `glGenTextures`), bounded skip/reject receipts, requires KAGE + stock vitaGL, default OFF |
 
 The main CMake build runs this recipe in its binary directory with the
 switches derived from those options.
+
+`0035-isaac-rgb-subupload.patch` addresses the measured video upload path:
+RGB/UNSIGNED_BYTE into linear U8U8U8U8_ABGR. The row helper supplies alpha255,
+matches stock read_rgb888/write_rgba8888 bytes, and rejects aliases/invalid spans
+before any write. It changes only level-zero conversion; other paths retain
+their callbacks. COW allocation, old-storage retirement, descriptor updates,
+mips and texture state are retained. The old-image copy is elided only for a
+valid complete level-zero replacement with no additional mips or alignment
+padding. Partial updates, unknown layouts/formats and NULL allocations retain
+that copy. The private `vglIsaacRgbSubuploadSnapshot` endpoint reports actual
+entries/conversions/copy elisions/bytes and the compiled NEON path.
+`test_rgb_subupload.py` regenerates real stock/patched bodies and executes them,
+then runs the actual ARM NEON rows with strict bounds. It accepts an explicitly
+verified isolated Unicorn DLL for the known Thumb memory-hook ITSTATE bug.
+
+`0037-isaac-intensity-texture.patch` (zero-context hunks in `textures.c`,
+`shared.h` and `utils/gpu_utils.h`, applied after 0035) hooks texture
+definition, sub-image, integer parameters, colour attachment, the common
+texture free and the `glGenTextures` name hand-out into
+`isaac_intensity_texture.h`. Admission scans every texel of
+a level-0 RGBA page of the four measured shapes and requires R=G=B; it then
+stores one byte (`U8_RRRR`, alpha equal) or two (`A8L8` = SDK `U8U8_GRRR`,
+written by the stock `write_ra88` callback) per texel. Every replacement
+allocates and builds the new descriptor before retiring the old storage, so an
+allocation or SDK failure leaves the texture unchanged. An object that had an
+ordinary definition, sub-image, non-filter/wrap parameter or attachment is
+excluded for the rest of ITS life; `glGenTextures` clears the mark at the
+stock `TEX_UNUSED -> TEX_UNINITIALIZED` transition, because stock hands out the
+lowest free slot and a per-slot mark refused the pages loaded after a mass
+delete. No framebuffer points at a slot that is handed out: stock
+`glDeleteTextures` frees an attached object at once only when its single
+reference is the active read/write FBO (it clears `fb->tex`; the stale
+`ref_counter` of 1 is zeroed by `glGenTextures`), and otherwise keeps it
+`TEX_VALID` + dirty until the framebuffer releases it. The helper counts every
+event in 25 words (per-shape upload/upload-failed/skip/reject, storage kind,
+deopt, live compact pages/bytes; word 0 = tty lines printed) and exports them
+through the consumer-declared `vglIsaacIntensitySnapshot` (not in `vitaGL.h`),
+which `gl_vita_backend.c` reads to copy them into `native.log`, because the
+`sceClibPrintf` lines reach only the Cat-A-Log tty. The recipe hashes the
+patch and helper only when ON; OFF build.sh skips both and `nm` refuses
+`isaacIntensityPrepare`/`isaacIntensityRelease`/`vglIsaacIntensitySnapshot` in
+an OFF archive (and requires all three ON). `test_intensity_texture.py`
+regenerates the bare/control/diagnostic chains from the stock archive, proves
+the guard-stripped sources equal their pre-patch bytes, and executes the real
+patched bodies (OOM and 38 SDK failure positions, every (L,A) pair, name reuse
+through the real `glGenTextures`/`glDeleteTextures`/detach, including a
+delete while attached to the active FBO, receipt caps), together with the
+runtime reader extracted verbatim from `gl_vita_backend.c`: after every step
+the words must match the tty lines by kind and the live slots, and the
+`native.log` line must carry the last event and the counters.
+`test_vitagl_stock_patch_chain.py` (`prove_intensity_texture`) checks the
+placement of all nine guarded blocks on the three chains. Number 0036 belongs
+to the render-thread worker-wait probe of the spawn-stall investigation;
+when both are ON, 0036 applies first, and the chain proof repeats every chain
+with any `0036-*.patch` found in this directory (0036 itself applies only on
+the control chain).
 
 The default-OFF `ISAAC_VITA_LASER_LIGHT_HALO_DEPTH_APPROX` removes only the
 halo helper's depth-test veto. The normal guest renderer enables depth, so
@@ -919,3 +978,56 @@ Existing P8, freshly regenerated metadata-owner, phase-profile and shader
 cache fixtures cover reason accounting/poison exits, size subset, modular
 wrap, recovery/publication, OFF/zero, ABI loss/rebaseline, record bounds and
 same-revision identity.
+
+## Scene guard (0034, default OFF)
+
+Stock vitaGL ignores the return of `setup_render_target` and of every
+`sceGxmBeginScene` in `scene_reset` (they are only logged under `LOG_ERRORS`,
+which this recipe does not define). When `sceGxmCreateRenderTarget` refuses a
+new offscreen target under GXM driver-memory pressure (seen at Ultra Greed's
+death, Vita error C2-12828-1), no scene is open, the next `glClear` gets
+`SCE_GXM_ERROR_NOT_WITHIN_SCENE` from `sceGxmReserveVertexDefaultUniformBuffer`,
+ignores it and `sceGxmSetUniformDataF` writes the clear position through the
+uninitialised `vbuffer` (data abort, dfar 0x10e). `update_scissor_test` has the
+same shape twice.
+
+`ISAAC_SCENE_GUARD=1` applies `0034-isaac-scene-guard.patch` last (after 0032)
+with `--unidiff-zero`; every line it adds is inside `#ifdef
+HAVE_ISAAC_SCENE_GUARD`, so the OFF source is textually identical. In `gxm.c`
+the guard records whether a scene is open (set from each `sceGxmBeginScene`
+result, cleared at `sceGxmEndScene`), counts `setup_render_target`,
+`sceGxmBeginScene` and `sceGxmEndScene` failures, and makes `scene_end` a
+counted no-op when no scene is open and none is dangling (the occlusion
+`query_fence` does not advance; `vglSwapBuffers` still queues the flip).
+
+A failed `sceGxmEndScene` does not close the scene. Measured on the Vita on
+2026-09-27 (Chinese font pages under VRAM pressure): one EndScene failed, then
+every `sceGxmBeginScene` returned `SCE_GXM_ERROR_WITHIN_SCENE` and the display
+never received another scene. Stock vitaGL recovers from this by itself,
+because `scene_reset` calls `scene_end` before every begin and so retries the
+end; the first revision of the guard marked the scene closed and then skipped
+that retry forever. The guard now keeps such a scene *dangling*: a failed end
+other than `SCE_GXM_ERROR_NOT_WITHIN_SCENE`, or a begin that returns
+`SCE_GXM_ERROR_WITHIN_SCENE`, sets it; a successful begin, a successful end or
+`NOT_WITHIN_SCENE` clears it; `scene_end` is never skipped while it is set.
+`glClear` returns right after
+`scene_reset` when no scene is open, NULL-initialises `vbuffer`/`fbuffer`,
+checks both reserve results and skips the uniform writes and the draw when
+either failed (counted as a skipped clear). Both `update_scissor_test` mask
+sites do the same (counted as skipped draws). The other draw paths reserve
+from vitaGL's own circular pool and `sceGxmDraw` without a scene fails closed
+inside the SDK, so they are untouched. Exports for the consumer, not declared
+in `vitaGL.h`: `vglIsaacSceneGuardSnapshot(uint32_t out[8])` = rt_fail,
+begin_fail, end_fail, reserve_fail, skipped_clear, skipped_draw, skipped_end,
+last_err, `vglIsaacSceneGuardRecovery(uint32_t out[4])` = dangling (0/1),
+end_retry (ends attempted on a dangling scene), recovered (dangling scenes a
+retried end closed), last EndScene error, and `vglIsaacSceneGuardChanged()` =
+change edge. The KAGE backend logs `KAGE VITA SCENE GUARD: on` at the cold
+initialize and, after a swap on which the edge moved, `KAGE VITA SCENE GUARD:
+rt_fail=.. begin_fail=.. end_fail=.. reserve_fail=.. skipped(clear,draw)=..,..
+last_err=0x........ skipped_end=.. dangling=.. end_retry=.. recovered=..
+end_err=0x........ changes=..` (first eight changes, then every 256th).
+Healthy recovery reads `dangling=0` with `recovered` equal to the number of
+failed ends that were not followed by another failure. Contract keys
+`scene_guard`, `scene_guard_patch_sha256`; the archive exports the hooks iff
+the switch is on.

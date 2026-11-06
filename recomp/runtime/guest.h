@@ -217,6 +217,8 @@ typedef struct CPU {
         };
     };
     uint8_t  df;            /* direction flag for string ops */
+    uint8_t  idf;           /* EFLAGS.ID (bit 21): only pushfd/popfd see it;
+                             * toggled by CPUID-presence probes */
 
     /* Set by a translated function that reached something we cannot execute.
      * Never silently ignored: the guarded driver checks it. */
@@ -1475,21 +1477,21 @@ extern unsigned char *g_guest_coverage_cases;
 #error GUEST_COVERAGE_HOOKS must be 0 or 1
 #endif
 
-/* Opt-in census of translated body entries (ISAAC_VITA_PROFILE_FUNCTION_ENTRIES,
- * profile builds only): every generated body calls guest_coverage_function
- * exactly once on entry, so this counts direct calls, tail jumps and indirect
- * dispatches alike; direct + tail = ent - g(l) in ph120.ik.  One increment per
- * entry; production and every default build compile it to nothing. */
-#if defined(ISAAC_VITA_PROFILE_FUNCTION_ENTRIES)
+/* Body-entry censuses, profile builds only (guest_entry_census.h): every body
+ * calls guest_coverage_function once on entry; ..._FUNCTION_ENTRIES = ph120.ik
+ * ent=, ..._FUNCTION_ENTRY_CENSUS = ph120.fe.  Default builds: nothing. */
+#if defined(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS)
+# include "guest_entry_census.h"
+#elif defined(ISAAC_VITA_PROFILE_FUNCTION_ENTRIES)
 extern uint32_t g_guest_function_entries;
-# define GUEST_PROFILE_NOTE_FUNCTION_ENTRY() (++g_guest_function_entries)
+# define GUEST_PROFILE_NOTE_FUNCTION_ENTRY(id) (++g_guest_function_entries)
 #else
-# define GUEST_PROFILE_NOTE_FUNCTION_ENTRY() ((void)0)
+# define GUEST_PROFILE_NOTE_FUNCTION_ENTRY(id) ((void)0)
 #endif
 
 static inline void guest_coverage_function(uint32_t id)
 {
-    GUEST_PROFILE_NOTE_FUNCTION_ENTRY();
+    GUEST_PROFILE_NOTE_FUNCTION_ENTRY(id);
 #if GUEST_COVERAGE_HOOKS
     unsigned char *bytes = g_guest_coverage_functions;
     if (bytes) ((volatile unsigned char *)bytes)[id] = 1u;
@@ -1570,6 +1572,21 @@ extern int g_guest_gl_inventory_mode;
 /* Exact caller-side KAGE handoff.  False means execute the original guest
  * bytes; true requires an explicitly enabled, already-ready PC backend. */
 int guest_kage_pc_handoff_ready(void);
+
+/* Guard of the automatic-Intro ACTION_MENUCONFIRM seam in the cutscene
+ * update owner sub_004b78d0 (gen_all.py INTRO_PC_NATIVE_SKIP_SITE_RVA,
+ * issue #14).  The generated text spells this same-length name.  Without
+ * ISAAC_VITA_INTRO_PLAY it is an alias of the handoff predicate, so every
+ * unit preprocesses to the tokens it had before the rename and the Intro is
+ * still auto-confirmed once the backend is ready.  With it, only the owner
+ * unit and the KAGE boundary sources see a real function, which on Vita
+ * declines the forced confirm: the stock Intro plays and the game's own
+ * ACTION_MENUCONFIRM test (Cross) skips it. */
+#if defined(ISAAC_VITA_INTRO_PLAY) && ISAAC_VITA_INTRO_PLAY
+int guest_kage_intro_skip_ready(void);
+#else
+#define guest_kage_intro_skip_ready guest_kage_pc_handoff_ready
+#endif
 
 /* Platform capability helpers used by translated CPUID/XGETBV. */
 void guest_cpuid(CPU *__restrict c);
@@ -1848,6 +1865,33 @@ static inline uint32_t guest_fs_base_generated(CPU *__restrict c)
     ((void)(_eax = (c)->eax, _ecx = (c)->ecx, _edx = (c)->edx, \
             _ebx = (c)->ebx, _esp = (c)->esp, _ebp = (c)->ebp, \
             _esi = (c)->esi, _edi = (c)->edi))
+/* GUEST_GPR_FLUSH_MASK(c, m) is emitted only by a generation with
+ * GUEST_GPR_FLUSH_MASK=1 (recomp/gpr_flush_mask.py): m names the registers
+ * that may have been written since the last DECL/RELOAD/FLUSH on some path;
+ * every other field already holds its local, so storing it changes nothing.
+ * GCC cannot drop those stores itself because a guest store through an
+ * integer-cast pointer may alias `*c` as far as it knows.  Header knob
+ * GUEST_GPR_FLUSH_MASKED=0 (default) publishes all eight as before, so the
+ * same corpus builds the old objects. */
+#ifndef GUEST_GPR_FLUSH_MASKED
+#define GUEST_GPR_FLUSH_MASKED 0
+#endif
+#if GUEST_GPR_FLUSH_MASKED != 0 && GUEST_GPR_FLUSH_MASKED != 1
+#error GUEST_GPR_FLUSH_MASKED must be 0 or 1
+#endif
+#if GUEST_GPR_FLUSH_MASKED
+#define GUEST_GPR_FLUSH_MASK(c, m) \
+    ((void)(((m) & 0x01U ? (void)((c)->eax = _eax) : (void)0), \
+            ((m) & 0x02U ? (void)((c)->ecx = _ecx) : (void)0), \
+            ((m) & 0x04U ? (void)((c)->edx = _edx) : (void)0), \
+            ((m) & 0x08U ? (void)((c)->ebx = _ebx) : (void)0), \
+            ((m) & 0x10U ? (void)((c)->esp = _esp) : (void)0), \
+            ((m) & 0x20U ? (void)((c)->ebp = _ebp) : (void)0), \
+            ((m) & 0x40U ? (void)((c)->esi = _esi) : (void)0), \
+            ((m) & 0x80U ? (void)((c)->edi = _edi) : (void)0)))
+#else
+#define GUEST_GPR_FLUSH_MASK(c, m) GUEST_GPR_FLUSH(c)
+#endif
 #if GUEST_GENERATED_STACK_GUARD
 /* Checked stack: the out-of-line validators read and write c->esp, so the
  * local is published before and reloaded after each one.  A rejected
@@ -1892,6 +1936,7 @@ static inline uint32_t guest_fs_base_generated(CPU *__restrict c)
 #define GUEST_GPR_DECL ((void)0)
 #define GR(reg) c->reg
 #define GUEST_GPR_FLUSH(c) ((void)0)
+#define GUEST_GPR_FLUSH_MASK(c, m) ((void)0)
 #define GUEST_GPR_RELOAD(c) ((void)0)
 #define GPUSH(value) gpush_generated(c, value)
 #define GPOP() gpop_generated(c)

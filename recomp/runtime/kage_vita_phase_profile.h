@@ -38,7 +38,10 @@
  * directly after k. The GL fill census ISAAC_VITA_GL_FILL_CENSUS adds fa and
  * fp directly after f, or in f's place when the vitaGL draw policy is off. The
  * fully enabled order is
- * t,c,a,gt,gw,gd,gu,gx,vz,x,xd,g,d,i,o,y,v,q,f,fa,fp,e,k,kp,b,h,p,l,m,n,s,r,w,ik,ih,mem,ha,rl.
+ * t,c,a,tl,gt,gw,gd,gu,gx,vz,x,xd,g,d,i,o,y,v,q,f,fa,fp,e,k,kp,b,h,p,l,m,n,s,r,w,ik,ih,mem,ha,rl.
+ * ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH=OBSERVE|ON adds tl directly after a.
+ * ISAAC_VITA_KAGE_QUAD_FASTPATH appends kq after mem and the diagnostic
+ * ISAAC_VITA_UNIFORM_SET_RECEIPT appends us after kq (both before ha).
  * ROOM_LOG_MARKERS adds rl last, followed by at most eight separate roomlog
  * events. Those timestamps mark successful logger formatting, not room arrival
  * or durable fwrite. Queue/reset loss and saturation are explicit; no forced
@@ -58,7 +61,10 @@
  * winners with correlated same-loop phases; swap remains nested in render).
  * Optional room diagnostics follow x/xd: fh, png/pngf, io/ioo/ioc, sfx/sfxn and
  * nr/free/nrm/nrs. Their take validity/baseline and inclusive-scope contracts
- * are documented in kage_vita_room_profile.h and the producer headers. */
+ * are documented in kage_vita_room_profile.h and the producer headers.
+ * ISAAC_VITA_ARCHIVE_READ_TRAIL adds rts (summary) and up to CAP rt records
+ * (one per packed-archive seek run) directly after ioc; see
+ * host_vita_archive_trail.h. */
 #define KAGE_VITA_PHASE_PROFILE_WINDOW 120u
 
 void kage_vita_phase_profile_reset(void);

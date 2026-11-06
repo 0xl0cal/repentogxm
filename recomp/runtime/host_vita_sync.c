@@ -571,11 +571,25 @@ static void vita_sync_ResetEvent(CPU *__restrict c)
     vita_sync_stdcall_return(c, 4U);
 }
 
+#if defined(ISAAC_VITA_THEORA_WORKER_PUMP)
+/* host_vita_theora_worker_pump.c: 1 when this Sleep ends a pumped slice of
+ * theoraplayer's worker loop (no delay; the shim returns to the guest). */
+int isaac_vita_theora_worker_pump_intercept_sleep(CPU *__restrict c,
+                                                  uint32_t milliseconds);
+#endif
+
 static void vita_sync_Sleep(CPU *__restrict c)
 {
-    int result = isaac_vita_sync_sleep_milliseconds(
-        vita_sync_arg(c, 0U));
+    int result;
 
+#if defined(ISAAC_VITA_THEORA_WORKER_PUMP)
+    if (isaac_vita_theora_worker_pump_intercept_sleep(c, vita_sync_arg(c, 0U))) {
+        if (!c->fault)
+            vita_sync_stdcall_return(c, 4U);
+        return;
+    }
+#endif
+    result = isaac_vita_sync_sleep_milliseconds(vita_sync_arg(c, 0U));
     if (result < 0) {
         isaac_vita_sync_log_failure("sceKernelDelayThread", result);
         vita_sync_fault(c,

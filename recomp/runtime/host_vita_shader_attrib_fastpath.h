@@ -59,4 +59,53 @@ int isaac_vita_shader_attribs_disable_try(CPU *__restrict c);
 #define ISAAC_VITA_SHADER_ATTRIB_MAX_COUNT        16u
 #define ISAAC_VITA_SHADER_ATTRIB_GL_FLOAT         0x1406u
 
+
+#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+/* Memo geometry and the oracle's mutant hooks, private to
+ * host_vita_shader_attrib_fastpath.c.  They live here, at the end of the
+ * header, so the replay TU keeps every line (its line table) of the build
+ * before this knob: with the defaults the preprocessed replay is token for
+ * token the 16-entry memo of commit e6b69f7.
+ *
+ * ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES (CMake STRING 16|32|64|128,
+ * default 16).  16 keeps attrib_memo_slot's legacy fold
+ * ((self >> 4) ^ (self >> 9)) & 15.  Every other size indexes by
+ * (self >> 2) & (ENTRIES - 1): Shader objects are 4-byte aligned and the
+ * static ones sit 0x2c bytes (11 words, an odd stride) apart, so a run of up
+ * to ENTRIES consecutive objects never shares a slot.  Measured on the
+ * frozen PE (test_vita_shader_attrib_fastpath.py, static census of the 23
+ * `mov [imm32], 0xb5e0a8` constructions): the legacy fold leaves 10 / 7 / 2
+ * extra occupants at 16 / 32 / 64 entries, among them ColorOffset 0x987c4f3c
+ * and the KAGE textured built-in 0x987c7a9c in one slot even at 64; the
+ * (self >> 2) index leaves 0 at 64 and 128.  Heap-constructed Shader objects
+ * are not in that census. */
+# if !defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES) || \
+     ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES == 16
+#  define ISAAC_VITA_SHADER_ATTRIB_MEMO_ENTRIES 16u
+#  define ISAAC_VITA_SHADER_ATTRIB_MEMO_SLOT(self) attrib_memo_slot(self)
+#  define ISAAC_VITA_SHADER_ATTRIB_MEMO_LEGACY_SLOT
+# else
+#  define ISAAC_VITA_SHADER_ATTRIB_MEMO_ENTRIES \
+    ((uint32_t)ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES)
+#  define ISAAC_VITA_SHADER_ATTRIB_MEMO_SLOT(self) \
+    (&s_attrib_memo[((uint32_t)(self) >> 2) & (ATTRIB_MEMO_ENTRIES - 1u)])
+#  if defined(__GNUC__)
+#   define ISAAC_VITA_SHADER_ATTRIB_MEMO_LEGACY_SLOT __attribute__((unused))
+#  else
+#   define ISAAC_VITA_SHADER_ATTRIB_MEMO_LEGACY_SLOT
+#  endif
+# endif
+/* Host-oracle mutants (must-FAIL legs of the test) predefine these two:
+ * ORACLE_MUTATE_MEMO_NO_GENERATION reads a constant generation,
+ * ORACLE_MUTATE_MEMO_NO_NAME_BYTES compares name addresses only.  A
+ * production build never defines them. */
+# if !defined(ISAAC_VITA_SHADER_ATTRIB_MEMO_GENERATION)
+#  define ISAAC_VITA_SHADER_ATTRIB_MEMO_GENERATION \
+    g_isaac_vita_gl_location_generation
+# endif
+# if !defined(ISAAC_VITA_SHADER_ATTRIB_MEMO_HIT)
+#  define ISAAC_VITA_SHADER_ATTRIB_MEMO_HIT attrib_memo_hit
+# endif
+#endif
+
 #endif

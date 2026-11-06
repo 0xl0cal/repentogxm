@@ -31,6 +31,10 @@ ISAAC_CRT_SEEK_SHADOW_TEST_ROOT="$root" \
 ISAAC_CRT_SEEK_SHADOW_TEST_OUT="$work/seek-shadow" \
     bash "$root/vita/test_crt_seek_shadow.sh"
 
+ISAAC_CRT_FREAD_COMPLETE_TEST_ROOT="$root" \
+ISAAC_CRT_FREAD_COMPLETE_TEST_OUT="$work/fread-complete" \
+    bash "$root/vita/test_crt_fread_complete.sh"
+
 "$cc" $common_flags -DGUEST_IMAGE_BASE=0x98000000u \
     -DISAAC_VITA_ARCHIVE_FILE_CACHE=1 \
     -DISAAC_VITA_CRT_DESCRIPTOR_RECOVER=1 \
@@ -44,6 +48,42 @@ ISAAC_CRT_SEEK_SHADOW_TEST_OUT="$work/seek-shadow" \
     -lSceRtc_stub -lSceIofilemgr_stub \
     -o "$work/vita-crt-import-oracle.elf"
 
+# The verbose arcdiag ring (every archive fread/fseek/ftell/fclose retained,
+# 1024 events, frozen-PE wrapper frame walk) must compile and link under the
+# same -Werror set; the production OFF object is proven byte-identical by the
+# ARM identity gate on the Linux build host, not here.
+"$cc" $common_flags -DGUEST_IMAGE_BASE=0x98000000u \
+    -DISAAC_VITA_ARCHIVE_FILE_CACHE=1 \
+    -DISAAC_VITA_CRT_DESCRIPTOR_RECOVER=1 \
+    -DISAAC_VITA_CRT_FREAD_ORACLE=1 \
+    -DISAAC_VITA_ARCHIVE_DIAG_VERBOSE=1 \
+    -I"$root/runtime" -I"$root/vita" \
+    "$root/runtime/guest_stack_legacy_oracle_stub.c" \
+    "$root/runtime/host_vita_first_fault.c" \
+    "$root/runtime/host_vita_archive_cache.c" \
+    "$root/runtime/host_vita_crt.c" \
+    "$root/runtime/vita_crt_import_test.c" \
+    -lSceRtc_stub -lSceIofilemgr_stub \
+    -o "$work/vita-crt-import-oracle-verbose.elf"
+
+# The short packed-archive fread completion (ISAAC_VITA_CRT_FREAD_COMPLETE,
+# newlib cursor arithmetic under __NEWLIB__) must compile and link under the
+# same -Werror set; the production OFF object is proven byte-identical by the
+# ARM identity gate on the Linux build host, not here.
+"$cc" $common_flags -DGUEST_IMAGE_BASE=0x98000000u \
+    -DISAAC_VITA_ARCHIVE_FILE_CACHE=1 \
+    -DISAAC_VITA_CRT_DESCRIPTOR_RECOVER=1 \
+    -DISAAC_VITA_CRT_FREAD_ORACLE=1 \
+    -DISAAC_VITA_CRT_FREAD_COMPLETE=1 \
+    -I"$root/runtime" -I"$root/vita" \
+    "$root/runtime/guest_stack_legacy_oracle_stub.c" \
+    "$root/runtime/host_vita_first_fault.c" \
+    "$root/runtime/host_vita_archive_cache.c" \
+    "$root/runtime/host_vita_crt.c" \
+    "$root/runtime/vita_crt_import_test.c" \
+    -lSceRtc_stub -lSceIofilemgr_stub \
+    -o "$work/vita-crt-import-oracle-fread-complete.elf"
+
 "$readelf" -h "$work/vita-crt-import-oracle.elf"
 "$readelf" -A "$work/vita-crt-import-oracle.elf"
 sha256sum \
@@ -56,9 +96,11 @@ sha256sum \
     "$root/runtime/host_vita_crt.c" \
     "$root/runtime/host_vita_crt_raw_archive_oracle.c" \
     "$root/runtime/host_vita_crt_seek_shadow_oracle.c" \
+    "$root/runtime/host_vita_crt_fread_complete_oracle.c" \
     "$root/runtime/host_vita_memory.h" \
     "$root/runtime/vita_crt_import_test.c" \
     "$root/vita/test_crt_raw_archive.sh" \
     "$root/vita/test_crt_seek_shadow.sh" \
+    "$root/vita/test_crt_fread_complete.sh" \
     "$work/vita-crt-import-oracle.elf"
-echo "Vita CRT import compile/link/static ABI check: PASS (60 handlers; exact TLS/_exit/exit family with four exit call sites and source oracle; utility qsort is the exact 7-site/6-comparator guest-callback implementation; complete 6-slot convert DLL with exact 456-physical-call numeric census: atoi 191 direct + 46 register loads feeding 102 unique register calls = 293 physical calls; EDX:EAX/x87 oracle; complete contiguous 16-slot stdio family, no direct raw allocation in bounded vfprintf streaming, exact missing 8-slot/92-call census with fwrite #2772, fflush #2773 and predicted fread #2793 pinned, one-newlib locked FILE registry, 16 KiB read buffering, optional read-only SEEK_END shadow, one-idle packed-archive cache, exact-ENOMEM raw SceIo packed-archive fallback, and fread/fseek hot dispatch; exact 5-import/22-call UCRT time family; source oracle built but execution is accepted only through Vita3K or hardware)"
+echo "Vita CRT import compile/link/static ABI check: PASS (60 handlers; exact TLS/_exit/exit family with four exit call sites and source oracle; utility qsort is the exact 7-site/6-comparator guest-callback implementation; complete 6-slot convert DLL with exact 456-physical-call numeric census: atoi 191 direct + 46 register loads feeding 102 unique register calls = 293 physical calls; EDX:EAX/x87 oracle; complete contiguous 16-slot stdio family, no direct raw allocation in bounded vfprintf streaming, exact missing 8-slot/92-call census with fwrite #2772, fflush #2773 and predicted fread #2793 pinned, one-newlib locked FILE registry, 16 KiB read buffering, optional read-only SEEK_END shadow, optional short packed-archive fread completion, one-idle packed-archive cache, exact-ENOMEM raw SceIo packed-archive fallback, and fread/fseek hot dispatch; exact 5-import/22-call UCRT time family; source oracle built but execution is accepted only through Vita3K or hardware)"

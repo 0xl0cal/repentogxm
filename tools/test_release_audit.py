@@ -160,6 +160,10 @@ def test_suspicious_media_extensions() -> None:
         "recomp/vita/assets/sce_sys/livearea/contents/bg0.png",
         "recomp/vita/assets/sce_sys/livearea/contents/nicalis.png",
         "recomp/vita/assets/sce_sys/livearea/contents/startup.png",
+        "recomp/vita/assets/sce_sys/livearea/contents/1.png",
+        "recomp/vita/assets/sce_sys/livearea/contents/2.png",
+        "recomp/vita/assets/sce_sys/livearea/contents/3.png",
+        "recomp/vita/assets/sce_sys/livearea/contents/4.png",
     })
     check(
         module.ALLOWED_MEDIA_ASSETS == expected_allowlist,

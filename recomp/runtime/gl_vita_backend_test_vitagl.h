@@ -76,6 +76,28 @@ void oracle_glVertexAttribPointer(
 void oracle_glViewport(
     GLint x, GLint y, GLsizei width, GLsizei height);
 void oracle_glNoop();
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+/* The readback sync drains vitaGL's GXM context; the oracle counts the
+ * drains and records the count each native read observes. */
+typedef struct SceGxmContext SceGxmContext;
+void sceGxmFinish(SceGxmContext *context);
+void oracle_glReadPixels(
+    GLint x, GLint y, GLsizei width, GLsizei height,
+    GLenum format, GLenum type, void *pixels);
+/* The detail path inspects the attached texture through vitaGL's
+ * exported accessors and the GXM descriptor getters; the oracle serves a
+ * fixed 8x4 linear RGBA8 texture. */
+typedef struct SceGxmTexture SceGxmTexture;
+SceGxmTexture *vglGetGxmTexture(GLenum target);
+void *vglGetTexDataPointer(GLenum target);
+uint32_t sceGxmTextureGetFormat(const SceGxmTexture *texture);
+uint32_t sceGxmTextureGetType(const SceGxmTexture *texture);
+unsigned int sceGxmTextureGetWidth(const SceGxmTexture *texture);
+unsigned int sceGxmTextureGetHeight(const SceGxmTexture *texture);
+unsigned int sceGxmTextureGetStride(const SceGxmTexture *texture);
+void *sceGxmTextureGetData(const SceGxmTexture *texture);
+#define SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR 0x0C000000u
+#endif
 #if defined(ISAAC_GL_VITA_LOCATION_ORACLE)
 /* gl_vita_location_cache_oracle.c models attribute locations and shader
  * attachment; every other oracle keeps the constant facade below. */
@@ -140,7 +162,11 @@ void vglIsaacMarkColorOffsetShader(
 #define glGetStringi                 oracle_glReturnString
 #define glGetUniformLocation         oracle_glGetUniformLocation
 #define glLinkProgram                oracle_glLinkProgram
+#if defined(ISAAC_VITA_FBO_READBACK_FIX)
+#define glReadPixels                 oracle_glReadPixels
+#else
 #define glReadPixels                 oracle_glNoop
+#endif
 #define glShaderSource               oracle_glShaderSource
 #define glTexImage2D                 oracle_glTexImage2D
 #define glTexParameteri              oracle_glNoop

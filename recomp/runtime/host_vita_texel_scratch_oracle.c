@@ -583,6 +583,46 @@ int main(void)
         &cpu, stack, ROUTING_SCRATCH_BASE));
     ROUTING_CHECK(cpu.fault && strstr(cpu.fault, "double/stale free"));
 
+    /* Chinese font requests are exactly 16 and 32 MiB. Keep both literals
+     * independent of the capacity macros, so old limits fail behavior.
+     * Only the 32M capacity admits them; the frozen 0x00bd6000 default and
+     * the 8 MiB diagnostic both route them to ordinary malloc with their
+     * original sizes and reach the diagnostic when that also fails. */
+    for (unsigned font = 0U; font < 2U; ++font) {
+        const uint32_t font_requests[2] = {16777216U, 33554432U};
+        uint32_t request = font_requests[font];
+        unsigned native_before = s_routing_native_malloc_calls;
+        unsigned diagnostic_before = s_routing_diagnostic_calls;
+        unsigned reserve_before = s_routing_memblock_alloc_calls;
+
+        ROUTING_CHECK(routing_texel_malloc(
+            &cpu, stack, request,
+            KAGE_VITA_TEXEL_PNG_LOADER_RETURN, 1, &result));
+#if !defined(ISAAC_VITA_TEXEL_SCRATCH_32M)
+        ROUTING_CHECK(!cpu.fault && result == 0U &&
+                      s_routing_native_malloc_calls == native_before + 1U &&
+                      s_routing_native_malloc_size == request &&
+                      s_routing_diagnostic_calls == diagnostic_before + 1U);
+#else
+        ROUTING_CHECK(!cpu.fault && result == ROUTING_SCRATCH_BASE &&
+                      s_routing_native_malloc_calls == native_before &&
+                      s_routing_diagnostic_calls == diagnostic_before);
+        ROUTING_CHECK(routing_free(&cpu, stack, result));
+        ROUTING_CHECK(!cpu.fault);
+        ROUTING_CHECK(routing_texel_malloc(
+            &cpu, stack, request,
+            KAGE_VITA_TEXEL_PNG_LOADER_RETURN, 1, &result));
+        ROUTING_CHECK(!cpu.fault && result == ROUTING_SCRATCH_BASE &&
+                      s_routing_native_malloc_calls == native_before &&
+                      s_routing_diagnostic_calls == diagnostic_before);
+        ROUTING_CHECK(routing_free(&cpu, stack, result));
+        ROUTING_CHECK(!cpu.fault);
+#endif
+        ROUTING_CHECK(s_routing_memblock_alloc_calls == reserve_before &&
+                      s_routing_memblock_free_calls == 0U &&
+                      s_routing_memblock_live);
+    }
+
     ROUTING_CHECK(isaac_vita_texel_scratch_oracle_reset() == 0);
     ROUTING_CHECK(!s_routing_memblock_live &&
                   s_routing_memblock_free_calls == 1U);
@@ -648,6 +688,8 @@ static unsigned s_log_count;
 static char s_logs[ORACLE_LOG_CAPACITY][ORACLE_LOG_BYTES];
 
 static int s_inject_concurrency;
+static int s_inject_reserve_busy;
+static int s_reserve_busy_result;
 static int s_thread_result;
 static int s_concurrent_result;
 static isaac_vita_texel_scratch_decision s_concurrent_decision;
@@ -724,6 +766,12 @@ SceUID sceKernelAllocMemBlock(const char *name, SceKernelMemBlockType type,
     if (s_texel_live)
         return -0x702;
     s_texel_live = 1;
+
+    if (s_inject_reserve_busy) {
+        s_inject_reserve_busy = 0;
+        s_reserve_busy_result = isaac_vita_texel_scratch_reserve(
+            ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING);
+    }
 
     /* The production lifecycle lock is held across this syscall.  Starting
      * and joining here makes the second request truly concurrent without a
@@ -819,6 +867,8 @@ static void reset_fake(void)
     memset(s_logs, 0, sizeof s_logs);
     reset_texel_canaries();
     s_inject_concurrency = 0;
+    s_inject_reserve_busy = 0;
+    s_reserve_busy_result = 99;
     s_thread_result = -1;
     s_concurrent_result = 99;
     memset(&s_concurrent_decision, 0xa5,
@@ -865,6 +915,9 @@ int main(void)
 #ifdef ISAAC_VITA_TEXEL_SCRATCH_8M
     CHECK(KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES == 0x00801000U);
     CHECK(KAGE_VITA_TEXEL_SCRATCH_REQUEST_MAX_BYTES == 8388608U);
+#elif defined(ISAAC_VITA_TEXEL_SCRATCH_32M)
+    CHECK(KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES == 0x02001000U);
+    CHECK(KAGE_VITA_TEXEL_SCRATCH_REQUEST_MAX_BYTES == 33554432U);
 #else
     CHECK(KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES == 0x00bd6000U);
     CHECK(KAGE_VITA_TEXEL_SCRATCH_REQUEST_MAX_BYTES == 0x00bd6000U);
@@ -874,6 +927,69 @@ int main(void)
     CHECK(((uintptr_t)s_anm2_block &
            (KAGE_VITA_TEXEL_MEMBLOCK_PAGE_BYTES - 1U)) == 0U);
 
+    CHECK(isaac_vita_texel_scratch_oracle_reset() == 0);
+    reset_fake();
+
+    /* Early reserve publishes backing only, never a logical guest lease.
+     * Clean refusal retries; invalid rollback remains poisoned. */
+    CHECK(!isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_FLOOR));
+    CHECK(s_texel_alloc_calls == 0U);
+    s_alloc_result = -0x111;
+    CHECK(!isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(isaac_vita_texel_scratch_oracle_snapshot(&snapshot));
+    CHECK(!snapshot.base && !snapshot.live && !snapshot.poisoned);
+    s_alloc_result = (int)ORACLE_TEXEL_UID;
+    s_get_result = -0x222;
+    CHECK(!isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(!s_texel_live && s_texel_free_calls == 1U);
+    s_get_result = 0;
+    s_literal_base = ORACLE_STACK_FLOOR;
+    CHECK(!isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(!s_texel_live && s_texel_free_calls == 2U);
+    s_literal_base = 0x91000000U;
+    s_inject_reserve_busy = 1;
+    CHECK(isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(s_reserve_busy_result == 0 && s_texel_alloc_calls == 4U);
+    CHECK(isaac_vita_texel_scratch_oracle_snapshot(&snapshot));
+    CHECK(snapshot.base == 0x91000000U && !snapshot.live &&
+          !snapshot.live_size && !snapshot.high_water &&
+          !snapshot.acquired_count && !snapshot.freed_count);
+    CHECK(isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(s_texel_alloc_calls == 4U);
+    CHECK(exact_malloc(4096U, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    first = decision.pointer;
+    CHECK(first == (void *)(uintptr_t)0x91000000U);
+    CHECK(!isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(isaac_vita_texel_scratch_free(first, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    CHECK(!isaac_vita_texel_scratch_reserve(0x91001000U, 0x91002000U));
+    CHECK(isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(s_texel_alloc_calls == 4U && s_texel_free_calls == 2U);
+    CHECK(isaac_vita_texel_scratch_oracle_reset() == 0);
+    reset_fake();
+    s_get_result = -0x333;
+    s_free_result = -0x444;
+    CHECK(!isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(isaac_vita_texel_scratch_oracle_snapshot(&snapshot));
+    CHECK(snapshot.poisoned && snapshot.uid == ORACLE_TEXEL_UID &&
+          !snapshot.base && !snapshot.live && !snapshot.acquired_count);
+    CHECK(!isaac_vita_texel_scratch_reserve(
+        ORACLE_STACK_FLOOR, ORACLE_STACK_CEILING));
+    CHECK(exact_malloc(4096U, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_REJECTED);
+    CHECK(decision.fault && strstr(decision.fault, "poisoned") &&
+          s_texel_alloc_calls == 1U);
+    s_free_result = 0;
     CHECK(isaac_vita_texel_scratch_oracle_reset() == 0);
     reset_fake();
 
@@ -1185,6 +1301,59 @@ int main(void)
      * surrounding canaries and the 8 MiB mode's padding page unchanged.
      * Oversize realloc remains a handled NULL and retains the old lease. */
     reset_fake();
+
+    /* Literal hardware failure size, not a test derived from the new limit.
+     * Touch the final guest-visible byte, retain the non-guest padding page,
+     * then free/reacquire the same backing without another reservation.
+     * The frozen 0x00bd6000 default and the 8 MiB diagnostic refuse both
+     * font atlases without reserving anything (the hardware failure). */
+#if !defined(ISAAC_VITA_TEXEL_SCRATCH_32M)
+    CHECK(exact_malloc(16777216U, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_NOT_HANDLED);
+    CHECK(exact_malloc(33554432U, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_NOT_HANDLED);
+    CHECK(!decision.pointer && !decision.fault && s_texel_alloc_calls == 0U);
+    CHECK(texel_canaries_are_intact());
+#else
+    CHECK(exact_malloc(16777216U, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    first = decision.pointer;
+    CHECK(first == s_texel_block && s_texel_alloc_calls == 1U);
+    ((unsigned char *)first)[0] = 0x31U;
+    ((unsigned char *)first)[16777215U] = 0x42U;
+    CHECK(texel_canaries_are_intact());
+    CHECK(bytes_are(s_texel_block + 16777216U,
+                    KAGE_VITA_TEXEL_MEMBLOCK_PAGE_BYTES, ORACLE_BLOCK_BYTE));
+    CHECK(isaac_vita_texel_scratch_free(first, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    CHECK(exact_malloc(16777216U, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    CHECK(decision.pointer == first && s_texel_alloc_calls == 1U &&
+          s_texel_free_calls == 0U);
+    CHECK(isaac_vita_texel_scratch_free(first, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    CHECK(texel_canaries_are_intact());
+
+    CHECK(exact_malloc(33554432U, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    CHECK(KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES == 0x02001000U);
+    CHECK(KAGE_VITA_TEXEL_SCRATCH_REQUEST_MAX_BYTES == 33554432U);
+    CHECK(decision.pointer == first);
+    ((unsigned char *)first)[33554431U] = 0x53U;
+    CHECK(texel_canaries_are_intact());
+    CHECK(bytes_are(s_texel_block + 33554432U,
+                    KAGE_VITA_TEXEL_MEMBLOCK_PAGE_BYTES, ORACLE_BLOCK_BYTE));
+    CHECK(isaac_vita_texel_scratch_free(first, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    CHECK(exact_malloc(33554432U, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    CHECK(decision.pointer == first && s_texel_alloc_calls == 1U &&
+          s_texel_free_calls == 0U);
+    CHECK(isaac_vita_texel_scratch_free(first, &decision) ==
+          ISAAC_VITA_TEXEL_SCRATCH_HANDLED);
+    CHECK(texel_canaries_are_intact());
+#endif
+
     CHECK(exact_malloc(KAGE_VITA_TEXEL_SCRATCH_REQUEST_MAX_BYTES,
                        &decision) ==
           ISAAC_VITA_TEXEL_SCRATCH_HANDLED);

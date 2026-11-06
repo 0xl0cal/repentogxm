@@ -60,3 +60,4 @@
 #undef glUseProgram
 #undef glVertexAttribPointer
 #undef glViewport
+#undef SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR

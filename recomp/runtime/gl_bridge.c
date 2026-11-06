@@ -13,9 +13,12 @@
 #endif
 
 #include "gl_bridge.h"
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+#include "gl_record_backend.h"
+#endif
 
 #if defined(ISAAC_VITA_GL_WRAPPER_TIME)
-/* ---- ISAAC_VITA_GL_WRAPPER_TIME (wf/cpu-render-20260906) begin ----------
+/* ---- ISAAC_VITA_GL_WRAPPER_TIME begin -------------------------------------
  * Wrapper entry/return clock around every adapter run (guest_gl_run_owned);
  * bucket per registry entry, classified once at backend install by the
  * frozen name (gl_vita_backend.h legend).  The clock is the one ph120.gt
@@ -461,6 +464,10 @@ int guest_gl_resolve_provider(
 
 uint32_t guest_gl_backend_return_rva(void)
 {
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    uint32_t recorded_rva;
+    if (isaac_gl_record_return_rva(&recorded_rva)) return recorded_rva;
+#endif
 #define GUEST_GL_FROZEN_IMAGE_SIZE 0x0085f000u
     uintptr_t active = guest_gl_active_load();
     CPU *cpu;
@@ -739,6 +746,9 @@ void guest_gl_owned_leave(CPU *__restrict c, uint32_t token)
 GUEST_NORETURN void guest_gl_backend_fault(
     uint32_t address, const char *message)
 {
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    isaac_gl_record_before_fault();
+#endif
     uintptr_t state = guest_gl_active_load();
     CPU *cpu;
 

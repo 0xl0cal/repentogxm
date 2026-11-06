@@ -121,6 +121,8 @@ def gate_tests(root: Path) -> None:
     sources = {}
     entries = []
     for name, extra in (("guest_0007.c", f' -include "{header.as_posix()}"'),
+                        ("guest_stubs.c", f' -include "{header.as_posix()}"'),
+                        ("guest_table.c", f' -include "{header.as_posix()}"'),
                         ("guest.c", "")):
         source = (root / "source" / "recomp" /
                   ("runtime" if name == "guest.c" else "generated") / name)

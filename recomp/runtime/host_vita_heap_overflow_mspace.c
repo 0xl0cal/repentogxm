@@ -246,13 +246,17 @@ int isaac_vita_heap_overflow_mspace_contains(const void *pointer)
 
 void *isaac_vita_heap_overflow_mspace_malloc(size_t size)
 {
+    /* The guest MS CRT permits a live, freeable malloc(0) result. Keep the
+     * router's logical request zero, but reserve and validate one physical
+     * byte here instead of rejecting it after native malloc failed. */
+    size_t backing_size = size ? size : 1U;
     void *result;
 
     if (s_overflow.state != ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY ||
-        !size || !overflow_size_fits_sce(size))
+        !overflow_size_fits_sce(size))
         return NULL;
-    result = sceClibMspaceMalloc(s_overflow.mspace, (SceSize)size);
-    return overflow_publish_allocation(result, size);
+    result = sceClibMspaceMalloc(s_overflow.mspace, (SceSize)backing_size);
+    return overflow_publish_allocation(result, backing_size);
 }
 
 void *isaac_vita_heap_overflow_mspace_calloc(size_t count, size_t size)

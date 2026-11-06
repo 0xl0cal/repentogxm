@@ -11,6 +11,9 @@
  * repaid by ordinary wrapper ticks with bounded debt and bounded render
  * starvation.  Game::Update itself has a separate monotonic 30-Hz floor: stale
  * wall-clock debt is dropped, never replayed as a burst of simulation ticks.
+ * (ISAAC_VITA_FULLSPEED_FLOOR_DEBT=ON keeps up to a capped few milliseconds
+ * of ordinary lateness on the floor instead of dropping it; stale debt is
+ * still dropped.  See kage_vita_fullspeed_floor_debt_anchor.)
  *
  * Any sequencing or parity invariant required by the gates fails open: the
  * original Render and software limiter run from that point onward.
@@ -23,6 +26,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+# include "kage_vita_backend.h"
+#endif
 
 #if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
 # if !defined(ISAAC_VITA_FULLSPEED_SCHEDULER) || !defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
@@ -42,6 +48,49 @@
 void isaac_vita_log(const char *format, ...);
 extern int sceKernelDelayThread(unsigned int delay_us);
 
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+/* S5 floor debt (ISAAC_VITA_FULLSPEED_FLOOR_DEBT, with the stale cut
+ * described below).  1 = OBSERVE, 2 = ON. */
+# if ISAAC_VITA_FULLSPEED_FLOOR_DEBT != 1 && ISAAC_VITA_FULLSPEED_FLOOR_DEBT != 2
+#  error "ISAAC_VITA_FULLSPEED_FLOOR_DEBT must be 1 (OBSERVE) or 2 (ON)"
+# endif
+# if !defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US) || \
+     ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US < 1 || \
+     ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US > 16666
+#  error "floor debt cap must be 1..16666 us (below one 60-Hz wrapper tick)"
+# endif
+# if defined(KAGE_VITA_HEAD_ADVANCE)
+#  error "floor debt and full-head advance are not proven together"
+# endif
+# define KAGE_VITA_FLOOR_DEBT_MODE ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+# define KAGE_VITA_FLOOR_DEBT_CAP_UNITS \
+    ((uint64_t)ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US * 3u)
+static KageVitaFullspeedFloorDebtSnapshot s_floor_debt;
+/* ON: the interpolated frame just admitted was inside the slack band; the
+ * next pace's lateness is attributed to it (slack(l,us)). */
+static uint32_t s_slack_admit_pending;
+/* A stale wrapper drop or a loop-head clock reset happened since the last
+ * pace: the grid moved without the floor, so the next pace keeps nothing. */
+static uint32_t s_floor_debt_head_stale;
+#endif
+#if defined(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US) && ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US
+# if !defined(KAGE_VITA_FLOOR_DEBT_MODE)
+#  error "admit slack without floor debt lowers UPS: never ship it alone"
+# endif
+# if ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US >= ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US
+#  error "admit slack must be smaller than the floor debt cap"
+# endif
+# define KAGE_VITA_ADMIT_SLACK_UNITS \
+    ((uint64_t)ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US * 3u)
+#endif
+/* The deadline the interpolated-frame time test compares against.  Only ON
+ * with a slack moves it; OFF and OBSERVE keep the stock token. */
+#if defined(KAGE_VITA_ADMIT_SLACK_UNITS) && KAGE_VITA_FLOOR_DEBT_MODE == 2
+# define KAGE_VITA_ADMIT_DEADLINE_UNITS admit_deadline_units
+#else
+# define KAGE_VITA_ADMIT_DEADLINE_UNITS s_next_game_due_units
+#endif
+
 enum KageVitaFullspeedTickFlag {
     KAGE_VITA_TICK_SERVICE = 1u << 0,
     KAGE_VITA_TICK_MANAGER_DISPATCH = 1u << 1,
@@ -54,7 +103,13 @@ enum KageVitaFullspeedTickFlag {
     KAGE_VITA_TICK_PRESENT = 1u << 8,
     KAGE_VITA_TICK_RENDER_RETURN = 1u << 9,
     KAGE_VITA_TICK_GAME_POINTER_PUBLISH = 1u << 10,
-    KAGE_VITA_TICK_MANAGER_COUNTER_REBASE = 1u << 11
+    KAGE_VITA_TICK_MANAGER_COUNTER_REBASE = 1u << 11,
+    /* Host-only receipt: the Render gate validated a Continue without Game.
+     * Never emitted by a guest seam; expires at the next loop head. */
+    KAGE_VITA_TICK_CONTINUE_WITHOUT_GAME = 1u << 12
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+    , KAGE_VITA_TICK_VIDEO_SERVICE = 1u << 13
+#endif
 };
 
 static uint64_t s_next_due_units;
@@ -83,6 +138,27 @@ static uint32_t s_pre_game_age;
 static uint64_t s_render_entry_us;
 static uint64_t s_last_render_units;
 static uint32_t s_have_last_render;
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+/* Render cost for the non-full admission test only.  int2j tour 3
+ * (2026-09-17 issue re-check): every light-room window presented 100 per
+ * 120 loops with skip(a,l,n,f)=20,0,20,0 at rnd50 6.4 ms, swp50 0.1 ms,
+ * rnd95 17.1 ms.  One Render in five paid a ~10.6-ms wait inside Present,
+ * the inclusive s_last_render_units then refused the next interpolated
+ * frame, and the refusal put the next wait on a full-phase Render again.
+ * The admission cost is therefore the last Render body (entry to the
+ * Present seam) plus only the part of its Present wait that the Render
+ * before it also paid: an isolated wait is not predicted, persistent
+ * back-pressure (every Present waits) still is.  s_last_render_units stays
+ * inclusive for the floor realignment and the render-bound full phase.
+ * This is a bet that the wait will not land on the admitted frame: in the
+ * host oracle it wins when the wait ends on the 60-Hz edge (120 presents at
+ * exactly 30 UPS) and costs simulation time when the wait has a fixed length
+ * (120 presents at 29.73 UPS for 10.6 ms) or the GPU is the bottleneck. */
+static uint64_t s_present_entry_us;
+static uint64_t s_last_present_wait_units;
+static uint32_t s_have_last_present_wait;
+static uint64_t s_render_admission_units;
+#endif
 static uint32_t s_tick_flags;
 static uint32_t s_render_decision;
 static uint32_t s_manager_pointer;
@@ -95,6 +171,60 @@ static uint32_t s_game_update_return_site;
 static uint32_t s_consecutive_full_render_skips;
 static uint32_t s_logged;
 static uint32_t s_disable_logged;
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+static uint32_t s_previous_tick_had_game;
+static uint32_t s_video_priority_logged;
+
+static void kage_vita_fullspeed_video_priority_receipt(uint32_t full)
+{
+    if (s_video_priority_logged)
+        return;
+    s_video_priority_logged = 1u;
+    isaac_vita_log("KAGE VITA VIDEO PRIORITY: tick=%u full=%u single-clip=1 "
+                   "game-current/previous=0/0 late-render=admitted",
+                   (unsigned)s_counters.wrapper_ticks, (unsigned)full);
+}
+#endif
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+/* port.ini fps_lock duty (design section 2): the non-full phase n (the
+ * s_counters.nonfull_phases value after its increment, so the first one is
+ * n = 1) is admitted when n % k == 0; k = 0 admits none.  With the counter
+ * starting at 1 the present pattern per full/non-full pair is
+ *   k=1  F N        (60)
+ *   k=2  F _ F N    (45)
+ *   k=3  F _ F _ F N (40)
+ *   k=0  F _        (30)
+ * The counter is zeroed by the per-epoch clear together with the rest of
+ * s_counters; s_duty_k itself is boot state and is never cleared.  The
+ * duty is a cap: another_tick_due and the affordability test still apply to
+ * admitted phases exactly as without it. */
+static uint8_t s_duty_k = 1u;
+
+void kage_vita_fullspeed_scheduler_set_duty(uint8_t k)
+{
+    s_duty_k = k <= 3u ? k : 1u;
+}
+
+static inline int kage_vita_fullspeed_duty_admits(uint32_t nonfull_phases)
+{
+    return s_duty_k == 0u ? 0 : (nonfull_phases % s_duty_k) == 0u;
+}
+
+/* 1 -> 60, 2 -> 45, 3 -> 40, 0 -> 30 for the CADENCE30 banner. */
+static unsigned kage_vita_fullspeed_duty_fps_lock(void)
+{
+    switch (s_duty_k) {
+    case 0u:
+        return 30u;
+    case 2u:
+        return 45u;
+    case 3u:
+        return 40u;
+    default:
+        return 60u;
+    }
+}
+#endif
 
 #if defined(KAGE_VITA_HEAD_ADVANCE)
 static uint64_t s_head_advance_credit_units;
@@ -176,6 +306,182 @@ static int kage_vita_fullspeed_clock_units(
     return 1;
 }
 
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+#define KAGE_VITA_STR2(x) #x
+#define KAGE_VITA_STR(x) KAGE_VITA_STR2(x)
+
+/* S5 floor debt, called by the Game::Update pace once its floor wait (if
+ * any) is over, with the stock anchor (the old floor after a wait, the
+ * clock otherwise).  Returns the anchor the next floor is built on.
+ *
+ * Late path (no wait, clock at or after a live floor): the update starts
+ * late_units after its floor.  ON keeps min(late, CAP, lateness after this
+ * full head's own grid deadline) of that as debt, so the next floor is
+ * max(old floor, now - CAP, this head's grid deadline) + one Game tick:
+ * never earlier than old floor + 33.333 ms, never more than CAP earlier than
+ * stock, never before the next full head's grid deadline (gf <= 0; the grid
+ * clamp below).
+ *
+ * Stale cut: nothing is kept when the
+ * lateness is one Game tick or more (menus, Continue, loads, a stall that is
+ * not ordinary jitter), or when a stale wrapper drop, a head clock reset or
+ * a head sleep that returned with the clock before it started moved the
+ * 60-Hz grid since the previous pace (the grid rule).  Rule A keeps a load,
+ * pause or long stall from being repaid; the grid rule keeps nothing after
+ * the grid itself jumped.  The grid clamp alone already keeps gf <= 0 after
+ * a grid jump: without the grid rule the host oracle passes every behaviour
+ * check, its heavy rooms start and render exactly as with it (same digest;
+ * their post-drop paces are merely filed as late), and only the two
+ * clock-fault scenarios keep debt across the fault.  The rule stays as the
+ * conservative choice there.  OBSERVE counts and always returns the stock
+ * anchor. */
+static uint64_t kage_vita_fullspeed_floor_debt_anchor(
+    uint32_t waited_for_floor, uint64_t now_units, uint64_t stock_anchor_units)
+{
+    uint64_t anchor_units = stock_anchor_units;
+    uint32_t head_stale = s_floor_debt_head_stale;
+    uint32_t slack_admit = s_slack_admit_pending;
+
+# if defined(ISAAC_KAGE_VITA_FULLSPEED_ORACLE_NO_HEAD_STALE_CUT)
+    /* Host-oracle negative control only: rule A (one Game tick) alone. */
+    head_stale = 0u;
+# endif
+    s_floor_debt_head_stale = 0u;
+    s_slack_admit_pending = 0u;
+    if (waited_for_floor || (s_have_game_due &&
+                             now_units == s_next_game_due_units)) {
+        /* On time: slept to the floor, or reached it exactly. */
+        kage_vita_fullspeed_add_u32(&s_floor_debt.paces, 1u);
+    } else if (s_have_game_due && now_units > s_next_game_due_units) {
+        uint64_t late_units = now_units - s_next_game_due_units;
+
+        kage_vita_fullspeed_add_u32(&s_floor_debt.paces, 1u);
+        if (head_stale ||
+                late_units >= KAGE_VITA_FULLSPEED_GAME_TICK_UNITS) {
+            kage_vita_fullspeed_add_u32(&s_floor_debt.stale, 1u);
+            if (late_units < KAGE_VITA_FULLSPEED_GAME_TICK_UNITS)
+                kage_vita_fullspeed_add_u32(&s_floor_debt.stale_grid, 1u);
+            kage_vita_fullspeed_add_u32(&s_floor_debt.stale_us,
+                kage_vita_fullspeed_units_to_us(late_units));
+        } else {
+            uint64_t kept_units = late_units < KAGE_VITA_FLOOR_DEBT_CAP_UNITS ?
+                late_units : KAGE_VITA_FLOOR_DEBT_CAP_UNITS;
+            /* Grid clamp (the wake-overshoot case):
+             * keep at most this pace's lateness after its own full head's
+             * grid deadline, s_next_due_units - TICK.  The rest is lateness
+             * of the floor itself: a waited pace's realign (below) moves the
+             * grid by the whole wait, wake overshoot included, so a pace-wait
+             * overshoot above the head-wait overshoot plus the service leaves
+             * the floor ahead of the next full head's grid deadline (gf > 0).
+             * Keeping that part would put the next floor ahead of the grid
+             * again, and gf would stay > 0 until the next stale event, since
+             * every later pace then starts late and none waits or realigns.
+             * With the clamp the next floor is never before the next full
+             * head's grid deadline (s_next_due_units + TICK, the gf sample
+             * point), so a late pace always leaves gf <= 0.  On this late
+             * path no realign follows, so s_next_due_units is final here.
+             * Whole microseconds, so late_us == kept_us + over_us holds.
+             * OBSERVE applies it to its accounting too, but on stock's
+             * trajectory: a waited pace there realigns the grid by its whole
+             * wake overshoot, so the clamp binds at most late paces after
+             * one, while ON leaves that state at its first
+             * late pace and rarely binds again.  OBSERVE's kept is therefore
+             * not what ON would keep; clamp_us (min(late, cap) - kept) is
+             * counted apart so kept_us + clamp_us = sum min(late, cap), the
+             * part of the lateness the cap lets ON keep. */
+            uint64_t grid_units = s_next_due_units +
+                KAGE_VITA_FULLSPEED_TICK_UNITS;
+            uint64_t capped_units = kept_units;
+            uint64_t room_units = 0u;
+            uint32_t late_us = kage_vita_fullspeed_units_to_us(late_units);
+            /* Bucket 0: the pace began inside its floor's own microsecond
+             * (the clock is whole us, the floor is in 1/3 us). */
+            uint32_t bucket = late_units < 3u ? 0u : late_us < 250u ? 1u :
+                late_us < 1000u ? 2u : late_us < 2000u ? 3u :
+                late_us < 5000u ? 4u : late_us < 16667u ? 5u : 6u;
+
+            /* now + GAME_TICK cannot wrap: the pace disabled the scheduler
+             * before calling here if it could. */
+            if (grid_units >= s_next_due_units &&
+                    now_units + KAGE_VITA_FULLSPEED_GAME_TICK_UNITS > grid_units)
+                room_units = now_units + KAGE_VITA_FULLSPEED_GAME_TICK_UNITS -
+                    grid_units;
+# if !defined(ISAAC_KAGE_VITA_FULLSPEED_ORACLE_NO_GRID_CLAMP) && \
+     !defined(ISAAC_KAGE_VITA_FULLSPEED_ORACLE_NO_STALE_CUT)
+            if (kept_units > room_units)
+                kept_units = room_units - room_units % 3u;
+# else
+            /* Host-oracle negative controls only: no grid clamp (round 0). */
+            (void)room_units;
+# endif
+            kage_vita_fullspeed_add_u32(&s_floor_debt.late, 1u);
+            kage_vita_fullspeed_add_u32(&s_floor_debt.late_us, late_us);
+            kage_vita_fullspeed_add_u32(&s_floor_debt.late_hist[bucket], 1u);
+            if (late_us > s_floor_debt.late_max_us)
+                s_floor_debt.late_max_us = late_us;
+            kage_vita_fullspeed_add_u32(&s_floor_debt.kept_us,
+                kage_vita_fullspeed_units_to_us(kept_units));
+            if (kept_units < late_units) {
+                kage_vita_fullspeed_add_u32(&s_floor_debt.over, 1u);
+                kage_vita_fullspeed_add_u32(&s_floor_debt.over_us,
+                    kage_vita_fullspeed_units_to_us(late_units - kept_units));
+            }
+            /* The clamped kept is a multiple of 3 units, so the rounded
+             * clamp_us adds up: kept_us + clamp_us = ceil(min(late, cap) / 3). */
+            if (kept_units < capped_units) {
+                kage_vita_fullspeed_add_u32(&s_floor_debt.clamp, 1u);
+                kage_vita_fullspeed_add_u32(&s_floor_debt.clamp_us,
+                    kage_vita_fullspeed_units_to_us(capped_units - kept_units));
+            }
+            if (slack_admit) {
+                kage_vita_fullspeed_add_u32(&s_floor_debt.slack_late, 1u);
+                kage_vita_fullspeed_add_u32(&s_floor_debt.slack_late_us,
+                                            late_us);
+            }
+# if KAGE_VITA_FLOOR_DEBT_MODE == 2
+            anchor_units = now_units - kept_units;
+# endif
+        }
+# if KAGE_VITA_FLOOR_DEBT_MODE == 2 && \
+     defined(ISAAC_KAGE_VITA_FULLSPEED_ORACLE_NO_STALE_CUT)
+        /* Host-oracle negative control only (the design draft without the
+         * stale cut): every late pace keeps min(late, CAP). */
+        anchor_units = now_units - (late_units < KAGE_VITA_FLOOR_DEBT_CAP_UNITS ?
+            late_units : KAGE_VITA_FLOOR_DEBT_CAP_UNITS);
+# endif
+    }
+    return anchor_units;
+}
+
+/* gf after a pace: the next full head's grid deadline (the next head is the
+ * non-full one, s_next_due_units) minus the floor just set, in signed us. */
+static void kage_vita_fullspeed_floor_debt_note_grid(void)
+{
+    uint64_t grid_units = s_next_due_units + KAGE_VITA_FULLSPEED_TICK_UNITS;
+    int32_t gf_us;
+
+    if (grid_units < s_next_due_units)
+        return;
+    if (grid_units >= s_next_game_due_units) {
+        uint32_t us = kage_vita_fullspeed_units_to_us(
+            grid_units - s_next_game_due_units);
+        gf_us = us > (uint32_t)INT32_MAX ? INT32_MAX : (int32_t)us;
+        if (grid_units > s_next_game_due_units)
+            kage_vita_fullspeed_add_u32(&s_floor_debt.gf_pos, 1u);
+    } else {
+        uint32_t us = kage_vita_fullspeed_units_to_us(
+            s_next_game_due_units - grid_units);
+        gf_us = us > (uint32_t)INT32_MAX ? -INT32_MAX : -(int32_t)us;
+    }
+    if (s_floor_debt.gf_n == 0u || gf_us > s_floor_debt.gf_max_us)
+        s_floor_debt.gf_max_us = gf_us;
+    if (s_floor_debt.gf_n == 0u || gf_us < s_floor_debt.gf_min_us)
+        s_floor_debt.gf_min_us = gf_us;
+    s_floor_debt.gf_last_us = gf_us;
+    kage_vita_fullspeed_add_u32(&s_floor_debt.gf_n, 1u);
+}
+#endif
+
 /* Early RET tokens whose unchanged-frame return is accepted rather than
  * failed open.  The generated hooks only report the eight machine-pinned
  * sites, so membership here is the sole policy decision. */
@@ -235,6 +541,26 @@ static void kage_vita_fullspeed_sequence_failure(void)
 {
     kage_vita_fullspeed_add_u32(&s_counters.sequence_violations, 1u);
     kage_vita_fullspeed_disable();
+}
+
+/* One bounded extra record before the existing first DISABLE record. The
+ * caller immediately disables; subsequent gates return before reaching here.
+ * Values on the right are the gate arguments, not stale entry snapshots. */
+static void kage_vita_fullspeed_render_failure(
+    const char *reason, uint32_t manager, uint32_t counter,
+    uint32_t interpolation, uint32_t game, uint32_t frame)
+{
+    if (!s_disable_logged)
+        isaac_vita_log(
+            "KAGE VITA CADENCE30 GATE: reason=%s tick=%u flags=%03x "
+            "saved/current mgr=%08x/%08x ctr=%u/%u interp=%u/%u "
+            "game=%08x/%08x frame=%u/%u",
+            reason, (unsigned)s_counters.wrapper_ticks, (unsigned)s_tick_flags,
+            (unsigned)s_manager_pointer, (unsigned)manager,
+            (unsigned)s_manager_counter_before, (unsigned)counter,
+            (unsigned)s_interpolation_enabled, (unsigned)interpolation,
+            (unsigned)s_game_pointer, (unsigned)game,
+            (unsigned)s_game_frame_after, (unsigned)frame);
 }
 
 static void kage_vita_fullspeed_game_pointer_failure(void)
@@ -372,7 +698,8 @@ static void kage_vita_fullspeed_finish_previous_tick(void)
              ((s_tick_flags & KAGE_VITA_TICK_GAME_END) != 0u)) ||
             ((s_tick_flags & (KAGE_VITA_TICK_MANAGER_COUNTER_REBASE |
                               KAGE_VITA_TICK_GAME_POINTER_PUBLISH)) != 0u &&
-             (s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) == 0u))
+             (s_tick_flags & (KAGE_VITA_TICK_GAME_BEGIN |
+                              KAGE_VITA_TICK_CONTINUE_WITHOUT_GAME)) == 0u))
         kage_vita_fullspeed_sequence_failure();
     if ((s_tick_flags & KAGE_VITA_TICK_RENDER_ENTRY) != 0u) {
         required = KAGE_VITA_TICK_RENDER_BODY |
@@ -492,6 +819,12 @@ static void kage_vita_fullspeed_pace_game_update(void)
      * (no wait) still re-anchors to the current clock so stalls drop stale
      * simulation time exactly as before. */
     floor_anchor_units = waited_for_floor ? s_next_game_due_units : now_units;
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+    /* S5 floor debt: see kage_vita_fullspeed_floor_debt_anchor.  The
+     * overflow guard below applies to its anchor too. */
+    floor_anchor_units = kage_vita_fullspeed_floor_debt_anchor(
+        waited_for_floor, now_units, floor_anchor_units);
+#endif
     if (floor_anchor_units > UINT64_MAX - KAGE_VITA_FULLSPEED_GAME_TICK_UNITS)
         floor_anchor_units = now_units;
     s_next_game_due_units =
@@ -560,6 +893,10 @@ static void kage_vita_fullspeed_pace_game_update(void)
 #else
         s_next_due_units += floor_wait_units;
 #endif
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+    if (s_have_last_due)
+        kage_vita_fullspeed_floor_debt_note_grid();
+#endif
     s_last_clock_us = now_us;
 }
 
@@ -593,6 +930,17 @@ static void kage_vita_fullspeed_scheduler_clear(uint32_t runtime_enabled)
     s_render_entry_us = 0u;
     s_last_render_units = 0u;
     s_have_last_render = 0u;
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+    s_present_entry_us = 0u;
+    s_last_present_wait_units = 0u;
+    s_have_last_present_wait = 0u;
+    s_render_admission_units = 0u;
+#endif
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+    memset(&s_floor_debt, 0, sizeof s_floor_debt);
+    s_slack_admit_pending = 0u;
+    s_floor_debt_head_stale = 0u;
+#endif
     s_tick_flags = 0u;
     s_render_decision = 1u;
     s_manager_pointer = 0u;
@@ -606,6 +954,10 @@ static void kage_vita_fullspeed_scheduler_clear(uint32_t runtime_enabled)
     s_consecutive_full_render_skips = 0u;
     s_logged = 0u;
     s_disable_logged = 0u;
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+    s_previous_tick_had_game = 0u;
+    s_video_priority_logged = 0u;
+#endif
 }
 
 void kage_vita_fullspeed_scheduler_reset(void)
@@ -651,6 +1003,9 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
         kage_vita_fullspeed_add_u32(&s_counters.clock_resets, 1u);
         s_next_due_units = now_units;
         s_have_last_due = 0u;
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+        s_floor_debt_head_stale = 1u;
+#endif
     }
 
 #if defined(KAGE_VITA_HEAD_ADVANCE)
@@ -672,6 +1027,9 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
             s_have_last_due = 0u;
 #if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
             pre_game_clock_ok = 0u;
+#endif
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+            s_floor_debt_head_stale = 1u;
 #endif
         }
     }
@@ -712,6 +1070,10 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
                     dropped * KAGE_VITA_FULLSPEED_TICK_UNITS;
                 due_ticks = KAGE_VITA_FULLSPEED_STALE_DUE_TICKS;
                 kage_vita_fullspeed_drop_ticks(dropped);
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+                /* The grid just jumped forward without the floor. */
+                s_floor_debt_head_stale = 1u;
+#endif
             }
             s_current_due_units = s_next_due_units;
             if (s_next_due_units >
@@ -751,6 +1113,9 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
         s_pre_game_age = 0u;
     s_tick_head_us = now_us;
 #endif
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+    s_previous_tick_had_game = (s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) != 0u;
+#endif
     s_tick_flags = 0u;
     s_render_decision = 1u;
     s_manager_pointer = 0u;
@@ -775,13 +1140,35 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
 #if defined(KAGE_VITA_HEAD_ADVANCE)
             " head-advance=4500us-experimental"
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+            " render-cost=excludes-present"
+#endif
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+# if KAGE_VITA_FLOOR_DEBT_MODE == 2
+            " floor-debt=on"
+# else
+            " floor-debt=observe"
+# endif
+            " cap=" KAGE_VITA_STR(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US) "us"
+# if defined(KAGE_VITA_ADMIT_SLACK_UNITS)
+            " admit-slack=" KAGE_VITA_STR(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US) "us"
+# endif
+#endif
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+            " fps_lock=%u"
+#endif
             ,
             ISAAC_VITA_FULLSPEED_SCHEDULER_BUILD_ID,
             (unsigned)KAGE_VITA_FULLSPEED_TICK_UNITS,
             (unsigned)KAGE_VITA_FULLSPEED_GAME_TICK_UNITS,
             (unsigned)KAGE_VITA_FULLSPEED_MAX_CATCHUP_TICKS,
             (unsigned)KAGE_VITA_FULLSPEED_STALE_CATCHUP_TICKS,
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+            (unsigned)KAGE_VITA_FULLSPEED_MAX_FULL_RENDER_SKIPS,
+            kage_vita_fullspeed_duty_fps_lock());
+#else
             (unsigned)KAGE_VITA_FULLSPEED_MAX_FULL_RENDER_SKIPS);
+#endif
     }
 }
 
@@ -790,6 +1177,20 @@ void kage_vita_fullspeed_scheduler_note_service(void)
     (void)kage_vita_fullspeed_note_once(
         KAGE_VITA_TICK_SERVICE, &s_counters.service_calls);
 }
+
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+void kage_vita_fullspeed_scheduler_note_video_service(void)
+{
+    /* Only a completed outer service before Manager dispatch can publish the
+     * receipt. Internal CL=1 services must not carry it into another phase. */
+    if (s_initialized && s_runtime_enabled &&
+            (s_tick_flags & KAGE_VITA_TICK_SERVICE) != 0u &&
+            (s_tick_flags & (KAGE_VITA_TICK_MANAGER_DISPATCH |
+                             KAGE_VITA_TICK_MANAGER_ENTRY |
+                             KAGE_VITA_TICK_RENDER_GATE)) == 0u)
+        s_tick_flags |= KAGE_VITA_TICK_VIDEO_SERVICE;
+}
+#endif
 
 void kage_vita_fullspeed_scheduler_note_manager_dispatch(void)
 {
@@ -1043,6 +1444,14 @@ int kage_vita_fullspeed_scheduler_plan_render(
     uint64_t now_units;
     uint32_t full_phase;
     uint32_t another_tick_due;
+    uint32_t continue_without_game;
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+    uint32_t video_priority;
+#endif
+
+#define RENDER_FAILURE(reason) kage_vita_fullspeed_render_failure( \
+    reason, manager_pointer, manager_counter, interpolation_enabled, \
+    game_pointer, game_frame)
 
     if (!kage_vita_fullspeed_note_flag_once(KAGE_VITA_TICK_RENDER_GATE))
         return 1;
@@ -1050,6 +1459,7 @@ int kage_vita_fullspeed_scheduler_plan_render(
         return 1;
     if ((s_tick_flags & KAGE_VITA_TICK_MANAGER_ENTRY) == 0u ||
             manager_pointer == 0u || manager_pointer != s_manager_pointer) {
+        RENDER_FAILURE("manager-identity");
         kage_vita_fullspeed_sequence_failure();
         return 1;
     }
@@ -1061,6 +1471,7 @@ int kage_vita_fullspeed_scheduler_plan_render(
     if (interpolation_enabled != s_interpolation_enabled) {
         if ((s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) == 0u ||
                 (s_tick_flags & KAGE_VITA_TICK_GAME_END) == 0u) {
+            RENDER_FAILURE("interpolation");
             kage_vita_fullspeed_sequence_failure();
             return 1;
         }
@@ -1068,38 +1479,57 @@ int kage_vita_fullspeed_scheduler_plan_render(
     }
     if (((s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) != 0u) !=
             ((s_tick_flags & KAGE_VITA_TICK_GAME_END) != 0u)) {
+        RENDER_FAILURE("game-pair");
         kage_vita_fullspeed_sequence_failure();
         return 1;
     }
+    /* J835 Continue normalizes the odd counter at pinned 004b4031. A
+     * pending cutscene can then select Manager's cutscene branch instead of
+     * 004b0311 (Game::Update). A device capture (tick 5400) records
+     * precisely this rebase with neither Game hook. A publication alone is
+     * NOT this exception. All identity/counter/interpolation/clock checks
+     * still apply; only this tick may adopt the frame restored by Continue.
+     * Runtime enabled here means the rebase/publication validators passed. */
+    continue_without_game =
+        (s_tick_flags & KAGE_VITA_TICK_MANAGER_COUNTER_REBASE) != 0u &&
+        (s_tick_flags & (KAGE_VITA_TICK_GAME_BEGIN |
+                         KAGE_VITA_TICK_GAME_END)) == 0u &&
+        s_game_pointer != 0u;
     if ((s_tick_flags & (KAGE_VITA_TICK_MANAGER_COUNTER_REBASE |
                          KAGE_VITA_TICK_GAME_POINTER_PUBLISH)) != 0u &&
             ((s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) == 0u ||
-             (s_tick_flags & KAGE_VITA_TICK_GAME_END) == 0u)) {
+             (s_tick_flags & KAGE_VITA_TICK_GAME_END) == 0u) &&
+            !continue_without_game) {
+        RENDER_FAILURE("continue-no-game");
         kage_vita_fullspeed_sequence_failure();
         return 1;
     }
     if (manager_counter != s_manager_counter_before + 1u) {
+        RENDER_FAILURE("counter");
         kage_vita_fullspeed_add_u32(&s_counters.parity_violations, 1u);
         kage_vita_fullspeed_disable();
         return 1;
     }
     full_phase = manager_counter & 1u;
     if (game_pointer != s_game_pointer) {
+        RENDER_FAILURE("game-identity");
         kage_vita_fullspeed_game_pointer_failure();
         return 1;
     }
     if (game_frame != s_game_frame_after) {
         /* Manager-owned Continue/load paths can restore Game+0x1a30dc from
          * saved state after the entry snapshot without calling Game::Update.
-         * Accept that state rebase only on the native non-full phase.  Every
+         * Accept that state rebase on the native non-full phase, or this
+         * authenticated Continue-without-Game tick. Every
          * actual Game::Update remains authenticated above and independently
-         * paced by the 33.333-ms floor; full-phase frame changes stay strict. */
+         * paced by the 33.333-ms floor; other full-phase changes stay strict. */
         if ((s_tick_flags & (KAGE_VITA_TICK_GAME_BEGIN |
                              KAGE_VITA_TICK_GAME_END)) == 0u &&
-                full_phase == 0u) {
+                (full_phase == 0u || continue_without_game)) {
             s_game_frame_before = game_frame;
             s_game_frame_after = game_frame;
         } else {
+            RENDER_FAILURE("game-frame");
             kage_vita_fullspeed_add_u32(
                 &s_counters.game_frame_violations, 1u);
             kage_vita_fullspeed_disable();
@@ -1110,12 +1540,29 @@ int kage_vita_fullspeed_scheduler_plan_render(
     now_us = isaac_vita_get_process_time();
     if (now_us < s_last_clock_us ||
             !kage_vita_fullspeed_clock_units(now_us, &now_units)) {
+        RENDER_FAILURE("clock");
         kage_vita_fullspeed_add_u32(&s_counters.clock_resets, 1u);
         kage_vita_fullspeed_disable();
         return 1;
     }
     s_last_clock_us = now_us;
     another_tick_due = now_units >= s_next_due_units;
+    if (continue_without_game)
+        s_tick_flags |= KAGE_VITA_TICK_CONTINUE_WITHOUT_GAME;
+
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+    /* owner-continuefix-first-arm.log: 297 paid RGB services lost their Render
+     * admission, then fetch discarded 193 ready frames. During a cutscene
+     * there is no Game update to protect by skipping that presentation.
+     * Require no Game call in EITHER phase of a gameplay pair: a retained
+     * clip cannot grant the following interpolation tick extra GPU time.
+     * All identity/pair/frame/clock checks above remain authoritative. */
+    video_priority = (s_tick_flags & KAGE_VITA_TICK_VIDEO_SERVICE) != 0u &&
+        (s_tick_flags & (KAGE_VITA_TICK_GAME_BEGIN | KAGE_VITA_TICK_GAME_END)) == 0u &&
+        !s_previous_tick_had_game;
+    if (video_priority)
+        another_tick_due = 0u; /* admission only; deadlines/Game floor untouched */
+#endif
 
     if (full_phase) {
         kage_vita_fullspeed_add_u32(&s_counters.full_phases, 1u);
@@ -1125,21 +1572,41 @@ int kage_vita_fullspeed_scheduler_plan_render(
             kage_vita_fullspeed_add_u32(
                 &s_counters.interpolation_phases, 1u);
         if ((s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) != 0u) {
+            RENDER_FAILURE("nonfull-game");
             kage_vita_fullspeed_add_u32(
                 &s_counters.parity_violations, 1u);
             kage_vita_fullspeed_disable();
             return 1;
         }
+#undef RENDER_FAILURE
         /* Preserve the game's original even-phase Render when interpolation
          * is enabled and the following wrapper is not due yet.  Once a whole
          * tick is waiting, discard the interpolated frame first so the fixed
          * 30-Hz Game update cadence remains authoritative. */
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+        /* port.ini fps_lock: the duty term reuses this exact skip statement
+         * (same counters, same return); see kage_vita_fullspeed_duty_admits. */
+        if (!interpolation_enabled || another_tick_due ||
+                !kage_vita_fullspeed_duty_admits(s_counters.nonfull_phases)) {
+#else
         if (!interpolation_enabled || another_tick_due) {
+#endif
             s_render_decision = 0u;
             kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);
             kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
             return 0;
         }
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+        /* GL render thread one frame behind: the same interpolated-frame skip
+         * (same counters, same return), so Present never waits for it and the
+         * next Game::Update keeps its cadence.  Full phases always render. */
+        if (!kage_vita_backend_render_admit()) {
+            s_render_decision = 0u;
+            kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);
+            kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
+            return 0;
+        }
+#endif
         uint64_t next_start_reserve_units = s_last_update_units;
 #if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
         /* The floor is the next Game::Update START, not its completion.
@@ -1169,13 +1636,59 @@ int kage_vita_fullspeed_scheduler_plan_render(
          * is stale and in the past, and without this guard every non-full
          * menu frame was refused: Bundle33 measured the post-Exit menu at
          * 30 FPS with 60 non-full skips per window against 43 FPS before. */
+#if defined(KAGE_VITA_ADMIT_SLACK_UNITS)
+        /* S5 admit slack.  slack_band is
+         * 1 exactly when the time test below is live and the frame's
+         * predicted end lies in (floor, floor + slack]: the stock test
+         * refuses it, ON admits it (its overrun then becomes lateness that
+         * the floor debt keeps), OBSERVE refuses it and counts it.  The
+         * operands are the time test's own, read after the duty skip, the
+         * GL admission and the reserve above. */
+# if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+#  define KAGE_VITA_ADMIT_COST_UNITS s_render_admission_units
+# else
+#  define KAGE_VITA_ADMIT_COST_UNITS s_last_render_units
+# endif
+        uint64_t admit_deadline_units =
+            s_next_game_due_units <= UINT64_MAX - KAGE_VITA_ADMIT_SLACK_UNITS ?
+                s_next_game_due_units + KAGE_VITA_ADMIT_SLACK_UNITS : UINT64_MAX;
+        uint32_t slack_band =
+            s_have_game_due && s_have_last_render && s_have_last_update &&
+            s_next_game_due_units > now_units &&
+            KAGE_VITA_ADMIT_COST_UNITS <= UINT64_MAX - next_start_reserve_units &&
+            now_units <= UINT64_MAX -
+                (KAGE_VITA_ADMIT_COST_UNITS + next_start_reserve_units) &&
+            now_units + KAGE_VITA_ADMIT_COST_UNITS + next_start_reserve_units >
+                s_next_game_due_units &&
+            now_units + KAGE_VITA_ADMIT_COST_UNITS + next_start_reserve_units <=
+                admit_deadline_units;
+# undef KAGE_VITA_ADMIT_COST_UNITS
+        if (slack_band)
+            kage_vita_fullspeed_add_u32(&s_floor_debt.slack_band, 1u);
+# if KAGE_VITA_FLOOR_DEBT_MODE == 2
+        s_slack_admit_pending = slack_band;
+# endif
+#endif
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+        /* Same test on the body plus recurring Present wait (see the
+         * declaration): an isolated wait no longer refuses the frame. */
+        if (s_have_game_due && s_have_last_render && s_have_last_update &&
+                s_next_game_due_units > now_units &&
+                s_render_admission_units <=
+                    UINT64_MAX - next_start_reserve_units &&
+                now_units <= UINT64_MAX -
+                    (s_render_admission_units + next_start_reserve_units) &&
+                now_units + s_render_admission_units +
+                    next_start_reserve_units > KAGE_VITA_ADMIT_DEADLINE_UNITS) {
+#else
         if (s_have_game_due && s_have_last_render && s_have_last_update &&
                 s_next_game_due_units > now_units &&
                 s_last_render_units <= UINT64_MAX - next_start_reserve_units &&
                 now_units <= UINT64_MAX -
                     (s_last_render_units + next_start_reserve_units) &&
                 now_units + s_last_render_units + next_start_reserve_units >
-                    s_next_game_due_units) {
+                    KAGE_VITA_ADMIT_DEADLINE_UNITS) {
+#endif
             s_render_decision = 0u;
             kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);
             kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
@@ -1183,6 +1696,10 @@ int kage_vita_fullspeed_scheduler_plan_render(
         }
         s_consecutive_full_render_skips = 0u;
         s_render_decision = 1u;
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+        if (video_priority && now_units >= s_next_due_units)
+            kage_vita_fullspeed_video_priority_receipt(0u);
+#endif
         return 1;
     }
 
@@ -1221,6 +1738,12 @@ int kage_vita_fullspeed_scheduler_plan_render(
         kage_vita_fullspeed_add_u32(&s_counters.forced_renders, 1u);
     s_consecutive_full_render_skips = 0u;
     s_render_decision = 1u;
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+    if (video_priority && now_units >= s_next_due_units) {
+        kage_vita_fullspeed_add_u32(&s_counters.forced_renders, 1u);
+        kage_vita_fullspeed_video_priority_receipt(1u);
+    }
+#endif
     return 1;
 }
 
@@ -1273,11 +1796,45 @@ void kage_vita_fullspeed_scheduler_note_render_return(void)
                 now_us - s_render_entry_us, &elapsed_units)) {
         s_last_render_units = elapsed_units;
         s_have_last_render = 1u;
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+        /* Present is nested inside Render.  Its seam is the first statement
+         * of kage_pc_backend_present, a few calls before the profiler's swp
+         * bracket around vglSwapBuffers; "wait" is everything from that
+         * seam to this return, so body + wait == elapsed exactly.  The
+         * first sample, a tick without Present, or an inconsistent clock
+         * admits on the inclusive duration, as without this knob. */
+        {
+            uint64_t body_units;
+            uint64_t wait_units;
+
+            if ((s_tick_flags & KAGE_VITA_TICK_PRESENT) != 0u &&
+                    s_present_entry_us >= s_render_entry_us &&
+                    s_present_entry_us <= now_us &&
+                    kage_vita_fullspeed_clock_units(
+                        s_present_entry_us - s_render_entry_us,
+                        &body_units)) {
+                wait_units = elapsed_units - body_units;
+                s_render_admission_units = body_units +
+                    (s_have_last_present_wait &&
+                     s_last_present_wait_units < wait_units ?
+                        s_last_present_wait_units : wait_units);
+                s_last_present_wait_units = wait_units;
+                s_have_last_present_wait = 1u;
+            } else {
+                s_render_admission_units = elapsed_units;
+                s_have_last_present_wait = 0u;
+            }
+        }
+#endif
     }
 }
 
 void kage_vita_fullspeed_scheduler_note_present(void)
 {
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+    /* The one added clock read per Present; consumed at Render return. */
+    s_present_entry_us = isaac_vita_get_process_time();
+#endif
     if (kage_vita_fullspeed_note_once(
             KAGE_VITA_TICK_PRESENT, &s_counters.presents) &&
             (s_tick_flags & KAGE_VITA_TICK_RENDER_BODY) == 0u)
@@ -1298,3 +1855,31 @@ void kage_vita_fullspeed_scheduler_snapshot(
     if (snapshot)
         *snapshot = s_counters;
 }
+
+#if defined(KAGE_VITA_FLOOR_DEBT_MODE)
+void kage_vita_fullspeed_scheduler_floor_debt_take(
+    KageVitaFullspeedFloorDebtSnapshot *snapshot)
+{
+    if (!snapshot)
+        return;
+    *snapshot = s_floor_debt;
+    /* The window identity stamp (header): the floor the next pace waits
+     * for, read on the game thread like every other receipt field. */
+    snapshot->floor_us = s_runtime_enabled && s_have_game_due ?
+        s_next_game_due_units / 3u : 0u;
+    memset(&s_floor_debt, 0, sizeof s_floor_debt);
+}
+#endif
+
+#if defined(ISAAC_VITA_DEBUG_OVERLAY)
+void kage_vita_fullspeed_scheduler_debug_overlay_timings(
+    uint32_t *update_us, uint32_t *render_us)
+{
+    if (update_us)
+        *update_us = s_have_last_update
+            ? kage_vita_fullspeed_units_to_us(s_last_update_units) : 0u;
+    if (render_us)
+        *render_us = s_have_last_render
+            ? kage_vita_fullspeed_units_to_us(s_last_render_units) : 0u;
+}
+#endif

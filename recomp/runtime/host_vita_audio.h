@@ -39,6 +39,33 @@
 #define ISAAC_VITA_AUDIO_OGG_QUEUE_COUNT         4U
 #define ISAAC_VITA_AUDIO_OGG_EOF_OFFSET          0x0000008cU
 
+/* Frozen MusicManager facts (ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT and the
+ * starvation shield's rationale).  The per-slot update (0x003a18f0, thiscall,
+ * one stack word) computes active = stream->IsPlaying() || slot.paused(+9)
+ * after its first ten updates; an inactive slot whose stream still owns an AL
+ * source (stream +8, vtable +0x28 = 0x3fa860) and whose keep byte (+0xa) is
+ * clear is logged as "music stopped playing" (0x3a1a62) and reset through
+ * sub_0056e9a0 (call 0x3a1a6c, return marker 0x3a1a71).  That reset lives in
+ * guest_0168.c and the caller in guest_0107.c, so GNU ld --wrap=sub_0056e9a0
+ * sees the edge without touching the corpus.  MusicManager::Update
+ * (0x0039fbf0, this = ecx, kept at [ebp-4]) calls the slot update for slot 0
+ * (this+0, return 0x39fd3e) and slots 1..6 (this+0x34*i, return 0x39fd4f);
+ * 0x3a1b51 calls it for the eighth slot at this+0x32c (return 0x3a1b56).
+ * The slot update's aligned prologue (push ebx; mov ebx,esp; sub esp,8; and
+ * esp,-8; add esp,4; push ebp; mov ebp,[ebx+4]; mov [esp+4],ebp; mov
+ * ebp,esp) leaves its caller's ebp at [ebp] and the return address at
+ * [ebp+4]. */
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT_UPDATE_RVA   0x003a18f0U
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT_RESET_RVA    0x0056e9a0U
+#define ISAAC_VITA_AUDIO_MUSIC_DROP_RETURN       0x003a1a71U
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT0_RETURN      0x0039fd3eU
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT_LOOP_RETURN  0x0039fd4fU
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT7_RETURN      0x003a1b56U
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT_STRIDE       0x00000034U
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT_LOOP_COUNT   7U
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT7_OFFSET      0x0000032cU
+#define ISAAC_VITA_AUDIO_MUSIC_SLOT_UNKNOWN      255U
+
 /* The removed guest worker called Manager::Update and then slept for 5 ms.
  * Room-construction polls retain that exact minimum cadence.  Save parsing
  * has more than one second of measured OGG refill headroom, so its owner-thread
@@ -251,6 +278,23 @@ int isaac_vita_audio_shutdown_active(void);
  * attempt.  This is separate from shutdown_active so an incomplete close can
  * still be retried without consuming the one-shot final telemetry record. */
 void isaac_vita_audio_log_final(void);
+#if defined(ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN)
+/* ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN: the abort-stop replacement for
+ * shutdown_active.  The guest did not exit (fault, bad_alloc, unsupported
+ * import, stack fault), so the process is about to be ended by
+ * sceKernelExitProcess and nothing may join a pthread any more: under the
+ * heap exhaustion behind a bad_alloc, pthread-embedded's thread-exit path
+ * lazily initialises the TCB cancelLock (PTHREAD_MUTEX_INITIALIZER ->
+ * pthread_mutex_init -> calloc(1, 20)); a failed calloc stores NULL into the
+ * mutex and returns ENOMEM, pte_thread_detach_and_exit_np ignores the status
+ * and pthread_mutex_unlock then reads NULL+12 (the C2-12828-1 data abort of
+ * the cold Chinese dump, EventThread joined by alcDestroyContext).  This call
+ * touches no OpenAL entry point and no guest byte; it only reports the owner
+ * it leaves behind.  Returns SKIPPED when an owner (complete or partial) is
+ * left to the process exit and NONE when there was no owner. */
+#define ISAAC_VITA_AUDIO_SHUTDOWN_SKIPPED 2
+int isaac_vita_audio_abort_skip_teardown(void);
+#endif
 const char *isaac_vita_audio_manager_status_name(int status);
 
 #endif

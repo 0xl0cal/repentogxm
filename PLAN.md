@@ -74,8 +74,12 @@ by the heap (priority 5).
    3,294 fragments; the same exit worked early in the session, so heap use
    grows with play time. Saves were written before the crash.
    Done: a one-slot emergency allocation for that stream queue
-   (`ISAAC_VITA_OGG_QUEUE_EMERGENCY`); not a fragmentation cure.
-   Next: log heap usage periodically during play, find what grows.
+   (`ISAAC_VITA_OGG_QUEUE_EMERGENCY`); not a fragmentation cure. The
+   second-tier pool size is a knob (`ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES`,
+   default 0x007d5000 = the released 8 MiB).
+   Next: on the device, `0x017fd000` (24 MiB class) with
+   `ISAAC_VITA_LUA_ARENA_MB=33`; log heap usage periodically during play,
+   find what grows.
 6. An open EID description box breaks 60 FPS: Lua costs about 0.8 ms per frame
    with the box closed and 8-10 ms with it open.
    Done: native `__index` and `getClass` seams.

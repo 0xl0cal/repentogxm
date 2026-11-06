@@ -184,4 +184,57 @@ void isaac_vita_kage_quad_fastpath_take(IsaacVitaKageQuadCounters *out);
  * `this` at [F+0x34] before the push (005601c2). */
 #define ISAAC_VITA_KAGE_QUAD_FRAME_THIS_SLOT      0x34u
 
+/* ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE: the blend/batch select sub_005607a0
+ * replayed natively, with the hit path of the batch lookup sub_005603f0
+ * (current slot matches the blend descriptor, the batch group and its id
+ * list); a lookup miss, the pair-vector growth, SetBlend and the size
+ * getters still run the translated/registered code with the exact call
+ * state.  Facts copied from the generated listing of guest_0166.c
+ * (generated-int3-off) at the addresses named.
+ *
+ * Names matched by logic in REPENTOGON libzhl (PC build; offsets differ and
+ * were NOT transferred): sub_005603f0 = KAGE_Graphics_ImageBase::get_batch
+ * (bool isTransparent); image +0x20 _predefinedShader, +0x40 _renderBatches,
+ * +0x4c _lastRenderBatch, +0x50 _reusableTransparentRenderBatches, +0x5c
+ * _lastTransparentRenderBatch; 0x7c7a30 KAGE_Graphics_Manager with
+ * _blendMode at +4, and here _shader at +0x14 ("group" below),
+ * currentRenderTarget at +0x18, renderTargetUsesScreenSize at +0x1c (REP:
+ * +0x18/+0x1c/+0x20); 0x7e7d28 = ImageManager::_transparentBatches
+ * (vector<pair<RenderBatch*, ImageBase*>>).  The three "group" objects are
+ * the predefined shaders inside the Manager (inferred from the select, not
+ * named in REP). */
+#define ISAAC_VITA_KAGE_QUAD_LOOKUP_RVA           0x005603F0u  /* ret 4 */
+#define ISAAC_VITA_KAGE_QUAD_PAIRS_GROW_RVA       0x0008D900u  /* ret 8 */
+/* Return words of the select's call sites (call address + its length). */
+#define ISAAC_VITA_KAGE_QUAD_RET_SET_BLEND        0x005608A8u  /* call [eax+0x38] */
+#define ISAAC_VITA_KAGE_QUAD_RET_LOOKUP_TRANSLUCENT 0x005608B7u
+#define ISAAC_VITA_KAGE_QUAD_RET_LOOKUP_CUSTOM    0x005608D4u  /* opaque, non-default */
+#define ISAAC_VITA_KAGE_QUAD_RET_LOOKUP_DEFAULT   0x00560954u  /* opaque, default */
+#define ISAAC_VITA_KAGE_QUAD_RET_PAIRS_GROW       0x00560949u
+#define ISAAC_VITA_KAGE_QUAD_RET_SELECT_WIDTH     0x0056096Cu  /* call eax */
+#define ISAAC_VITA_KAGE_QUAD_RET_SELECT_HEIGHT    0x00560999u  /* call eax */
+/* Globals the select reads and writes (RVAs). */
+#define ISAAC_VITA_KAGE_QUAD_G_BATCH_GROUP        0x007C7A44u  /* u32 group object */
+#define ISAAC_VITA_KAGE_QUAD_G_GROUP_0            0x007C7A70u  /* [this+0x20] == 0 */
+#define ISAAC_VITA_KAGE_QUAD_G_GROUP_1            0x007C7A9Cu
+#define ISAAC_VITA_KAGE_QUAD_G_GROUP_2            0x007C7AC8u
+#define ISAAC_VITA_KAGE_QUAD_G_PAIRS              0x007E7D28u  /* (batch, image) vector */
+#define ISAAC_VITA_KAGE_QUAD_G_PAIRS_END          0x007E7D2Cu
+#define ISAAC_VITA_KAGE_QUAD_G_PAIRS_CAP          0x007E7D30u
+#define ISAAC_VITA_KAGE_QUAD_G_PREV_BATCH         0x007E7D34u
+#define ISAAC_VITA_KAGE_QUAD_G_PREV_IMAGE         0x007E7D38u
+/* Image/batch fields the select and the lookup hit path read. */
+#define ISAAC_VITA_KAGE_QUAD_OFF_GROUP            0x20u
+#define ISAAC_VITA_KAGE_QUAD_OFF_SLOT_DEFAULT     0x4Cu  /* opaque, default blend */
+#define ISAAC_VITA_KAGE_QUAD_OFF_SLOT_CUSTOM      0x5Cu  /* translucent or custom */
+#define ISAAC_VITA_KAGE_QUAD_BATCH_GROUP          0x10u  /* batch: group object */
+#define ISAAC_VITA_KAGE_QUAD_BATCH_IDS            0x14u  /* batch: vector<u32> */
+#define ISAAC_VITA_KAGE_QUAD_GROUP_IDS            0x1Cu  /* group: vector<u32> */
+#define ISAAC_VITA_KAGE_QUAD_VT_SET_BLEND         0x38u  /* Renderer vtable */
+#define ISAAC_VITA_KAGE_QUAD_VT_RENDERER_WIDTH    0x30u
+#define ISAAC_VITA_KAGE_QUAD_VT_RENDERER_HEIGHT   0x34u
+/* Id lists longer than this take the translated lookup (fail closed; the
+ * x86 compares any length). */
+#define ISAAC_VITA_KAGE_QUAD_LOOKUP_MAX_IDS       64u
+
 #endif

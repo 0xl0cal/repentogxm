@@ -10,9 +10,17 @@ flags="-std=gnu11 -O2 -Wall -Wextra -Werror -DISAAC_VITA_ARCHIVE_CACHE_ORACLE=1"
 mkdir -p "$run/ux0:/data/isaacr001/resources/packed" \
          "$run/ux0:/data/isaacr001/resources/loose"
 
-"$host_cc" $flags -I"$root/runtime" -I"$root/vita" \
+# Twice: without ISAAC_VITA_CRT_DESCRIPTOR_RECOVER (identity) and with it
+# (the newlib fd release repair after a refused close, against a transcribed
+# copy of newlib's descriptor table).
+for recover in off on; do
+recover_flag=
+if [ "$recover" = on ]; then
+    recover_flag=-DISAAC_VITA_CRT_DESCRIPTOR_RECOVER=1
+fi
+"$host_cc" $flags $recover_flag -I"$root/runtime" -I"$root/vita" \
     "$root/runtime/host_vita_archive_cache.c" -x c - \
-    -o "$work/archive-cache-host-oracle" <<'EOF'
+    -o "$work/archive-cache-host-oracle-$recover" <<'EOF'
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -503,8 +511,185 @@ static int test_key_contracts(void)
     return 0;
 }
 
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+/* newlib 0da3cb1 as disassembled (lib_a-syscalls.o _close_r, lib_a-io.o
+ * __vita_release_descriptor and __vita_fd_drop): _close_r is -1/EBADF unless
+ * the release succeeds; release needs fd 1..255 with a map entry and clears
+ * it only when drop >= 0; drop decrements a ref_count above 1, otherwise
+ * calls sceIoClose(sce_uid), frees filename whatever the result, and only on
+ * success decrements and memsets the entry. */
+#define SCE_ENODEV ((int32_t)UINT32_C(0x80010013))
+
+static isaac_vita_archive_newlib_fd s_pool[4];
+static isaac_vita_archive_newlib_fd *s_fdmap[ISAAC_VITA_ARCHIVE_NEWLIB_FD_COUNT];
+static char s_names[16][32];
+static unsigned s_name_next;
+static const char *s_freed[16];
+static unsigned s_freed_count;
+static unsigned s_double_frees;
+static unsigned s_sce_close_calls;
+static unsigned s_dummy_opens;
+static int32_t s_dead_uid = -1;
+static int s_dummy_fails;
+static int s_dummy_close_fails;
+
+static void fake_free(const char *pointer)
+{
+    unsigned i;
+
+    for (i = 0U; i < s_freed_count; ++i)
+        if (s_freed[i] == pointer)
+            ++s_double_frees;
+    if (s_freed_count < 16U)
+        s_freed[s_freed_count++] = pointer;
+}
+
+static int32_t fake_sce_close(int32_t uid)
+{
+    ++s_sce_close_calls;
+    if (uid == s_dead_uid || (uid == 900 && s_dummy_close_fails))
+        return SCE_ENODEV;
+    return 0;
+}
+
+static int fake_drop(isaac_vita_archive_newlib_fd *map)
+{
+    int32_t result;
+
+    if (map->ref_count != 1) {
+        --map->ref_count;
+        return 0;
+    }
+    result = fake_sce_close(map->sce_uid);
+    if (map->filename)
+        fake_free(map->filename);
+    if (result < 0)
+        return -(int)(result & 0xff);
+    --map->ref_count;
+    memset(map, 0, sizeof *map);
+    return 0;
+}
+
+int isaac_vita_archive_cache_oracle_close_r(void *reent, int fd)
+{
+    int released = 0;
+
+    if ((unsigned)(fd - 1) <= 254U && s_fdmap[fd] &&
+        fake_drop(s_fdmap[fd]) >= 0) {
+        s_fdmap[fd] = NULL;
+        released = 1;
+    }
+    *(int *)reent = released ? 0 : EBADF;
+    return released ? 0 : -1;
+}
+
+isaac_vita_archive_newlib_fd *isaac_vita_archive_cache_oracle_fd_entry(int fd)
+{
+    return s_fdmap[fd];
+}
+
+int32_t isaac_vita_archive_cache_oracle_dummy_open(void)
+{
+    ++s_dummy_opens;
+    return s_dummy_fails ? SCE_ENODEV : 900;
+}
+
+static void fake_open(int fd, unsigned slot, int32_t uid, int ref_count)
+{
+    char *name = s_names[s_name_next++ % 16U];
+
+    memset(&s_pool[slot], 0, sizeof s_pool[slot]);
+    s_pool[slot].sce_uid = uid;
+    s_pool[slot].ref_count = ref_count;
+    (void)snprintf(name, sizeof s_names[0], "ux0:/f%d", fd);
+    s_pool[slot].filename = name;
+    s_fdmap[fd] = &s_pool[slot];
+}
+
+static int pool_entry_clear(unsigned slot)
+{
+    static const isaac_vita_archive_newlib_fd zero;
+
+    return memcmp(&s_pool[slot], &zero, sizeof zero) == 0;
+}
+
+static int test_fd_close_repair(void)
+{
+    uint32_t repaired;
+    uint32_t leaked;
+    int reent_errno;
+
+    /* A healthy close: one sceIoClose, released, nothing repaired. */
+    fake_open(5, 0U, 100, 1);
+    reent_errno = -1;
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 5) == 0);
+    CHECK(reent_errno == 0 && !s_fdmap[5] && pool_entry_clear(0U) &&
+          s_sce_close_calls == 1U && s_dummy_opens == 0U);
+
+    /* The leak itself, through newlib's plain close: the refused close
+     * keeps map and pool entry (ref_count 1) and frees the filename it still
+     * points at. */
+    fake_open(6, 1U, 200, 1);
+    s_dead_uid = 200;
+    CHECK(isaac_vita_archive_cache_oracle_close_r(&reent_errno, 6) == -1);
+    CHECK(reent_errno == EBADF && s_fdmap[6] == &s_pool[1] &&
+          s_pool[1].ref_count == 1 && s_pool[1].filename == s_names[1] &&
+          s_freed_count == 2U && s_freed[1] == s_names[1]);
+
+    /* The repair: the same refused close, then the release again on the
+     * dummy handle; the fd and pool entry are back, the dangling filename
+     * is not freed twice, the caller still sees -1/EBADF. */
+    fake_open(7, 2U, 200, 1);
+    s_sce_close_calls = 0U;
+    reent_errno = 0;
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 7) == -1);
+    CHECK(reent_errno == EBADF && !s_fdmap[7] && pool_entry_clear(2U) &&
+          s_sce_close_calls == 2U && s_dummy_opens == 1U &&
+          s_double_frees == 0U && s_freed_count == 3U);
+    isaac_vita_archive_fd_repair_counts(&repaired, &leaked);
+    CHECK(repaired == 1U && leaked == 0U);
+
+    /* No dummy handle: counted, the entry stays as newlib left it. */
+    fake_open(8, 3U, 200, 1);
+    s_dummy_fails = 1;
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 8) == -1);
+    CHECK(reent_errno == EBADF && s_fdmap[8] == &s_pool[3] &&
+          s_dummy_opens == 2U && s_double_frees == 0U);
+    s_dummy_fails = 0;
+    /* The dummy's own close refused: counted, never freed twice. */
+    fake_open(9, 0U, 200, 1);
+    s_dummy_close_fails = 1;
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 9) == -1);
+    CHECK(reent_errno == EBADF && s_fdmap[9] == &s_pool[0] &&
+          s_dummy_opens == 3U && s_double_frees == 0U);
+    s_dummy_close_fails = 0;
+    isaac_vita_archive_fd_repair_counts(&repaired, &leaked);
+    CHECK(repaired == 1U && leaked == 2U);
+
+    /* Never touched: a standard or out-of-range fd, an unmapped fd, a
+     * directory entry, and a shared (dup'd) entry whose close succeeds. */
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 2) == -1);
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 256) == -1);
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 40) == -1);
+    fake_open(10, 1U, 200, 1);
+    s_pool[1].type = 1U;
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 10) == -1);
+    CHECK(s_fdmap[10] == &s_pool[1] && s_dummy_opens == 3U);
+    fake_open(11, 2U, 200, 2);
+    CHECK(isaac_vita_archive_fd_close_repair(&reent_errno, &reent_errno, 11) == 0);
+    CHECK(reent_errno == 0 && !s_fdmap[11] &&
+          s_pool[2].ref_count == 1 && s_dummy_opens == 3U);
+    isaac_vita_archive_fd_repair_counts(&repaired, &leaked);
+    CHECK(repaired == 1U && leaked == 2U && s_double_frees == 0U);
+    return 0;
+}
+#endif
+
 int main(void)
 {
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    CHECK(test_fd_close_repair() == 0);
+#endif
     CHECK(write_fixture(ARCHIVE_A, "abcdef"));
     CHECK(write_fixture(ARCHIVE_B, "uvwxyz"));
     CHECK(write_fixture(ARCHIVE_MUSIC, "music"));
@@ -522,16 +707,23 @@ int main(void)
     CHECK(test_diag_ring_tail() == 0);
     CHECK(test_diag_log_bound() == 0);
     CHECK(s_live_files == 0U);
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    puts("Vita archive one-idle FILE cache host oracle "
+         "(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER, fd release repair): PASS");
+#else
     puts("Vita archive one-idle FILE cache host oracle: PASS");
+#endif
     return 0;
 }
 EOF
 
-(CDPATH= cd -- "$run" && "$work/archive-cache-host-oracle")
+(CDPATH= cd -- "$run" && "$work/archive-cache-host-oracle-$recover")
+done
 
 sha256sum \
     "$root/runtime/host_vita_archive_cache.h" \
     "$root/runtime/host_vita_archive_cache.c" \
     "$root/vita/test_archive_cache.sh" \
-    "$work/archive-cache-host-oracle"
+    "$work/archive-cache-host-oracle-off" \
+    "$work/archive-cache-host-oracle-on"
 echo "Vita archive one-idle FILE cache host behavior: PASS"

@@ -44,6 +44,15 @@
  * untouched; states only the batch select can produce (a null or hollow
  * fresh batch) are probed for the replay's fault after the select.
  *
+ * ORACLE_REAL_BATCH_LOOKUP (the "select" flavours, built with
+ * ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE, with and without the vanilla/KAGE
+ * seams): the stand-in lookup is replaced by the real sub_005603f0 (with
+ * the real sub_00567620 id compare and sub_0055ecf0 constructor) behind a
+ * tracing wrapper, over a world prepare_lookup derives from the case
+ * (group id vectors, batch slots, opaque and free lists) and perturbs one
+ * field at a time; the native select's hits must trace exactly what the
+ * translated lookup traces, its misses enter the same translated body.
+ *
  * Executed on a 32-bit identity-mapped host (MSVC x86, /LARGEADDRESSAWARE so
  * the 0x98xxxxxx image words can be committed at their real addresses). */
 #include "guest.c"
@@ -58,6 +67,13 @@
 static void oracle_floor_note(CPU *__restrict c, double value, uint32_t at);
 #define ISAAC_KAGE_QUAD_ORACLE_FLOOR_NOTE(c, value, arg) \
     oracle_floor_note((c), (value), (arg))
+#if defined(ORACLE_REAL_BATCH_LOOKUP)
+/* A batch lookup the native select answered: traced like the translated
+ * lookup's entry and return below. */
+static void oracle_lookup_hit(CPU *__restrict c, uint32_t batch, uint32_t edx);
+#define ISAAC_KAGE_QUAD_ORACLE_LOOKUP_HIT(c, batch, edx) \
+    oracle_lookup_hit((c), (batch), (edx))
+#endif
 /* The fast path itself, with its entry point renamed so the oracle can wrap
  * it and count verdicts; the seamed body calls the public name. */
 #define isaac_vita_kage_quad_try oracle_kage_quad_impl
@@ -218,6 +234,7 @@ int isaac_vita_kage_quad_try(CPU *__restrict c)
 #define ORACLE_INDEX_WORDS 64u
 #define ORACLE_DIRTY_SLOTS 8u
 #define ORACLE_PAIR_SLOTS 8u
+#define ORACLE_LONG_IDS 72u
 
 /* Guard words below the floor absorb the raw pushes of the translated body
  * on a stack too shallow for its frame; words above the ceiling absorb the
@@ -251,6 +268,15 @@ typedef struct arena {
     uint32_t allocator_vtable[16];
     uint32_t renderer_vtable[16];     /* +0x30 GetWidth, +0x34 GetHeight, +0x38 SetBlend */
     uint32_t renderer_size[2];
+    /* The real batch lookup's world (ORACLE_REAL_BATCH_LOOKUP): the id
+     * vectors of the three group objects and a foreign one, the ids of
+     * batch/batch2, the long id list, the image's opaque batch list
+     * ([this+0x40]) and translucent free list ([this+0x50]). */
+    uint32_t group_ids[4][4];
+    uint32_t batch_ids[2][ORACLE_LONG_IDS];
+    uint32_t long_ids[ORACLE_LONG_IDS];
+    uint32_t opaque_list[4];
+    uint32_t free_list[4];
 } arena;
 
 static arena s_arena;
@@ -286,6 +312,183 @@ static uint32_t grow_take(CPU *__restrict c, uint32_t at_rva, uint32_t bytes)
     return at;
 }
 
+static void trace_lookup_entry(const CPU *c)
+{
+    trace("batch-select this=%08x arg=%u ret=%08x eax=%08x edx=%08x "
+          "ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", c->ecx,
+          ld8(c->esp + 4u), ld32(c->esp), c->eax, c->edx, c->ebx, c->esp,
+          c->ebp, c->esi, c->edi);
+}
+
+static void trace_regs(const char *what, const CPU *c)
+{
+    trace("%s ret=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x "
+          "ebp=%08x esi=%08x edi=%08x\n", what, ld32(c->esp), c->eax, c->ecx,
+          c->edx, c->ebx, c->esp, c->ebp, c->esi, c->edi);
+}
+
+#if defined(ORACLE_REAL_BATCH_LOOKUP)
+/* The real sub_005603f0 (the test compiles the corpus body under this
+ * name) behind a tracing wrapper: the entry state of every translated
+ * lookup and what it returns (ECX, the popped security cookie, is dead
+ * after every call site and not traced).  The native select's hits go
+ * through oracle_lookup_hit, which must trace the same two lines. */
+void real_sub_005603f0(CPU *__restrict c);
+static unsigned s_lookup_calls;
+static unsigned s_native_hits;
+static unsigned s_length_faults;
+/* The index record of the batch the lookup returned and its count then:
+ * reserved() compares it after the reference run. */
+static int s_lookup_valid;
+static uint32_t s_lookup_rec, s_lookup_icount;
+
+static void lookup_return(uint32_t eax, uint32_t edx, uint32_t esp,
+                          const CPU *c)
+{
+    uint32_t records;
+    trace("batch-select -> eax=%08x edx=%08x esp=%08x ebx=%08x ebp=%08x "
+          "esi=%08x edi=%08x\n", eax, edx, esp, c->ebx, c->ebp, c->esi,
+          c->edi);
+    s_lookup_valid = 0;
+    records = eax ? ld32(eax + 0x2cu) : 0u;
+    if (records) {
+        s_lookup_rec = records + ld32(eax + 0x30u) * 16u;
+        s_lookup_icount = ld32(s_lookup_rec + 4u);
+        s_lookup_valid = 1;
+    }
+}
+
+void sub_005603f0(CPU *__restrict c)
+{
+    ++s_stub_calls;
+    ++s_batch_selects;
+    ++s_lookup_calls;
+    trace_lookup_entry(c);
+    real_sub_005603f0(c);
+    lookup_return(c->eax, c->edx, c->esp, c);
+}
+
+static void oracle_lookup_hit(CPU *__restrict c, uint32_t batch, uint32_t edx)
+{
+    ++s_stub_calls;
+    ++s_batch_selects;
+    ++s_native_hits;
+    trace_lookup_entry(c);
+    /* ret 4 pops the return word and the argument. */
+    lookup_return(batch, edx, c->esp + 8u, c);
+}
+
+/* The lookup's own callees outside the linked set (its miss paths):
+ * stand-ins with the frozen ABIs of the listing. */
+
+/* sub_005eacf8 operator new / sub_005eb09c (cdecl size): grow arena. */
+void sub_005eacf8(CPU *__restrict c)
+{
+    uint32_t size = ld32(c->esp + 4u);
+    ++s_stub_calls;
+    trace_regs("new", c);
+    c->eax = grow_take(c, 0x005eacf8u, size);
+    c->ecx = UINT32_C(0x13131313);
+    c->edx = UINT32_C(0x14141414);
+    (void)gpop(c);
+}
+
+void sub_005eb09c(CPU *__restrict c)
+{
+    uint32_t size = ld32(c->esp + 4u);
+    ++s_stub_calls;
+    trace_regs("new-record", c);
+    c->eax = grow_take(c, 0x005eb09cu, size);
+    c->ecx = UINT32_C(0x15151515);
+    c->edx = UINT32_C(0x16161616);
+    (void)gpop(c);
+}
+
+/* sub_0031ed10 vector<u32>::operator=(const vector &) (thiscall; ret 4):
+ * the source's elements into fresh grow-arena storage. */
+void sub_0031ed10(CPU *__restrict c)
+{
+    uint32_t dst = c->ecx, src = ld32(c->esp + 4u);
+    ++s_stub_calls;
+    trace_regs("ids-assign", c);
+    if (dst != src) {
+        uint32_t begin = ld32(src), bytes = ld32(src + 4u) - begin, at;
+        /* the listing's sar count above 0x3fffffff ends in _Xlength_error */
+        if (bytes > 0x10000u)
+            guest_fault(c, VA(0x00010b40u), "oracle vector length error");
+        at = grow_take(c, 0x0031ed10u, bytes + 4u);
+        memmove((void *)(uintptr_t)at, (const void *)(uintptr_t)begin, bytes);
+        st32(dst, at);
+        st32(dst + 4u, at + bytes);
+        st32(dst + 8u, at + bytes);
+    }
+    c->eax = dst;
+    c->ecx = UINT32_C(0x17171717);
+    c->edx = UINT32_C(0x18181818);
+    (void)gpop(c);
+    c->esp += 4u;
+}
+
+/* sub_002798a0 vector<u32> reallocation for n elements (thiscall; ret 4):
+ * begin = end = new storage, cap = begin + 4n, as the listing leaves it. */
+void sub_002798a0(CPU *__restrict c)
+{
+    uint32_t vec = c->ecx, n = ld32(c->esp + 4u), at;
+    ++s_stub_calls;
+    trace_regs("ids-reserve", c);
+    if (n > 0x3fffffffu)    /* 002798b1: ja -> call 0x10b40 */
+        guest_fault(c, VA(0x00010b40u), "oracle vector length error");
+    at = grow_take(c, 0x002798a0u, 4u * n + 4u);
+    st32(vec, at);
+    st32(vec + 4u, at);
+    st32(vec + 8u, at + 4u * n);
+    c->eax = at + 4u * n;
+    c->ecx = UINT32_C(0x19191919);
+    c->edx = UINT32_C(0x1a1a1a1a);
+    (void)gpop(c);
+    c->esp += 4u;
+}
+
+/* sub_0059a5e0 allocator alloc (thiscall size, flags; ret 8): reached only
+ * for ring records with capacity, which a fresh batch never has. */
+void sub_0059a5e0(CPU *__restrict c)
+{
+    ++s_stub_calls;
+    trace_regs("record-alloc", c);
+    c->eax = grow_take(c, 0x0059a5e0u, ld32(c->esp + 4u));
+    c->ecx = UINT32_C(0x1b1b1b1b);
+    c->edx = UINT32_C(0x1c1c1c1c);
+    (void)gpop(c);
+    c->esp += 8u;
+}
+
+/* sub_000be2b0 growth of the image's opaque batch list (thiscall insert
+ * position, &value; ret 8): twice the storage, value appended. */
+void sub_000be2b0(CPU *__restrict c)
+{
+    uint32_t vec = c->ecx, pos = ld32(c->esp + 4u), value = ld32(c->esp + 8u);
+    uint32_t begin = ld32(vec), end = ld32(vec + 4u), cap = ld32(vec + 8u);
+    uint32_t count = (end - begin) / 4u;
+    uint32_t newcap = cap == begin ? 1u : (cap - begin) / 4u * 2u;
+    uint32_t at;
+
+    ++s_stub_calls;
+    trace_regs("list-grow", c);
+    if (pos != end)
+        guest_fault(c, VA(0x000be2b0u), "oracle list growth not at the end");
+    at = grow_take(c, 0x000be2b0u, newcap * 4u);
+    memcpy((void *)(uintptr_t)at, (const void *)(uintptr_t)begin, count * 4u);
+    st32(at + count * 4u, ld32(value));
+    st32(vec, at);
+    st32(vec + 4u, at + (count + 1u) * 4u);
+    st32(vec + 8u, at + newcap * 4u);
+    c->eax = at + count * 4u;
+    c->ecx = UINT32_C(0x1d1d1d1d);
+    c->edx = UINT32_C(0x1e1e1e1e);
+    (void)gpop(c);
+    c->esp += 8u;
+}
+#else
 /* sub_005603f0: the batch lookup/creation of the blend select (thiscall,
  * one bool argument; ret 4; 736 translated lines over hash containers and
  * allocators).  Stand-in: returns the batch the case prescribes and traces
@@ -295,10 +498,7 @@ void sub_005603f0(CPU *__restrict c)
 {
     ++s_stub_calls;
     ++s_batch_selects;
-    trace("batch-select this=%08x arg=%u ret=%08x eax=%08x edx=%08x "
-          "ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", c->ecx,
-          ld8(c->esp + 4u), ld32(c->esp), c->eax, c->edx, c->ebx, c->esp,
-          c->ebp, c->esi, c->edi);
+    trace_lookup_entry(c);
     c->eax = s_batch_select == 0 ? A(batch[0]) :
              s_batch_select == 1 ? A(batch2[0]) : 0u;
     c->ecx = UINT32_C(0x22222222);
@@ -306,6 +506,7 @@ void sub_005603f0(CPU *__restrict c)
     (void)gpop(c);
     c->esp += 4u;
 }
+#endif
 
 /* sub_0008d900: growth of the (batch, image) pair vector at 0x7e7d28
  * (thiscall, insert position, &pair; ret 8).  Stand-in: storage for twice
@@ -320,6 +521,7 @@ void sub_0008d900(CPU *__restrict c)
     uint32_t at;
 
     ++s_stub_calls;
+    trace_regs("pairs-grow", c);
     trace("pairs-grow vec=%08x pos=%08x pair=%08x,%08x begin=%08x end=%08x "
           "cap=%08x\n", vec, pos, ld32(value), ld32(value + 4u), begin, end,
           cap);
@@ -431,6 +633,7 @@ void sub_0055e330(CPU *__restrict c)
 #define ORACLE_RENDERER_W_VA    UINT32_C(0x985a0be0)
 #define ORACLE_RENDERER_H_VA    UINT32_C(0x985a0bf0)
 #define ORACLE_SET_BLEND_VA     UINT32_C(0x985a0c00)
+#define ORACLE_GETTER_WR_VA     UINT32_C(0x985a0c10)   /* unbinds the target */
 
 static void getter_trace(const char *which, const CPU *c)
 {
@@ -472,6 +675,16 @@ static void oracle_get_height_clobber(CPU *__restrict c)
     c->eax = ld32(c->ecx + 0x104u);
     c->ebx = UINT32_C(0xb3b3b3b3);
     c->edx = UINT32_C(0xd4d4d4d4);
+    (void)gpop(c);
+}
+
+/* A GetWidth that unbinds the render target as a side effect: both the
+ * cull and the select re-read [0x7c7a48] before the height call. */
+static void oracle_get_width_rebind(CPU *__restrict c)
+{
+    getter_trace("wr", c);
+    c->eax = ld32(c->ecx + 0x100u);
+    st32(VA(ISAAC_VITA_KAGE_QUAD_G_CULL_TARGET), 0u);
     (void)gpop(c);
 }
 
@@ -543,15 +756,17 @@ static void oracle_floor_foreign(CPU *__restrict c)
     (void)gpop(c);
 }
 
-static const uint32_t s_registered_addrs[10] = {
+static const uint32_t s_registered_addrs[11] = {
     ORACLE_ALLOC_VA, ORACLE_FREE_VA, ORACLE_GETTER_W_VA, ORACLE_GETTER_H_VA,
     ORACLE_GETTER_WC_VA, ORACLE_GETTER_HC_VA, ORACLE_FLOOR_FOREIGN_VA,
     ORACLE_RENDERER_W_VA, ORACLE_RENDERER_H_VA, ORACLE_SET_BLEND_VA,
+    ORACLE_GETTER_WR_VA,
 };
-static const guest_fn s_registered_fns[10] = {
+static const guest_fn s_registered_fns[11] = {
     oracle_alloc, oracle_free, oracle_get_width, oracle_get_height,
     oracle_get_width_clobber, oracle_get_height_clobber, oracle_floor_foreign,
     oracle_renderer_get_width, oracle_renderer_get_height, oracle_set_blend,
+    oracle_get_width_rebind,
 };
 
 /* ---- image pages ------------------------------------------------------ */
@@ -687,7 +902,8 @@ typedef struct kq_case {
     uint8_t cull_enable, size_override, snap_enable, premultiply;
     int target_mode;            /* 0 none, 1 getters, 2 clobbering getters,
                                    3 null vtable, 4 null width slot,
-                                   5 null height slot */
+                                   5 null height slot, 6 GetWidth unbinds
+                                   the target */
     int32_t target_w, target_h;
     float depth;
     /* The blend select's world (unbatched images). */
@@ -702,6 +918,11 @@ typedef struct kq_case {
     uint32_t b2_velem, b2_ielem;
     ring_record b2_vrec, b2_irec;
     int b2_vrecords_null, b2_irecords_null;
+    /* The real lookup's world (ORACLE_REAL_BATCH_LOOKUP), see
+     * prepare_lookup: 0 = the image's slot holds a batch matching the
+     * state at the lookup (batch_select 1 = a miss on descriptor word 0
+     * that the lists answer with batch2), LOOKUP_* = one perturbation. */
+    int lookup;
     int quad_null, uv_null, colour_null, formats_null, batch_null;
     int vrecords_null, irecords_null, vptr_null, iptr_null;
     int import_not_ready, slot_bad;
@@ -817,6 +1038,163 @@ static void opaque(kq_case *k)
     for (i = 0u; i < 4u; ++i)
         k->colours[i][3] = 1.0f;           /* alpha sum 4.0: bool 0 */
 }
+
+enum {
+    LOOKUP_HIT = 0,
+    LOOKUP_DESC0, LOOKUP_DESC1, LOOKUP_DESC2, LOOKUP_DESC3,
+    LOOKUP_GROUP,           /* the batch's group word differs */
+    LOOKUP_ID_COUNT,        /* one id more than the group's */
+    LOOKUP_ID_VALUE,        /* the last id differs */
+    LOOKUP_SLOT_NULL,       /* empty slot: the lists answer */
+    LOOKUP_CREATE,          /* empty slot and lists: a new batch */
+    LOOKUP_CREATE_FULL,     /* no match, opaque list at capacity: it grows */
+    LOOKUP_NEGATIVE_COUNT,  /* end < begin on both vectors, first ids differ */
+    LOOKUP_LONG_HIT,        /* 70 equal ids: above the replay's bound */
+    LOOKUP_LONG_MISS,       /* 70 ids, the last differs */
+    LOOKUP_MID_HIT,         /* 40 equal ids: below the bound */
+    LOOKUP_MID_MISS,        /* 40 ids, the last differs */
+    LOOKUP_KINDS
+};
+
+#if defined(ORACLE_REAL_BATCH_LOOKUP)
+/* The world the real sub_005603f0 reads, derived from the case: group i
+ * (the three group objects 0x7c7a70/9c/c8 and the foreign 0x7c7b00) holds
+ * i ids; batch and batch2 carry the blend descriptor and group the select
+ * will have installed when it calls the lookup (SetBlend's descriptor for a
+ * translucent quad under the default one, the group [this+0x20] selects)
+ * and a copy of that group's ids; both slots hold batch, the opaque list
+ * is {batch, batch2} and the free list {batch2}; k->lookup then perturbs
+ * one thing. */
+static void prepare_lookup(const kq_case *k)
+{
+    static const uint32_t group_rvas[4] = {
+        0x007c7a70u, 0x007c7a9cu, 0x007c7ac8u, 0x007c7b00u
+    };
+    const uint32_t image = A(image[0]);
+    const uint32_t current = VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER) + 4u;
+    uint32_t batches[2], colour[4], desc[4], held, mode, src, n, i, b;
+    int lookup = k->lookup ? k->lookup :
+                 k->batch_select == 1 ? LOOKUP_DESC0 : LOOKUP_HIT;
+    int is_default = 1, create = 0;
+
+    batches[0] = A(batch[0]);
+    batches[1] = A(batch2[0]);
+    for (i = 0u; i < 4u; ++i) {
+        uint32_t group = VA(group_rvas[i]), j;
+        for (j = 0u; j < 4u; ++j)
+            s_arena.group_ids[i][j] = 0x1d000000u + 0x100u * i + j;
+        st32(group + 0x1cu, A(group_ids[i][0]));
+        st32(group + 0x20u, A(group_ids[i][0]) + 4u * i);
+        st32(group + 0x24u, A(group_ids[i][0]) + 16u);
+    }
+    for (i = 0u; i < 4u; ++i)
+        colour[i] = A(colours[i][0]);
+    for (i = 0u; i < 4u; ++i) {
+        desc[i] = ld32(current + 4u * i);
+        if (desc[i] != ld32(VA(ORACLE_BLEND_DEFAULT_RVA) + 4u * i))
+            is_default = 0;
+    }
+    if (kq_translucent(colour) && is_default)
+        for (i = 0u; i < 4u; ++i)
+            desc[i] = ld32(VA(k->premultiply ? ORACLE_BLEND_PREMULTIPLIED_RVA :
+                              ORACLE_BLEND_TRANSLUCENT_RVA) + 4u * i);
+    held = ld32(VA(ISAAC_VITA_KAGE_QUAD_G_BATCH_GROUP));
+    mode = held;
+    if (k->group != 3u) {
+        int index = held == VA(group_rvas[0]) ? 0 :
+                    held == VA(group_rvas[1]) ? 1 :
+                    held == VA(group_rvas[2]) ? 2 : -1;
+        if (index < 0 || (uint32_t)index != k->group)
+            mode = k->group <= 2u ? VA(group_rvas[k->group]) : held;
+    }
+    n = mode == VA(group_rvas[0]) ? 0u : mode == VA(group_rvas[1]) ? 1u :
+        mode == VA(group_rvas[2]) ? 2u : 3u;
+    if (lookup == LOOKUP_LONG_HIT || lookup == LOOKUP_LONG_MISS ||
+            lookup == LOOKUP_MID_HIT || lookup == LOOKUP_MID_MISS) {
+        n = lookup == LOOKUP_MID_HIT || lookup == LOOKUP_MID_MISS ? 40u : 70u;
+        for (i = 0u; i < n; ++i)
+            s_arena.long_ids[i] = 0x2e000000u + i;
+        st32(mode + 0x1cu, A(long_ids[0]));
+        st32(mode + 0x20u, A(long_ids[0]) + 4u * n);
+        st32(mode + 0x24u, A(long_ids[0]) + 4u * n);
+    }
+    src = ld32(mode + 0x1cu);
+    for (b = 0u; b < 2u; ++b) {
+        for (i = 0u; i < 4u; ++i)
+            st32(batches[b] + 4u * i, desc[i]);
+        st32(batches[b] + 0x10u, mode);
+        for (i = 0u; i < ORACLE_LONG_IDS; ++i)
+            s_arena.batch_ids[b][i] = i < n ? ld32(src + 4u * i) :
+                                      0xbad00000u + i;
+        st32(batches[b] + 0x14u, A(batch_ids[b][0]));
+        st32(batches[b] + 0x18u, A(batch_ids[b][0]) + 4u * n);
+        st32(batches[b] + 0x1cu, A(batch_ids[b][0]) + 4u * ORACLE_LONG_IDS);
+    }
+    switch (lookup) {
+    case LOOKUP_DESC0: case LOOKUP_DESC1: case LOOKUP_DESC2: case LOOKUP_DESC3:
+        i = (uint32_t)(lookup - LOOKUP_DESC0);
+        st32(batches[0] + 4u * i, desc[i] ^ 0x100u);
+        break;
+    case LOOKUP_GROUP:
+        st32(batches[0] + 0x10u, mode == VA(group_rvas[0]) ?
+                                 VA(group_rvas[1]) : VA(group_rvas[0]));
+        break;
+    case LOOKUP_ID_VALUE:
+        if (n) {
+            s_arena.batch_ids[0][n - 1u] ^= 1u;
+            break;
+        }
+        /* no ids to differ in: one more instead */
+        /* fall through */
+    case LOOKUP_ID_COUNT:
+        st32(batches[0] + 0x18u, ld32(batches[0] + 0x18u) + 4u);
+        break;
+    case LOOKUP_CREATE_FULL:
+        st32(batches[0], desc[0] ^ 0x100u);
+        st32(batches[1], desc[0] ^ 0x200u);
+        create = 1;
+        break;
+    case LOOKUP_CREATE:
+        create = 1;
+        break;
+    case LOOKUP_NEGATIVE_COUNT:
+        st32(batches[0] + 0x18u, ld32(batches[0] + 0x14u) - 4u);
+        st32(mode + 0x20u, ld32(mode + 0x1cu) - 4u);
+        s_arena.batch_ids[0][0] = 0xbad0beefu;
+        break;
+    case LOOKUP_LONG_MISS:
+    case LOOKUP_MID_MISS:
+        s_arena.batch_ids[0][n - 1u] ^= 1u;
+        break;
+    default:
+        break;
+    }
+    /* The slot the select reads holds batch; the other one holds batch2,
+     * which matches too: reading the wrong slot returns the wrong batch. */
+    {
+        uint32_t read_slot = !kq_translucent(colour) && is_default ?
+            ISAAC_VITA_KAGE_QUAD_OFF_SLOT_DEFAULT :
+            ISAAC_VITA_KAGE_QUAD_OFF_SLOT_CUSTOM;
+        uint32_t other_slot = read_slot == ISAAC_VITA_KAGE_QUAD_OFF_SLOT_CUSTOM ?
+            ISAAC_VITA_KAGE_QUAD_OFF_SLOT_DEFAULT :
+            ISAAC_VITA_KAGE_QUAD_OFF_SLOT_CUSTOM;
+        st32(image + read_slot,
+             lookup == LOOKUP_SLOT_NULL || create ? 0u : batches[0]);
+        st32(image + other_slot, create ? 0u : batches[1]);
+    }
+    s_arena.opaque_list[0] = batches[0];
+    s_arena.opaque_list[1] = batches[1];
+    s_arena.free_list[0] = batches[1];
+    st32(image + 0x40u, A(opaque_list[0]));
+    st32(image + 0x44u, A(opaque_list[0]) +
+         (lookup == LOOKUP_CREATE ? 0u : 8u));
+    st32(image + 0x48u, A(opaque_list[0]) +
+         (lookup == LOOKUP_CREATE_FULL ? 8u : 16u));
+    st32(image + 0x50u, A(free_list[0]));
+    st32(image + 0x54u, A(free_list[0]) + (create ? 0u : 4u));
+    st32(image + 0x58u, A(free_list[0]) + 16u);
+}
+#endif
 
 static void prepare(const kq_case *k, CPU *c, uint32_t *entry_esp_out)
 {
@@ -935,6 +1313,7 @@ static void prepare(const kq_case *k, CPU *c, uint32_t *entry_esp_out)
         s_arena.target_vtable[i] = 0x7b000000u + i;
     s_arena.target_vtable[0x28u / 4u] =
         k->target_mode == 2 ? ORACLE_GETTER_WC_VA :
+        k->target_mode == 6 ? ORACLE_GETTER_WR_VA :
         k->target_mode == 4 ? 0u : ORACLE_GETTER_W_VA;
     s_arena.target_vtable[0x2cu / 4u] =
         k->target_mode == 2 ? ORACLE_GETTER_HC_VA :
@@ -996,6 +1375,10 @@ static void prepare(const kq_case *k, CPU *c, uint32_t *entry_esp_out)
          k->slot_bad ? ORACLE_FLOOR_FOREIGN_VA :
          VA(ISAAC_VITA_KAGE_QUAD_FLOOR_IAT_RVA));
     g_isaac_vita_import_ids_ready = !k->import_not_ready;
+#if defined(ORACLE_REAL_BATCH_LOOKUP)
+    prepare_lookup(k);
+    s_lookup_valid = 0;
+#endif
 
     /* CPU: ECX = this, the six stdcall arguments above the return word. */
     c->eax = 0x11110000u;
@@ -1208,6 +1591,11 @@ static int reserved(const kq_case *k)
     const ring_record *rec;
     uint32_t before;
 
+#if defined(ORACLE_REAL_BATCH_LOOKUP)
+    /* The batch is whatever the real lookup returned. */
+    if (unbatched_case)
+        return s_lookup_valid && ld32(s_lookup_rec + 4u) != s_lookup_icount;
+#endif
     if (unbatched_case && k->batch_select == 1) {
         rec = &s_arena.irecs2[0];
         before = k->b2_irec.count;
@@ -1275,6 +1663,19 @@ static void compare(const kq_case *k, const char *tag, guest_fn ref,
         printf("--- reference\n%.900s\n--- seamed\n%.900s\n", s_ref_state,
                s_seam_state);
     }
+#if defined(ORACLE_REAL_BATCH_LOOKUP)
+    /* A negative id count sends the lookup's miss path into the vector
+     * length error: both sides fault there with the same state (compared
+     * above); the replay unwinds without a verdict. */
+    if (k->lookup == LOOKUP_NEGATIVE_COUNT &&
+        strstr(s_ref_state, "fault=oracle vector length error") != NULL) {
+        ++s_length_faults;
+        if (seam_census.handled != 0u || seam_census.rejected != 0u ||
+            counters.calls != 1u || counters.unbatched != 1u)
+            fail(k->name, tag, "length-fault case left a verdict");
+        return;
+    }
+#endif
 #if defined(ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE)
     /* OBSERVE: the checks run and count, the verdict is always REJECTED and
      * the translated body runs (trace/state identical by construction). */
@@ -1614,6 +2015,8 @@ static void random_case(kq_case *k, const char *name, uint32_t seed)
         k->dirty_cap = 0u;
     }
     k->b2_velem = k->stride;
+    /* The real lookup's world (drawn last: nothing above changes). */
+    k->lookup = (lcg() & 1u) ? LOOKUP_HIT : (int)(lcg() % LOOKUP_KINDS);
 }
 
 int main(int argc, char **argv)
@@ -2015,6 +2418,88 @@ int main(int argc, char **argv)
     unbatch(&k); k.esp_offset = ISAAC_VITA_KAGE_QUAD_DEPTH_BYTES;
     compare_both(&k);
 
+#if defined(ORACLE_REAL_BATCH_LOOKUP)
+    printf("=== the real batch lookup: hits and every miss path ===\n");
+    for (seed = 0u; seed < 6u; ++seed) {
+        /* shape 0 translucent, 1 opaque under the default descriptor, 2
+         * opaque under a custom one; group 0 holds no ids, group 2 two. */
+        uint32_t shape = seed % 3u, group = seed < 3u ? 0u : 2u;
+        int kind;
+        for (kind = 0; kind < LOOKUP_KINDS; ++kind) {
+            case_init(&k, NAME("lookup-%s-g%u-%02d", shape == 0u ?
+                               "translucent" : shape == 1u ?
+                               "opaque-default" : "opaque-custom",
+                               group, kind));
+            unbatch(&k);
+            k.group = group;
+            if (shape != 0u)
+                opaque(&k);
+            if (shape == 2u) {
+                k.blend_custom = 1;
+                k.blend[0] = 1u; k.blend[1] = 3u; k.blend[2] = 1u;
+                k.blend[3] = 0u;
+            }
+            k.lookup = kind;
+            compare_both(&k);
+        }
+    }
+    case_init(&k, "lookup-hit-premultiplied");
+    unbatch(&k); k.premultiply = 1u;
+    compare_both(&k);
+    /* minss second-operand rule: w/w = 0/0 = NaN in either slot. */
+    case_init(&k, "lookup-hit-target-zero-width");
+    unbatch(&k); k.target_w = 0; k.cull_enable = 0u;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-target-zero-height");
+    unbatch(&k); k.target_h = 0; k.cull_enable = 0u;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-target-zero-both");
+    unbatch(&k); opaque(&k); k.target_w = 0; k.target_h = 0;
+    k.cull_enable = 0u;
+    compare_both(&k);
+    /* GetWidth unbinds the target: the height comes from the Renderer. */
+    case_init(&k, "lookup-hit-width-unbinds-target");
+    unbatch(&k); k.target_mode = 6; k.cull_enable = 0u;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-width-unbinds-target-culled-first");
+    unbatch(&k); opaque(&k); k.target_mode = 6;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-group-none");
+    unbatch(&k); k.group = 3u; k.group_ptr = 3;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-group-foreign");
+    unbatch(&k); k.group = 4u; k.group_ptr = 2;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-group-2-held");
+    unbatch(&k); k.group = 2u; k.group_ptr = 2;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-prev-image-self");
+    unbatch(&k); k.prev_image = 1;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-prev-batch-same");
+    unbatch(&k); k.prev_batch = 1;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-pairs-grow");
+    unbatch(&k); k.pairs_used = ORACLE_PAIR_SLOTS;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-pairs-empty-vector");
+    unbatch(&k); opaque(&k); k.blend_custom = 1; k.blend[1] = 5u;
+    k.pairs_used = 0u; k.pairs_cap = 0u;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-clobbering-getters");
+    unbatch(&k); k.target_mode = 2;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-renderer-getters");
+    unbatch(&k); opaque(&k); k.target_mode = 0;
+    compare_both(&k);
+    case_init(&k, "lookup-create-pairs-grow");
+    unbatch(&k); k.lookup = LOOKUP_CREATE; k.pairs_used = ORACLE_PAIR_SLOTS;
+    compare_both(&k);
+    case_init(&k, "lookup-hit-deep-stack");
+    unbatch(&k); k.esp_offset = ISAAC_VITA_KAGE_QUAD_DEPTH_BYTES;
+    compare_both(&k);
+
+#endif
     printf("=== numeric cases (LCG) ===\n");
     for (seed = 1u; seed <= 160u; ++seed) {
         random_case(&k, NAME("lcg-%03u", seed), seed);
@@ -2202,6 +2687,9 @@ int main(int argc, char **argv)
     k.count = 0u; k.stride = 0u; k.velem = 0x40u; k.iptr_null = 1;
     decline(&k, ISAAC_VITA_KAGE_QUAD_DECLINE_OBJECT_BUFFER);
     probe_rejects(&k);
+#if !defined(ORACLE_REAL_BATCH_LOOKUP)
+    /* (The real lookup cannot return these states: the fault probes belong
+       to the stand-in flavours.) */
     /* A batched image whose batch is null: the unbatched image reads the
        batch only after the select (a fault probe below). */
     case_init(&k, "probe-unbatched-null-records-not-read");
@@ -2210,6 +2698,7 @@ int main(int argc, char **argv)
     /* prepare() nulls the image's batch word; the select returns the batch
        object, whose null records the replay faults on after the select. */
     probe_fault(&k, "null vertex ring records");
+#endif
     case_init(&k, "probe-unbound-cpu");
     {
         CPU foreign;
@@ -2236,6 +2725,7 @@ int main(int argc, char **argv)
             fail(k.name, "probe", "NULL CPU did not decline cleanly");
     }
 
+#if !defined(ORACLE_REAL_BATCH_LOOKUP)
     printf("=== faults: states only the select produces ===\n");
     case_init(&k, "fault-select-null-batch");
     unbatch(&k); k.batch_select = 2;
@@ -2260,7 +2750,13 @@ int main(int argc, char **argv)
     unbatch(&k); k.batch_select = 1;
     k.b2_vrec.capacity = 64u; k.b2_vrec.count = 3u;
     probe_fault(&k, "ring record without a buffer");
+#endif
 
+#if defined(ORACLE_REAL_BATCH_LOOKUP)
+    printf("Vita kage quad real lookup: translated lookups=%u; "
+           "native hits=%u; length faults=%u\n", s_lookup_calls,
+           s_native_hits, s_length_faults);
+#endif
     if (s_failures) {
         printf("Vita kage quad fast path oracle: FAIL; failures=%u\n",
                s_failures);

@@ -86,8 +86,13 @@ void isaac_vita_log(const char *format, ...);
  * at a higher priority every UpdateSize period.  Pin the mixer to the third
  * user core; the owner thread is moved to the other two below. */
 unsigned int _oal_thread_affinity = SCE_KERNEL_CPU_MASK_USER_2;
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+/* The GL render thread is pinned to USER_1. */
+#define AUDIO_REFILL_OWNER_MASK SCE_KERNEL_CPU_MASK_USER_0
+#else
 #define AUDIO_REFILL_OWNER_MASK \
     (SCE_KERNEL_CPU_MASK_USER_0 | SCE_KERNEL_CPU_MASK_USER_1)
+#endif
 #endif
 
 #define AUDIO_REFILL_SOURCE_TABLE 128U
@@ -125,13 +130,32 @@ typedef struct audio_refill_state {
     uint32_t replays;           /* ... with the source AL_STOPPED */
     uint32_t partial_refills;   /* stream alBufferData below the slot size */
     uint32_t last_replay_source;
+#endif
+#if defined(ISAAC_VITA_AUDIO_REFILL_STOP_TRACKING)
     /* the guest stopped this source since its last play: the next play
-     * from QueueData is a restart, not a replay */
+     * from QueueData is a restart, not a replay, and the starvation shield
+     * leaves the source alone */
     uint8_t stopped_since_play[AUDIO_REFILL_SOURCE_TABLE];
 #endif
 } audio_refill_state;
 
 static audio_refill_state s_refill;
+
+#if defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+typedef struct audio_shield_state {
+    uint32_t events;    /* shielded IsPlaying answers (replays + starved) */
+    uint32_t replays;   /* the shield itself restarted the source */
+    uint32_t starved;   /* answered AL_PLAYING with nothing fresh queued */
+    uint32_t passes;    /* live+stopped source left truthful (registry) */
+    uint32_t last_source;
+    /* buffers the stream site queued while the source was AL_STOPPED and no
+     * alSourcePlay consumed since: the only unplayed PCM a stopped source
+     * can hold (OpenAL Soft reports all of a stopped queue as processed) */
+    uint8_t fresh[AUDIO_REFILL_SOURCE_TABLE];
+} audio_shield_state;
+
+static audio_shield_state s_shield;
+#endif
 
 static uint32_t audio_refill_clamp(uint64_t value)
 {
@@ -345,13 +369,120 @@ void isaac_vita_audio_refill_note_play(void)
         ++s_refill.plays;
 }
 
-#if defined(ISAAC_VITA_AUDIO_REFILL_REPLAYS)
+#if defined(ISAAC_VITA_AUDIO_REFILL_STOP_TRACKING)
 void isaac_vita_audio_refill_note_stop(uint32_t source)
 {
     if (source < AUDIO_REFILL_SOURCE_TABLE)
         s_refill.stopped_since_play[source] = 1U;
 }
+#endif
 
+#if defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD) || \
+    defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+uint32_t isaac_vita_audio_refill_last_refill_age_ms(uint32_t source)
+{
+    uint64_t at;
+    uint64_t now;
+
+    if (source >= AUDIO_REFILL_SOURCE_TABLE)
+        return UINT32_MAX;
+    at = s_refill.last_refill_us[source];
+    if (!at)
+        return UINT32_MAX;
+    now = isaac_vita_get_process_time();
+    if (now < at)
+        return 0U;
+    return audio_refill_clamp((now - at) / 1000U);
+}
+#endif
+
+#if defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+void isaac_vita_audio_shield_note_queue(uint32_t source, int32_t source_state,
+                                        int32_t count)
+{
+    if (source >= AUDIO_REFILL_SOURCE_TABLE || count <= 0 ||
+            source_state != ISAAC_VITA_AUDIO_AL_STOPPED)
+        return;
+    /* queued after the source stopped: never played; saturate, the
+     * decision only asks "any" */
+    if ((uint32_t)count > 255U - s_shield.fresh[source])
+        s_shield.fresh[source] = 255U;
+    else
+        s_shield.fresh[source] = (uint8_t)(s_shield.fresh[source] +
+                                           (uint8_t)count);
+}
+
+void isaac_vita_audio_shield_note_play(uint32_t source)
+{
+    if (source >= AUDIO_REFILL_SOURCE_TABLE)
+        return;
+    s_shield.fresh[source] = 0U;
+    /* a play after the guest's own stop makes the source eligible again
+     * (note_play_state does the same when the replay counter is compiled) */
+    s_refill.stopped_since_play[source] = 0U;
+}
+
+int isaac_vita_audio_shield_decide(uint32_t source, int32_t queued,
+                                   int32_t processed)
+{
+    int verdict;
+    uint32_t events;
+
+    /* Registry view of "live": the source refilled from the stream site at
+     * least once (a name the manager hands to a stream, not an SFX name)
+     * and the guest did not stop it itself since its last play. */
+    if (source >= AUDIO_REFILL_SOURCE_TABLE ||
+            !s_refill.last_refill_us[source] ||
+            s_refill.stopped_since_play[source]) {
+        if (s_shield.passes != UINT32_MAX)
+            ++s_shield.passes;
+        return ISAAC_VITA_AUDIO_SHIELD_PASS;
+    }
+    if (s_shield.fresh[source]) {
+        verdict = ISAAC_VITA_AUDIO_SHIELD_REPLAY;
+        s_shield.fresh[source] = 0U;
+        /* the adapter issues the alSourcePlay: keep the refill counters
+         * truthful about it and count it as a replay (source ran dry) */
+        if (s_shield.replays != UINT32_MAX)
+            ++s_shield.replays;
+        if (s_refill.plays != UINT32_MAX)
+            ++s_refill.plays;
+#if defined(ISAAC_VITA_AUDIO_REFILL_REPLAYS)
+        if (s_refill.replays != UINT32_MAX)
+            ++s_refill.replays;
+        s_refill.last_replay_source = source;
+#endif
+    } else {
+        verdict = ISAAC_VITA_AUDIO_SHIELD_STARVED;
+        if (s_shield.starved != UINT32_MAX)
+            ++s_shield.starved;
+    }
+    s_shield.last_source = source;
+    events = s_shield.events == UINT32_MAX ? UINT32_MAX : ++s_shield.events;
+    if (events <= 8U || (events & 63U) == 0U)
+        isaac_vita_log(
+            "KAGE VITA AUDIO SHIELD: n=%u replays=%u starved=%u src=%u "
+            "queued=%u processed=%u",
+            (unsigned)events, (unsigned)s_shield.replays,
+            (unsigned)s_shield.starved, (unsigned)source,
+            (unsigned)(queued < 0 ? 0 : queued),
+            (unsigned)(processed < 0 ? 0 : processed));
+    return verdict;
+}
+
+void isaac_vita_audio_shield_log_final(void)
+{
+    isaac_vita_log(
+        "KAGE VITA AUDIO SHIELD FINAL: events=%u replays=%u starved=%u "
+        "passes=%u last_src=%u refills=%u plays=%u",
+        (unsigned)s_shield.events, (unsigned)s_shield.replays,
+        (unsigned)s_shield.starved, (unsigned)s_shield.passes,
+        (unsigned)s_shield.last_source, (unsigned)s_refill.refills,
+        (unsigned)s_refill.plays);
+}
+#endif
+
+#if defined(ISAAC_VITA_AUDIO_REFILL_REPLAYS)
 void isaac_vita_audio_refill_note_play_state(
     uint32_t source, uint32_t return_address, int32_t source_state,
     int32_t queued)

@@ -40,6 +40,9 @@
 #include <malloc.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+#include "guest_stack_memblock.h"
+#endif
 #else
 #include <windows.h>
 #endif
@@ -100,6 +103,18 @@ static uint32_t            g_import_count;
 static void               *g_stack_mem;
 static CPU                *g_stack_owner;
 static uint32_t            g_stack_base, g_stack_top;
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+/* Dedicated USER_RW block behind the guest stack (zero-initialised .bss; a
+ * zero snapshot reads as status none / uid 0 before the first acquire). */
+static guest_stack_memblock_snapshot g_stack_memblock;
+_Static_assert(GUEST_STACK_MEMBLOCK_REQUEST_BYTES ==
+                   GUEST_STACK_SIZE + GUEST_STACK_MEMBLOCK_PAGE_BYTES,
+               "guest stack memblock request is the stack plus one page");
+_Static_assert((GUEST_STACK_MEMBLOCK_REQUEST_BYTES &
+                (~GUEST_STACK_MEMBLOCK_REQUEST_BYTES + 1U)) ==
+                   GUEST_STACK_MEMBLOCK_PAGE_BYTES,
+               "guest stack memblock request must keep a 4 KiB low bit");
+#endif
 static unsigned char      *g_tib;
 #if defined(ISAAC_VITA_SYNC_IMPORT_FASTPATH)
 static int g_vita_sync_import_fastpath_ready;
@@ -1212,7 +1227,15 @@ int guest_stack_init(CPU *c)
     if (!c || g_stack_mem)
         return 1;
 #ifdef __vita__
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+    /* Fail-closed: no newlib fallback, so the raw-allocator gate rows for
+     * this function are exactly the OFF set minus memalign/free. */
+    void *p = NULL;
+    if (guest_stack_memblock_acquire(GUEST_STACK_SIZE, &g_stack_memblock) == 1)
+        p = (void *)g_stack_memblock.base;
+#else
     void *p = memalign(16U, GUEST_STACK_SIZE);
+#endif
 #else
     void *p = VirtualAlloc(NULL, GUEST_STACK_SIZE,
                            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -1229,7 +1252,12 @@ int guest_stack_init(CPU *c)
             GUEST_STACK_LOW_MARGIN + GUEST_STACK_TOP_MARGIN ||
         base > UINT32_MAX - GUEST_STACK_SIZE) {
 #ifdef __vita__
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+        (void)guest_stack_memblock_release(&g_stack_memblock);
+        g_stack_memblock.status = GUEST_STACK_MEMBLOCK_NONE;
+#else
         free(p);
+#endif
 #else
         VirtualFree(p, 0, MEM_RELEASE);
 #endif
@@ -1244,7 +1272,12 @@ int guest_stack_init(CPU *c)
      * pass the checked floor/ceiling boundary before touching memory. */
     if (guest_stack_bind(c, floor, ceiling) != 0) {
 #ifdef __vita__
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+        (void)guest_stack_memblock_release(&g_stack_memblock);
+        g_stack_memblock.status = GUEST_STACK_MEMBLOCK_NONE;
+#else
         free(p);
+#endif
 #else
         VirtualFree(p, 0, MEM_RELEASE);
 #endif
@@ -1270,6 +1303,9 @@ int guest_stack_init(CPU *c)
 
 void guest_stack_free(CPU *c)
 {
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+    int release_memblock = 0;
+#endif
     if (g_stack_mem) {
         if (!c || g_stack_owner != c || c->stack_owner != c) {
             fprintf(stderr,
@@ -1277,7 +1313,16 @@ void guest_stack_free(CPU *c)
             return;
         }
 #ifdef __vita__
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+        /* The unmap comes last (below): the guest sampler and the Lua beat
+         * (other cores) gate their raw stack loads on c->stack_floor/ceiling,
+         * so a reader re-checking that guard after the release must already
+         * see the unbinding.  The entry tail stops both readers before this
+         * call; the order here covers a reader that re-checks late. */
+        release_memblock = 1;
+#else
         free(g_stack_mem);
+#endif
 #else
         VirtualFree(g_stack_mem, 0, MEM_RELEASE);
 #endif
@@ -1300,7 +1345,28 @@ void guest_stack_free(CPU *c)
         c->stack_fault_native_site = (uintptr_t)0U;
         c->stack_fault_kind = GUEST_STACK_FAULT_NONE;
     }
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+    if (release_memblock) {
+        /* Every unbinding store above reaches the other cores before the
+         * range disappears. */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        (void)guest_stack_memblock_release(&g_stack_memblock);
+        g_stack_memblock.uid = -1;
+        g_stack_memblock.status = GUEST_STACK_MEMBLOCK_NONE;
+    }
+#endif
 }
+#if defined(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+/* Boot-receipt accessor (entry_vita.c); the knob is defined for the Vita
+ * target only, so no __vita__ fence is needed here. */
+int guest_stack_memblock_snapshot_get(guest_stack_memblock_snapshot *out)
+{
+    if (!out)
+        return 0;
+    *out = g_stack_memblock;
+    return 1;
+}
+#endif
 
 /* ---------------------------------------------------------- dispatch ---- */
 
@@ -2304,6 +2370,77 @@ const char *guest_import_name(uint32_t slot_addr)
     return imported ? imported->name : NULL;
 }
 
+#if defined(ISAAC_VITA_CXX_THROW_DIAG)
+/* C++ throws are unimplemented (_CxxThrowException and __std_exception_copy
+ * stay unresolved), so the stop that follows is unchanged; this only names
+ * what was thrown.  Runs once, on the fatal path, never on a live frame. */
+void isaac_vita_log(const char *format, ...);
+
+static int cxx_diag_ptr_ok(uint32_t a, uint32_t bytes)
+{
+    /* shortcut: plausibility range only (Vita user mappings), not a
+     * mapping query; good enough for a one-shot fatal diagnostic. */
+    return a >= 0x80000000u && a < 0xc0000000u - bytes;
+}
+
+static uint32_t cxx_diag_ld32(uint32_t a)
+{
+    return cxx_diag_ptr_ok(a, 4u) ? *(const uint32_t *)(uintptr_t)a : 0u;
+}
+
+static void cxx_diag_text(char *out, size_t cap, uint32_t text, uint32_t len)
+{
+    size_t i;
+
+    if (!cxx_diag_ptr_ok(text, len))
+        len = 0u;
+    if (len > cap - 1u)
+        len = (uint32_t)(cap - 1u);
+    for (i = 0; i < len; ++i) {
+        char ch = *(const char *)(uintptr_t)(text + i);
+        out[i] = (ch >= 0x20 && ch < 0x7f) ? ch : '.';
+    }
+    out[len] = '\0';
+}
+
+static void guest_cxx_throw_diag(CPU *c, const char *import_name)
+{
+    /* Both imports take the object (or its __std_exception_data) as the
+     * first stack argument, above the pushed return address. */
+    uint32_t arg0 = cxx_diag_ld32(c->esp + 4u);
+    uint32_t object, vtable, col, td, str_size, str_cap, str_data, what;
+    char type_name[80], message[400], base_what[160];
+
+    if (strcmp(import_name, "VCRUNTIME140.dll!__std_exception_copy") == 0)
+        object = arg0 - 4u;     /* copy ctor passes &src->_Data (+4) */
+    else if (strcmp(import_name, "VCRUNTIME140.dll!_CxxThrowException") == 0)
+        object = arg0;
+    else
+        return;
+    vtable = cxx_diag_ld32(object);
+    col = cxx_diag_ld32(vtable - 4u);       /* MSVC CompleteObjectLocator */
+    td = cxx_diag_ld32(col + 12u);          /* -> TypeDescriptor */
+    cxx_diag_text(type_name, sizeof type_name, td + 8u, 79u);
+    what = cxx_diag_ld32(object + 4u);      /* std::exception _What */
+    cxx_diag_text(base_what, sizeof base_what, what, 159u);
+    /* luabridge::LuaException copy ctor at RVA 0x4335a0: lua_State* at +0xc,
+     * std::string m_what at +0x10 (MSVC x86: 16-byte buffer, size +0x10,
+     * capacity +0x14 relative to the string). */
+    str_size = cxx_diag_ld32(object + 0x20u);
+    str_cap = cxx_diag_ld32(object + 0x24u);
+    str_data = str_cap >= 16u ? cxx_diag_ld32(object + 0x10u) : object + 0x10u;
+    cxx_diag_text(message, sizeof message, str_data,
+                  str_size < 4096u ? str_size : 0u);
+    isaac_vita_log(
+        "KAGE VITA CXX THROW: via=%s obj=%08x vt=%08x type=%s L=%08x "
+        "what=\"%s\" luamsg(size=%u cap=%u)=\"%s\" ret=%08x",
+        import_name, (unsigned)object, (unsigned)vtable, type_name,
+        (unsigned)cxx_diag_ld32(object + 0xcu), base_what,
+        (unsigned)str_size, (unsigned)str_cap, message,
+        (unsigned)cxx_diag_ld32(c->esp));
+}
+#endif
+
 guest_fn guest_lookup(uint32_t addr)
 {
 #if defined(ISAAC_VITA_PHASE_PROFILE)
@@ -2521,6 +2658,9 @@ generic_import_id_dispatch:
 #else
         if (guest_host_import(c, imported->name))
             return;
+#endif
+#if defined(ISAAC_VITA_CXX_THROW_DIAG)
+        guest_cxx_throw_diag(c, imported->name);
 #endif
         guest_fault(c, addr, imported->name);
         return;

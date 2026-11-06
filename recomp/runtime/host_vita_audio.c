@@ -23,6 +23,11 @@
  * production builds; see host_vita_audio_refill.h for the measured rationale. */
 #include "host_vita_audio_refill.h"
 #endif
+#if (defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD) || \
+     defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)) && \
+    !defined(ISAAC_VITA_AUDIO_REFILL_HOOKS)
+#error "ISAAC_VITA_AUDIO_STARVATION_SHIELD / ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT require the stream refill layer (ISAAC_VITA_AUDIO_REFILL_HOOKS: ISAAC_VITA_AUDIO_WORKER or ISAAC_VITA_AUDIO_REFILL_RECEIPT)"
+#endif
 #ifdef ISAAC_VITA_OPENAL_POOL_ROUTER
 #include "guest_pe.h"
 #include "host_vita_openal_pool.h"
@@ -618,10 +623,140 @@ int isaac_vita_audio_shutdown_active(void)
     return status;
 }
 
+#if defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+/* ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT: GNU ld --wrap=sub_0056e9a0 routes
+ * every cross-unit call of the MusicManager slot reset here.  The receipt is
+ * taken only for the "music stopped playing" drop (return marker 0x3a1a71,
+ * see the pins in host_vita_audio.h), before the translated body runs and
+ * releases the stream, so the AL state of the source being dropped stands
+ * next to the REFILL/REPLAY/SHIELD lines in the device log.  Other callers
+ * of the reset (the jingle player at 0x488f5a) are only counted.  No guest
+ * byte is written and the CPU is handed to the real body untouched. */
+void __real_sub_0056e9a0(CPU *__restrict c);
+
+static uint32_t s_vita_audio_music_drops;
+static uint32_t s_vita_audio_slot_resets_other;
+
+/* Slot index from the frozen frames: the slot update's caller return sits at
+ * [ebp+4] and its caller's ebp at [ebp]; MusicManager::Update keeps `this`
+ * at [ebp-4] and hands out slot 0 (this+0), slots 1..6 (this+0x34*i) and,
+ * from 0x3a1b51, slot 7 (this+0x32c).  Anything else is UNKNOWN (255). */
+static uint32_t vita_audio_music_drop_slot_index(const CPU *__restrict c,
+                                                 uint32_t slot)
+{
+    uint32_t caller = ld32(c->ebp + 4U);
+    uint32_t owner;
+    uint32_t offset;
+
+    if (ISAAC_VITA_AUDIO_REFILL_IS_SITE(
+            caller, ISAAC_VITA_AUDIO_MUSIC_SLOT0_RETURN))
+        return 0U;
+    if (ISAAC_VITA_AUDIO_REFILL_IS_SITE(
+            caller, ISAAC_VITA_AUDIO_MUSIC_SLOT7_RETURN))
+        return ISAAC_VITA_AUDIO_MUSIC_SLOT_LOOP_COUNT;
+    if (!ISAAC_VITA_AUDIO_REFILL_IS_SITE(
+            caller, ISAAC_VITA_AUDIO_MUSIC_SLOT_LOOP_RETURN))
+        return ISAAC_VITA_AUDIO_MUSIC_SLOT_UNKNOWN;
+    owner = ld32(ld32(c->ebp) - 4U);
+    if (slot <= owner)
+        return ISAAC_VITA_AUDIO_MUSIC_SLOT_UNKNOWN;
+    offset = slot - owner;
+    if (offset % ISAAC_VITA_AUDIO_MUSIC_SLOT_STRIDE != 0U ||
+            offset / ISAAC_VITA_AUDIO_MUSIC_SLOT_STRIDE >=
+                ISAAC_VITA_AUDIO_MUSIC_SLOT_LOOP_COUNT)
+        return ISAAC_VITA_AUDIO_MUSIC_SLOT_UNKNOWN;
+    return offset / ISAAC_VITA_AUDIO_MUSIC_SLOT_STRIDE;
+}
+
+void __wrap_sub_0056e9a0(CPU *__restrict c)
+{
+    uint32_t marker = guest_stack_address(c, c->esp, 4U, 0U);
+    uint32_t site = marker ? ld32(marker) : 0U;
+
+    if (!c->fault && ISAAC_VITA_AUDIO_REFILL_IS_SITE(
+                         site, ISAAC_VITA_AUDIO_MUSIC_DROP_RETURN)) {
+        uint32_t slot = c->ecx;
+        uint32_t stream = ld32(slot);
+        uint32_t source = 0U;
+        uint32_t eof = 0U;
+        uint32_t loop = 0U;
+        ALint state = 0;
+        ALint queued = 0;
+        ALint processed = 0;
+        uint32_t count;
+
+        if (stream && (stream & 3U) == 0U &&
+                ld32(stream) == (uint32_t)GUEST_IMAGE_BASE +
+                                    ISAAC_VITA_AUDIO_OGG_VTABLE_RVA) {
+            source = ld32(stream + ISAAC_VITA_AUDIO_OGG_SOURCE_OFFSET);
+            eof = ld8(stream + ISAAC_VITA_AUDIO_OGG_EOF_OFFSET);
+            loop = ld8(stream + ISAAC_VITA_AUDIO_OGG_LOOP_OFFSET);
+            if (source && s_vita_audio_owner.context) {
+                alGetSourcei((ALuint)source, ISAAC_VITA_AUDIO_AL_SOURCE_STATE,
+                             &state);
+                alGetSourcei((ALuint)source,
+                             ISAAC_VITA_AUDIO_AL_BUFFERS_QUEUED, &queued);
+                alGetSourcei((ALuint)source,
+                             ISAAC_VITA_AUDIO_AL_BUFFERS_PROCESSED,
+                             &processed);
+            }
+        }
+        count = vita_audio_counter_increment(&s_vita_audio_music_drops);
+        if (count <= 16U || (count & 15U) == 0U)
+            isaac_vita_log(
+                "KAGE VITA AUDIO MUSIC DROP: slot=%u stream=0x%08x src=%u "
+                "state=%d queued=%d processed=%d eof=%u loop=%u "
+                "last_refill_ms=%u",
+                (unsigned)vita_audio_music_drop_slot_index(c, slot),
+                (unsigned)stream, (unsigned)source, (int)state,
+                (int)queued, (int)processed, (unsigned)eof, (unsigned)loop,
+                (unsigned)isaac_vita_audio_refill_last_refill_age_ms(
+                    source));
+    } else {
+        (void)vita_audio_counter_increment(&s_vita_audio_slot_resets_other);
+    }
+    __real_sub_0056e9a0(c);
+}
+#endif
+
 void isaac_vita_audio_log_final(void)
 {
     vita_audio_openal_pool_log_final();
+#if defined(ISAAC_VITA_AUDIO_REFILL_HOOKS) && defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+    isaac_vita_audio_shield_log_final();
+#endif
+#if defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+    isaac_vita_log(
+        "KAGE VITA AUDIO MUSIC DROP FINAL: drops=%u other_resets=%u",
+        (unsigned)s_vita_audio_music_drops,
+        (unsigned)s_vita_audio_slot_resets_other);
+#endif
 }
+
+#if defined(ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN)
+int isaac_vita_audio_abort_skip_teardown(void)
+{
+    const vita_audio_manager_owner *owner = &s_vita_audio_owner;
+
+    if (!owner->manager)
+        return ISAAC_VITA_AUDIO_SHUTDOWN_NONE;
+    /* Deliberately no alDeleteSources/alDeleteBuffers, alcMakeContextCurrent,
+     * alcDestroyContext or alcCloseDevice: the last two join the OpenAL event
+     * and mixer pthreads, whose exit path needs a calloc the exhausted heap
+     * cannot serve (see host_vita_audio.h).  Not even a source stop: every AL
+     * entry point may allocate through the same heaps.  The owner record and
+     * the guest manager bytes stay as they are; the process exit retires the
+     * device. */
+    isaac_vita_log(
+        "KAGE VITA AUDIO ABORT: owner=0x%08x context=%u device=%u "
+        "names=%u/%u (OpenAL teardown skipped; process exit retires the "
+        "device)",
+        (unsigned)owner->manager, (unsigned)(owner->context != NULL),
+        (unsigned)(owner->device != NULL), (unsigned)owner->sources_live,
+        (unsigned)owner->buffers_live);
+    return ISAAC_VITA_AUDIO_SHUTDOWN_SKIPPED;
+}
+#endif
 
 const char *isaac_vita_audio_manager_status_name(int status)
 {
@@ -674,8 +809,55 @@ static void vita_audio_source_play(CPU *__restrict c)
     isaac_vita_audio_refill_note_play();
 #endif
 #endif
+#if defined(ISAAC_VITA_AUDIO_REFILL_HOOKS) && defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+    /* any play (guest or shield) consumes the buffers queued while stopped */
+    isaac_vita_audio_shield_note_play((uint32_t)vita_audio_arg(c, 0U));
+#endif
     vita_audio_cdecl_return(c);
 }
+
+#if defined(ISAAC_VITA_AUDIO_REFILL_HOOKS) && defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+/* ISAAC_VITA_AUDIO_STARVATION_SHIELD: the StreamSourceOgg in the manager's
+ * active list [manager+0xc, manager+0x10) that owns this AL source name, or
+ * 0 when there is none or it reached eof (+0x8c).  StreamSource::Stop
+ * (0x5bf0a0) erases the object from that list (sub_0056f850) before it asks
+ * IsPlaying and stops the source, so a stream the guest stopped on purpose
+ * is never found here; a non-looping track that really ended reports eof
+ * and keeps answering not-playing.  The walk runs on the owner thread inside
+ * the guest's own IsPlaying call over at most the 16 stream names of the
+ * device headroom, with the same shape checks as the cooperative receipt. */
+static uint32_t vita_audio_live_stream_object(uint32_t source)
+{
+    uint32_t manager = s_vita_audio_owner.manager;
+    uint32_t begin;
+    uint32_t end;
+    uint32_t at;
+
+    if (!manager || !s_vita_audio_owner.context)
+        return 0U;
+    begin = ld32(manager + ISAAC_VITA_AUDIO_MANAGER_ACTIVE_BEGIN_OFFSET);
+    end = ld32(manager + ISAAC_VITA_AUDIO_MANAGER_ACTIVE_END_OFFSET);
+    if (begin == end || begin == 0U || end < begin ||
+            ((begin | end) & 3U) != 0U ||
+            end - begin > ISAAC_VITA_AUDIO_DEVICE_SOURCE_COUNT * 4U)
+        return 0U;
+    for (at = begin; at != end; at += 4U) {
+        uint32_t object = ld32(at);
+
+        if (object == 0U || (object & 3U) != 0U)
+            return 0U;
+        if (ld32(object) !=
+                (uint32_t)GUEST_IMAGE_BASE + ISAAC_VITA_AUDIO_OGG_VTABLE_RVA)
+            continue;
+        if (ld32(object + ISAAC_VITA_AUDIO_OGG_SOURCE_OFFSET) != source)
+            continue;
+        if (ld8(object + ISAAC_VITA_AUDIO_OGG_EOF_OFFSET) != 0U)
+            return 0U;
+        return object;
+    }
+    return 0U;
+}
+#endif
 
 static void vita_audio_get_source_i(CPU *__restrict c)
 {
@@ -696,6 +878,31 @@ static void vita_audio_get_source_i(CPU *__restrict c)
         *value = (ALint)isaac_vita_audio_refill_filter_processed(
             (uint32_t)source, (int32_t)*value, (int32_t)queued);
     }
+#if defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+    /* StreamSource::IsPlaying of a live stream whose source ran dry: the
+     * only other alGetSourcei the shield ever touches.  Any other parameter,
+     * return site, state, or a source without a live OGG owner passes. */
+    else if (parameter == ISAAC_VITA_AUDIO_AL_SOURCE_STATE && value &&
+             *value == ISAAC_VITA_AUDIO_AL_STOPPED &&
+             ISAAC_VITA_AUDIO_REFILL_IS_SITE(
+                 ld32(guest_stack_address(c, c->esp, 4U, 0U)),
+                 ISAAC_VITA_AUDIO_STREAM_IS_PLAYING_RETURN) &&
+             vita_audio_live_stream_object((uint32_t)source) != 0U) {
+        ALint queued = 0;
+        ALint processed = 0;
+        int verdict;
+
+        alGetSourcei(source, ISAAC_VITA_AUDIO_AL_BUFFERS_QUEUED, &queued);
+        alGetSourcei(source, ISAAC_VITA_AUDIO_AL_BUFFERS_PROCESSED,
+                     &processed);
+        verdict = isaac_vita_audio_shield_decide(
+            (uint32_t)source, (int32_t)queued, (int32_t)processed);
+        if (verdict == ISAAC_VITA_AUDIO_SHIELD_REPLAY)
+            alSourcePlay(source);
+        if (verdict != ISAAC_VITA_AUDIO_SHIELD_PASS)
+            *value = ISAAC_VITA_AUDIO_AL_PLAYING;
+    }
+#endif
 #endif
     vita_audio_cdecl_return(c);
 }
@@ -703,7 +910,7 @@ static void vita_audio_get_source_i(CPU *__restrict c)
 static void vita_audio_source_stop(CPU *__restrict c)
 {
     alSourceStop((ALuint)vita_audio_arg(c, 0U));
-#if defined(ISAAC_VITA_AUDIO_REFILL_HOOKS) && defined(ISAAC_VITA_AUDIO_REFILL_REPLAYS)
+#if defined(ISAAC_VITA_AUDIO_REFILL_HOOKS) && defined(ISAAC_VITA_AUDIO_REFILL_STOP_TRACKING)
     isaac_vita_audio_refill_note_stop((uint32_t)vita_audio_arg(c, 0U));
 #endif
     vita_audio_cdecl_return(c);
@@ -740,6 +947,13 @@ static void vita_audio_source_queue_buffers(CPU *__restrict c)
             alGetSourcei(source, ISAAC_VITA_AUDIO_AL_SOURCE_STATE, &state);
         isaac_vita_audio_refill_note_queue(
             (uint32_t)source, return_address, (int32_t)state);
+#if defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+        /* state stays 0 for foreign callers, so only the stream site can
+         * mark buffers queued into a stopped source as fresh */
+        isaac_vita_audio_shield_note_queue(
+            (uint32_t)source, (int32_t)state,
+            (int32_t)vita_audio_arg(c, 1U));
+#endif
     }
 #endif
     vita_audio_cdecl_return(c);

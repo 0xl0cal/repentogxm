@@ -377,6 +377,20 @@ int isaac_vita_crt_file_lookup_hint_get(uint32_t out[2]);
 #define ISAAC_VITA_CRT_GETENV_HOMEPATH_RETURN_RVA  0x0050ab51U
 #define ISAAC_VITA_CRT_GETENV_HOMEPATH_NAME_VA     0x9875a9c0U
 #define ISAAC_VITA_CRT_GETENV_HOMEPATH_NAME        "HOMEPATH"
+/* libyuv InitCpuFlags (005d6480..005d67xx) holds the third and last getenv
+ * reference in the image: after CPUID it asks for twelve LIBYUV_DISABLE_*
+ * switches, in image string order below.  None is set on a PC, so each
+ * answers NULL and libyuv dispatches on guest_cpuid alone (X86 + SSE2): its
+ * SSSE3/SSE4/AVX row functions stay untranslated stubs and unreachable.
+ * Reached by every video cutscene (theoraplayer converts each decoded
+ * frame through libyuv).  Pinned by test_crt_getenv_names.py. */
+#define ISAAC_VITA_CRT_GETENV_LIBYUV_IAT_LOAD_RVA     0x005d651dU
+#define ISAAC_VITA_CRT_GETENV_LIBYUV_FIRST_CALL_RVA   0x005d6528U
+#define ISAAC_VITA_CRT_GETENV_LIBYUV_FIRST_RETURN_RVA 0x005d652aU
+#define ISAAC_VITA_CRT_GETENV_LIBYUV_NAME_COUNT       12U
+#define ISAAC_VITA_CRT_GETENV_LIBYUV_NAMES_FIRST_RVA  0x00769f6cU
+#define ISAAC_VITA_CRT_GETENV_LIBYUV_NAMES_LAST_RVA   0x0076a054U
+#define ISAAC_VITA_CRT_GETENV_LIBYUV_NAMES "LIBYUV_DISABLE_SSSE3", "LIBYUV_DISABLE_SSE41", "LIBYUV_DISABLE_X86", "LIBYUV_DISABLE_SSE2", "LIBYUV_DISABLE_F16C", "LIBYUV_DISABLE_ASM", "LIBYUV_DISABLE_FMA3", "LIBYUV_DISABLE_AVX3", "LIBYUV_DISABLE_AVX2", "LIBYUV_DISABLE_ERMS", "LIBYUV_DISABLE_SSE42", "LIBYUV_DISABLE_AVX"
 #define ISAAC_VITA_CRT_GETENV_NAME_MAX             32U
 
 #define ISAAC_VITA_CRT_VSPRINTF_NAME \
@@ -1103,6 +1117,13 @@ void isaac_vita_crt_seek_shadow_report(const char *why);
  * seek shadow report and the archive-cache shutdown emit it; not defined when
  * the option is compiled out. */
 void isaac_vita_crt_descriptor_recover_report(const char *why);
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+/* ISAAC_VITA_CRT_FREAD_COMPLETE only: one bounded "KAGE VITA CRT FREAD
+ * COMPLETE" counter line (short packed-archive reads completed in place).
+ * The seek shadow report and the archive-cache shutdown emit it; the
+ * declaration is compiled out with the option. */
+void isaac_vita_crt_fread_complete_report(const char *why);
+#endif
 
 /* Returns one only when NAME was handled.  Zero is a mutation-free handoff:
  * the outer Vita import dispatcher remains responsible for the exact loud

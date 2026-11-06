@@ -203,6 +203,53 @@ static void attrib_sparse_add(IsaacVitaAttribReplaySparseBucket *bucket,
 # include "gl_vita_backend.h"
 #endif
 
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+/* ISAAC_VITA_GL_RECORD_ATTRIB_BATCH (RENDER60 S4, default OFF): on a
+ * location-memo hit, while the installed table's lookup/toggle/pointer
+ * members are the GL recorder's own (isaac_gl_record_attribs_batch_ready),
+ * the replay hands the remembered locations, the component counts, the
+ * stride and the base to the recorder, which applies the producer shadow
+ * notes the per-call record_gl* members would and publishes ONE ring record
+ * instead of count toggles + count pointers (Disable: count toggles).  The
+ * render thread unpacks it into the same s_target wrapper calls, same
+ * arguments, same order (gl_record_backend.c record_replay_attribs), so
+ * vitaGL and every wrapper-side counter see the per-call sequence.  The
+ * guest-visible retire is the per-call one: [ebp+8] = last location,
+ * EAX/ECX from the last format (Enable) or EAX = last location (Disable),
+ * ESP += 16, the ownership word entered and left once.  A miss, a decline
+ * or a foreign table runs the unchanged per-call loop below.  The memo
+ * VERIFY lookups, the per-wrapper ph120.gd split and the stall-probe
+ * breadcrumbs describe crossings this path does not make; CMake refuses the
+ * same combinations. */
+# if !defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+#  error ISAAC_VITA_GL_RECORD_ATTRIB_BATCH batches location-memo hits: it needs ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO
+# endif
+# if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY)
+#  error ISAAC_VITA_GL_RECORD_ATTRIB_BATCH would reorder the VERIFY lookups of ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY
+# endif
+# if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+#  error ISAAC_VITA_GL_RECORD_ATTRIB_BATCH and ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE are exclusive (DIRECT_STATE refuses the recorder)
+# endif
+# if defined(ISAAC_VITA_GL_WRAPPER_TIME)
+#  error ISAAC_VITA_GL_RECORD_ATTRIB_BATCH has no per-attribute split for ISAAC_VITA_GL_WRAPPER_TIME
+# endif
+# if defined(ISAAC_VITA_STALL_PROBE)
+#  error ISAAC_VITA_GL_RECORD_ATTRIB_BATCH makes no per-wrapper crossings for the stall-probe breadcrumbs
+# endif
+# include "gl_record_backend.h"
+_Static_assert(ISAAC_GL_RECORD_ATTRIB_BATCH_TYPE ==
+               ISAAC_VITA_SHADER_ATTRIB_GL_FLOAT,
+               "S4: the recorder's attribute type is the replay's GL_FLOAT");
+_Static_assert(ISAAC_GL_RECORD_ATTRIB_BATCH_MAX ==
+               ISAAC_VITA_SHADER_ATTRIB_MAX_COUNT,
+               "S4: the recorder batch bound is the replay's attribute bound");
+/* One-shot proof that the path is live, with the values the first batch
+ * actually carried (platform.c on the device; the recorder unit itself
+ * stays free of logging so every host harness links it unchanged). */
+void isaac_vita_log(const char *format, ...);
+static int s_attrib_batch_banner;
+#endif
+
 #if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
 /* ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO: remember the glGetAttribLocation
  * answers per Shader object so a replay whose object still reads exactly as
@@ -237,7 +284,7 @@ static void attrib_sparse_add(IsaacVitaAttribReplaySparseBucket *bucket,
  * loc(...,m) via isaac_vita_gl_location_memo_note_mismatch, and the
  * looked-up value is what the replay uses and re-memoises. */
 # include "gl_vita_backend.h"
-# define ATTRIB_MEMO_ENTRIES 16u
+# define ATTRIB_MEMO_ENTRIES ISAAC_VITA_SHADER_ATTRIB_MEMO_ENTRIES
 # define ATTRIB_MEMO_NAME_MAX 63u   /* == gl_vita_backend.c GL_VITA_LOCATION_NAME_MAX */
 
 typedef struct attrib_memo_name {
@@ -261,7 +308,7 @@ _Static_assert((ATTRIB_MEMO_ENTRIES & (ATTRIB_MEMO_ENTRIES - 1u)) == 0u,
 
 static attrib_memo_entry s_attrib_memo[ATTRIB_MEMO_ENTRIES];
 
-/* Direct-mapped by the object address; a collision is only a miss. */
+ISAAC_VITA_SHADER_ATTRIB_MEMO_LEGACY_SLOT /* 16 entries; a collision only misses */
 static attrib_memo_entry *attrib_memo_slot(uint32_t self)
 {
     return &s_attrib_memo[((self >> 4) ^ (self >> 9)) &
@@ -332,10 +379,10 @@ static int attrib_memo_note(attrib_memo_entry *entry, uint32_t index,
  * half-written entry behind. */
 # define ATTRIB_MEMO_BEGIN(self, program, attribs, count) \
     do { \
-        memo_generation = g_isaac_vita_gl_location_generation; \
-        memo = attrib_memo_slot(self); \
-        memo_hit = attrib_memo_hit(memo, memo_generation, (self), \
-                                   (program), (attribs), (count)); \
+        memo_generation = ISAAC_VITA_SHADER_ATTRIB_MEMO_GENERATION; \
+        memo = ISAAC_VITA_SHADER_ATTRIB_MEMO_SLOT(self); \
+        memo_hit = ISAAC_VITA_SHADER_ATTRIB_MEMO_HIT(memo, memo_generation, \
+                (self), (program), (attribs), (count)); \
         memo_fill = !memo_hit; \
         if (memo_fill) \
             memo->generation = 0u; \
@@ -549,6 +596,38 @@ int isaac_vita_shader_attribs_enable_try(CPU *__restrict c)
 #endif
     ATTRIB_TIME_MARK(ISAAC_VITA_GL_WRAPPER_K_ATTRIB_ENABLE,
                      ISAAC_VITA_GL_REPLAY_OWN);
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    if (memo_hit && isaac_gl_record_attribs_batch_ready(backend, count, 1)) {
+        guest_gl_int locations[ISAAC_VITA_SHADER_ATTRIB_MAX_COUNT];
+        uint8_t components[ISAAC_VITA_SHADER_ATTRIB_MAX_COUNT];
+
+        /* The per-call loop's operands: remembered locations, ncomp of the
+         * validated format (1..8, attrib_object_ok), base + running
+         * offset (advanced by the recorder per element). */
+        for (i = 0u; i < count; ++i) {
+            uint32_t format = ld32(attribs + i * 8u + 4u);
+            locations[i] = memo->names[i].location;
+            components[i] = k_format_components[format - 1u];
+            last_format = format;
+        }
+        ATTRIB_SAMPLER_PUBLISH(s_token_enable);
+        isaac_gl_record_attribs_enable(count, locations, components,
+                                       (int32_t)stride, base);
+        ATTRIB_SAMPLER_RESTORE(sampler_enclosing_target);
+        if (!s_attrib_batch_banner) {
+            s_attrib_batch_banner = 1;
+            isaac_vita_log("KAGE VITA GL RECORD ATTRIB BATCH: first enable "
+                           "count=%u loc[0]=%d loc[last]=%d stride=%d "
+                           "op=%u,%u", (unsigned)count, (int)locations[0],
+                           (int)locations[count - 1u], (int)stride,
+                           (unsigned)ISAAC_GL_RECORD_ATTRIBS_ENABLE_OPCODE,
+                           (unsigned)ISAAC_GL_RECORD_ATTRIBS_DISABLE_OPCODE);
+        }
+        /* The last iteration's `mov [ebp+8], eax` survives. */
+        st32(c->esp + 4u, (uint32_t)locations[count - 1u]);
+        goto attrib_batch_retire;
+    }
+#endif
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
     {
         guest_gl_addr names[ISAAC_VITA_SHADER_ATTRIB_MAX_COUNT];
@@ -664,6 +743,9 @@ int isaac_vita_shader_attribs_enable_try(CPU *__restrict c)
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
 direct_state_retire:
 #endif
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+attrib_batch_retire:
+#endif
 #if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
     ATTRIB_MEMO_COMMIT(self, program, attribs, count);
 #endif
@@ -728,6 +810,20 @@ int isaac_vita_shader_attribs_disable_try(CPU *__restrict c)
 #endif
     ATTRIB_TIME_MARK(ISAAC_VITA_GL_WRAPPER_K_ATTRIB_DISABLE,
                      ISAAC_VITA_GL_REPLAY_OWN);
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    if (memo_hit && isaac_gl_record_attribs_batch_ready(backend, count, 0)) {
+        guest_gl_int locations[ISAAC_VITA_SHADER_ATTRIB_MAX_COUNT];
+
+        for (i = 0u; i < count; ++i)
+            locations[i] = memo->names[i].location;
+        ATTRIB_SAMPLER_PUBLISH(s_token_disable);
+        isaac_gl_record_attribs_disable(count, locations);
+        ATTRIB_SAMPLER_RESTORE(sampler_enclosing_target);
+        /* The void adapter leaves EAX at the last location. */
+        c->eax = (uint32_t)locations[count - 1u];
+        goto attrib_batch_retire;
+    }
+#endif
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
     {
         guest_gl_addr names[ISAAC_VITA_SHADER_ATTRIB_MAX_COUNT];
@@ -818,6 +914,9 @@ int isaac_vita_shader_attribs_disable_try(CPU *__restrict c)
     }
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
 direct_state_retire:
+#endif
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+attrib_batch_retire:
 #endif
 #if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
     ATTRIB_MEMO_COMMIT(self, program, attribs, count);

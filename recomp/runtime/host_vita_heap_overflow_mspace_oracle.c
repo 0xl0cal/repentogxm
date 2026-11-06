@@ -588,8 +588,6 @@ static int test_ready_lifecycle(void)
     CHECK(!isaac_vita_heap_overflow_mspace_snapshot_get(NULL));
 
     malloc_calls = s_mspace_malloc_calls;
-    CHECK(!isaac_vita_heap_overflow_mspace_malloc(0U) &&
-          s_mspace_malloc_calls == malloc_calls);
 #if SIZE_MAX > UINT32_MAX
     CHECK(!isaac_vita_heap_overflow_mspace_malloc((size_t)UINT32_MAX + 1U) &&
           s_mspace_malloc_calls == malloc_calls);
@@ -605,6 +603,57 @@ static int test_ready_lifecycle(void)
     CHECK(snapshot_is(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY, 0U, 1));
     CHECK(oracle_reset());
     CHECK(s_bad_api_calls == 0U);
+    return 0;
+}
+
+static int test_zero_size_malloc(void)
+{
+    isaac_vita_heap_overflow_forbidden_ranges ranges = safe_ranges();
+    isaac_vita_heap_overflow_mspace_realloc_status status;
+    void *first;
+    void *second;
+    void *replacement;
+    unsigned calls;
+
+    CHECK(oracle_reset());
+    CHECK(!isaac_vita_heap_overflow_mspace_malloc(0U) &&
+          s_mspace_malloc_calls == 0U);
+    CHECK(isaac_vita_heap_overflow_mspace_init(&ranges));
+    first = isaac_vita_heap_overflow_mspace_malloc(0U);
+    second = isaac_vita_heap_overflow_mspace_malloc(0U);
+    CHECK(first && second && first != second &&
+          ((uintptr_t)first & 7U) == 0U &&
+          ((uintptr_t)second & 7U) == 0U &&
+          fake_allocation_find(first)->size == 1U &&
+          fake_allocation_find(second)->size == 1U &&
+          s_mspace_malloc_calls == 2U &&
+          snapshot_is(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY, 2U, 1));
+    CHECK(!isaac_vita_heap_overflow_mspace_test_reset());
+    s_fail_mspace_malloc = 1;
+    CHECK(!isaac_vita_heap_overflow_mspace_malloc(0U) &&
+          s_mspace_malloc_calls == 3U &&
+          snapshot_is(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY, 2U, 1));
+    replacement = isaac_vita_heap_overflow_mspace_realloc(first, 64U, &status);
+    CHECK(replacement && status ==
+              ISAAC_VITA_HEAP_OVERFLOW_MSPACE_REALLOC_SUCCESS &&
+          fake_allocation_find(replacement)->size == 64U &&
+          snapshot_is(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY, 2U, 1));
+    CHECK(!isaac_vita_heap_overflow_mspace_realloc(replacement, 0U, &status) &&
+          status == ISAAC_VITA_HEAP_OVERFLOW_MSPACE_REALLOC_FREED &&
+          snapshot_is(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY, 1U, 1));
+    CHECK(isaac_vita_heap_overflow_mspace_free(second) &&
+          snapshot_is(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_READY, 0U, 1));
+
+    /* The normalized byte still passes through result validation/rollback. */
+    calls = s_mspace_free_calls;
+    s_misalign_next_result = 1;
+    CHECK(!isaac_vita_heap_overflow_mspace_malloc(0U) &&
+          s_mspace_free_calls == calls + 1U &&
+          snapshot_is(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_DRAIN_ONLY, 0U, 1));
+    calls = s_mspace_malloc_calls;
+    CHECK(!isaac_vita_heap_overflow_mspace_malloc(0U) &&
+          s_mspace_malloc_calls == calls && s_bad_api_calls == 0U);
+    CHECK(oracle_reset());
     return 0;
 }
 
@@ -957,13 +1006,25 @@ int main(int argc, char **argv)
         return 0;
     }
     CHECK(argc == 1);
-    CHECK(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x007d5000U);
+    CHECK((ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES &
+           (~ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES + 1U)) == 0x00001000U);
+    CHECK(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES ==
+          ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES + 0x00001000U);
+#if ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x007d5000U
     CHECK(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES == 0x007d6000U);
+#elif ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES == 0x017fd000U
+    CHECK(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES == 0x017fe000U);
+#else
+#error "overflow mspace oracle: pool size has no pinned receipt"
+#endif
+    printf("overflow mspace oracle: pool_bytes=%u\n",
+           (unsigned)ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES);
     CHECK(test_invalid_configuration() == 0);
     CHECK(test_initial_failures() == 0);
     CHECK(test_forbidden_ranges() == 0);
     CHECK(test_validation_rollback_orphans() == 0);
     CHECK(test_ready_lifecycle() == 0);
+    CHECK(test_zero_size_malloc() == 0);
     CHECK(test_outer_exact_base_contract() == 0);
     CHECK(test_internal_page_accounting() == 0);
     CHECK(test_api_failure_and_realloc() == 0);

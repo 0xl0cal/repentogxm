@@ -643,6 +643,7 @@ FLAG_WRITERS = {
     "comiss": "*", "ucomiss": "*", "comisd": "*", "ucomisd": "*",
     "xadd": "*", "cmpxchg": "*", "lock cmpxchg8b": "Z",
     "sahf": "*", "btc": "C",
+    "popfd": "*",
 }
 
 

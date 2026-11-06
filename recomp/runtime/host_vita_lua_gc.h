@@ -30,7 +30,7 @@ void isaac_vita_lua_gc_profile_unwind(uint32_t depth);
 
 #endif
 
-#if defined(ISAAC_VITA_LUA_GC_PROFILE) || defined(ISAAC_VITA_HEAP_CENSUS)
+#if defined(ISAAC_VITA_LUA_GC_PROFILE) || defined(ISAAC_VITA_HEAP_CENSUS) || defined(ISAAC_VITA_DEBUG_OVERLAY)
 /* host_vita_lua.c: private-arena live/peak KiB and guest-heap fallbacks;
  * zeros when ISAAC_VITA_LUA_ARENA_MB is 0.  Also the lua(l,pk,fb) source of
  * the ph120.mem heap receipt (ISAAC_VITA_HEAP_CENSUS), which declares the

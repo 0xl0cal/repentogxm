@@ -71,7 +71,7 @@ FORBIDDEN_COMPONENTS = {
     "workshop",
 }
 
-# These five package images are pinned byte-for-byte by
+# These nine package images are pinned byte-for-byte by
 # recomp/vita/test_livearea_package.py.  This exception only bypasses the
 # broad media-extension heuristic; it does not grant redistribution rights or
 # override the repository-wide provenance gate.  Never allowlist a directory
@@ -82,6 +82,8 @@ ALLOWED_MEDIA_ASSETS: frozenset[str] = frozenset({
     "recomp/vita/assets/sce_sys/livearea/contents/bg0.png",
     "recomp/vita/assets/sce_sys/livearea/contents/nicalis.png",
     "recomp/vita/assets/sce_sys/livearea/contents/startup.png",
+    "recomp/vita/assets/sce_sys/livearea/contents/1.png", "recomp/vita/assets/sce_sys/livearea/contents/2.png",
+    "recomp/vita/assets/sce_sys/livearea/contents/3.png", "recomp/vita/assets/sce_sys/livearea/contents/4.png",
 })
 
 SUSPICIOUS_MEDIA_SUFFIXES = {
@@ -115,6 +117,9 @@ SUSPICIOUS_MEDIA_SUFFIXES = {
 }
 
 GENERATED_GUEST_RE = re.compile(r"(?:^|/)guest_[0-9]{4}\.c$", re.I)
+# The Lua binding replay headers carry translated bodies and raw PE bytes;
+# configure generates them into the build directory (DISTRIBUTION.md).
+GENERATED_BINDING_HEADERS = frozenset({"host_vita_lua_binding_mirror.h", "host_vita_lua_binding_table.h"})
 
 PRIVATE_MARKERS = (
     b"-----BEGIN " + b"PRIVATE KEY-----",
@@ -210,6 +215,8 @@ def path_blockers(rel: str, scope: str) -> list[str]:
         blockers.append(f"forbidden runtime/input file in {scope}: {rel}")
     if GENERATED_GUEST_RE.search(normalized):
         blockers.append(f"generated translated guest code in {scope}: {rel}")
+    if basename in GENERATED_BINDING_HEADERS:
+        blockers.append(f"generated Lua binding replay header in {scope}: {rel}")
 
     bad_components = components & FORBIDDEN_COMPONENTS
     if bad_components:

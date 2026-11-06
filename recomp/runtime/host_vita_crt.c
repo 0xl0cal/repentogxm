@@ -29,14 +29,31 @@
 #include "host_vita_atof_smallint.h"
 #endif
 #include "host_vita_import_id.h"
+#if defined(ISAAC_VITA_LAUNCH_ARGS_FILE)
+#include "host_vita_launch_args.h"
+#endif
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
 #if !defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
 #error ISAAC_VITA_ASYNC_SAVE_WRITE requires the ARCHIVE_FILE_CACHE token layout
 #endif
 #include "host_vita_async_write.h"
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+#if !defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
+#error ISAAC_VITA_GAME_LOG_ASYNC requires the ARCHIVE_FILE_CACHE token layout
+#endif
+#include "host_vita_game_log.h"
+/* The host oracle substitutes a tmpfile() for the demotion reopen. */
+#ifndef vita_crt_game_log_native_fopen
+#define vita_crt_game_log_native_fopen(path, mode) fopen((path), (mode))
+#endif
+#endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
 #include "host_vita_archive_cache.h"
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+#include <psp2/kernel/processmgr.h>
+#include "host_vita_archive_trail.h"
+#endif
 #ifndef ISAAC_VITA_ARCHIVE_DIAG_BUILD_ID
 #define ISAAC_VITA_ARCHIVE_DIAG_BUILD_ID "link:unstamped"
 #endif
@@ -77,6 +94,14 @@ int isaac_vita_crt_seek_shadow_oracle_fstat(int descriptor,
 #define vita_crt_recover_native_ftell ftell
 #endif
 #endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+#if !defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
+#error ISAAC_VITA_CRT_FREAD_COMPLETE requires the ARCHIVE_FILE_CACHE token layout
+#endif
+#endif
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+#include "host_vita_access_cache.h"
+#endif
 #include "host_vita_heap.h"
 #include "host_vita_startup.h"
 #include "third_party/musl_fmt_fp/musl_fmt_fp.h"
@@ -87,6 +112,13 @@ int isaac_vita_crt_seek_shadow_oracle_fstat(int descriptor,
 #include "vita_host_services.h"
 #if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
 #include "kage_vita_phase_profile.h"
+#endif
+#if defined(ISAAC_VITA_OGG_READAHEAD)
+#if !defined(ISAAC_VITA_ARCHIVE_FILE_CACHE) || \
+    !defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+#error ISAAC_VITA_OGG_READAHEAD needs the archive cache token layout and the recover path
+#endif
+#include "host_vita_ogg_readahead.h"
 #endif
 
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
@@ -166,7 +198,11 @@ static uint32_t s_tls_atexit_registered;
 static uint32_t s_empty_environment[1];
 static uint32_t s_empty_environment_pointer;
 static char s_argv0[] = "isaac-ng.exe";
+#if defined(ISAAC_VITA_LAUNCH_ARGS_FILE)
+static uint32_t s_argv[2 + ISAAC_VITA_LAUNCH_ARGS_MAX];
+#else
 static uint32_t s_argv[2];
+#endif
 static uint32_t s_argv_pointer;
 static int32_t s_argc = 1;
 static int s_environment_ready;
@@ -205,6 +241,18 @@ typedef struct vita_crt_file_token {
      * fclose hands it to the writer thread.  file.stream stays NULL. */
     isaac_vita_async_write_image async_write;
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* The guest's log.txt held as the game-log write-behind lane (one per
+     * process).  file.stream stays NULL while live; after a demotion the
+     * token continues on a newlib FILE ("r+b" for a w/wb lane, so fread
+     * must keep answering EBADF like the original "wb" stream). */
+    struct {
+        uint8_t live;
+        uint8_t demoted_write_only;
+        uint8_t demoted_error;
+        uint8_t reserved;
+    } game_log;
+#endif
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     /* Read-only newlib-lane SEEK_END elision.  pending_end means the FILE's
      * real cursor still sits where the guest last left it while the logical
@@ -231,6 +279,10 @@ typedef struct vita_crt_file_token {
         char mode[4];
     } recover;
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+    /* Per-token read-trail run state (host_vita_archive_trail.h). */
+    isaac_vita_archive_trail_token trail;
+#endif
 #else
     FILE *stream;
 #endif
@@ -242,6 +294,11 @@ typedef struct vita_crt_file_token {
 } vita_crt_file_token;
 
 static vita_crt_file_token s_file_tokens[ISAAC_VITA_CRT_FILE_TOKEN_COUNT];
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+/* Slot of the live game-log lane token, -1 when none.  Under s_file_lock. */
+static int s_game_log_index = -1;
+static int vita_crt_game_log_demote_locked(int index, long offset, int origin);
+#endif
 #if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
 /* All access is under s_file_lock.  This stores no FILE pointer.  Invalidate
  * at both token-publication sites: the remembered linear-search first match
@@ -266,6 +323,9 @@ static int vita_crt_dynamic_file_is_live(const vita_crt_file_token *entry)
     return entry->file.stream != NULL || entry->raw_archive.live != 0U
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
         || entry->async_write.live != 0U
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+        || entry->game_log.live != 0U
 #endif
         ;
 #else
@@ -423,6 +483,10 @@ static size_t vita_crt_file_fwrite(const void *buffer, size_t size,
         s_file_tokens[dynamic_index].async_write.live)
         return isaac_vita_async_write_image_write(
             &s_file_tokens[dynamic_index].async_write, buffer, size, count);
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (dynamic_index >= 0 && s_file_tokens[dynamic_index].game_log.live)
+        return isaac_vita_game_log_write(buffer, size, count);
 #endif
     if (dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].raw_archive.live) {
@@ -735,6 +799,16 @@ static int vita_crt_file_fseek(FILE *stream, int dynamic_index,
         return isaac_vita_async_write_image_seek(
             &s_file_tokens[dynamic_index].async_write, offset, origin);
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (dynamic_index >= 0 && s_file_tokens[dynamic_index].game_log.live) {
+        /* A seek to the current end is answered from the tracked position;
+         * anything else hands the token to a newlib FILE which performs it. */
+        int lane_result = isaac_vita_game_log_seek(offset, origin);
+        if (lane_result != ISAAC_VITA_GAME_LOG_SEEK_DEMOTE)
+            return lane_result;
+        return vita_crt_game_log_demote_locked(dynamic_index, offset, origin);
+    }
+#endif
     if (dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].raw_archive.live)
         return vita_crt_raw_archive_fseek(
@@ -753,6 +827,10 @@ static long vita_crt_file_ftell(FILE *stream, int dynamic_index)
         s_file_tokens[dynamic_index].async_write.live)
         return isaac_vita_async_write_image_tell(
             &s_file_tokens[dynamic_index].async_write);
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (dynamic_index >= 0 && s_file_tokens[dynamic_index].game_log.live)
+        return isaac_vita_game_log_tell();
 #endif
     if (dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].raw_archive.live)
@@ -777,6 +855,13 @@ static int vita_crt_file_fileno(FILE *stream, int dynamic_index)
         return (int)(ISAAC_VITA_CRT_ASYNC_WRITE_FD_BASE +
                      (uint32_t)dynamic_index);
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* Same shape for the lane: a slot-derived pseudo descriptor above the
+     * async-save range, consumed only by the two lock bridges. */
+    if (dynamic_index >= 0 && s_file_tokens[dynamic_index].game_log.live)
+        return (int)(ISAAC_VITA_CRT_GAME_LOG_FD_BASE +
+                     (uint32_t)dynamic_index);
+#endif
     if (dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].raw_archive.live) {
         /* A SceUID is not a newlib fd-map index.  Do not publish a handle
@@ -796,6 +881,12 @@ static int vita_crt_file_fflush(FILE *stream, int dynamic_index)
         s_file_tokens[dynamic_index].async_write.live)
         return 0;
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* Not reached for a lane token: vita_crt_fflush answers the lane before
+     * the dispatcher.  Kept for a caller that has no guest stack to read. */
+    if (dynamic_index >= 0 && s_file_tokens[dynamic_index].game_log.live)
+        return isaac_vita_game_log_flush(ISAAC_VITA_GAME_LOG_SEVERITY_UNKNOWN);
+#endif
     if (dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].raw_archive.live)
         return 0;
@@ -812,6 +903,10 @@ static int vita_crt_file_feof(FILE *stream, int dynamic_index)
         s_file_tokens[dynamic_index].async_write.live)
         return 0;
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (dynamic_index >= 0 && s_file_tokens[dynamic_index].game_log.live)
+        return 0;
+#endif
     if (dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].raw_archive.live)
         return s_file_tokens[dynamic_index].raw_archive.eof != 0U;
@@ -824,6 +919,14 @@ static int vita_crt_file_ferror(FILE *stream, int dynamic_index)
     if (dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].async_write.live)
         return s_file_tokens[dynamic_index].async_write.error != 0U;
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (dynamic_index >= 0 && s_file_tokens[dynamic_index].game_log.live)
+        return isaac_vita_game_log_error() ||
+            s_file_tokens[dynamic_index].game_log.demoted_error != 0U;
+    if (dynamic_index >= 0 &&
+        s_file_tokens[dynamic_index].game_log.demoted_error)
+        return 1;
 #endif
     if (dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].raw_archive.live)
@@ -839,6 +942,9 @@ typedef struct vita_crt_format_output {
     FILE *stream;
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     isaac_vita_async_write_image *async_image;
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    int game_log;
 #endif
     uint8_t *stream_buffer;
     uint32_t stream_capacity;
@@ -1184,16 +1290,22 @@ _Static_assert(ISAAC_VITA_CRT_STANDARD_STREAM_COUNT +
  * fread/fseek on such a token is recovered exactly once: fresh handle first,
  * positioned at the logical cursor recorded before the call (no syscall:
  * raw position, deferred SEEK_END, or newlib's _offset - _r), then the dead
- * handle is closed, the fresh one swapped into the slot (the published token
- * value is the slot address and does not change) and the whole call redone.
- * Anything that cannot be done exactly leaves the token untouched and lets
- * the ordinary failure path run. */
+ * handle is closed, the fresh one swapped into the slot and the whole call
+ * redone.  The published token value is the slot address on every lane
+ * (vita_crt_fopen): a newlib FILE address would outlive its FILE, which
+ * newlib's __sfp hands to the next fopen, and one token value would then
+ * name two live slots (hardware 2026-10-12: an ArchivedFile read landed on
+ * a keyless write-only FILE, EBADF, "block header is invalid").  An EBADF
+ * failure is recovered like ENODEV, though no kernel EBADF has been seen
+ * after a suspend yet.  Anything that cannot be done exactly leaves the
+ * token untouched and lets the ordinary failure path run. */
 typedef struct vita_crt_descriptor_recover_stats {
     uint32_t enodev;        /* ENODEV failures on tokens with a retained path */
     uint32_t recovered;     /* ... redone on a fresh handle (one receipt each) */
     uint32_t unknown_pos;   /* ... abandoned: logical cursor unknown */
     uint32_t reopen_fail;   /* ... abandoned: fresh open, size or seek failed */
     uint32_t redo_fail;     /* redone calls that failed again */
+    uint32_t ebadf;         /* as enodev, for EBADF failures */
 } vita_crt_descriptor_recover_stats;
 
 typedef struct vita_crt_descriptor_recover_receipt {
@@ -1350,12 +1462,13 @@ static void vita_crt_recover_note_io_shadow(vita_crt_file_token *entry)
 #endif
 
 /* Caller owns s_file_lock.  One recovery attempt for a call that failed
- * with ENODEV on a token with a retained path.  Returns 1 when the token
- * owns a fresh handle at the recorded cursor and the caller must redo the
- * call from its start; 0 leaves the token untouched.  The receipt is filled
- * for the caller to log once the lock is released. */
+ * with ENODEV or EBADF (`trigger`) on a token with a retained path.  Returns
+ * 1 when the token owns a fresh handle at the recorded cursor and the caller
+ * must redo the call from its start; 0 leaves the token untouched.  The
+ * receipt is filled for the caller to log once the lock is released. */
 static int vita_crt_recover_token(vita_crt_file_token *entry, long position,
-                                  int need_position, const char *op,
+                                  int need_position, int trigger,
+                                  const char *op,
                                   vita_crt_descriptor_recover_receipt *receipt)
 {
     const char *name;
@@ -1363,7 +1476,14 @@ static int vita_crt_recover_token(vita_crt_file_token *entry, long position,
     int saved_errno = errno;
     int recovered;
 
-    ++s_descriptor_recover.enodev;
+    if (trigger == EBADF)
+        ++s_descriptor_recover.ebadf;
+    else
+        ++s_descriptor_recover.enodev;
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+    /* A dead descriptor means a suspend: files may have changed meanwhile. */
+    isaac_vita_access_cache_invalidate();
+#endif
     if (entry->raw_archive.live) {
         if (position < 0L) {
             ++s_descriptor_recover.unknown_pos;
@@ -1404,6 +1524,186 @@ static void vita_crt_recover_log_receipt(
     isaac_vita_log(
         "arcdiag v1 tag=descriptor-recover-v1 key=%s lane=%s pos=%ld op=%s",
         receipt->key, receipt->lane, receipt->position, receipt->op);
+}
+#endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+/* The ArchivedFile block reader (sub_0059c270) reads each block header with
+ * fread(buf, 4, 1) and the payload with fread(buf, 1, len) through the File
+ * wrapper (sub_00596560) and ignores the payload count, so one short read
+ * on a packed-archive FILE token silently shifts the cursor and a later
+ * header read dies on "ArchivedFile block header is invalid" (tour 1,
+ * 2026-09-17: mines heavy.ogg streamed from repentance.a, the cursor 48
+ * bytes short after 86 valid blocks, no EOF/error flag on the stream).  A
+ * read on a packed-archive token that returns fewer elements than requested
+ * while the stream reports neither EOF nor an error is completed here: the
+ * remainder is read again from the cursor the first read left, until the
+ * request is whole, a real EOF, an error, or the attempt bound.  Byte
+ * elements need no cursor (the count is the consumed byte count); a wider
+ * element may have been partially consumed (newlib copies the partial bytes
+ * and returns floor), which only the cursor before the call reveals, so
+ * that cursor is taken for size > 1 archive reads without a syscall.  Loose
+ * files and the write lanes are never touched. */
+enum {
+    VITA_CRT_FREAD_COMPLETE_MAX_LOOPS = 8U,
+    VITA_CRT_FREAD_COMPLETE_LOG_FIRST = 8U
+};
+
+typedef struct vita_crt_fread_complete_stats {
+    uint32_t short_reads;   /* archive reads short without EOF/error */
+    uint32_t completed;     /* ... brought to the full request */
+    uint32_t incomplete;    /* ... still short after the loop */
+    uint32_t loops;         /* completion reads issued */
+    uint32_t unknown_pos;   /* wider elements with no usable cursor: untouched */
+    uint32_t logged;        /* receipts written (the first LOG_FIRST) */
+} vita_crt_fread_complete_stats;
+
+typedef struct vita_crt_fread_complete_receipt {
+    char key[ISAAC_VITA_ARCHIVE_CACHE_KEY_CAPACITY];
+    uint32_t token;
+    uint32_t size;
+    uint32_t want;          /* elements requested */
+    uint32_t got;           /* elements the first read returned */
+    uint32_t loops;
+    uint32_t rc;            /* elements handed to the guest */
+    long position;          /* cursor after the call, -1 unknown */
+    uint32_t n;             /* short_reads including this one */
+    int read_errno;
+    uint8_t eof;
+    uint8_t error;
+    uint8_t raw;
+    uint8_t log;
+} vita_crt_fread_complete_receipt;
+
+static vita_crt_fread_complete_stats s_fread_complete;
+
+/* Caller owns s_file_lock.  The cursor of a live token without a syscall,
+ * or -1 when it is not known exactly; copied from vita_crt_recover_position
+ * minus the deferred-SEEK_END branch (fread applies that seek before it
+ * reads, so the real cursor is the logical one here).  A raw token keeps
+ * the cursor arithmetically.  newlib's own ftell arithmetic is _offset - _r,
+ * exact only while __SOFF says _offset is (a failed read or seek clears it;
+ * a short read that returned bytes keeps it). */
+static long vita_crt_fread_complete_position(const vita_crt_file_token *entry,
+                                             FILE *stream)
+{
+    if (entry->raw_archive.live) {
+        if ((uint64_t)entry->raw_archive.position >
+            (uint64_t)ISAAC_VITA_CRT_RAW_ARCHIVE_LONG_MAX)
+            return -1L;
+        return (long)entry->raw_archive.position;
+    }
+    if (!stream)
+        return -1L;
+#if defined(__NEWLIB__)
+    if ((stream->_flags & (__SOFF | __SRD)) == (__SOFF | __SRD) &&
+        !(stream->_flags & __SWR) && stream->_ub._base == NULL)
+        return (long)stream->_offset - (long)stream->_r;
+    return -1L;
+#else
+    /* Host oracles: libc exposes no cursor field, so one real ftell. */
+    return ftell(stream);
+#endif
+}
+
+/* Caller owns s_file_lock.  `got` is the first read's element count; the
+ * return value is the element count for the guest.  position_before is the
+ * cursor the first read started from (-1 when not taken or unknown;
+ * consulted only for size > 1).  errno on return is the last completion
+ * read's errno, or the caller's when no completion read was issued.  The
+ * receipt is filled for the caller to log once the lock is released. */
+static size_t vita_crt_fread_complete(vita_crt_file_token *entry,
+                                      FILE *stream, int index,
+                                      uint32_t buffer, uint32_t size,
+                                      uint32_t count, size_t got,
+                                      long position_before,
+                                      vita_crt_fread_complete_receipt *receipt)
+{
+    uint64_t total = (uint64_t)size * (uint64_t)count;
+    uint64_t done = (uint64_t)size * (uint64_t)got;
+    uint32_t loops = 0U;
+    int known = 1;
+    int read_errno = errno;
+    size_t result = got;
+
+    ++s_fread_complete.short_reads;
+    memset(receipt, 0, sizeof *receipt);
+    memcpy(receipt->key, entry->file.key, strlen(entry->file.key) + 1U);
+    receipt->token = entry->token;
+    receipt->size = size;
+    receipt->want = count;
+    receipt->got = (uint32_t)got;
+    receipt->n = s_fread_complete.short_reads;
+    receipt->raw = entry->raw_archive.live ? 1U : 0U;
+    if (size != 1U) {
+        long now = position_before < 0L ? -1L
+            : vita_crt_fread_complete_position(entry, stream);
+
+        if (now < 0L || now < position_before ||
+            (uint64_t)(now - position_before) > total ||
+            (uint64_t)(now - position_before) < done)
+            known = 0;
+        else
+            done = (uint64_t)(now - position_before);
+    }
+    if (!known) {
+        ++s_fread_complete.unknown_pos;
+        ++s_fread_complete.incomplete;
+    }
+    while (known && done < total &&
+           loops < VITA_CRT_FREAD_COMPLETE_MAX_LOOPS) {
+        void *rest = (void *)(uintptr_t)(buffer + (uint32_t)done);
+        size_t more;
+
+        ++loops;
+        errno = 0;
+        if (entry->raw_archive.live)
+            more = vita_crt_raw_archive_fread(
+                entry, rest, 1U, (size_t)(total - done));
+        else
+            more = vita_crt_native_fread(
+                rest, 1U, (size_t)(total - done), stream);
+        read_errno = errno;
+        done += (uint64_t)more;
+        if (vita_crt_file_feof(stream, index) ||
+            vita_crt_file_ferror(stream, index))
+            break;
+    }
+    if (known) {
+        result = (size_t)(done / size);
+        s_fread_complete.loops += loops;
+        if (result >= count)
+            ++s_fread_complete.completed;
+        else
+            ++s_fread_complete.incomplete;
+    }
+    receipt->loops = loops;
+    receipt->rc = (uint32_t)result;
+    receipt->read_errno = read_errno;
+    receipt->eof = vita_crt_file_feof(stream, index) ? 1U : 0U;
+    receipt->error = vita_crt_file_ferror(stream, index) ? 1U : 0U;
+    receipt->position = vita_crt_fread_complete_position(entry, stream);
+    if (s_fread_complete.logged < VITA_CRT_FREAD_COMPLETE_LOG_FIRST) {
+        ++s_fread_complete.logged;
+        receipt->log = 1U;
+    }
+    errno = read_errno;
+    return result;
+}
+
+/* Never under s_file_lock.  One bounded line for each of the first
+ * LOG_FIRST short reads; the counters carry the rest (report line). */
+static void vita_crt_fread_complete_log_receipt(
+    const vita_crt_fread_complete_receipt *receipt)
+{
+    isaac_vita_log(
+        "KAGE VITA CRT FREAD SHORT: tok=%08x want=%u got=%u loops=%u rc=%u "
+        "size=%u key=%s lane=%s pos=%ld eof=%u err=%u errno=%d n=%u",
+        (unsigned)receipt->token, (unsigned)receipt->want,
+        (unsigned)receipt->got, (unsigned)receipt->loops,
+        (unsigned)receipt->rc, (unsigned)receipt->size, receipt->key,
+        receipt->raw ? "raw" : "newlib", receipt->position,
+        (unsigned)receipt->eof, (unsigned)receipt->error,
+        receipt->read_errno, (unsigned)receipt->n);
 }
 #endif
 
@@ -2245,6 +2545,19 @@ static int vita_crt_initialize_environment_storage(CPU *__restrict c)
     if (!vita_crt_guest_pointer(c, s_argv, &s_argv_pointer))
         return 0;
     s_argc = 1;
+#if defined(ISAAC_VITA_LAUNCH_ARGS_FILE)
+    {
+        char *extra[ISAAC_VITA_LAUNCH_ARGS_MAX];
+        unsigned count = isaac_vita_launch_args_load(s_argv0, extra);
+        unsigned i;
+
+        for (i = 0U; i < count; ++i)
+            if (!vita_crt_guest_pointer(c, extra[i], &s_argv[1U + i]))
+                return 0;
+        s_argv[1U + count] = 0U;
+        s_argc = 1 + (int32_t)count;
+    }
+#endif
     s_environment_ready = 1;
     return 1;
 }
@@ -2287,6 +2600,20 @@ static void vita_crt_p_argc(CPU *__restrict c)
     vita_crt_cdecl_return(c);
 }
 
+/* The twelve libyuv CPU-dispatch switches: unset on a PC, so NULL here. */
+static int vita_crt_getenv_is_libyuv_switch(const char *measured)
+{
+    static const char *const names[ISAAC_VITA_CRT_GETENV_LIBYUV_NAME_COUNT] = {
+        ISAAC_VITA_CRT_GETENV_LIBYUV_NAMES
+    };
+    unsigned i;
+
+    for (i = 0U; i < ISAAC_VITA_CRT_GETENV_LIBYUV_NAME_COUNT; ++i)
+        if (strcmp(measured, names[i]) == 0)
+            return 1;
+    return 0;
+}
+
 static void vita_crt_getenv(CPU *__restrict c)
 {
     uint32_t name = vita_crt_arg(c, 0U);
@@ -2303,7 +2630,8 @@ static void vita_crt_getenv(CPU *__restrict c)
             return;
         c->eax = pointer;
     } else if (strcmp(measured, ISAAC_VITA_CRT_GETENV_HOMEDRIVE_NAME) == 0 ||
-               strcmp(measured, ISAAC_VITA_CRT_GETENV_HOMEPATH_NAME) == 0) {
+               strcmp(measured, ISAAC_VITA_CRT_GETENV_HOMEPATH_NAME) == 0 ||
+               vita_crt_getenv_is_libyuv_switch(measured)) {
         c->eax = 0U;
     } else {
         guest_fault(c, name, "getenv received an unmeasured variable name");
@@ -2331,6 +2659,19 @@ static void vita_crt_stdio_flush(vita_crt_format_output *out)
         return;
     }
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (out->game_log) {
+        if (out->stream_failed || !out->stream_used)
+            return;
+        errno = 0;
+        written = isaac_vita_game_log_write(out->stream_buffer, 1U,
+                                            out->stream_used);
+        if (written != out->stream_used)
+            out->stream_failed = 1;
+        out->stream_used = 0U;
+        return;
+    }
+#endif
     if (!out->stream || out->stream_failed || !out->stream_used)
         return;
     /* Each chunk is a separate native transaction.  Do not let an errno
@@ -2348,6 +2689,9 @@ static void vita_crt_stdio_put(vita_crt_format_output *out, uint8_t value)
     if (out->stream
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
         || out->async_image
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+        || out->game_log
 #endif
         ) {
         if (!out->stream_failed) {
@@ -2717,6 +3061,13 @@ static void vita_crt_stdio_common_vsprintf(CPU *__restrict c)
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     out.async_image = NULL;
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* String output never rides the lane.  Left unset, stack garbage sent
+     * every sprintf byte down the stream branch (int2 boot: the save-path
+     * buffer stayed empty -> "Failed to obtain writable save data
+     * directory!"). */
+    out.game_log = 0;
+#endif
     if (!vita_crt_stdio_format(c, format, arguments, &out, 1))
         return;
     if (!buffer) {
@@ -2765,6 +3116,13 @@ static void vita_crt_stdio_common_vsprintf_s(CPU *__restrict c)
     out.stream = NULL;
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     out.async_image = NULL;
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* String output never rides the lane.  Left unset, stack garbage sent
+     * every sprintf byte down the stream branch (int2 boot: the save-path
+     * buffer stayed empty -> "Failed to obtain writable save data
+     * directory!"). */
+    out.game_log = 0;
 #endif
     if (!vita_crt_stdio_format(c, format, arguments, &out, 1))
         return;
@@ -3014,6 +3372,27 @@ static void vita_crt_file_unlock(void)
     __sync_synchronize();
     __sync_lock_release(&s_file_lock);
 }
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+
+/* The same process clock as ph120.s at= and roomlog at=.  Read only when a
+ * run opens (a seek, or the first read after fopen), never per fread. */
+static uint64_t vita_crt_trail_now(void)
+{
+    return sceKernelGetProcessTimeWide();
+}
+
+/* The phase reporter's per-window take.  Like the lookup-hint getter it
+ * never waits: a busy lock leaves the records for the next window. */
+int isaac_vita_crt_archive_trail_take(isaac_vita_archive_trail_window *out)
+{
+    if (!out || __sync_lock_test_and_set(&s_file_lock, 1U))
+        return 0;
+    __sync_synchronize();
+    isaac_vita_archive_trail_take(out);
+    vita_crt_file_unlock();
+    return 1;
+}
+#endif
 
 #if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
 int isaac_vita_crt_file_lookup_hint_get(uint32_t out[2])
@@ -3122,6 +3501,12 @@ void isaac_vita_crt_seek_shadow_report(const char *why)
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     isaac_vita_crt_descriptor_recover_report(why);
 #endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+    isaac_vita_crt_fread_complete_report(why);
+#endif
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+    isaac_vita_access_cache_report(why);
+#endif
     errno = saved_errno;
 }
 #endif
@@ -3132,11 +3517,14 @@ void isaac_vita_crt_descriptor_recover_report(const char *why)
 {
     vita_crt_descriptor_recover_stats snapshot;
     uint32_t retained = 0U;
+    uint32_t fd_repaired;
+    uint32_t fd_leaked;
     uint32_t index;
     int saved_errno = errno;
 
     vita_crt_file_lock();
     snapshot = s_descriptor_recover;
+    isaac_vita_archive_fd_repair_counts(&fd_repaired, &fd_leaked);
     for (index = 0U; index < ISAAC_VITA_CRT_FILE_TOKEN_COUNT; ++index) {
         if (vita_crt_dynamic_file_is_live(&s_file_tokens[index]) &&
             s_file_tokens[index].recover.path[0])
@@ -3145,10 +3533,32 @@ void isaac_vita_crt_descriptor_recover_report(const char *why)
     vita_crt_file_unlock();
     isaac_vita_log(
         "KAGE VITA CRT DESCRIPTOR RECOVER: why=%s enodev=%u recovered=%u "
-        "unknown_pos=%u reopen_fail=%u redo_fail=%u retained=%u",
+        "unknown_pos=%u reopen_fail=%u redo_fail=%u retained=%u ebadf=%u "
+        "fd_repaired=%u fd_leaked=%u",
         why, (unsigned)snapshot.enodev, (unsigned)snapshot.recovered,
         (unsigned)snapshot.unknown_pos, (unsigned)snapshot.reopen_fail,
-        (unsigned)snapshot.redo_fail, (unsigned)retained);
+        (unsigned)snapshot.redo_fail, (unsigned)retained,
+        (unsigned)snapshot.ebadf, (unsigned)fd_repaired,
+        (unsigned)fd_leaked);
+    errno = saved_errno;
+}
+#endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+/* One bounded counter line.  Never under s_file_lock while logging. */
+void isaac_vita_crt_fread_complete_report(const char *why)
+{
+    vita_crt_fread_complete_stats snapshot;
+    int saved_errno = errno;
+
+    vita_crt_file_lock();
+    snapshot = s_fread_complete;
+    vita_crt_file_unlock();
+    isaac_vita_log(
+        "KAGE VITA CRT FREAD COMPLETE: why=%s short=%u completed=%u "
+        "incomplete=%u loops=%u unknown_pos=%u logged=%u",
+        why, (unsigned)snapshot.short_reads, (unsigned)snapshot.completed,
+        (unsigned)snapshot.incomplete, (unsigned)snapshot.loops,
+        (unsigned)snapshot.unknown_pos, (unsigned)snapshot.logged);
     errno = saved_errno;
 }
 #endif
@@ -3249,12 +3659,81 @@ _Static_assert(ISAAC_VITA_CRT_LOG_BATCH_SIZE == 8U &&
                "Vita logger batch ABI/policy drifted");
 #endif
 
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+/* Caller owns s_file_lock.  The frozen logger's severity (0 INFO, 1 WARN,
+ * 2 ERROR, 3 ASSERT) for an fflush that arrived through the measured
+ * adapter chain: the adapter has no EBP prologue, so imported fflush sees
+ * its own return at ESP, the logger's return at ESP+8 and the logger's
+ * severity argument at EBP+8 (the same stack shape
+ * vita_crt_log_batch_classify_locked reads).  Any other caller is UNKNOWN
+ * and its flush is synchronous. */
+static unsigned vita_crt_game_log_severity_locked(CPU *__restrict c)
+{
+    if (!guest_stack_contains(c, c->esp, 12U) ||
+        ld32(c->esp) != ISAAC_VITA_CRT_FFLUSH_FIRST_RETURN_RVA ||
+        ld32(c->esp + 8U) != ISAAC_VITA_CRT_FFLUSH_FIRST_ORIGIN_RETURN_RVA ||
+        c->ebp > UINT32_MAX - 8U ||
+        !guest_stack_contains(c, c->ebp + 8U, 4U))
+        return ISAAC_VITA_GAME_LOG_SEVERITY_UNKNOWN;
+    return ld32(c->ebp + 8U) & 3U;
+}
+#endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
 static int vita_crt_archive_diag_relevant_key(const char *key)
 {
     return key && (strcmp(key, "afterbirth.a") == 0 ||
                    strcmp(key, "afterbirthp.a") == 0);
 }
+
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+/* Verbose ring: every archive key is relevant, so a short payload read on
+ * repentance.a is written immediately, not only one on afterbirth*.a. */
+#define VITA_CRT_ARCHIVE_DIAG_KEY_RELEVANT(key) 1
+
+/* The frozen PE reaches fread/fseek through its File wrappers: 0x596560 and
+ * 0x596590 (fread, import returns 0x596581 / 0x5965b1) and 0x596500 (fseek
+ * SEEK_END / SEEK_CUR / SEEK_SET, import returns 0x596523 / 0x596538 /
+ * 0x59654d).  Each opens a standard frame, so [ebp+4] is the wrapper's
+ * caller (the ArchivedFile block-reader site) and [[ebp]+4] that caller's
+ * caller.  Any other immediate return is reported as the parent itself. */
+static void vita_crt_archive_diag_verbose_callers(
+    CPU *__restrict c, uint32_t *parent, uint32_t *grandparent)
+{
+    uint32_t address = guest_stack_address(c, c->esp, 4U, 0U);
+    uint32_t immediate = address ? ld32(address) : 0U;
+    uint32_t saved_ebp;
+
+    *parent = immediate;
+    *grandparent = 0U;
+    switch (immediate) {
+    case 0x00596523U:
+    case 0x00596538U:
+    case 0x0059654dU:
+    case 0x00596581U:
+    case 0x005965b1U:
+        break;
+    default:
+        return;
+    }
+    if (c->ebp > UINT32_MAX - 8U)
+        return;
+    address = guest_stack_address(c, c->ebp + 4U, 4U, 0U);
+    if (address)
+        *parent = ld32(address);
+    address = guest_stack_address(c, c->ebp, 4U, 0U);
+    if (!address)
+        return;
+    saved_ebp = ld32(address);
+    if (saved_ebp > UINT32_MAX - 8U)
+        return;
+    address = guest_stack_address(c, saved_ebp + 4U, 4U, 0U);
+    if (address)
+        *grandparent = ld32(address);
+}
+#else
+#define VITA_CRT_ARCHIVE_DIAG_KEY_RELEVANT(key) \
+    vita_crt_archive_diag_relevant_key(key)
+#endif
 
 static void vita_crt_archive_diag_log_event(
     const char *reason, const isaac_vita_archive_diag_event *event)
@@ -3282,8 +3761,14 @@ static void vita_crt_archive_diag_log_event(
 void isaac_vita_crt_archive_diag_dump(void)
 {
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    /* 1024 events do not belong on a thread stack; a dump runs at a fatal. */
+    static isaac_vita_archive_diag_event
+        events[ISAAC_VITA_ARCHIVE_DIAG_RING_CAPACITY];
+#else
     isaac_vita_archive_diag_event
         events[ISAAC_VITA_ARCHIVE_DIAG_RING_CAPACITY];
+#endif
     uint32_t latest_sequence = 0U;
     uint32_t count;
     uint32_t index;
@@ -3315,6 +3800,12 @@ int isaac_vita_crt_flush_all(void)
 #endif
 
     vita_crt_file_lock();
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* The lane's pending bytes reach the card before newlib's own buffers:
+     * a controlled guest exit loses nothing (counted as an exit append). */
+    if (s_game_log_index >= 0)
+        (void)isaac_vita_game_log_flush_exit();
+#endif
 #if defined(ISAAC_VITA_GAME_LOG_BATCH)
     tracked = vita_crt_log_batch_tracks_flush_locked(0U, 0);
 #endif
@@ -3461,7 +3952,17 @@ void isaac_vita_crt_archive_cache_shutdown(void)
 #elif defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     isaac_vita_crt_descriptor_recover_report("shutdown");
 #endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE) && \
+    !defined(ISAAC_VITA_CRT_SEEK_SHADOW)
+    isaac_vita_crt_fread_complete_report("shutdown");
+#endif
     errno = saved_errno;
+#endif
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE) && \
+    !(defined(ISAAC_VITA_ARCHIVE_FILE_CACHE) && \
+      defined(ISAAC_VITA_CRT_SEEK_SHADOW))
+    /* Otherwise the seek shadow's shutdown report already printed it. */
+    isaac_vita_access_cache_report("shutdown");
 #endif
 }
 
@@ -3613,6 +4114,117 @@ static int vita_crt_fopen_async_write_locked(CPU *__restrict c,
 }
 #endif
 
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+/* Caller owns s_file_lock.  Returns 1 when the open was completed (token
+ * published or fault raised) on the game-log lane; 0 hands the path to the
+ * ordinary native fopen with the lock still held. */
+static int vita_crt_fopen_game_log_locked(CPU *__restrict c,
+                                          const char *native_path,
+                                          const char *mode,
+                                          int saved_errno)
+{
+    uint32_t token = 0U;
+    uint32_t i;
+
+    if (!isaac_vita_game_log_eligible(native_path, mode))
+        return 0;
+    for (i = 0U; i < ISAAC_VITA_CRT_FILE_TOKEN_COUNT; ++i) {
+        if (!vita_crt_dynamic_file_is_live(&s_file_tokens[i]))
+            break;
+    }
+    /* A full table keeps the exact native "table full" fault path. */
+    if (i == ISAAC_VITA_CRT_FILE_TOKEN_COUNT)
+        return 0;
+    /* The lane performs the one native open newlib would perform; a refusal
+     * (worker unavailable, native open failure with errno) keeps the native
+     * fopen path, which then reports the same outcome. */
+    if (!isaac_vita_game_log_open(native_path, mode))
+        return 0;
+    if (!vita_crt_guest_pointer(c, &s_file_tokens[i], &token)) {
+        /* The lane opened but its slot has no guest-visible address.  Surface
+         * this exactly like a native fopen failure -- a NULL FILE with a CRT
+         * errno -- and release the lane, instead of returning to the guest
+         * with a stale EAX and an unbalanced stack. */
+        (void)isaac_vita_game_log_close();
+        vita_crt_file_unlock();
+        vita_crt_file_errno_restore(saved_errno, 1, EIO);
+        c->eax = 0U;
+        vita_crt_cdecl_return(c);
+        return 1;
+    }
+    memset(&s_file_tokens[i].game_log, 0, sizeof s_file_tokens[i].game_log);
+    s_file_tokens[i].game_log.live = 1U;
+    s_file_tokens[i].file.stream = NULL;
+    s_file_tokens[i].file.key[0] = '\0';
+    s_file_tokens[i].token = token;
+    s_game_log_index = (int)i;
+#if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
+    vita_crt_seek_shadow_clear(&s_file_tokens[i]);
+#endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    vita_crt_recover_clear(&s_file_tokens[i]);
+#endif
+#if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
+    s_file_lookup_hint = ISAAC_VITA_CRT_FILE_TOKEN_COUNT;
+#endif
+    c->eax = token;
+    vita_crt_file_unlock();
+    errno = saved_errno;
+    vita_crt_cdecl_return(c);
+    return 1;
+}
+
+/* Caller owns s_file_lock.  Hand the live lane token to a newlib FILE on the
+ * same path at the lane's logical position, after draining: "r+b" for a w/wb
+ * lane (a "wb" reopen would truncate what the lane already appended; fread
+ * keeps answering EBADF through demoted_write_only), "ab" for an a/ab lane.
+ * The new FILE is first placed at the logical position (newlib opens "r+b"
+ * at 0 and "ab" at the end) so a guest SEEK_CUR resolves exactly where the
+ * synchronous "wb"/"ab" FILE would have been.  origin == -1 is the
+ * second-fopen demotion (no guest seek requested); otherwise the guest's
+ * fseek is performed on the new FILE.  Returns the fseek result the caller
+ * reports; on a reopen failure the lane stays live (drained, cursors empty)
+ * and the seek fails with EIO. */
+static int vita_crt_game_log_demote_locked(int index, long offset, int origin)
+{
+    vita_crt_file_token *entry = &s_file_tokens[index];
+    const char *native_path = NULL;
+    char mode[4] = { 0 };
+    long position = 0L;
+    FILE *stream;
+    int write_only;
+
+    (void)isaac_vita_game_log_release(
+        &position, mode, &native_path,
+        origin == -1 ? ISAAC_VITA_GAME_LOG_RELEASE_OPEN
+                     : ISAAC_VITA_GAME_LOG_RELEASE_SEEK);
+    write_only = mode[0] == 'w';
+    stream = native_path
+        ? vita_crt_game_log_native_fopen(native_path, write_only ? "r+b" : "ab")
+        : NULL;
+    if (!stream) {
+        isaac_vita_game_log_rearm();
+        errno = EIO;
+        return -1;
+    }
+    entry->file.stream = stream;
+    entry->file.key[0] = '\0';
+    entry->game_log.live = 0U;
+    entry->game_log.demoted_write_only = write_only ? 1U : 0U;
+    s_game_log_index = -1;
+#if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
+    vita_crt_seek_shadow_publish(entry, mode, native_path);
+#endif
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    vita_crt_recover_publish(entry, mode, native_path);
+#endif
+    if (fseek(stream, position, SEEK_SET) != 0)
+        return -1;
+    if (origin == -1)
+        return 0;
+    return fseek(stream, offset, origin);
+}
+#endif
 static void vita_crt_fopen(CPU *__restrict c)
 {
     uint32_t guest_path = vita_crt_arg(c, 0U);
@@ -3652,6 +4264,14 @@ static void vita_crt_fopen(CPU *__restrict c)
         return;
     }
     vita_crt_file_lock();
+#if defined(ISAAC_VITA_LAUNCH_ARGS_FILE)
+    /* --vita-save-slot= (host_vita_launch_args.h): store
+     * the bench save slot in Manager+0x10 once Manager::Init has cleared it,
+     * and keep it there.  No-op without the token. */
+    (void)isaac_vita_launch_args_slot_apply(
+        GUEST_IMAGE_BASE + ISAAC_VITA_LAUNCH_ARGS_MANAGER_RVA,
+        GUEST_IMAGE_BASE + ISAAC_VITA_LAUNCH_ARGS_GAME_RVA, native_path);
+#endif
 #if defined(ISAAC_VITA_IO_PROFILE)
     if (s_io_profile_active)
         vita_crt_profile_add(&s_io_profile.fopen_calls, 1U);
@@ -3666,6 +4286,16 @@ static void vita_crt_fopen(CPU *__restrict c)
      * save becomes a memory image instead of a 1 KiB-buffered newlib FILE. */
     isaac_vita_async_write_sync_path(native_path);
     if (vita_crt_fopen_async_write_locked(c, native_path, mode, saved_errno))
+        return;
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* Read-your-writes: a second fopen of the lane's path (any mode) first
+     * hands the live lane to a newlib FILE at its logical end, so the new
+     * stream observes every byte.  Then a fresh w/wb/a/ab log.txt becomes
+     * the lane instead of a 1 KiB-buffered newlib FILE. */
+    if (s_game_log_index >= 0 && isaac_vita_game_log_owns_path(native_path))
+        (void)vita_crt_game_log_demote_locked(s_game_log_index, 0L, -1);
+    if (vita_crt_fopen_game_log_locked(c, native_path, mode, saved_errno))
         return;
 #endif
     errno = 0;
@@ -3704,6 +4334,11 @@ static void vita_crt_fopen(CPU *__restrict c)
         vita_crt_cdecl_return(c);
         return;
     }
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+    /* "w"/"a" opens have created their file by now. */
+    if (mode[0] != 'r')
+        isaac_vita_access_cache_note_create(native_path);
+#endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
     if (opened_entry.file.key[0]) {
         errno = 0;
@@ -3777,6 +4412,16 @@ static void vita_crt_fopen(CPU *__restrict c)
         return;
     }
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+    /* Recovery swaps the FILE under a live token: publish the slot. */
+    if (!direct &&
+        !vita_crt_guest_pointer(c, &s_file_tokens[i], &token)) {
+        (void)isaac_vita_archive_cache_force_discard(&opened_entry.file);
+        vita_crt_file_unlock();
+        errno = saved_errno;
+        return;
+    }
+#endif
     if (direct &&
         !vita_crt_guest_pointer(c, &s_file_tokens[i], &token)) {
         (void)vita_crt_raw_archive_close(&opened_entry);
@@ -3786,6 +4431,11 @@ static void vita_crt_fopen(CPU *__restrict c)
     }
     s_file_tokens[i].file = opened_entry.file;
     s_file_tokens[i].raw_archive = opened_entry.raw_archive;
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+    isaac_vita_archive_trail_open(&s_file_tokens[i].trail,
+                                  s_file_tokens[i].file.key,
+                                  vita_crt_trail_now());
+#endif
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     vita_crt_seek_shadow_publish(&s_file_tokens[i], mode, native_path);
 #endif
@@ -3903,6 +4553,9 @@ static void vita_crt_stdio_common_vfprintf(CPU *__restrict c)
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     out.async_image = NULL;
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    out.game_log = 0;
+#endif
     if (!vita_crt_stdio_format(c, format, arguments, &out, 1))
         return;
     length = out.written;
@@ -3950,6 +4603,10 @@ static void vita_crt_stdio_common_vfprintf(CPU *__restrict c)
     out.async_image = dynamic_index >= 0 &&
         s_file_tokens[dynamic_index].async_write.live
         ? &s_file_tokens[dynamic_index].async_write : NULL;
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    out.game_log = dynamic_index >= 0 &&
+        s_file_tokens[dynamic_index].game_log.live;
 #endif
     out.stream_buffer = chunk;
     out.stream_capacity = sizeof chunk;
@@ -3999,6 +4656,10 @@ static void vita_crt_fclose(CPU *__restrict c)
     int was_cacheable;
     int was_raw;
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    isaac_vita_archive_diag_event close_event;
+    int verbose_close = 0;
+#endif
 
     vita_crt_file_lock();
     if (!vita_crt_find_file_token_unlocked(
@@ -4019,12 +4680,55 @@ static void vita_crt_fclose(CPU *__restrict c)
     if (s_io_profile_active)
         vita_crt_profile_add(&s_io_profile.fclose_calls, 1U);
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    /* Before either lane clears file.key and before errno is cleared for the
+     * close itself: the cursor the archive token is closed at. */
+    if (s_file_tokens[index].file.key[0]) {
+        uint32_t verbose_parent;
+        uint32_t verbose_grandparent;
+
+        vita_crt_archive_diag_verbose_callers(
+            c, &verbose_parent, &verbose_grandparent);
+        memset(&close_event, 0, sizeof close_event);
+        close_event.kind = ISAAC_VITA_ARCHIVE_DIAG_CLOSE;
+        close_event.token = token;
+        close_event.position_before =
+            (int32_t)vita_crt_file_ftell(stream, index);
+        close_event.position_after = close_event.position_before;
+        if (close_event.position_before < 0)
+            close_event.flags |= ISAAC_VITA_ARCHIVE_DIAG_FTELL_FAILED;
+        if (s_file_tokens[index].raw_archive.live)
+            close_event.flags |= ISAAC_VITA_ARCHIVE_DIAG_SCEIO_DIRECT;
+        close_event.caller_return = verbose_parent;
+        close_event.observed_word = verbose_grandparent;
+        memcpy(close_event.key, s_file_tokens[index].file.key,
+               strlen(s_file_tokens[index].file.key) + 1U);
+        verbose_close = 1;
+    }
+#endif
+#if defined(ISAAC_VITA_OGG_READAHEAD)
+    /* Before the archive cache idles or closes the FILE: the kernel
+     * position goes back to newlib's view and the descriptor leaves the
+     * read-ahead (a no-op for descriptors it never saw). */
+    if (stream)
+        isaac_vita_ogg_ra_forget(fileno(stream));
+#endif
     errno = 0;
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+    /* Before either lane clears file.key: the run that ends here is recorded
+     * as closed by fclose. */
+    isaac_vita_archive_trail_close(&s_file_tokens[index].trail);
+#endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
 #if defined(ISAAC_VITA_IO_PROFILE)
     closing_shadow = s_file_tokens[index].io_shadow;
     was_cacheable = s_file_tokens[index].file.key[0] != '\0';
     was_raw = s_file_tokens[index].raw_archive.live != 0U;
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (s_file_tokens[index].game_log.live)
+        result = isaac_vita_game_log_close();
+    else
 #endif
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     if (s_file_tokens[index].async_write.live)
@@ -4050,6 +4754,13 @@ static void vita_crt_fclose(CPU *__restrict c)
     result = fclose(stream);
     s_file_tokens[index].stream = NULL;
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    if (verbose_close) {
+        close_event.operation_result = result;
+        close_event.operation_errno = errno;
+        (void)isaac_vita_archive_diag_record(&close_event);
+    }
+#endif
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     if (!s_file_tokens[index].seek_shadow.read_only)
         vita_crt_seek_shadow_note_write();
@@ -4059,6 +4770,12 @@ static void vita_crt_fclose(CPU *__restrict c)
     vita_crt_recover_clear(&s_file_tokens[index]);
 #endif
     s_file_tokens[index].token = 0U;
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (s_game_log_index == index)
+        s_game_log_index = -1;
+    memset(&s_file_tokens[index].game_log, 0,
+           sizeof s_file_tokens[index].game_log);
+#endif
 #if defined(ISAAC_VITA_GAME_LOG_BATCH)
     if (tracked) {
         if (result == EOF) {
@@ -4153,6 +4870,9 @@ static void vita_crt_fread(CPU *__restrict c)
     int32_t raw_position_before = -1;
     int raw_position_valid = 0;
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    long verbose_position_before = -1L;
+#endif
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     vita_crt_descriptor_recover_receipt recover_receipt =
         { { 0 }, NULL, NULL, -1L };
@@ -4160,6 +4880,12 @@ static void vita_crt_fread(CPU *__restrict c)
     int recover_armed = 0;
     int recovered = 0;
     uint8_t recover_raw_error = 0U;
+#endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+    vita_crt_fread_complete_receipt complete_receipt =
+        { { 0 }, 0U, 0U, 0U, 0U, 0U, 0U, -1L, 0U, 0, 0U, 0U, 0U, 0U };
+    long complete_position_before = -1L;
+    int completed = 0;
 #endif
 
     if (!vita_crt_file_buffer_range(
@@ -4206,6 +4932,20 @@ static void vita_crt_fread(CPU *__restrict c)
             raw_position_valid = 1;
         }
     }
+#endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+    /* Only a wider element needs the cursor before the read (a partial
+     * element newlib already copied is invisible in the count); after the
+     * deferred SEEK_END is applied, without a syscall. */
+    if (archive_key && size > 1U)
+        complete_position_before = vita_crt_fread_complete_position(
+            &s_file_tokens[index], stream);
+#endif
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    /* After the deferred SEEK_END is applied: the exact newlib cursor the
+     * read starts from, so before + consumed == after can be checked. */
+    if (archive_key && !raw_position_valid)
+        verbose_position_before = vita_crt_file_ftell(stream, index);
 #endif
     /* The two measured ArchivedFile adapters always request exactly one
      * four-byte block header.  Reject a distorted shape before native fread:
@@ -4287,7 +5027,27 @@ static void vita_crt_fread(CPU *__restrict c)
      * perturb the value observed by the existing CRT path. */
     isaac_vita_exit_menu_profile_fread_begin(bytes);
 #endif
+#if defined(ISAAC_VITA_OGG_READAHEAD)
+    /* A native Vorbis top-up (nv_guest_vcall sets the context) reading a
+     * read-only newlib-lane token: hand its descriptor to the read-ahead
+     * below newlib.  Idempotent, errno-neutral, no guest state. */
+    if (isaac_vita_ogg_ra_context && index >= 0 && stream &&
+        !s_file_tokens[index].raw_archive.live &&
+        s_file_tokens[index].recover.path[0])
+        isaac_vita_ogg_ra_note(fileno(stream),
+                               s_file_tokens[index].recover.path);
+#endif
     errno = 0;
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    if (index >= 0 && (s_file_tokens[index].game_log.live ||
+                       s_file_tokens[index].game_log.demoted_write_only)) {
+        /* newlib returns 0 with the error flag for a read on a "wb" stream;
+         * the demoted "r+b" FILE must keep giving that answer. */
+        s_file_tokens[index].game_log.demoted_error = 1U;
+        errno = EBADF;
+        result = 0U;
+    } else
+#endif
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     if (index >= 0 && s_file_tokens[index].async_write.live) {
         /* newlib returns 0 with the error flag for a read on a "wb" stream. */
@@ -4306,9 +5066,10 @@ static void vita_crt_fread(CPU *__restrict c)
             (void *)(uintptr_t)buffer, size, count, stream);
     read_errno = errno;
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
-    if (recover_armed && result < count && read_errno == ENODEV &&
+    if (recover_armed && result < count &&
+        (read_errno == ENODEV || read_errno == EBADF) &&
         vita_crt_recover_token(&s_file_tokens[index], recover_position, 1,
-                               "fread", &recover_receipt)) {
+                               read_errno, "fread", &recover_receipt)) {
         /* The whole request again from the recorded cursor: a partial
          * element newlib already copied is read again, not skipped. */
         stream = vita_crt_dynamic_stream(&s_file_tokens[index]);
@@ -4326,6 +5087,17 @@ static void vita_crt_fread(CPU *__restrict c)
         read_errno = errno;
     }
 #endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+    if (archive_key && bytes != 0U && result < count &&
+        !vita_crt_file_feof(stream, index) &&
+        !vita_crt_file_ferror(stream, index)) {
+        result = vita_crt_fread_complete(
+            &s_file_tokens[index], stream, index, buffer, size, count,
+            result, complete_position_before, &complete_receipt);
+        read_errno = errno;
+        completed = 1;
+    }
+#endif
 #if defined(ISAAC_VITA_EXIT_MENU_PROFILE)
     isaac_vita_exit_menu_profile_fread_end(
         (uint32_t)((uint64_t)size * (uint64_t)result));
@@ -4339,6 +5111,18 @@ static void vita_crt_fread(CPU *__restrict c)
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     if (recovered && failed)
         ++s_descriptor_recover.redo_fail;
+#endif
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+    if (index >= 0 && s_file_tokens[index].trail.keyed) {
+        uint64_t trail_now = 0U;
+
+        if (isaac_vita_archive_trail_needs_clock(
+                &s_file_tokens[index].trail))
+            trail_now = vita_crt_trail_now();
+        isaac_vita_archive_trail_read(
+            &s_file_tokens[index].trail,
+            (uint32_t)((uint64_t)size * (uint64_t)result), trail_now);
+    }
 #endif
 #if defined(ISAAC_VITA_IO_PROFILE)
     if (s_io_profile_active) {
@@ -4400,7 +5184,7 @@ static void vita_crt_fread(CPU *__restrict c)
             fault_message = "ArchivedFile block header is invalid";
         }
     } else if (archive_key &&
-               vita_crt_archive_diag_relevant_key(archive_key) &&
+               VITA_CRT_ARCHIVE_DIAG_KEY_RELEVANT(archive_key) &&
                result < count) {
         memset(&event, 0, sizeof event);
         event.kind = ISAAC_VITA_ARCHIVE_DIAG_FREAD;
@@ -4428,6 +5212,48 @@ static void vita_crt_fread(CPU *__restrict c)
         (void)isaac_vita_archive_diag_record(&event);
         log_anomaly = 1;
     }
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    /* Every other read on an archive token, any key: header and payload
+     * reads of every ArchivedFile, with the block-reader site and its caller
+     * (off= holds the caller's caller RVA, word= the first payload word). */
+    if (archive_key && !log_anomaly) {
+        uint32_t verbose_parent;
+        uint32_t verbose_grandparent;
+
+        vita_crt_archive_diag_verbose_callers(
+            c, &verbose_parent, &verbose_grandparent);
+        memset(&event, 0, sizeof event);
+        event.kind = ISAAC_VITA_ARCHIVE_DIAG_FREAD;
+        event.token = token;
+        if (index >= 0 && s_file_tokens[index].raw_archive.live)
+            event.flags |= ISAAC_VITA_ARCHIVE_DIAG_SCEIO_DIRECT;
+        if (vita_crt_file_feof(stream, index))
+            event.flags |= ISAAC_VITA_ARCHIVE_DIAG_EOF;
+        if (vita_crt_file_ferror(stream, index))
+            event.flags |= ISAAC_VITA_ARCHIVE_DIAG_STREAM_ERROR;
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+        if (recovered)
+            event.flags |= ISAAC_VITA_ARCHIVE_DIAG_RECOVERED;
+#endif
+        event.position_after =
+            (int32_t)vita_crt_file_ftell(stream, index);
+        if (event.position_after < 0)
+            event.flags |= ISAAC_VITA_ARCHIVE_DIAG_FTELL_FAILED;
+        event.position_before = raw_position_valid
+            ? raw_position_before : (int32_t)verbose_position_before;
+        event.operation_result = (int32_t)result;
+        event.operation_errno = read_errno;
+        event.element_size = size;
+        event.element_count = count;
+        event.elements_returned = (uint32_t)result;
+        event.caller_return = verbose_parent;
+        event.requested_offset = (int32_t)verbose_grandparent;
+        if ((uint64_t)size * (uint64_t)result >= 4U)
+            event.observed_word = ld32(buffer);
+        memcpy(event.key, archive_key, strlen(archive_key) + 1U);
+        (void)isaac_vita_archive_diag_record(&event);
+    }
+#endif
 #else
     if (archive_header) {
         uint32_t raw = result == 1U ? ld32(buffer) : 0U;
@@ -4447,6 +5273,12 @@ static void vita_crt_fread(CPU *__restrict c)
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     if (recovered) {
         vita_crt_recover_log_receipt(&recover_receipt);
+        errno = saved_errno;
+    }
+#endif
+#if defined(ISAAC_VITA_CRT_FREAD_COMPLETE)
+    if (completed && complete_receipt.log) {
+        vita_crt_fread_complete_log_receipt(&complete_receipt);
         errno = saved_errno;
     }
 #endif
@@ -4534,6 +5366,9 @@ static void vita_crt_fseek(CPU *__restrict c)
     int track_archive_seek = 0;
     int seek_anomaly = 0;
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    int verbose_seek = 0;
+#endif
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     int report_due = 0;
 #endif
@@ -4568,6 +5403,12 @@ static void vita_crt_fseek(CPU *__restrict c)
     if (track_archive_seek)
         position_before = vita_crt_file_ftell(stream, index);
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    /* Every seek on an archive token, whichever wrapper site issued it. */
+    verbose_seek = index >= 0 && s_file_tokens[index].file.key[0];
+    if (verbose_seek && !track_archive_seek)
+        position_before = vita_crt_file_ftell(stream, index);
+#endif
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     /* Raw tokens seek arithmetically and never reach the kernel here.  Only
      * a SEEK_CUR redo depends on the cursor; SEEK_SET and SEEK_END are redone
@@ -4588,9 +5429,10 @@ static void vita_crt_fseek(CPU *__restrict c)
 #endif
     seek_errno = errno;
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
-    if (recover_armed && result != 0 && seek_errno == ENODEV &&
+    if (recover_armed && result != 0 &&
+        (seek_errno == ENODEV || seek_errno == EBADF) &&
         vita_crt_recover_token(&s_file_tokens[index], recover_position,
-                               origin == SEEK_CUR, "fseek",
+                               origin == SEEK_CUR, seek_errno, "fseek",
                                &recover_receipt)) {
         /* Through the lane dispatcher again, so the seek shadow's deferred
          * state is exactly what a first-time success would have left. */
@@ -4604,8 +5446,13 @@ static void vita_crt_fseek(CPU *__restrict c)
     }
 #endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    if (track_archive_seek || verbose_seek ||
+        (result != 0 && index >= 0 && s_file_tokens[index].file.key[0])) {
+#else
     if (track_archive_seek ||
         (result != 0 && index >= 0 && s_file_tokens[index].file.key[0])) {
+#endif
         position_after = vita_crt_file_ftell(stream, index);
         memset(&event, 0, sizeof event);
         event.kind = ISAAC_VITA_ARCHIVE_DIAG_FSEEK;
@@ -4617,6 +5464,23 @@ static void vita_crt_fseek(CPU *__restrict c)
         event.position_after = (int32_t)position_after;
         event.operation_errno = seek_errno;
         event.caller_return = parent_return;
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+        {
+            uint32_t verbose_parent;
+            uint32_t verbose_grandparent;
+
+            /* Same value as parent_return for the constructor seam; the
+             * caller's caller rides in word= (unused by seeks). */
+            vita_crt_archive_diag_verbose_callers(
+                c, &verbose_parent, &verbose_grandparent);
+            event.caller_return = verbose_parent;
+            event.observed_word = verbose_grandparent;
+        }
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+        if (recovered)
+            event.flags |= ISAAC_VITA_ARCHIVE_DIAG_RECOVERED;
+#endif
+#endif
         if (position_after < 0L)
             event.flags |= ISAAC_VITA_ARCHIVE_DIAG_FTELL_FAILED;
         if (vita_crt_archive_diag_relevant_key(
@@ -4631,6 +5495,15 @@ static void vita_crt_fseek(CPU *__restrict c)
             (track_archive_seek && origin == SEEK_SET &&
              position_after != (long)offset);
     }
+#endif
+#if defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+    if (index >= 0 && s_file_tokens[index].trail.keyed)
+        isaac_vita_archive_trail_seek(
+            &s_file_tokens[index].trail, offset, origin, result,
+            track_archive_seek && result == 0 && position_after >= 0L
+                ? (int64_t)position_after : (int64_t)-1,
+            parent_return == ISAAC_VITA_CRT_ARCHIVE_SEEK_PARENT_RETURN_RVA,
+            result == 0 ? vita_crt_trail_now() : 0U);
 #endif
 #if defined(ISAAC_VITA_IO_PROFILE)
     if (s_io_profile_active) {
@@ -4706,6 +5579,32 @@ static void vita_crt_ftell(CPU *__restrict c)
 #else
     result = ftell(stream);
 #endif
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    if (index >= 0 && s_file_tokens[index].file.key[0]) {
+        isaac_vita_archive_diag_event event;
+        uint32_t verbose_parent;
+        uint32_t verbose_grandparent;
+
+        vita_crt_archive_diag_verbose_callers(
+            c, &verbose_parent, &verbose_grandparent);
+        memset(&event, 0, sizeof event);
+        event.kind = ISAAC_VITA_ARCHIVE_DIAG_FTELL;
+        event.token = token;
+        event.operation_result = result < 0L ? -1 : 0;
+        event.position_before = (int32_t)result;
+        event.position_after = (int32_t)result;
+        event.operation_errno = errno;
+        event.caller_return = verbose_parent;
+        event.observed_word = verbose_grandparent;
+        if (result < 0L)
+            event.flags |= ISAAC_VITA_ARCHIVE_DIAG_FTELL_FAILED;
+        if (s_file_tokens[index].raw_archive.live)
+            event.flags |= ISAAC_VITA_ARCHIVE_DIAG_SCEIO_DIRECT;
+        memcpy(event.key, s_file_tokens[index].file.key,
+               strlen(s_file_tokens[index].file.key) + 1U);
+        (void)isaac_vita_archive_diag_record(&event);
+    }
+#endif
     vita_crt_file_unlock();
     vita_crt_file_errno_restore(saved_errno, result < 0, EIO);
     c->eax = (uint32_t)(int32_t)result;
@@ -4731,6 +5630,27 @@ static void vita_crt_fflush(CPU *__restrict c)
         guest_fault(c, token, "fflush received an unknown FILE token");
         return;
     }
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* The lane owns the flush policy for its token: an INFO flush from the
+     * frozen logger chain returns without storage I/O, WARN/ERROR/ASSERT and
+     * every flush from elsewhere append synchronously.  Answered before the
+     * GAME_LOG_BATCH classifier, which therefore never latches this token
+     * and stays inert for log.txt.  The wait inside is safe under
+     * s_file_lock: the guest thread is the only s_file_lock owner and the
+     * lane worker never takes it. */
+    if (token && index >= 0 && s_file_tokens[index].game_log.live) {
+        errno = 0;
+        result = isaac_vita_game_log_flush(
+            vita_crt_game_log_severity_locked(c));
+        vita_crt_file_unlock();
+        vita_crt_file_errno_restore(saved_errno, result == EOF, EIO);
+        c->eax = (uint32_t)result;
+        vita_crt_cdecl_return(c);
+        return;
+    }
+    if (!token && s_game_log_index >= 0)
+        isaac_vita_game_log_flush_null();
+#endif
 #if defined(ISAAC_VITA_GAME_LOG_BATCH)
     if (vita_crt_log_batch_classify_locked(c, token, &exact_logger) ==
             VITA_CRT_LOG_BATCH_DEFER) {
@@ -4808,6 +5728,11 @@ int isaac_vita_crt_osfhandle_is_owned(uint32_t handle)
         if (!found && s_file_tokens[i].async_write.live &&
             (uint32_t)descriptor ==
                 ISAAC_VITA_CRT_ASYNC_WRITE_FD_BASE + i)
+            found = 1;
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+        if (!found && s_file_tokens[i].game_log.live &&
+            (uint32_t)descriptor == ISAAC_VITA_CRT_GAME_LOG_FD_BASE + i)
             found = 1;
 #endif
     }

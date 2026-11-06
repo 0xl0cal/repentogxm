@@ -11,6 +11,9 @@
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
 #include "host_vita_async_write.h"
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+#include "host_vita_game_log.h"
+#endif
 
 #define VITA_FIND_PATH_UNITS_MAX 1024U
 #define VITA_FIND_PATH_UTF8_MAX  4096U
@@ -777,6 +780,10 @@ static void vita_find_FindFirstFileW(CPU *__restrict c)
     /* A directory scan must list every save whose image is still queued.
      * The queue is empty in steady state, so this returns immediately. */
     isaac_vita_async_write_drain();
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* A scan of the log's directory lists the file at its full size. */
+    isaac_vita_game_log_sync_directory(directory);
 #endif
     if (!vita_find_has_wildcard(pattern)) {
         result = vita_find_exact(c, guest_pattern, output,

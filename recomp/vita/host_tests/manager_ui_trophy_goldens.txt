@@ -1,0 +1,6 @@
+# manager_ui_trophy_host_test frame hashes (FNV-1a of the 960x544 canvas words);
+# regenerate with MANAGER_UI_TROPHY_UPDATE=1 after a deliberate change.
+achievements-trophy-light-en 90765e6d
+achievements-trophy-light-ru ac21d584
+achievements-trophy-dark-en b1345a71
+achievements-trophy-dark-ru 6216b6e5

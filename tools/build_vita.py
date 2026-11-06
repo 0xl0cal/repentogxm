@@ -53,13 +53,13 @@ LINKER_MAP_NAME = "isaac_first_arm_fault.map"
 VPK_LIVEAREA_ASSETS = (
     (
         "sce_sys/icon0.png",
-        13_038,
-        "0c0b2c1d637edfa5222ecef970f7a54e143c9aed70d094644f6aaadeea157f46",
+        8_180,
+        "bbd840ceb8b3270e196b91aa6d4a6acd1fca056a96e164906e492c0e44e21151",
     ),
     (
         "sce_sys/pic0.png",
-        137_840,
-        "7d8f862809ef87ea4dd69b7446b112abf4549f8a6e2b968e76a31157ccc68148",
+        208_071,
+        "c7209f10d8927fefc001050a62f11d091c3bcf412558a89dc3587777c7e9c215",
     ),
     (
         "sce_sys/livearea/contents/bg0.png",
@@ -73,13 +73,33 @@ VPK_LIVEAREA_ASSETS = (
     ),
     (
         "sce_sys/livearea/contents/startup.png",
-        8_982,
-        "2600254658cc2667d787d60722c82779353204b4d16c4aecf0b4ca72791f0000",
+        7_258,
+        "ca275da960367078055b0996a11ac9701a85c4cdf64d4aeab8da416fca9db219",
+    ),
+    (
+        "sce_sys/livearea/contents/1.png",
+        2_739,
+        "4f986ba1c75ee358bf8c7b0b652c9bbd0ec70da927a0fd51e65c134f70381060",
+    ),
+    (
+        "sce_sys/livearea/contents/2.png",
+        4_946,
+        "2dd3d09566861ce322395093bf3324939f6825165ce64b6ae3a4a499c2d05b3e",
+    ),
+    (
+        "sce_sys/livearea/contents/3.png",
+        5_344,
+        "227b9694bc4bff0bd86d2259bf4fd64c147ba3708e84a9007abff0cfeaee36be",
+    ),
+    (
+        "sce_sys/livearea/contents/4.png",
+        3_022,
+        "016ca78d4b9b676ca8c6d05594ca7569a28c36dab7e91e4220c4586256f8fbdf",
     ),
     (
         "sce_sys/livearea/contents/template.xml",
-        1_210,
-        "889dd7af1c66ad86a2b765a239ee8f93356b023cdf984f8a48ca154500f5c945",
+        1_378,
+        "b14122f0a7cecfd36b8b6304086ca1b0eebadc9551fcb167dd7962cb70da36e8",
     ),
 )
 VPK_LIVEAREA_MEMBERS = tuple(
@@ -90,6 +110,19 @@ VPK_MANAGER_MEMBER = "isaac-manager.bin"
 VPK_MANAGER_LICENSE_MEMBER = "licenses/libftpvita.txt"
 VPK_MANAGER_LICENSE_SOURCE = (
     VITA_SOURCE_DIR / "third_party" / "libftpvita" / "LICENSE"
+)
+# Manager UI2 (--manager-ui2): the three
+# DejaVu IMF1 atlases and the DejaVu licence ship only when the knob is ON
+# (CMake ISAAC_VPK_MANAGER_ASSET_FILES, empty OFF).
+VPK_MANAGER_UI2_ASSETS = (
+    ("manager/font-title-24.imf",
+     VITA_SOURCE_DIR / "assets" / "manager" / "font-title-24.imf"),
+    ("manager/font-body-16.imf",
+     VITA_SOURCE_DIR / "assets" / "manager" / "font-body-16.imf"),
+    ("manager/font-small-12.imf",
+     VITA_SOURCE_DIR / "assets" / "manager" / "font-small-12.imf"),
+    ("licenses/dejavu.txt",
+     VITA_SOURCE_DIR / "third_party" / "dejavu" / "LICENSE"),
 )
 RAW_ALLOCATOR_GATE_RECEIPT_NAME = "vita-raw-allocator-gate.json"
 RAW_ALLOCATOR_GATE_RAW_SYMBOLS = (
@@ -228,6 +261,18 @@ LUA53_DEAD_RAW_RELOCATIONS = (
     {
         "function": "l_alloc", "symbol": "realloc",
         "type": "R_ARM_THM_JUMP24", "count": 1,
+    },
+)
+# ISAAC_VITA_LUA_CORE_ARM=ON (-marm): the same two edges in ARM state; mirrors
+# LUA_EXPECTED_RAW_RELOCATIONS_ARM in recomp/vita/vita_raw_allocator_gate.py.
+LUA53_DEAD_RAW_RELOCATIONS_ARM = (
+    {
+        "function": "l_alloc", "symbol": "free",
+        "type": "R_ARM_CALL", "count": 1,
+    },
+    {
+        "function": "l_alloc", "symbol": "realloc",
+        "type": "R_ARM_JUMP24", "count": 1,
     },
 )
 LOADING_SPECIALIST_RELATIVE_PATH = (
@@ -1054,6 +1099,7 @@ def cmake_configure_command(
     png_native_unfilter: bool,
     texture_churn_profile: bool,
     game_log_batch: bool,
+    game_log_async: bool,
     continue_overlay: bool,
     texel_oom_diagnostic: bool,
     texel_scratch: bool,
@@ -1078,6 +1124,11 @@ def cmake_configure_command(
     stable_30_presentation: bool = False,
     laser_ring_shadow_skip: bool = False,
     ogg_queue_emergency: bool = False,
+    runtime_settings: bool = False,
+    manager_settings_ui: bool = False,
+    manager_save_gamestate: bool = False,
+    manager_ui2: bool = False,
+    manager_ui2_game_skin: bool = False,
 ) -> list[str]:
     on_off = lambda value: "ON" if value else "OFF"
     lua_source_value = _lua_source_option_value(lua, lua_source)
@@ -1103,6 +1154,10 @@ def cmake_configure_command(
         # the value even for a reused build directory so an ambient cache
         # cannot silently select that A/B variant.
         "-DISAAC_VITA_GUEST_STACK_GUARD=ON",
+        # The overflow pool size is a direct-CMake STRING knob (release caches
+        # may raise it); this wrapper always builds the shipped default and
+        # pins a reused cache to it so an ambient value cannot leak in.
+        "-DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x007d5000",
         # Direct CMake keeps the narrow game-compatibility edge opt-in.  The
         # physical-hardware profile always selects it and pins reused caches.
         "-DISAAC_VITA_ANM2_MISSING_LAYER_GUARD=ON",
@@ -1156,6 +1211,7 @@ def cmake_configure_command(
         f"-DISAAC_VITA_PNG_NATIVE_UNFILTER={on_off(png_native_unfilter)}",
         f"-DISAAC_VITA_TEXTURE_CHURN_PROFILE={on_off(texture_churn_profile)}",
         f"-DISAAC_VITA_GAME_LOG_BATCH={on_off(game_log_batch)}",
+        f"-DISAAC_VITA_GAME_LOG_ASYNC={on_off(game_log_async)}",
         f"-DISAAC_VITA_CONTINUE_OVERLAY={on_off(continue_overlay)}",
         # The original-Vita effect policy remains an explicit experimental
         # profile until its combined hardware A/B is accepted.  Pin OFF even
@@ -1183,6 +1239,11 @@ def cmake_configure_command(
         "-DISAAC_VITA_FULLSPEED_SCHEDULER=OFF",
         f"-DISAAC_VITA_STABLE_30_PRESENTATION="
         f"{on_off(stable_30_presentation)}",
+        f"-DISAAC_VITA_RUNTIME_SETTINGS={on_off(runtime_settings)}",
+        f"-DISAAC_VITA_MANAGER_SETTINGS_UI={on_off(manager_settings_ui)}",
+        f"-DISAAC_VITA_MANAGER_SAVE_GAMESTATE={on_off(manager_save_gamestate)}",
+        f"-DISAAC_VITA_MANAGER_UI2={on_off(manager_ui2)}",
+        f"-DISAAC_VITA_MANAGER_UI2_GAME_SKIN={on_off(manager_ui2_game_skin)}",
         "-DISAAC_VITA_GUEST_LOOKUP_CACHE=OFF",
         # Full IAT registration authenticates both hot sync IDs before use.
         # Canonical physical builds select this CPU-only dispatch shortcut.
@@ -1391,7 +1452,28 @@ def _verify_raw_allocator_lua_archive(
     record: object,
     *,
     archive_input: object,
+    core_arm: bool = False,
+    finalizer_pace: bool = False,
+    integer2str: bool = False,
 ) -> int:
+    dead_relocations = (
+        LUA53_DEAD_RAW_RELOCATIONS_ARM if core_arm else LUA53_DEAD_RAW_RELOCATIONS
+    )
+    # ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON compiles lgc.c from the derived
+    # <build>/lua53-gc-finalizer-pace/lgc.c; the gate (lua_compile_closure)
+    # verifies that derivation and adds its derived_sha256 to that one member
+    # row only, so exactly lgc.c carries the key when the knob is ON.
+    # ISAAC_VITA_LUA_INTEGER2STR=ON does the same for lobject.c
+    # (<build>/lua53-integer2str/lobject.c); each knob owns its one member.
+    derived_names: set[str] = set()
+    if finalizer_pace:
+        derived_names.add("lgc.c")
+    if integer2str:
+        derived_names.add("lobject.c")
+    member_keys = {
+        "source", "source_sha256", "object", "member", "size",
+        "sha256", "raw_relocations",
+    }
     if not isinstance(record, dict) or set(record) != {
         "path", "size", "sha256", "manifest_sha256", "source_set_sha256",
         "source_count", "member_count", "members", "allocator_policy",
@@ -1421,11 +1503,14 @@ def _verify_raw_allocator_lua_archive(
     object_paths: set[str] = set()
     member_names: set[str] = set()
     for row, (name, source_sha256) in zip(members, c_records):
-        if not isinstance(row, dict) or set(row) != {
-            "source", "source_sha256", "object", "member", "size",
-            "sha256", "raw_relocations",
-        }:
+        derived = name in derived_names
+        expected_keys = member_keys | {"derived_sha256"} if derived else member_keys
+        if not isinstance(row, dict) or set(row) != expected_keys:
             raise BuildError("raw allocator gate Lua member row is malformed")
+        if derived and not _is_sha256(row.get("derived_sha256")):
+            raise BuildError(
+                f"raw allocator gate Lua derived {name} identity is malformed"
+            )
         logical_source = f"{LUA53_LOGICAL_SOURCE_PREFIX}/{name}"
         logical_object = (
             f"{RAW_ALLOCATOR_GATE_LOGICAL_OBJECT_PREFIX}"
@@ -1433,7 +1518,7 @@ def _verify_raw_allocator_lua_archive(
         )
         member_name = name + ".obj"
         expected_relocations = (
-            list(LUA53_DEAD_RAW_RELOCATIONS) if name == "lauxlib.c" else []
+            list(dead_relocations) if name == "lauxlib.c" else []
         )
         if (
             row.get("source") != logical_source
@@ -1455,7 +1540,7 @@ def _verify_raw_allocator_lua_archive(
     expected_policy = {
         "required_final_symbol": LUA53_REQUIRED_FINAL_SYMBOL,
         "discarded_final_symbols": list(LUA53_DISCARDED_ALLOCATOR_SYMBOLS),
-        "dead_raw_relocations": list(LUA53_DEAD_RAW_RELOCATIONS),
+        "dead_raw_relocations": list(dead_relocations),
     }
     if record.get("allocator_policy") != expected_policy:
         raise BuildError("raw allocator gate Lua allocator policy changed")
@@ -1620,7 +1705,10 @@ def verify_raw_allocator_gate(
     lua_object_count = 0
     if lua_enabled:
         lua_object_count = _verify_raw_allocator_lua_archive(
-            closure["lua_archive"], archive_input=inputs["lua_archive"]
+            closure["lua_archive"], archive_input=inputs["lua_archive"],
+            core_arm=_cache_bool(cache, "ISAAC_VITA_LUA_CORE_ARM"),
+            finalizer_pace=_cache_bool(cache, "ISAAC_VITA_LUA_GC_FINALIZER_PACE"),
+            integer2str=_cache_bool(cache, "ISAAC_VITA_LUA_INTEGER2STR"),
         )
     if (
         receipt.get("source_count") != len(sources) + lua_object_count
@@ -1760,6 +1848,7 @@ def verify_package(
     artifacts: dict[str, Path],
     *,
     audio: bool = False,
+    manager_ui2: bool = False,
 ) -> None:
     if artifacts["ELF"].read_bytes()[:4] != b"\x7fELF":
         raise BuildError(f"built executable is not ELF: {artifacts['ELF']}")
@@ -1792,6 +1881,10 @@ def verify_package(
             }
             if audio:
                 expected.add("alsoft.conf")
+            if manager_ui2:
+                expected.update(
+                    member for member, unused_source in VPK_MANAGER_UI2_ASSETS
+                )
             if names != expected:
                 missing = sorted(expected - names)
                 unexpected = sorted(names - expected)
@@ -1804,6 +1897,10 @@ def verify_package(
             packaged_manager_license = package.read(VPK_MANAGER_LICENSE_MEMBER)
             packaged_pe = package.read("isaac-ng.exe.unpacked.exe")
             packaged_audio_config = package.read("alsoft.conf") if audio else None
+            packaged_manager_ui2 = {
+                member: package.read(member)
+                for member, unused_source in VPK_MANAGER_UI2_ASSETS
+            } if manager_ui2 else {}
             livearea_members = tuple(
                 name
                 for name in member_names
@@ -1849,6 +1946,13 @@ def verify_package(
         if packaged_audio_config != audio_config.read_bytes():
             raise BuildError(
                 "VPK alsoft.conf differs from recomp/vita/alsoft.conf"
+            )
+    for member, source in VPK_MANAGER_UI2_ASSETS if manager_ui2 else ():
+        if packaged_manager_ui2[member] != _regular_file(
+                source, f"manager UI2 asset {member}").read_bytes():
+            raise BuildError(
+                f"VPK {member} differs from recomp/vita/"
+                f"{source.relative_to(VITA_SOURCE_DIR).as_posix()}"
             )
     for member, expected_size, expected_sha256 in VPK_LIVEAREA_ASSETS:
         payload = packaged_livearea[member]
@@ -1953,6 +2057,7 @@ def validate_cmake_contract(
     png_native_unfilter: bool,
     texture_churn_profile: bool,
     game_log_batch: bool,
+    game_log_async: bool,
     continue_overlay: bool,
     texel_oom_diagnostic: bool,
     texel_scratch: bool,
@@ -1977,6 +2082,11 @@ def validate_cmake_contract(
     stable_30_presentation: bool = False,
     laser_ring_shadow_skip: bool = False,
     ogg_queue_emergency: bool = False,
+    runtime_settings: bool = False,
+    manager_settings_ui: bool = False,
+    manager_save_gamestate: bool = False,
+    manager_ui2: bool = False,
+    manager_ui2_game_skin: bool = False,
 ) -> dict[str, object]:
     """Prove that CMake used the requested feature/base/heap contract."""
 
@@ -1985,6 +2095,7 @@ def validate_cmake_contract(
         "CMAKE_BUILD_TYPE": "Release",
         "ISAAC_GUEST_BASE": f"0x{GUEST_BASE:08x}",
         "ISAAC_VITA_HEAP_MB": str(heap_mb),
+        "ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES": "0x007d5000",
         "SOURCE_DATE_EPOCH": str(source_date_epoch),
     }
     for key, expected in expected_text.items():
@@ -2026,6 +2137,7 @@ def validate_cmake_contract(
         "ISAAC_VITA_PNG_NATIVE_UNFILTER": png_native_unfilter,
         "ISAAC_VITA_TEXTURE_CHURN_PROFILE": texture_churn_profile,
         "ISAAC_VITA_GAME_LOG_BATCH": game_log_batch,
+        "ISAAC_VITA_GAME_LOG_ASYNC": game_log_async,
         "ISAAC_VITA_CONTINUE_OVERLAY": continue_overlay,
         "ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE": False,
         "ISAAC_VITA_RENDERFRAME_FASTPATH": False,
@@ -2045,6 +2157,11 @@ def validate_cmake_contract(
         "ISAAC_VITA_WORLD_SEAM_DIAG": world_seam_diag,
         "ISAAC_VITA_FULLSPEED_SCHEDULER": False,
         "ISAAC_VITA_STABLE_30_PRESENTATION": stable_30_presentation,
+        "ISAAC_VITA_RUNTIME_SETTINGS": runtime_settings,
+        "ISAAC_VITA_MANAGER_SETTINGS_UI": manager_settings_ui,
+        "ISAAC_VITA_MANAGER_SAVE_GAMESTATE": manager_save_gamestate,
+        "ISAAC_VITA_MANAGER_UI2": manager_ui2,
+        "ISAAC_VITA_MANAGER_UI2_GAME_SKIN": manager_ui2_game_skin,
         "ISAAC_VITA_GUEST_LOOKUP_CACHE": False,
         "ISAAC_VITA_SYNC_IMPORT_FASTPATH": True,
         "ISAAC_VITA_TEXEL_OOM_DIAGNOSTIC": texel_oom_diagnostic,
@@ -3147,6 +3264,67 @@ def _argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--runtime-settings",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "read ux0:/data/isaacr001/port.ini once at boot: fps_lock "
+            "becomes the fullspeed scheduler's non-full admission duty when "
+            "that scheduler is compiled, remap keys are parsed and reported, "
+            "and the ISAAC VITA SETTINGS receipt line is logged; requires "
+            "--kage, incompatible with --io-profile (default: disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--manager-settings-ui",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "add the ISAAC SETTINGS page to the LiveArea manager (Start on "
+            "its home screen): FPS LOCK 60/45/40/30 saved to "
+            "ux0:/data/isaacr001/port.ini with DEFAULTS and UNDO through "
+            ".manager-backups/port-NNNN.ini; requires --runtime-settings "
+            "(default: disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--manager-save-gamestate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "the LiveArea manager backs up and restores gamestateN.dat (the "
+            "run in progress) together with persistentgamedataN.dat under "
+            "one .manager-backups/slotN-NNNN index; manager-only, no game "
+            "change (default: disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--manager-ui2",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "the LiveArea manager's list UI: pages HOME / MODS / "
+            "SAVES / SETTINGS / ACHIEVEMENTS / CONTROLS / ABOUT in a DejaVu "
+            "font with Cyrillic, themes game/dark/light and lang auto/en/ru "
+            "in ux0:/data/isaacr001/manager.ini; ships three font atlases "
+            "under manager/ in the VPK; manager-only, no game change; "
+            "requires --manager-settings-ui (default: disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--manager-ui2-game-skin",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "the manager UI2's game theme: the game's own menu sheets, button "
+            "glyphs and Team Meat fonts read at run time from "
+            "ux0:/data/isaacr001/resources/packed (nothing of the game is "
+            "packaged; the light theme and a status line when they are "
+            "missing); manager-only, no game change; requires --manager-ui2 "
+            "(default: disabled)"
+        ),
+    )
+    parser.add_argument(
         "--stable-30-presentation",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -3181,6 +3359,16 @@ def _argument_parser() -> argparse.ArgumentParser:
         help=(
             "flush the exact guest INFO logger every eight records while "
             "keeping WARN/ERROR/ASSERT synchronous (default: disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--game-log-async",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "hold the guest's log.txt as a host byte ring appended by one "
+            "worker thread; INFO flushes return without storage I/O, "
+            "WARN/ERROR/ASSERT flushes append synchronously (default: disabled)"
         ),
     )
     parser.add_argument(
@@ -3656,6 +3844,28 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         )
     if args.stable_30_presentation and not args.kage:
         raise BuildError("--stable-30-presentation requires --kage")
+    if args.runtime_settings and not args.kage:
+        raise BuildError("--runtime-settings requires --kage")
+    if args.runtime_settings and args.io_profile:
+        raise BuildError(
+            "--runtime-settings cannot be combined with --io-profile "
+            "(port.ini is opened before the io-profile wrappers initialise)"
+        )
+    if args.manager_settings_ui and not args.runtime_settings:
+        raise BuildError(
+            "--manager-settings-ui requires --runtime-settings "
+            "(the game must read the port.ini the manager writes)"
+        )
+    if args.manager_ui2 and not args.manager_settings_ui:
+        raise BuildError(
+            "--manager-ui2 requires --manager-settings-ui "
+            "(UI2 reuses the settings page model)"
+        )
+    if args.manager_ui2_game_skin and not args.manager_ui2:
+        raise BuildError(
+            "--manager-ui2-game-skin requires --manager-ui2 "
+            "(the game skin draws the UI2 pages)"
+        )
     if args.laser_ring_shadow_skip and not args.kage:
         raise BuildError("--laser-ring-shadow-skip requires --kage")
     if args.audio_stream_receipt and (not args.kage or not args.audio):
@@ -3688,6 +3898,10 @@ def _validate_arguments(args: argparse.Namespace) -> None:
             ("--texture-churn-profile", args.texture_churn_profile),
             ("--sim-cadence-receipt", args.sim_cadence_receipt),
             ("--stable-30-presentation", args.stable_30_presentation),
+            ("--runtime-settings", args.runtime_settings),
+            ("--manager-settings-ui", args.manager_settings_ui),
+            ("--manager-ui2", args.manager_ui2),
+            ("--manager-ui2-game-skin", args.manager_ui2_game_skin),
             ("--laser-ring-shadow-skip", args.laser_ring_shadow_skip),
             ("--audio-stream-receipt", args.audio_stream_receipt),
             ("--world-seam-diag", args.world_seam_diag),
@@ -4172,6 +4386,7 @@ def _self_test() -> None:
             png_native_unfilter=True,
             texture_churn_profile=False,
             game_log_batch=True,
+            game_log_async=False,
             continue_overlay=True,
             texel_oom_diagnostic=True,
             texel_scratch=True,
@@ -4207,6 +4422,7 @@ def _self_test() -> None:
             "-DISAAC_VITA_PNG_NATIVE_UNFILTER=ON",
             "-DISAAC_VITA_TEXTURE_CHURN_PROFILE=OFF",
             "-DISAAC_VITA_GAME_LOG_BATCH=ON",
+            "-DISAAC_VITA_GAME_LOG_ASYNC=OFF",
             "-DISAAC_VITA_CONTINUE_OVERLAY=ON",
             "-DISAAC_VITA_ORIGINAL_EFFECTS_PROFILE=OFF",
             "-DISAAC_VITA_RENDERFRAME_FASTPATH=OFF",
@@ -4226,6 +4442,11 @@ def _self_test() -> None:
             "-DISAAC_VITA_WORLD_SEAM_DIAG=OFF",
             "-DISAAC_VITA_FULLSPEED_SCHEDULER=OFF",
             "-DISAAC_VITA_STABLE_30_PRESENTATION=OFF",
+            "-DISAAC_VITA_RUNTIME_SETTINGS=OFF",
+            "-DISAAC_VITA_MANAGER_SETTINGS_UI=OFF",
+            "-DISAAC_VITA_MANAGER_SAVE_GAMESTATE=OFF",
+            "-DISAAC_VITA_MANAGER_UI2=OFF",
+            "-DISAAC_VITA_MANAGER_UI2_GAME_SKIN=OFF",
             "-DISAAC_VITA_GUEST_LOOKUP_CACHE=OFF",
             "-DISAAC_VITA_SYNC_IMPORT_FASTPATH=ON",
             "-DISAAC_VITA_TEXEL_OOM_DIAGNOSTIC=ON",
@@ -4287,6 +4508,7 @@ def _self_test() -> None:
             png_native_unfilter=False,
             texture_churn_profile=True,
             game_log_batch=False,
+            game_log_async=False,
             continue_overlay=False,
             texel_oom_diagnostic=False,
             texel_scratch=False,
@@ -4348,6 +4570,7 @@ def _self_test() -> None:
             png_native_unfilter=False,
             texture_churn_profile=False,
             game_log_batch=False,
+            game_log_async=False,
             continue_overlay=False,
             texel_oom_diagnostic=True,
             texel_scratch=True,
@@ -4364,6 +4587,52 @@ def _self_test() -> None:
             release=True,
             heap_terminal_fastpath=True,
         )
+        # K2c: the manager game skin is forwarded as given and OFF otherwise.
+        assert "-DISAAC_VITA_MANAGER_UI2_GAME_SKIN=OFF" in rollback_command
+        skin_command = cmake_configure_command(
+            "cmake",
+            root / "sdk",
+            root / "sdk/share/vita.toolchain.cmake",
+            pe_path,
+            generated,
+            root / "build-manager-skin",
+            heap_mb=81,
+            kage=True,
+            loading_specialist=False,
+            audio=False,
+            openal_pool=True,
+            io_profile=False,
+            archive_file_cache=False,
+            archive_validation_skip=False,
+            archive_validation_receipt=False,
+            fios_cache=False,
+            crt_seek_shadow=False,
+            continue_profile=False,
+            png_decode_profile=False,
+            png_native_unfilter=False,
+            texture_churn_profile=False,
+            game_log_batch=False,
+            game_log_async=False,
+            continue_overlay=False,
+            texel_oom_diagnostic=False,
+            texel_scratch=False,
+            texture_align8_policy=False,
+            anm2_scratch=False,
+            fxlayers_null_rollback=False,
+            fxray_alpha_mask=False,
+            heap_ledger_memblock=False,
+            heap_ledger_backshift=False,
+            heap_overflow_mspace=False,
+            room_entry_slab=False,
+            room_entry_hybrid=False,
+            source_date_epoch=1_700_000_000,
+            release=True,
+            manager_ui2=True,
+            manager_ui2_game_skin=True,
+        )
+        assert skin_command.count("-DISAAC_VITA_MANAGER_UI2_GAME_SKIN=ON") == 1
+        assert "-DISAAC_VITA_MANAGER_UI2_GAME_SKIN=OFF" not in skin_command
+        assert skin_command.count("-DISAAC_VITA_MANAGER_UI2=ON") == 1
         assert rollback_command.count(
             "-DISAAC_VITA_HEAP_TERMINAL_FASTPATH=ON"
         ) == 1
@@ -4377,6 +4646,7 @@ def _self_test() -> None:
         assert "-DISAAC_VITA_PNG_DECODE_PROFILE=OFF" in rollback_command
         assert "-DISAAC_VITA_PNG_NATIVE_UNFILTER=OFF" in rollback_command
         assert "-DISAAC_VITA_GAME_LOG_BATCH=OFF" in rollback_command
+        assert "-DISAAC_VITA_GAME_LOG_ASYNC=OFF" in rollback_command
         assert "-DISAAC_VITA_CONTINUE_OVERLAY=OFF" in rollback_command
 
         elf = root / "isaac_first_arm_fault"
@@ -5064,6 +5334,39 @@ def _self_test() -> None:
         else:
             raise AssertionError("misspelled OpenAL VPK member was accepted")
 
+        # Manager UI2 members: required with manager_ui2, refused without,
+        # and compared byte for byte with the tracked sources.
+        def write_fixture_ui2(mutate: str | None = None) -> None:
+            vpk.unlink()
+            with zipfile.ZipFile(
+                    vpk, "w", compression=zipfile.ZIP_STORED) as package:
+                package.writestr("sce_sys/param.sfo", b"fixture sfo")
+                package.writestr("eboot.bin", eboot.read_bytes())
+                package.writestr(
+                    "isaac-ng.exe.unpacked.exe", pe_path.read_bytes())
+                write_fixture_livearea(package)
+                for member, source in VPK_MANAGER_UI2_ASSETS:
+                    payload = source.read_bytes()
+                    if member == mutate:
+                        payload += b"mutated"
+                    package.writestr(member, payload)
+
+        write_fixture_ui2()
+        verify_package(pe_path, artifacts, manager_ui2=True)
+        try:
+            verify_package(pe_path, artifacts)
+        except BuildError as exc:
+            assert "unexpected=['licenses/dejavu.txt', " in str(exc)
+        else:
+            raise AssertionError("manager UI2 members accepted with UI2 OFF")
+        write_fixture_ui2(mutate="manager/font-body-16.imf")
+        try:
+            verify_package(pe_path, artifacts, manager_ui2=True)
+        except BuildError as exc:
+            assert "VPK manager/font-body-16.imf differs" in str(exc)
+        else:
+            raise AssertionError("mutated manager UI2 atlas was accepted")
+
         vpk.unlink()
         with zipfile.ZipFile(vpk, "w", compression=zipfile.ZIP_STORED) as package:
             package.writestr("sce_sys/param.sfo", b"fixture sfo")
@@ -5124,6 +5427,7 @@ def _self_test() -> None:
                 f"ISAAC_GENERATED_DIR:PATH={generated}",
                 "ISAAC_GUEST_BASE:STRING=0x98000000",
                 "ISAAC_VITA_HEAP_MB:STRING=81",
+                "ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES:STRING=0x007d5000",
                 "ISAAC_VITA_SCAFFOLD_ONLY:BOOL=OFF",
                 "ISAAC_VITA_GUEST_STACK_GUARD:BOOL=ON",
                 "ISAAC_VITA_ANM2_MISSING_LAYER_GUARD:BOOL=ON",
@@ -5154,6 +5458,7 @@ def _self_test() -> None:
                 "ISAAC_VITA_PNG_NATIVE_UNFILTER:BOOL=ON",
                 "ISAAC_VITA_TEXTURE_CHURN_PROFILE:BOOL=OFF",
                 "ISAAC_VITA_GAME_LOG_BATCH:BOOL=ON",
+                "ISAAC_VITA_GAME_LOG_ASYNC:BOOL=OFF",
                 "ISAAC_VITA_CONTINUE_OVERLAY:BOOL=ON",
                 "ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE:BOOL=OFF",
                 "ISAAC_VITA_RENDERFRAME_FASTPATH:BOOL=OFF",
@@ -5181,6 +5486,11 @@ def _self_test() -> None:
                 "ISAAC_VITA_VITAGL_STOCK_REFERENCE:BOOL=OFF",
                 "ISAAC_VITA_FULLSPEED_SCHEDULER:BOOL=OFF",
                 "ISAAC_VITA_STABLE_30_PRESENTATION:BOOL=OFF",
+                "ISAAC_VITA_RUNTIME_SETTINGS:BOOL=OFF",
+                "ISAAC_VITA_MANAGER_SETTINGS_UI:BOOL=OFF",
+                "ISAAC_VITA_MANAGER_SAVE_GAMESTATE:BOOL=OFF",
+                "ISAAC_VITA_MANAGER_UI2:BOOL=OFF",
+                "ISAAC_VITA_MANAGER_UI2_GAME_SKIN:BOOL=OFF",
                 "ISAAC_VITA_GUEST_LOOKUP_CACHE:BOOL=OFF",
                 "ISAAC_VITA_SYNC_IMPORT_FASTPATH:BOOL=ON",
                 "ISAAC_VITA_TEXEL_OOM_DIAGNOSTIC:BOOL=ON",
@@ -5223,6 +5533,7 @@ def _self_test() -> None:
             png_native_unfilter=True,
             texture_churn_profile=False,
             game_log_batch=True,
+            game_log_async=False,
             continue_overlay=True,
             texel_oom_diagnostic=True,
             texel_scratch=True,
@@ -5276,6 +5587,7 @@ def _self_test() -> None:
             "png_native_unfilter": True,
             "texture_churn_profile": True,
             "game_log_batch": True,
+            "game_log_async": False,
             "continue_overlay": True,
             "texel_oom_diagnostic": True,
             "texel_scratch": True,
@@ -5363,6 +5675,7 @@ def _self_test() -> None:
                 png_native_unfilter=True,
                 texture_churn_profile=False,
                 game_log_batch=True,
+                game_log_async=False,
                 continue_overlay=True,
                 texel_oom_diagnostic=True,
                 texel_scratch=True,
@@ -5406,6 +5719,7 @@ def _self_test() -> None:
                 png_native_unfilter=True,
                 texture_churn_profile=False,
                 game_log_batch=True,
+                game_log_async=False,
                 continue_overlay=True,
                 texel_oom_diagnostic=True,
                 texel_scratch=True,
@@ -5447,6 +5761,7 @@ def _self_test() -> None:
             png_native_unfilter=True,
             texture_churn_profile=False,
             game_log_batch=True,
+            game_log_async=False,
             continue_overlay=True,
             texel_oom_diagnostic=True,
             texel_scratch=True,
@@ -6294,9 +6609,104 @@ def _self_test() -> None:
         assert "--stable-30-presentation requires --kage" in str(exc)
     else:
         raise AssertionError("stable30 presentation accepted without KAGE")
+    assert not defaults.runtime_settings
+    settings_args = parser.parse_args([
+        "--pe", "fixture", "--vitasdk", "sdk", "--kage",
+        "--runtime-settings",
+    ])
+    assert settings_args.runtime_settings
+    _validate_arguments(settings_args)
+    settings_without_kage = parser.parse_args([
+        "--pe", "fixture", "--vitasdk", "sdk",
+        "--no-kage", "--runtime-settings",
+    ])
+    try:
+        _validate_arguments(settings_without_kage)
+    except BuildError as exc:
+        assert "--runtime-settings requires --kage" in str(exc)
+    else:
+        raise AssertionError("runtime settings accepted without KAGE")
+    settings_with_io_profile = parser.parse_args([
+        "--pe", "fixture", "--vitasdk", "sdk", "--kage",
+        "--runtime-settings", "--io-profile",
+    ])
+    try:
+        _validate_arguments(settings_with_io_profile)
+    except BuildError as exc:
+        assert "--runtime-settings cannot be combined with --io-profile" in \
+            str(exc)
+    else:
+        raise AssertionError("runtime settings accepted with the io profile")
+    assert not defaults.manager_settings_ui
+    assert parser.parse_args(["--manager-settings-ui"]).manager_settings_ui
+    settings_args.manager_settings_ui = True
+    _validate_arguments(settings_args)
+    manager_ui_without_runtime = parser.parse_args([
+        "--pe", "fixture", "--vitasdk", "sdk", "--kage",
+        "--manager-settings-ui",
+    ])
+    try:
+        _validate_arguments(manager_ui_without_runtime)
+    except BuildError as exc:
+        assert "--manager-settings-ui requires --runtime-settings" in str(exc)
+    else:
+        raise AssertionError(
+            "manager settings page accepted without runtime settings"
+        )
+    # WP2: manager-only knob, no coupling to the game knobs, default OFF.
+    assert not defaults.manager_save_gamestate
+    assert parser.parse_args(["--manager-save-gamestate"]).manager_save_gamestate
+    assert not parser.parse_args(
+        ["--no-manager-save-gamestate"]).manager_save_gamestate
+    gamestate_args = parser.parse_args([
+        "--pe", "fixture", "--vitasdk", "sdk", "--kage",
+        "--manager-save-gamestate",
+    ])
+    _validate_arguments(gamestate_args)
+    gamestate_args.runtime_settings = False
+    gamestate_args.manager_settings_ui = False
+    _validate_arguments(gamestate_args)
+    # K2a manager UI2: default OFF, needs the settings page (whose own
+    # requirement chain reaches --runtime-settings and --kage).
+    assert not defaults.manager_ui2
+    assert parser.parse_args(["--manager-ui2"]).manager_ui2
+    assert not parser.parse_args(["--no-manager-ui2"]).manager_ui2
+    # settings_args (--kage --runtime-settings, manager_settings_ui set
+    # above) is reused so the runtime/settings flag spellings keep their
+    # pinned counts in test_vita_runtime_settings.py.
+    assert settings_args.manager_settings_ui
+    settings_args.manager_ui2 = True
+    _validate_arguments(settings_args)
+    settings_args.manager_settings_ui = False
+    try:
+        _validate_arguments(settings_args)
+    except BuildError as exc:
+        assert "--manager-ui2 requires --manager-settings-ui" in str(exc)
+    else:
+        raise AssertionError("manager UI2 accepted without the settings page")
+    settings_args.manager_settings_ui = True
+    # K2c manager UI2 game skin: default OFF, needs --manager-ui2 (and
+    # through it the settings page, --runtime-settings and --kage).
+    assert not defaults.manager_ui2_game_skin
+    assert parser.parse_args(
+        ["--manager-ui2-game-skin"]).manager_ui2_game_skin
+    assert not parser.parse_args(
+        ["--no-manager-ui2-game-skin"]).manager_ui2_game_skin
+    settings_args.manager_ui2_game_skin = True
+    _validate_arguments(settings_args)
+    settings_args.manager_ui2 = False
+    try:
+        _validate_arguments(settings_args)
+    except BuildError as exc:
+        assert "--manager-ui2-game-skin requires --manager-ui2" in str(exc)
+    else:
+        raise AssertionError("manager game skin accepted without manager UI2")
+    settings_args.manager_ui2_game_skin = False
+    settings_args.manager_ui2 = False
     assert not defaults.audio_stream_receipt
     assert not defaults.world_seam_diag
     assert not defaults.game_log_batch
+    assert not defaults.game_log_async
     assert not defaults.continue_overlay
     assert defaults.texel_oom_diagnostic
     assert defaults.texel_scratch
@@ -6460,6 +6870,10 @@ def _self_test() -> None:
         ["--pe", "fixture", "--vitasdk", "sdk", "--game-log-batch"]
     )
     assert enabled_log_batch.game_log_batch
+    enabled_log_async = parser.parse_args(
+        ["--pe", "fixture", "--vitasdk", "sdk", "--game-log-async"]
+    )
+    assert enabled_log_async.game_log_async
     enabled_audio_receipt = parser.parse_args(
         ["--pe", "fixture", "--vitasdk", "sdk", "--audio-stream-receipt"]
     )
@@ -6518,6 +6932,9 @@ def _self_test() -> None:
     cmake_source = (VITA_SOURCE_DIR / "CMakeLists.txt").read_text(encoding="utf-8")
     assert 'option(ISAAC_VITA_CRT_SEEK_SHADOW' in cmake_source
     assert cmake_source.count("ISAAC_VITA_CRT_SEEK_SHADOW=1") == 1
+    assert 'option(ISAAC_VITA_GAME_LOG_ASYNC' in cmake_source
+    assert cmake_source.count("ISAAC_VITA_GAME_LOG_ASYNC=1") == 1
+    assert cmake_source.count("host_vita_game_log.c") == 3
     assert cmake_source.count(
         "ISAAC_VITA_CRT_SEEK_SHADOW requires ISAAC_VITA_ARCHIVE_FILE_CACHE=ON"
     ) == 1
@@ -6528,12 +6945,21 @@ def _self_test() -> None:
         "if(ISAAC_VITA_FXLAYERS_NULL_ROLLBACK OR\n"
         "     ISAAC_VITA_HEAP_OVERFLOW_MSPACE)"
     ) in cmake_source
-    assert cmake_source.count("host_vita_heap_overflow_mspace.c") == 1
+    # The pool-size knob names the raw/slab/external sources once more, in its
+    # one non-default set_property; the feature definitions stay single.
+    assert cmake_source.count("host_vita_heap_overflow_mspace.c") == 2
+    assert 'set(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES "0x007d5000" CACHE STRING' in cmake_source
+    assert cmake_source.count("isaac_validate_heap_overflow_mspace_bytes(") == 1
+    assert cmake_source.count(
+        "ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES="
+        "${ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES_NORMALIZED}U"
+    ) == 1
+    assert cmake_source.count("if(NOT ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES_IS_DEFAULT)") == 1
     assert 'option(ISAAC_VITA_ROOM_ENTRY_SLAB' in cmake_source
-    assert cmake_source.count("host_vita_room_entry_slab.c") == 2
+    assert cmake_source.count("host_vita_room_entry_slab.c") == 3
     assert cmake_source.count("ISAAC_VITA_ROOM_ENTRY_SLAB=1") == 1
     assert 'option(ISAAC_VITA_ROOM_ENTRY_HYBRID' in cmake_source
-    assert cmake_source.count("host_vita_room_entry_external.c") == 1
+    assert cmake_source.count("host_vita_room_entry_external.c") == 2
     assert cmake_source.count("ISAAC_VITA_ROOM_ENTRY_HYBRID=1") == 1
     assert 'option(ISAAC_VITA_ANM2_MISSING_LAYER_GUARD' in cmake_source
     assert (
@@ -6581,8 +7007,15 @@ def _self_test() -> None:
     assert 'option(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH' in cmake_source
     assert cmake_source.count("ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH=1") == 1
     assert 'REGEX "^void sub_005aeb00' in cmake_source
-    assert cmake_source.count("host_vita_archive_miniz_native.c") == 3
+    # The archive tinfl TU is named once in its source list, once in the
+    # MiniZ status comment, once in the PNG scope block and once in the
+    # inflate table memo's set_property (the memo adds its definition to
+    # this TU only; the PNG entry never sees it).
+    assert cmake_source.count("host_vita_archive_miniz_native.c") == 4
     assert cmake_source.count("host_vita_archive_miniz_guest.c") == 3
+    assert 'option(ISAAC_VITA_INFLATE_TABLE_MEMO' in cmake_source
+    assert cmake_source.count("ISAAC_VITA_INFLATE_TABLE_MEMO=1") == 1
+    assert cmake_source.count("host_vita_inflate_table_memo.c") == 2
     assert 'option(ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE' in cmake_source
     assert cmake_source.count("ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE=1") == 1
     assert cmake_source.count("sub_0047fbe0") == 1
@@ -6600,6 +7033,77 @@ def _self_test() -> None:
     assert 'option(ISAAC_VITA_WORLD_SEAM_DIAG' in cmake_source
     assert cmake_source.count("ISAAC_VITA_WORLD_SEAM_DIAG=1") == 1
     assert cmake_source.count("kage_vita_world_seam_diag.c") == 3
+    # port.ini runtime settings: one option, one per-source definition, the
+    # loader named by the source list, the owner list and the nested
+    # scheduler definition, the parser TU by the source list and the owners.
+    assert 'option(ISAAC_VITA_RUNTIME_SETTINGS' in cmake_source
+    assert cmake_source.count("ISAAC_VITA_RUNTIME_SETTINGS=1") == 1
+    # Source list, owner list, nested scheduler definition, build-raster
+    # forwarding, render-scale owner list (2c2602b), debug-overlay owner list:
+    # six mentions of the loader, all inside the block.
+    assert cmake_source.count("host_vita_runtime_settings.c") == 6
+    # The shared parser TU: three times in the runtime block (source list,
+    # owner list, debug-overlay owner list for the debug_overlay key) and once
+    # in the manager's target_sources() (both SELFs compile it).
+    assert cmake_source.count("host_vita_settings_parse.c") == 4
+    assert "ISAAC_VITA_RUNTIME_SETTINGS requires ISAAC_VITA_KAGE=ON" in \
+        cmake_source
+    assert cmake_source.count(
+        "ISAAC_VITA_RUNTIME_SETTINGS AND ISAAC_VITA_IO_PROFILE"
+    ) == 1
+    # Manager settings page: option, FATAL on the runtime knob, the two UI
+    # TUs and the per-target definition named once each inside its if().
+    assert 'option(ISAAC_VITA_MANAGER_SETTINGS_UI' in cmake_source
+    assert cmake_source.count("MANAGER_SETTINGS_UI=1") == 1
+    assert cmake_source.count("manager_settings_ui.c") == 1
+    assert cmake_source.count("manager_settings.c") == 1
+    # One target_sources(isaac_manager ...) per manager knob block: the
+    # settings page, manager UI2 and the UI2 game skin.
+    assert cmake_source.count("target_sources(isaac_manager PRIVATE") == 3
+    assert (
+        "ISAAC_VITA_MANAGER_SETTINGS_UI requires ISAAC_VITA_RUNTIME_SETTINGS=ON"
+        in cmake_source
+    )
+    # Manager UI2 game skin (K1 manager design 8.1 / 8.3): option OFF, FATAL
+    # without UI2, the skin and decoder units and the per-target definition
+    # named once each inside its if().
+    assert 'option(ISAAC_VITA_MANAGER_UI2_GAME_SKIN' in cmake_source
+    assert cmake_source.count("MANAGER_UI2_GAME_SKIN=1") == 1
+    for gameskin_unit in ("manager_skin_game.c", "manager_arch.c",
+                          "manager_png.c", "manager_bmfont.c",
+                          "manager_tinfl.c", "manager_blob_vita.c"):
+        assert cmake_source.count(gameskin_unit) == 1, gameskin_unit
+    assert (
+        "ISAAC_VITA_MANAGER_UI2_GAME_SKIN requires ISAAC_VITA_MANAGER_UI2=ON"
+        in cmake_source
+    )
+    # WP2 save-slot pairs: option OFF, one per-target definition on the
+    # manager (struct layouts in manager_storage.h change under it), never a
+    # per-source list that could miss a TU.
+    assert 'option(ISAAC_VITA_MANAGER_SAVE_GAMESTATE' in cmake_source
+    assert cmake_source.count("ISAAC_VITA_MANAGER_SAVE_GAMESTATE=1") == 1
+    assert cmake_source.count(
+        "target_compile_definitions(isaac_manager PRIVATE\n"
+        "    ISAAC_VITA_MANAGER_SAVE_GAMESTATE=1)"
+    ) == 1
+    # K2a manager UI2: option OFF, FATAL on the settings page, one per-target
+    # definition, the units named once each inside its if(), the VPK asset
+    # list empty OFF and added to both vita_create_vpk() calls.
+    assert 'option(ISAAC_VITA_MANAGER_UI2' in cmake_source
+    assert (
+        "ISAAC_VITA_MANAGER_UI2 requires ISAAC_VITA_MANAGER_SETTINGS_UI=ON"
+        in cmake_source
+    )
+    assert cmake_source.count("MANAGER_UI2=1") == 1
+    for unit in ("manager_font.c", "manager_canvas.c", "manager_theme.c",
+                 "manager_strings.c", "manager_ui.c", "manager_ui_draw.c",
+                 "manager_mods_meta.c", "manager_ini.c",
+                 "manager_assets_vita.c"):
+        assert len(re.findall(
+            rf"^    {re.escape(unit)}\)?$", cmake_source, re.MULTILINE
+        )) == 1, unit
+    assert cmake_source.count("set(ISAAC_VPK_MANAGER_ASSET_FILES)\n") == 1
+    assert cmake_source.count("    ${ISAAC_VPK_MANAGER_ASSET_FILES}\n") == 2
     assert cmake_source.count("sub_002ce770") == 2
     assert 'option(ISAAC_VITA_TRANSIENT_BLOOM_HALF_RES' in cmake_source
     assert cmake_source.count("ISAAC_VITA_TRANSIENT_BLOOM_HALF_RES=1") == 2
@@ -6651,7 +7155,12 @@ def _self_test() -> None:
     assert cmake_source.count("ISAAC_VITA_TEXTURE_CHURN_PROFILE=1") == 1
     assert "one aggregate x record per phase window" in cmake_source
     assert 'option(ISAAC_VITA_OPENAL_POOL' in cmake_source
-    assert cmake_source.count("host_vita_openal_pool.c") == 3
+    # Three source-list uses (AUDIO_ACTIVE sources, the OPENAL_POOL_ACTIVE
+    # define, the raw-allocator exemption) plus the comment that states the
+    # SFX floor preload's KAGE+AUDIO prerequisite.
+    assert cmake_source.count("host_vita_openal_pool.c") == 4, (
+        "host_vita_openal_pool.c: expected 3 source-list uses and the SFX "
+        "floor preload prerequisite comment in recomp/vita/CMakeLists.txt")
     assert cmake_source.count("isaac_vita_raw_allocator_poison.h") == 1
     assert cmake_source.count("vita_raw_allocator_gate.py") == 1
     assert cmake_source.count('"${ISAAC_VITA_READELF}"') == 2
@@ -6802,6 +7311,7 @@ def main(argv: list[str] | None = None) -> int:
             args.png_native_unfilter,
             args.texture_churn_profile,
             args.game_log_batch,
+            args.game_log_async,
             args.continue_overlay,
             args.texel_oom_diagnostic,
             args.texel_scratch,
@@ -6826,6 +7336,11 @@ def main(argv: list[str] | None = None) -> int:
             stable_30_presentation=args.stable_30_presentation,
             laser_ring_shadow_skip=args.laser_ring_shadow_skip,
             ogg_queue_emergency=args.ogg_queue_emergency,
+            runtime_settings=args.runtime_settings,
+            manager_settings_ui=args.manager_settings_ui,
+            manager_save_gamestate=args.manager_save_gamestate,
+            manager_ui2=args.manager_ui2,
+            manager_ui2_game_skin=args.manager_ui2_game_skin,
         )
         print("\n== CMake configure ==", flush=True)
         run_command(configure, environment)
@@ -6852,7 +7367,10 @@ def main(argv: list[str] | None = None) -> int:
             f"closure={raw_allocator_receipt['closure_sha256']}"
         )
         audio_active = bool(args.kage and args.audio)
-        verify_package(pe_path, artifacts, audio=audio_active)
+        verify_package(
+            pe_path, artifacts, audio=audio_active,
+            manager_ui2=args.manager_ui2,
+        )
         linker_map = locate_linker_map(build_dir)
         cache = _read_cmake_cache(build_dir)
         configuration = validate_cmake_contract(
@@ -6875,6 +7393,7 @@ def main(argv: list[str] | None = None) -> int:
             png_native_unfilter=args.png_native_unfilter,
             texture_churn_profile=args.texture_churn_profile,
             game_log_batch=args.game_log_batch,
+            game_log_async=args.game_log_async,
             continue_overlay=args.continue_overlay,
             texel_oom_diagnostic=args.texel_oom_diagnostic,
             texel_scratch=args.texel_scratch,
@@ -6899,6 +7418,11 @@ def main(argv: list[str] | None = None) -> int:
             stable_30_presentation=args.stable_30_presentation,
             laser_ring_shadow_skip=args.laser_ring_shadow_skip,
             ogg_queue_emergency=args.ogg_queue_emergency,
+            runtime_settings=args.runtime_settings,
+            manager_settings_ui=args.manager_settings_ui,
+            manager_save_gamestate=args.manager_save_gamestate,
+            manager_ui2=args.manager_ui2,
+            manager_ui2_game_skin=args.manager_ui2_game_skin,
         )
         toolchain_identity = collect_toolchain_identity(
             cmake_executable=Path(cmake_executable).resolve(),

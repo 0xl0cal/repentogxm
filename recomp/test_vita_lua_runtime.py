@@ -138,12 +138,45 @@ BRIDGE_VARIANTS: dict[str, list[str]] = {
         "/DISAAC_VITA_LUA_NATIVE_INDEX_VERIFY=1",
     ],
     "native-index-noverify": ["/DISAAC_VITA_LUA_NATIVE_INDEX=1"],
+    # ISAAC_VITA_LUA_LOADFILE_RETRY: GNU ld
+    # --wrap=luaL_loadfilex simulated by renaming.  host_vita_lua.c itself
+    # compiles unchanged apart from the rename (BRIDGE_SOURCE_DEFINES); the
+    # oracle adds one transient-fault import through
+    # vita_lua_loadfilex_import (check_loadfile_retry).
+    "loadfile-retry": [
+        "/DISAAC_VITA_LUA_LOADFILE_RETRY=1",
+        "/DISAAC_VITA_LUA_LOADFILE_ORACLE=1",
+        "/DISAAC_VITA_LUA_LOADFILE_RETRY_MAX=3U",
+        # strerror/fopen in the wrapper and the fake kernel (host only)
+        "/D_CRT_SECURE_NO_WARNINGS",
+    ],
 }
 # TUs that join the bridge only under their knob, exactly as
 # recomp/vita/CMakeLists.txt adds them (host_vita_lua_gc.c #errors when it is
 # compiled without one of its features).
 BRIDGE_EXTRA_SOURCES: dict[str, list[Path]] = {
     "gc": [RUNTIME / "host_vita_lua_gc.c"],
+    "loadfile-retry": [RUNTIME / "host_vita_lua_loadfile.c",
+                       RUNTIME / "vita_lua_loadfile_fault_impl.c"],
+}
+# Per-source defines inside a variant: the variant's own list applies to
+# every other bridge source.  host_vita_lua.c gets only the --wrap rename,
+# as recomp/vita/CMakeLists.txt adds nothing else to it.
+LOADFILE_WRAP = "/DluaL_loadfilex=__wrap_luaL_loadfilex"
+BRIDGE_SOURCE_DEFINES: dict[str, dict[str, list[str]]] = {
+    "loadfile-retry": {"host_vita_lua.c": [LOADFILE_WRAP]},
+}
+# Variants that rebuild some pristine Lua objects (GNU ld --wrap simulated
+# by renaming; lauxlib.c's FILE calls go through the fake sceIo kernel).
+LOADFILE_FAULT = RUNTIME / "vita_lua_loadfile_fault.h"
+BRIDGE_LUA_DEFINES: dict[str, dict[str, list[str]]] = {
+    "loadfile-retry": {
+        "lauxlib.c": ["/DVITA_LUA_LOADFILE_FAULT_STDIO=1",
+                      f"/FI{subprocess.list2cmdline([str(LOADFILE_FAULT)])}",
+                      "/DluaL_loadfilex=__real_luaL_loadfilex"],
+        "lbaselib.c": [LOADFILE_WRAP],
+        "loadlib.c": [LOADFILE_WRAP],
+    },
 }
 # Variants that also run with main.lua's VERIFY-trip scenarios armed.
 TRIP_VARIANTS = ("off", "native-index")
@@ -248,6 +281,37 @@ def check_native_index(name: str, on_output: str, verify: bool,
     return stats[-1].group(0)
 
 
+def check_loadfile_retry(outputs: dict[str, str]) -> str:
+    """The loadfile-retry bridge: same __index digest as OFF, one recovered
+    retry through vita_lua_loadfilex_import, the rebase run once per import
+    (two imports, two lookups), and no wrapper text in any other build."""
+    check_digests("normal/loadfile-retry", outputs["off:normal"],
+                  outputs["loadfile-retry:normal"], SCENARIOS)
+    on = outputs["loadfile-retry:normal"]
+    for name, text in outputs.items():
+        if not name.startswith("loadfile-retry:") and "LOADFILE" in text:
+            fail(f"{name}: a build without the knob logged LOADFILE lines")
+    case = re.search(r"^\[loadfile-retry\] bridge import: PASS "
+                     r"rebase_lookups=1,2 dump=([0-9a-f]{8})/\1 opens=2 "
+                     r"fired=1$", on, re.MULTILINE)
+    if not case:
+        fail("loadfile-retry: the bridge import case did not pass")
+    events = [line for line in on.splitlines()
+              if line.startswith("[log] KAGE VITA LUA LOADFILE RETRY: ")]
+    recovered = [line for line in events
+                 if " result=recovered kind=read attempts=2 status=0 " in line
+                 and re.search(r" path=.*main\.lua why=", line)]
+    stats = re.search(
+        r"\[log\] (KAGE VITA LUA LOADFILE STATS: why=bridge-loadfile-retry "
+        r"max=3 .* retries=1 recovered=1 unrecovered=0 changed=0 .*)$",
+        on, re.MULTILINE)
+    banners = on.count("KAGE VITA LUA LOADFILE STATS: why=first-load ")
+    if len(recovered) != 1 or not stats or banners != 1:
+        fail(f"loadfile-retry: receipts {events} stats={bool(stats)} "
+             f"banners={banners}")
+    return stats.group(1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lua-source", type=Path)
@@ -284,20 +348,39 @@ def main() -> int:
         variant_sources = (bridge_sources[:1]
                            + BRIDGE_EXTRA_SOURCES.get(variant, [])
                            + bridge_sources[1:])
-        bridge_compile = " ".join(
-            ["cl", "/nologo", "/std:c11", "/O2", "/W4", "/WX",
-             "/wd4310", *defines, f"/I{quote(source / 'src')}",
-             f"/I{quote(RUNTIME)}", f"/Fo{quote(str(variant_dir) + os.sep)}",
-             "/c"]
-            + [quote(path) for path in variant_sources]
-        )
+        per_source = BRIDGE_SOURCE_DEFINES.get(variant, {})
+        groups: dict[tuple[str, ...], list[Path]] = {}
+        for path in variant_sources:
+            groups.setdefault(tuple(per_source.get(path.name, defines)),
+                              []).append(path)
+        compiles = []
+        for group_defines, paths in groups.items():
+            compiles.append(" ".join(
+                ["cl", "/nologo", "/std:c11", "/O2", "/W4", "/WX",
+                 "/wd4310", *group_defines, f"/I{quote(source / 'src')}",
+                 f"/I{quote(RUNTIME)}",
+                 f"/Fo{quote(str(variant_dir) + os.sep)}", "/c"]
+                + [quote(path) for path in paths]))
+        variant_lua = BRIDGE_LUA_DEFINES.get(variant, {})
+        lua_dir = variant_dir / "lua"
+        if variant_lua:
+            lua_dir.mkdir(parents=True, exist_ok=True)
+        for name, lua_defines in variant_lua.items():
+            compiles.append(" ".join(
+                ["cl", "/nologo", "/std:c11", "/O2", "/W3",
+                 "/D_CRT_SECURE_NO_WARNINGS", *lua_defines,
+                 f"/I{quote(source / 'src')}",
+                 f"/Fo{quote(str(lua_dir) + os.sep)}", "/c",
+                 quote(source / "src" / name)]))
         executable = variant_dir / "vita-lua-runtime-oracle.exe"
         link = " ".join(
-            ["link", "/nologo", f"/out:{quote(executable)}", *lua_objects,
+            ["link", "/nologo", f"/out:{quote(executable)}",
+             *[quote(lua_dir / obj) if Path(obj).stem + ".c" in variant_lua
+               else obj for obj in lua_objects],
              *[quote(variant_dir / f"{path.stem}.obj")
                for path in variant_sources]]
         )
-        variants[variant] = (bridge_compile, link, executable)
+        variants[variant] = (" && ".join(compiles), link, executable)
     data_root = build / "oracle-data"
     mod_root = data_root / "mods" / "836319872"
     core_root = data_root / "resources" / "scripts"
@@ -334,6 +417,7 @@ def main() -> int:
                   outputs["fastdispatch:normal"], SCENARIOS)
     check_digests("normal/gc", outputs["off:normal"],
                   outputs["gc:normal"], SCENARIOS)
+    retry_receipt = check_loadfile_retry(outputs)
     stats = check_native_index("on+verify", outputs["native-index:normal"],
                                verify=True, trip=False)
     stats_plain = check_native_index(
@@ -349,6 +433,9 @@ def main() -> int:
           f"({SCENARIOS} scenarios) and OFF vs ON+VERIFY with the VERIFY trip "
           f"({TRIP_SCENARIOS}); " + stats[len("[log] "):])
     print("PASS: native-index ON without VERIFY: " + stats_plain[len("[log] "):])
+    print("PASS: ISAAC_VITA_LUA_LOADFILE_RETRY bridge import: digest identical "
+          "to OFF, transient read fault recovered, package.path rebased once "
+          "per import; " + retry_receipt)
     print("PASS: native-index VERIFY trip disables the replay: "
           + stats_trip[len("[log] "):])
     if temporary is not None:

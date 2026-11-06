@@ -1,0 +1,41 @@
+# manager_skin_game_host_test frame hashes (FNV-1a of the 960x544 canvas words)
+# over the synthetic install of manager_gameskin_fixtures.py; regenerate with
+# MANAGER_SKIN_GAME_UPDATE=1 after a deliberate skin or layout change.
+01-home-game-en 40faafbd
+02-home-ftp-on-game-en c9706505
+03-box-launch-ftp-game-en 814b486d
+04-mods-game-en 724f01f4
+05-mods-detail-game-en e3048622
+06-box-mods-all-game-en 542625c3
+07-mods-scrolled-game-en 3c9c516e
+08-saves-game-en db8522e2
+09-box-restore-game-en 92e8ea54
+10-saves-all-game-en 3fdd65f2
+11-settings-game-en 00f41b9a
+12-settings-pending-game-en 8054db78
+13-box-discard-game-en 1def2018
+14-achievements-game-en d6a53c6d
+15-controls-game-en 2a1a6779
+16-about-game-en 51a5b2da
+17-home-countdown-game-en f52118ec
+01-home-game-ru c2b5b371
+02-home-ftp-on-game-ru 2da748f4
+03-box-launch-ftp-game-ru c9528420
+04-mods-game-ru bc54d696
+05-mods-detail-game-ru fa25b228
+06-box-mods-all-game-ru 27c68566
+07-mods-scrolled-game-ru a048b6ac
+08-saves-game-ru 2cabeec0
+09-box-restore-game-ru 8d697603
+10-saves-all-game-ru 265ea30a
+11-settings-game-ru e2372a60
+12-settings-pending-game-ru c9322b14
+13-box-discard-game-ru 4a7adc26
+14-achievements-game-ru 8aef40f5
+15-controls-game-ru bead0bb6
+16-about-game-ru fbede266
+17-home-countdown-game-ru 681e65d8
+18-damaged-index-game-en 40faafbd
+20-mods-scan-failed-game-en eb084f55
+19-game-failed-en 8aba085d
+19-game-failed-ru d25abc01

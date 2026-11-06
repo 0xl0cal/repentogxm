@@ -40,11 +40,59 @@
 #include "host_vita_gl.h"
 #include "host_vita_import_id.h"
 
+/* Must-FAIL memo mutants (RENDER60 S2; test legs mutant-memo-no-generation
+ * and mutant-memo-no-name-bytes): the replay TU reads these two hooks
+ * (host_vita_shader_attrib_fastpath.h, end).  NO_GENERATION keys every
+ * entry on a constant generation, so a program-state mutation never empties
+ * the memo; NO_NAME_BYTES uses oracle_memo_hit_no_name_bytes below, the
+ * production attrib_memo_hit minus its byte comparison. */
+#if defined(ORACLE_MUTATE_MEMO_NO_GENERATION) || \
+    defined(ORACLE_MUTATE_MEMO_NO_NAME_BYTES)
+# if !defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+#  error the memo mutants need ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO
+# endif
+#endif
+#if defined(ORACLE_MUTATE_MEMO_NO_GENERATION)
+# define ISAAC_VITA_SHADER_ATTRIB_MEMO_GENERATION 1u
+#endif
+#if defined(ORACLE_MUTATE_MEMO_NO_NAME_BYTES)
+struct attrib_memo_entry;
+static int oracle_memo_hit_no_name_bytes(const struct attrib_memo_entry *entry,
+                                         uint32_t generation, uint32_t self,
+                                         uint32_t program, uint32_t attribs,
+                                         uint32_t count);
+# define ISAAC_VITA_SHADER_ATTRIB_MEMO_HIT oracle_memo_hit_no_name_bytes
+#endif
+
 /* The fast path itself, with its two entry points renamed so the oracle can
  * wrap them and count verdicts; the seamed bodies call the public names. */
 #define isaac_vita_shader_attribs_enable_try oracle_attrib_enable_impl
 #define isaac_vita_shader_attribs_disable_try oracle_attrib_disable_impl
 #include "host_vita_shader_attrib_fastpath.c"
+#if defined(ORACLE_MUTATE_MEMO_NO_NAME_BYTES)
+/* Copied from attrib_memo_hit (host_vita_shader_attrib_fastpath.c), with
+ * the remembered-bytes loop and the terminator check removed. */
+static int oracle_memo_hit_no_name_bytes(const struct attrib_memo_entry *entry,
+                                         uint32_t generation, uint32_t self,
+                                         uint32_t program, uint32_t attribs,
+                                         uint32_t count)
+{
+    uint32_t i;
+
+    if (entry->generation != generation || entry->self != self ||
+            entry->program != program || entry->attribs != attribs ||
+            entry->count != count)
+        return 0;
+    for (i = 0u; i < count; ++i) {
+        const attrib_memo_name *name = &entry->names[i];
+        uint32_t address = ld32(attribs + i * 8u);
+
+        if (address != name->address)
+            return 0;
+    }
+    return 1;
+}
+#endif
 #if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB)
 /* sdk32 scope=attrib clock (the TU declares the prototype on the host):
  * monotonic fixture, every read counted, so the summary pins how many reads
@@ -74,6 +122,73 @@ uint64_t sceKernelGetProcessTimeWide(void)
 #endif
 #if GUEST_IMAGE_BASE != 0x98000000u
 # error the frozen corpus text is rebased to 0x98000000
+#endif
+
+#if defined(ORACLE_ATTRIB_RECORDER)
+/* ORACLE_ATTRIB_RECORDER (flavours memo-recorder*, RENDER60 S2): the real
+ * typed recorder (gl_record_backend.c, gl_record_ring.c,
+ * gl_record_locations.c) with its consumer thread sits between the replay
+ * and the recording backend, exactly as recipes A and B install it: the fake
+ * backend is wrapped and installed ON the consumer thread inside a
+ * synchronous isaac_gl_record_worker_call closure (gl_vita_backend.c
+ * gl_vita_backend_install), every fake backend call - glGetAttribLocation
+ * answers, the program-state mutators and their generation bumps - runs on
+ * that thread, and the game-thread replay reads the generation word across
+ * the recorder's done_pos release/acquire.
+ *
+ * What changes against the inline flavours, and why:
+ * - backend lines are traced into a consumer-side buffer and appended to
+ *   the game-thread lines after the run (each stream keeps its own order);
+ *   the lookup line omits the name address, because a producer
+ *   location-cache hit replays the lookup from the ring copy of the name;
+ * - each run reinstalls the backend through the worker closure (as
+ *   gl_vita_backend_install does), which also empties the producer location
+ *   cache; the memo-keep runs skip only the generation bump;
+ * - the relink/reuse steps are real program-state mutators issued through
+ *   the installed (recorded) table, i.e. typed FENCE records; the consumer
+ *   sleeps ORACLE_MUTATOR_DELAY_MS before it bumps the word, so a fence that
+ *   did not wait would let the replay read the old generation; such a case
+ *   runs its seamed body first, right after the mutator, and the reference
+ *   second (any earlier synchronous lookup would hide a missing wait);
+ * - the per-run ring record count is checked: a memo hit removes exactly one
+ *   glGetAttribLocation record per attribute and nothing else;
+ * - the nested-callback case is skipped (a GL callback would run guest code
+ *   on the consumer, which the recorder never does) and counted. */
+# if !defined(ISAAC_VITA_GL_THREAD_RECORD) || \
+     !defined(ISAAC_VITA_GL_THREAD_WORKER) || \
+     !defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+#  error the recorder flavour needs GL_THREAD_RECORD, GL_THREAD_WORKER and the memo
+# endif
+# if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
+#  error DIRECT_STATE is FATAL with GL_THREAD_RECORD (recomp/vita/CMakeLists.txt)
+# endif
+# include "gl_record_backend.h"
+#endif
+
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+/* RENDER60 S4 (ISAAC_VITA_GL_RECORD_ATTRIB_BATCH): a memo-hit replay hands
+ * the attribute set to the recorder in one call.  Two shapes:
+ * - inline flavours (record-batch-memo, record-batch-decline): stand-ins of
+ *   the three recorder entry points, below.  ready() mirrors the real
+ *   predicate against the oracle's own table members; enable()/disable()
+ *   expand to the per-call wrapper sequence (enable + pointer per element,
+ *   base advanced by 4 * ncomp; disable per element) through the installed
+ *   table, i.e. the recorder API's specification.  The stream comparison
+ *   against the translated reference then proves the replay passes exactly
+ *   the per-call operands, order and count; ORACLE_RECORD_BATCH_DECLINE
+ *   forces the declined verdict so every hit also proves the per-call
+ *   fallback.
+ * - recorder flavours (memo-recorder-batch*): the real API in
+ *   gl_record_backend.c behind the real ring and consumer thread.  Beyond
+ *   the stream, the ring record count drops by exactly the batched records
+ *   and both attribute shadows (producer and consumer), poisoned before
+ *   each run, must end byte-identical to the reference run's.
+ * Both: one batch per seamed memo-hit replay with attributes and nothing
+ * else (per case and in total), and exactly one banner line. */
+# if !defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+#  error the attribute batch rides on the location memo
+# endif
+# include "gl_record_backend.h"
 #endif
 
 /* ---- the translated bodies (four link-time variants) ------------------ */
@@ -137,6 +252,41 @@ void isaac_vita_gl_location_memo_note_mismatch(void)
     ++s_memo_mismatches;
 }
 # endif
+# if defined(ORACLE_ATTRIB_RECORDER)
+/* Production writes the word only on the GL render thread (the contract at
+ * its definition in gl_vita_backend.c).  Every oracle write goes through
+ * oracle_generation_add, which counts any write made off the consumer
+ * thread; the summary requires zero, or this flavour would prove another
+ * protocol than the shipped one. */
+static unsigned s_generation_off_thread;
+static unsigned s_generation_writes;
+# endif
+static void oracle_generation_add(uint32_t n)
+{
+# if defined(ORACLE_ATTRIB_RECORDER)
+    if (!isaac_gl_record_on_render_thread())
+        ++s_generation_off_thread;
+    ++s_generation_writes;
+# endif
+    g_isaac_vita_gl_location_generation += n;
+}
+# if defined(ORACLE_ATTRIB_RECORDER)
+static void oracle_bump_closure(void *context)
+{
+    oracle_generation_add((uint32_t)(uintptr_t)context);
+}
+# endif
+/* A bump the case list asks for between runs: on the consumer under the
+ * recorder (a synchronous closure, like every production write), in place
+ * otherwise. */
+static void oracle_bump(uint32_t n)
+{
+# if defined(ORACLE_ATTRIB_RECORDER)
+    isaac_gl_record_worker_call(oracle_bump_closure, (void *)(uintptr_t)n);
+# else
+    oracle_generation_add(n);
+# endif
+}
 #endif
 
 /* ---- trace ------------------------------------------------------------ */
@@ -149,25 +299,47 @@ static unsigned s_log_calls;
 static unsigned s_handled;
 static unsigned s_rejected;
 
+#if defined(ORACLE_ATTRIB_RECORDER)
+/* Backend calls run on the recorder's consumer thread, the verdict, log and
+ * nested lines on the game (producer) thread: one buffer each, so neither
+ * thread ever writes the other's.  The consumer buffer is read and reset
+ * only while the consumer is idle (after a drain or a synchronous closure,
+ * both of which acquire its done_pos). */
+static char s_ctrace[1u << 17];
+static size_t s_ctrace_len;
+static int s_ctrace_overflow;
+#endif
+
 static void trace(const char *format, ...)
 {
+    char *buffer = s_trace;
+    size_t cap = sizeof s_trace;
+    size_t *len = &s_trace_len;
+    int *overflow = &s_trace_overflow;
     va_list ap;
     int n;
 
-    if (s_trace_len >= sizeof s_trace - 1u) {
-        s_trace_overflow = 1;
+#if defined(ORACLE_ATTRIB_RECORDER)
+    if (isaac_gl_record_on_render_thread()) {
+        buffer = s_ctrace;
+        cap = sizeof s_ctrace;
+        len = &s_ctrace_len;
+        overflow = &s_ctrace_overflow;
+    }
+#endif
+    if (*len >= cap - 1u) {
+        *overflow = 1;
         return;
     }
     va_start(ap, format);
-    n = vsnprintf(s_trace + s_trace_len, sizeof s_trace - s_trace_len,
-                  format, ap);
+    n = vsnprintf(buffer + *len, cap - *len, format, ap);
     va_end(ap);
-    if (n < 0 || (size_t)n >= sizeof s_trace - s_trace_len) {
-        s_trace_overflow = 1;
-        s_trace_len = sizeof s_trace - 1u;
+    if (n < 0 || (size_t)n >= cap - *len) {
+        *overflow = 1;
+        *len = cap - 1u;
         return;
     }
-    s_trace_len += (size_t)n;
+    *len += (size_t)n;
 }
 
 static void trace_reset(void)
@@ -175,6 +347,11 @@ static void trace_reset(void)
     s_trace_len = 0u;
     s_trace[0] = '\0';
     s_trace_overflow = 0;
+#if defined(ORACLE_ATTRIB_RECORDER)
+    s_ctrace_len = 0u;
+    s_ctrace[0] = '\0';
+    s_ctrace_overflow = 0;
+#endif
 }
 
 /* ---- verdict-counting wrappers around the fast path ------------------- */
@@ -249,6 +426,7 @@ typedef struct attrib_pair {
 } attrib_pair;
 
 static shader_object s_object;
+static shader_object *s_obj = &s_object;   /* the object of the current case */
 static attrib_pair s_pairs[ORACLE_MAX_ATTRIBS];
 static CPU s_cpu;
 static CPU s_foreign;
@@ -289,15 +467,39 @@ static guest_gl_int rec_glGetAttribLocation(guest_gl_uint program,
     }
     for (p = text; *p; ++p)
         hash = hash * 31u + (unsigned char)*p;
+#if defined(ORACLE_ATTRIB_RECORDER)
+    /* The name may be the ring copy (producer location-cache hit). */
+    trace("be glGetAttribLocation(%u,\"%s\")\n", program, text);
+#else
     trace("be glGetAttribLocation(%u,%08x,\"%s\")\n", program, name, text);
+#endif
     if (text[0] == 'x')
         return -1;
     return (guest_gl_int)(hash % 13u + 16u * s_link_epoch);
 }
 
+/* Every location a backend call receives must belong to the current link
+ * epoch: an
+ * answer above is hash % 13 + 16 * s_link_epoch, or -1, so index / 16 names
+ * the epoch that answered it.  The stream comparison cannot see a stale
+ * location that reaches BOTH bodies (the reference and the seamed run share
+ * the recorder's producer location cache); this check sees it in either.
+ * Runs where the answers are computed: on the consumer under the recorder,
+ * inline otherwise; read through census_take after a drain. */
+static unsigned s_location_uses;
+static unsigned s_stale_locations;
+
+static void check_location(guest_gl_uint index)
+{
+    ++s_location_uses;
+    if (index != UINT32_MAX && index / 16u != s_link_epoch)
+        ++s_stale_locations;
+}
+
 static void rec_glEnableVertexAttribArray(guest_gl_uint index)
 {
     ++s_backend_calls;
+    check_location(index);
     trace("be glEnableVertexAttribArray(%08x)\n", index);
     if (s_nested_body) {
         /* Re-entry from inside a GL callback: a nested thiscall frame on the
@@ -319,6 +521,7 @@ static void rec_glEnableVertexAttribArray(guest_gl_uint index)
 static void rec_glDisableVertexAttribArray(guest_gl_uint index)
 {
     ++s_backend_calls;
+    check_location(index);
     trace("be glDisableVertexAttribArray(%08x)\n", index);
 }
 
@@ -329,6 +532,7 @@ static void rec_glVertexAttribPointer(guest_gl_uint index, guest_gl_int size,
                                       guest_gl_addr pointer)
 {
     ++s_backend_calls;
+    check_location(index);
     trace("be glVertexAttribPointer(%08x,%d,%08x,%u,%d,%08x)\n", index, size,
           type, normalized, stride, pointer);
 }
@@ -339,18 +543,146 @@ static void rec_glCullFace(guest_gl_enum mode)
     trace("be glCullFace(%08x)\n", mode);
 }
 
-static void install_recording_backend(int with_pointer)
+#if defined(ORACLE_ATTRIB_RECORDER)
+/* The seven program-state mutators of the typed surface, exactly the FENCES
+ * set of recomp/vita/gl_record_surface.py (pinned by the test).  Each one is
+ * what its gl_vita_backend.c wrapper does to the memo's world: bump the
+ * generation (gl_vita_location_cache_invalidate) and change the program's
+ * answers (here: a new link epoch).  The consumer first sleeps, so a record
+ * that did not make the game thread wait for it is still unexecuted when
+ * the next replay reads the generation. */
+# define ORACLE_MUTATOR_DELAY_MS 50u
+# define ORACLE_CREATE_NAME 8u
+static unsigned s_mutator_calls;
+static unsigned s_mutator_off_thread;
+
+static void rec_mutate(void)
 {
+    if (!isaac_gl_record_on_render_thread())
+        ++s_mutator_off_thread;
+    Sleep(ORACLE_MUTATOR_DELAY_MS);
+    oracle_generation_add(1u);
+    ++s_link_epoch;
+    ++s_mutator_calls;
+}
+
+static void rec_glAttachShader(guest_gl_uint program, guest_gl_uint shader)
+{
+    (void)program;
+    (void)shader;
+    rec_mutate();
+}
+
+static void rec_glCompileShader(guest_gl_uint shader)
+{
+    (void)shader;
+    rec_mutate();
+}
+
+static guest_gl_uint rec_glCreateProgram(void)
+{
+    rec_mutate();
+    return ORACLE_CREATE_NAME;
+}
+
+static void rec_glDeleteProgram(guest_gl_uint program)
+{
+    (void)program;
+    rec_mutate();
+}
+
+static void rec_glDeleteShader(guest_gl_uint shader)
+{
+    (void)shader;
+    rec_mutate();
+}
+
+static void rec_glLinkProgram(guest_gl_uint program)
+{
+    (void)program;
+    rec_mutate();
+}
+
+static void rec_glShaderSource(guest_gl_uint shader, guest_gl_sizei count,
+                               guest_gl_addr string, guest_gl_addr length)
+{
+    (void)shader;
+    (void)count;
+    (void)string;
+    (void)length;
+    rec_mutate();
+}
+#endif
+
+static void fill_recording_backend(guest_gl_backend *backend,
+                                   int with_pointer)
+{
+    memset(backend, 0, sizeof *backend);
+    backend->glGetAttribLocation = rec_glGetAttribLocation;
+    backend->glEnableVertexAttribArray = rec_glEnableVertexAttribArray;
+    backend->glDisableVertexAttribArray = rec_glDisableVertexAttribArray;
+    if (with_pointer)
+        backend->glVertexAttribPointer = rec_glVertexAttribPointer;
+    backend->glCullFace = rec_glCullFace;
+#if defined(ORACLE_ATTRIB_RECORDER)
+    backend->glAttachShader = rec_glAttachShader;
+    backend->glCompileShader = rec_glCompileShader;
+    backend->glCreateProgram = rec_glCreateProgram;
+    backend->glDeleteProgram = rec_glDeleteProgram;
+    backend->glDeleteShader = rec_glDeleteShader;
+    backend->glLinkProgram = rec_glLinkProgram;
+    backend->glShaderSource = rec_glShaderSource;
+#endif
+}
+
+#if defined(ORACLE_ATTRIB_RECORDER)
+/* gl_vita_backend_install's order on the consumer (gl_vita_backend.c
+ * gl_vita_install_closure -> gl_vita_backend_install): stop the recorder,
+ * reset the location caches (the generation bump), wrap, install.  The RBO
+ * endpoints are never reached by these cases. */
+static IsaacGlRecordRboNative s_oracle_rbo;
+
+typedef struct oracle_install_args {
+    int with_pointer;
+    int bump;
+} oracle_install_args;
+
+static void oracle_install_closure(void *context)
+{
+    const oracle_install_args *args = (const oracle_install_args *)context;
     guest_gl_backend backend;
 
-    memset(&backend, 0, sizeof backend);
-    backend.glGetAttribLocation = rec_glGetAttribLocation;
-    backend.glEnableVertexAttribArray = rec_glEnableVertexAttribArray;
-    backend.glDisableVertexAttribArray = rec_glDisableVertexAttribArray;
-    if (with_pointer)
-        backend.glVertexAttribPointer = rec_glVertexAttribPointer;
-    backend.glCullFace = rec_glCullFace;
+    isaac_gl_record_stop();
+    if (args->bump)
+        oracle_generation_add(1u);
+    fill_recording_backend(&backend, args->with_pointer);
+    isaac_gl_record_wrap(&backend, &s_oracle_rbo);
     guest_gl_install_backend(&backend);
+}
+#endif
+
+/* bump: memo builds start the run with an emptied memo (the frozen
+ * stream); ignored without the memo. */
+static void install_recording_backend(int with_pointer, int bump)
+{
+#if defined(ORACLE_ATTRIB_RECORDER)
+    oracle_install_args args;
+
+    args.with_pointer = with_pointer;
+    args.bump = bump;
+    isaac_gl_record_worker_call(oracle_install_closure, &args);
+#else
+    guest_gl_backend backend;
+
+# if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+    if (bump)
+        oracle_generation_add(1u);
+# else
+    (void)bump;
+# endif
+    fill_recording_backend(&backend, with_pointer);
+    guest_gl_install_backend(&backend);
+#endif
 }
 
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
@@ -467,12 +799,142 @@ int gl_vita_backend_attribs_replay_disable(
 }
 #endif
 
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+/* The replay TU's one-shot banner (isaac_vita_log is platform.c's on the
+ * device): captured, counted, checked in the summary. */
+static char s_banner[384];
+static unsigned s_banner_calls;
+void isaac_vita_log(const char *format, ...)
+{
+    va_list ap;
+
+    ++s_banner_calls;
+    va_start(ap, format);
+    vsnprintf(s_banner, sizeof s_banner, format, ap);
+    va_end(ap);
+}
+
+# if !defined(ORACLE_ATTRIB_RECORDER)
+/* ---- S4 record-batch stand-ins (inline flavours) ---------------------- */
+static unsigned s_batch_enables, s_batch_disables, s_batch_declines;
+
+int isaac_gl_record_attribs_batch_ready(const guest_gl_backend *installed,
+                                        uint32_t count, int enable)
+{
+    int accept = installed && count >= 1u && count <= 16u &&
+        installed->glGetAttribLocation == rec_glGetAttribLocation &&
+        (enable ? installed->glEnableVertexAttribArray ==
+                      rec_glEnableVertexAttribArray &&
+                  installed->glVertexAttribPointer == rec_glVertexAttribPointer
+                : installed->glDisableVertexAttribArray ==
+                      rec_glDisableVertexAttribArray);
+#  if defined(ORACLE_RECORD_BATCH_DECLINE)
+    if (accept) {
+        ++s_batch_declines;
+        return 0;
+    }
+#  endif
+    return accept;
+}
+
+void isaac_gl_record_attribs_enable(uint32_t count,
+                                    const guest_gl_int *locations,
+                                    const uint8_t *components, int32_t stride,
+                                    uint32_t base)
+{
+    const guest_gl_backend *backend = guest_gl_installed_backend();
+    uint32_t i;
+
+    ++s_batch_enables;
+    trace("fastpath record batch enable %u\n", count);
+    for (i = 0u; i < count; ++i) {
+        backend->glEnableVertexAttribArray((guest_gl_uint)locations[i]);
+        backend->glVertexAttribPointer(
+            (guest_gl_uint)locations[i], (guest_gl_int)components[i],
+            (guest_gl_enum)ISAAC_GL_RECORD_ATTRIB_BATCH_TYPE,
+            (guest_gl_boolean)0u, (guest_gl_sizei)stride,
+            (guest_gl_addr)base);
+#  if !defined(ORACLE_MUTATE_BATCH_STANDIN_NO_ADVANCE)
+        base += (uint32_t)components[i] * 4u;   /* must-FAIL mutant skips it */
+#  endif
+    }
+}
+
+void isaac_gl_record_attribs_disable(uint32_t count,
+                                     const guest_gl_int *locations)
+{
+    const guest_gl_backend *backend = guest_gl_installed_backend();
+    uint32_t i;
+
+    ++s_batch_disables;
+    trace("fastpath record batch disable %u\n", count);
+    for (i = 0u; i < count; ++i)
+        backend->glDisableVertexAttribArray((guest_gl_uint)locations[i]);
+}
+
+static void oracle_batch_census(unsigned *batches, unsigned *declines)
+{
+    *batches = s_batch_enables + s_batch_disables;
+    *declines = s_batch_declines;
+}
+# else
+/* ---- S4 real recorder API (recorder flavours) ------------------------- */
+static void oracle_batch_census(unsigned *batches, unsigned *declines)
+{
+    uint32_t stats[4];
+
+    isaac_gl_record_oracle_batch_stats(stats);
+    *batches = stats[0] + stats[1];
+    *declines = 0u;
+}
+
+/* Both attribute shadows, poisoned before every run, each by its owner (the
+ * producer's here on the game thread, the consumer's in a synchronous
+ * closure on the render thread), and read after the run's drain. */
+#  define ORACLE_SHADOW_BYTES 512u
+static unsigned char s_shadow_run[2][ORACLE_SHADOW_BYTES];
+static uint32_t s_shadow_bytes;
+
+static void oracle_shadow_poison_closure(void *unused)
+{
+    (void)unused;
+    isaac_gl_record_oracle_shadow_poison(1, 0xa5u);
+}
+
+static void oracle_shadow_poison(void)
+{
+    isaac_gl_record_oracle_shadow_poison(0, 0xa5u);
+    isaac_gl_record_worker_call(oracle_shadow_poison_closure, NULL);
+}
+
+static void oracle_shadow_read(void)
+{
+    s_shadow_bytes = isaac_gl_record_oracle_shadow(0, s_shadow_run[0],
+                                                   ORACLE_SHADOW_BYTES);
+    (void)isaac_gl_record_oracle_shadow(1, s_shadow_run[1],
+                                        ORACLE_SHADOW_BYTES);
+}
+# endif
+#endif
+
 /* ---- image words at their real addresses ------------------------------ */
 
 #define ORACLE_TABLE_PAGE UINT32_C(0x98567000)
 #define ORACLE_TABLE_BYTES UINT32_C(0x1000)
 #define ORACLE_SLOT_PAGE UINT32_C(0x987bf000)
-#define ORACLE_SLOT_BYTES UINT32_C(0x4000)
+#if defined(ORACLE_ATTRIB_RECORDER)
+/* Also covers two real static Shader objects for the memo-slot alias cases:
+ * the ColorOffset shader at RVA 0x7c4f3c and the KAGE Position+Color+
+ * TexCoord shader at RVA 0x7c7a9c (frozen PE VAs 0xbc4f3c / 0xbc7a9c,
+ * constructed by `mov dword [imm32], 0xb5e0a8`; the test re-derives the
+ * whole static census from the PE).  Both use memo slot 4 of the legacy
+ * 16-entry hash. */
+# define ORACLE_SLOT_BYTES UINT32_C(0x9000)
+# define ORACLE_ALIAS_A UINT32_C(0x987c4f3c)
+# define ORACLE_ALIAS_B UINT32_C(0x987c7a9c)
+#else
+# define ORACLE_SLOT_BYTES UINT32_C(0x4000)
+#endif
 #define ORACLE_TABLES_RVA UINT32_C(0x005673ac)
 #define ORACLE_PE_BASE UINT32_C(0x00400000)
 
@@ -559,11 +1021,17 @@ typedef struct attrib_case {
     int expect_dyn_set;       /* pin the dyn census of both runs */
     unsigned expect_ref_dyn;
     unsigned expect_seam_dyn;
+    uint32_t object_at;       /* 0: the oracle's own object; else the
+                               * committed image address of the Shader */
+    int mutator;              /* recorder builds: ORACLE_MUTATOR_* issued
+                               * right before the (first) seamed run */
 } attrib_case;
 
 typedef struct census {
     unsigned dyn, calls, imports, backend, log, handled, rejected;
     unsigned batches, declines;   /* direct-state builds; zero otherwise */
+    unsigned uses, stale;         /* location uses; of an earlier epoch */
+    unsigned rbatch, rdecl;       /* S4 record batches / forced declines */
 } census;
 
 static void census_take(census *out)
@@ -575,12 +1043,20 @@ static void census_take(census *out)
     out->log = s_log_calls;
     out->handled = s_handled;
     out->rejected = s_rejected;
+    out->uses = s_location_uses;
+    out->stale = s_stale_locations;
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
     out->batches = s_direct_batches;
     out->declines = s_direct_declines;
 #else
     out->batches = 0u;
     out->declines = 0u;
+#endif
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    oracle_batch_census(&out->rbatch, &out->rdecl);
+#else
+    out->rbatch = 0u;
+    out->rdecl = 0u;
 #endif
 }
 
@@ -595,6 +1071,10 @@ static void census_delta(const census *before, census *after)
     after->rejected -= before->rejected;
     after->batches -= before->batches;
     after->declines -= before->declines;
+    after->uses -= before->uses;
+    after->stale -= before->stale;
+    after->rbatch -= before->rbatch;
+    after->rdecl -= before->rdecl;
 }
 
 static void oracle_entry(CPU *__restrict c)
@@ -649,15 +1129,17 @@ static void prepare(const attrib_case *k, CPU *c, uint32_t *storage,
         esp = floor - 4u;
     memset(storage, 0xcd,
            (ORACLE_STACK_GUARD_WORDS + ORACLE_STACK_WORDS) * sizeof storage[0]);
-    memset(&s_object, 0, sizeof s_object);
-    s_object.vtable = k->vtable ? k->vtable : ATTRIB_VTABLE;
-    s_object.pad04 = 0x0badf00du;
-    s_object.attribs = k->attribs_null ? 0u : (uint32_t)(uintptr_t)s_pairs;
-    s_object.count = k->count;
-    s_object.pad10 = 0x10101010u;
-    s_object.pad24 = 0x24242424u;
-    s_object.program = k->program;
-    s_object.pad2c = 0x2c2c2c2cu;
+    s_obj = k->object_at ? (shader_object *)(uintptr_t)k->object_at
+                         : &s_object;
+    memset(s_obj, 0, sizeof *s_obj);
+    s_obj->vtable = k->vtable ? k->vtable : ATTRIB_VTABLE;
+    s_obj->pad04 = 0x0badf00du;
+    s_obj->attribs = k->attribs_null ? 0u : (uint32_t)(uintptr_t)s_pairs;
+    s_obj->count = k->count;
+    s_obj->pad10 = 0x10101010u;
+    s_obj->pad24 = 0x24242424u;
+    s_obj->program = k->program;
+    s_obj->pad2c = 0x2c2c2c2cu;
     for (i = 0u; i < ORACLE_MAX_ATTRIBS; ++i) {
         s_pairs[i].name = (uint32_t)(uintptr_t)k->names[i];
         s_pairs[i].format = k->formats[i];
@@ -670,7 +1152,7 @@ static void prepare(const attrib_case *k, CPU *c, uint32_t *storage,
     st32(ATTRIB_SLOT_DISABLE, slot_value(t_disable, k->slot_second_bad));
 
     c->eax = 0x11110000u;
-    c->ecx = (uint32_t)(uintptr_t)&s_object;
+    c->ecx = (uint32_t)(uintptr_t)s_obj;
     c->edx = 0x33330000u;
     c->ebx = 0x44440000u;
     c->esp = esp;
@@ -720,8 +1202,8 @@ static void describe(char *out, size_t cap, const CPU *c, uint32_t entry_esp,
                 n += (size_t)snprintf(out + n, cap - n, "<above>,");
         }
         n += (size_t)snprintf(out + n, cap - n, " obj=");
-        bytes = (const unsigned char *)&s_object;
-        for (i = 0u; i < sizeof s_object && n + 3u < cap; ++i)
+        bytes = (const unsigned char *)s_obj;
+        for (i = 0u; i < sizeof *s_obj && n + 3u < cap; ++i)
             n += (size_t)snprintf(out + n, cap - n, "%02x", bytes[i]);
         n += (size_t)snprintf(out + n, cap - n, " pairs=");
         bytes = (const unsigned char *)s_pairs;
@@ -730,31 +1212,123 @@ static void describe(char *out, size_t cap, const CPU *c, uint32_t entry_esp,
     }
 }
 
+#if defined(ORACLE_ATTRIB_RECORDER)
+# define ORACLE_MUTATOR_NONE 0
+# define ORACLE_MUTATOR_LINK 6     /* index of glLinkProgram below */
+# define ORACLE_MUTATOR_REUSE 8   /* glDeleteProgram + glCreateProgram */
+static const char *const s_mutator_names[ORACLE_MUTATOR_REUSE] = {
+    "", "glAttachShader", "glCompileShader", "glCreateProgram",
+    "glDeleteProgram", "glDeleteShader", "glLinkProgram", "glShaderSource"
+};
+static unsigned s_create_mismatch;
+
+/* Issue the case's mutator through the installed table, i.e. through the
+ * recorder's typed record_<name> entry point, from the game thread.
+ * Returns the number of ring records it appended. */
+static uint32_t oracle_mutate(const attrib_case *k)
+{
+    const guest_gl_backend *backend = guest_gl_installed_backend();
+
+    switch (k->mutator) {
+    case 1: backend->glAttachShader(k->program, 3u); return 1u;
+    case 2: backend->glCompileShader(3u); return 1u;
+    case 3:
+        if (backend->glCreateProgram() != ORACLE_CREATE_NAME)
+            ++s_create_mismatch;
+        return 1u;
+    case 4: backend->glDeleteProgram(k->program); return 1u;
+    case 5: backend->glDeleteShader(3u); return 1u;
+    case 6: backend->glLinkProgram(k->program); return 1u;
+    case 7: backend->glShaderSource(3u, 0, 0u, 0u); return 1u;
+    case ORACLE_MUTATOR_REUSE:
+        backend->glDeleteProgram(k->program);
+        if (backend->glCreateProgram() != k->program)
+            ++s_create_mismatch;
+        return 2u;
+    default: return 0u;
+    }
+}
+
+/* Before a mutator, look up every attribute of the case through
+ * the installed (recorded) table, so the producer location cache holds the
+ * current link's answers when the FENCE runs.  Without this the install's
+ * own reset (isaac_gl_record_wrap) had already emptied that cache, and a
+ * FENCE that forgot its reset was unobservable (a
+ * no-fence-reset mutant passed).  Each cold lookup is one synchronous
+ * record; all of them precede the record window and the census. */
+static unsigned s_primed_lookups;
+
+static void oracle_prime_locations(const attrib_case *k)
+{
+    const guest_gl_backend *backend = guest_gl_installed_backend();
+    uint32_t i;
+
+    for (i = 0u; i < k->count && i < ORACLE_MAX_ATTRIBS; ++i) {
+        (void)backend->glGetAttribLocation(
+            k->program, (guest_gl_addr)(uintptr_t)k->names[i]);
+        ++s_primed_lookups;
+    }
+}
+#endif
+
+/* mutate: issue k->mutator right before the body (recorder builds; the
+ * argument is ignored otherwise).  *records: ring records the body
+ * appended (recorder builds; 0 otherwise). */
 static int run_variant(const attrib_case *k, guest_fn body, guest_fn nested,
-                       char *trace_out, size_t trace_cap, char *state_out,
-                       size_t state_cap, census *delta)
+                       int mutate, char *trace_out, size_t trace_cap,
+                       char *state_out, size_t state_cap, census *delta,
+                       unsigned *records)
 {
     CPU *c = k->foreign ? &s_foreign : &s_cpu;
     uint32_t *storage = k->foreign ? s_foreign_storage : s_stack_storage;
     uint32_t entry_esp;
     census before;
     int stop;
+#if defined(ORACLE_ATTRIB_RECORDER)
+    IsaacGlRecordWorkerWindow window;
+    uint32_t mutator_records = 0u;
+#endif
 
-#if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+    *records = 0u;
+    prepare(k, c, storage, &entry_esp);
     /* A fresh generation empties the memo (as a mutation would) so every
      * case outside the memo section sees the frozen full-lookup stream. */
-    if (!k->memo_keep)
-        ++g_isaac_vita_gl_location_generation;
+    install_recording_backend(!k->missing_pointer, !k->memo_keep);
+#if defined(ORACLE_ATTRIB_RECORDER)
+    if (mutate && k->mutator)
+        oracle_prime_locations(k);
 #endif
-    prepare(k, c, storage, &entry_esp);
-    install_recording_backend(!k->missing_pointer);
     s_nested_body = k->nested ? nested : NULL;
     s_nested_base = k->base;
     s_nested_stride = k->stride;
+#if defined(ORACLE_ATTRIB_RECORDER)
+# if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    oracle_shadow_poison();
+# endif
+    /* The record window starts here; this take's own closure is its first
+     * record. */
+    isaac_gl_record_worker_take(NULL);
+#endif
     trace_reset();
     census_take(&before);
+#if defined(ORACLE_ATTRIB_RECORDER)
+    if (mutate)
+        mutator_records = oracle_mutate(k);
+#else
+    (void)mutate;
+#endif
     s_body = body;
     stop = guest_run_until_stop(c, oracle_entry);
+#if defined(ORACLE_ATTRIB_RECORDER)
+    /* Every record ran on the consumer; the take is one more synchronous
+     * closure, after which the consumer-side counters and trace are ours. */
+    isaac_gl_record_drain();
+    isaac_gl_record_worker_take(&window);
+    *records = window.records - 1u - mutator_records;
+# if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    oracle_shadow_read();
+# endif
+#endif
     census_take(delta);
     census_delta(&before, delta);
     s_nested_body = NULL;
@@ -763,6 +1337,12 @@ static int run_variant(const attrib_case *k, guest_fn body, guest_fn nested,
     if (s_trace_overflow || s_trace_len + 1u > trace_cap)
         return 0;
     memcpy(trace_out, s_trace, s_trace_len + 1u);
+#if defined(ORACLE_ATTRIB_RECORDER)
+    /* Game-thread lines, then the consumer's backend lines. */
+    if (s_ctrace_overflow || s_trace_len + s_ctrace_len + 1u > trace_cap)
+        return 0;
+    memcpy(trace_out + s_trace_len, s_ctrace, s_ctrace_len + 1u);
+#endif
     return 1;
 }
 
@@ -773,9 +1353,31 @@ static char s_seam_state[4096];
 
 static unsigned s_cases;
 static unsigned s_failures;
+#if defined(ORACLE_ATTRIB_RECORDER)
+static unsigned s_recorder_skipped;
+static unsigned s_records_total;
+static unsigned s_records_saved;
+static int s_alias_collide;
+#endif
 static unsigned s_total_handled;
 static unsigned s_total_rejected;
 static unsigned s_total_backend;
+static unsigned s_epoch_uses;
+static unsigned s_epoch_stale;
+static unsigned s_epoch_exempt_cases;
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+static unsigned s_batch_expected;    /* seamed hit runs with attributes */
+static unsigned s_batch_seen_en, s_batch_seen_di, s_batch_seen_decl;
+# if defined(ORACLE_ATTRIB_RECORDER)
+static unsigned char s_shadow_ref[2][ORACLE_SHADOW_BYTES];
+static unsigned char s_shadow_seam[2][ORACLE_SHADOW_BYTES];
+/* After each run_variant: keep that run's shadows. */
+#  define ORACLE_KEEP_SHADOWS(dst) memcpy((dst), s_shadow_run, sizeof (dst))
+# endif
+#endif
+#if !defined(ORACLE_KEEP_SHADOWS)
+# define ORACLE_KEEP_SHADOWS(dst) ((void)0)
+#endif
 
 static void fail(const char *name, const char *tag, const char *why)
 {
@@ -808,7 +1410,14 @@ static void compare(const attrib_case *k, const char *tag, guest_fn ref,
     census ref_census, seam_census;
     unsigned crossings;
     unsigned expected_backend;
+    unsigned ref_records = 0u, seam_records = 0u;
     int expect_hit = 0;
+    int seam_first = 0;
+
+    /* The seamed run may come first (recorder mutator cases); MSVC cannot
+     * see that one of the two run_variant calls always fills each census. */
+    memset(&ref_census, 0, sizeof ref_census);
+    memset(&seam_census, 0, sizeof seam_census);
 
 #if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO) && \
     !defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY)
@@ -816,31 +1425,94 @@ static void compare(const attrib_case *k, const char *tag, guest_fn ref,
      * the glGetAttribLocation crossings from a hit. */
     expect_hit = k->expect_memo_hit;
 #endif
-    if (!run_variant(k, ref, ref, s_ref_trace, sizeof s_ref_trace,
-                     s_ref_state, sizeof s_ref_state, &ref_census)) {
+#if defined(ORACLE_ATTRIB_RECORDER)
+    if (k->nested) {
+        ++s_recorder_skipped;
+        printf("skip %-26s %-4s nested callback (no guest code on the "
+               "consumer)\n", k->name, tag);
+        return;
+    }
+    /* A mutator case: the seamed body runs first, straight after the
+     * mutator, so nothing synchronous sits between the two. */
+    seam_first = k->mutator != 0;
+#endif
+    if (seam_first &&
+            !run_variant(k, seam, seam, 1, s_seam_trace, sizeof s_seam_trace,
+                         s_seam_state, sizeof s_seam_state, &seam_census,
+                         &seam_records)) {
+        fail(k->name, tag, "seamed trace overflow");
+        return;
+    }
+    if (seam_first)
+        ORACLE_KEEP_SHADOWS(s_shadow_seam);
+    if (!run_variant(k, ref, ref, 0, s_ref_trace, sizeof s_ref_trace,
+                     s_ref_state, sizeof s_ref_state, &ref_census,
+                     &ref_records)) {
         fail(k->name, tag, "reference trace overflow");
         return;
     }
+    ORACLE_KEEP_SHADOWS(s_shadow_ref);
     if (ref_census.handled || ref_census.rejected) {
         fail(k->name, tag, "reference body reached the fast path");
         return;
     }
-    if (!run_variant(k, seam, seam, s_seam_trace, sizeof s_seam_trace,
-                     s_seam_state, sizeof s_seam_state, &seam_census)) {
+    if (!seam_first &&
+            !run_variant(k, seam, seam, 1, s_seam_trace, sizeof s_seam_trace,
+                         s_seam_state, sizeof s_seam_state, &seam_census,
+                         &seam_records)) {
         fail(k->name, tag, "seamed trace overflow");
         return;
     }
+    if (!seam_first)
+        ORACLE_KEEP_SHADOWS(s_shadow_seam);
+#if defined(ORACLE_ATTRIB_RECORDER) && defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    /* Same poisoned start, same final producer and consumer shadows: the
+     * batch applied exactly the per-call records' updates. */
+    if (s_shadow_bytes == 0u || s_shadow_bytes > ORACLE_SHADOW_BYTES)
+        fail(k->name, tag, "attribute shadow size outside the buffer");
+    else {
+        if (memcmp(s_shadow_ref[0], s_shadow_seam[0], s_shadow_bytes) != 0)
+            fail(k->name, tag, "producer attribute shadow differs");
+        if (memcmp(s_shadow_ref[1], s_shadow_seam[1], s_shadow_bytes) != 0)
+            fail(k->name, tag, "consumer attribute shadow differs");
+    }
+#endif
     ++s_cases;
     s_total_handled += seam_census.handled;
     s_total_rejected += seam_census.rejected;
     s_total_backend += ref_census.backend;
     printf("case %-26s %-4s verdict=%u/%u be=%u,%u dyn=%u,%u calls=%u,%u "
-           "imp=%u,%u log=%u\n",
+           "imp=%u,%u log=%u",
            k->name, tag, seam_census.handled, seam_census.rejected,
            ref_census.backend, seam_census.backend,
            ref_census.dyn, seam_census.dyn,
            ref_census.calls, seam_census.calls, ref_census.imports,
            seam_census.imports, ref_census.log);
+#if defined(ORACLE_ATTRIB_RECORDER)
+    printf(" rec=%u,%u", ref_records, seam_records);
+    /* Every crossing is one typed record replayed once on the consumer; a
+     * memo hit removes exactly its glGetAttribLocation records. */
+    if (ref_records != ref_census.backend)
+        fail(k->name, tag, "reference ring records != backend calls");
+    {
+        unsigned saved = expect_hit ? k->count : 0u;
+# if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+        /* S4: the 2n (Enable) or n (Disable) per-call records of a hit
+         * replay with attributes become one record. */
+        if (expect_hit && k->expect_handled && k->count)
+            saved += k->kind ? k->count - 1u : 2u * k->count - 1u;
+# endif
+        if (seam_records != ref_records - saved)
+            fail(k->name, tag, "seamed ring records != reference minus the "
+                               "memo-hit lookups (and the batched records)");
+    }
+    s_records_total += ref_records;
+    s_records_saved += ref_records - seam_records;
+#else
+    (void)ref_records;
+    (void)seam_records;
+#endif
+    printf("\n");
     /* The verdict trace lines exist only in the seamed run; strip them
      * before comparing the backend streams. */
     strip_lines(s_seam_trace, "fastpath ");
@@ -875,8 +1547,49 @@ static void compare(const attrib_case *k, const char *tag, guest_fn ref,
      * outer batch and then faults out of the run from inside it, so its
      * batch count is one with a handled count of zero: the trace compare
      * above already pins it. */
+    /* The epoch check covers every case whose locations are answers of
+     * glGetAttribLocation; with the lookup slot holding the glCullFace token
+     * or an import table that owns the token family, both bodies pass a
+     * non-answer (whatever eax holds) on, identically. */
+    if (k->slot_get_bad == 3 || k->hostile_imports) {
+        ++s_epoch_exempt_cases;
+    } else {
+        s_epoch_uses += ref_census.uses + seam_census.uses;
+        s_epoch_stale += ref_census.stale + seam_census.stale;
+        if (ref_census.stale || seam_census.stale)
+            fail(k->name, tag, "a location of an earlier link epoch reached "
+                               "the backend");
+    }
     if (ref_census.batches || ref_census.declines)
         fail(k->name, tag, "reference body reached the direct-state batch");
+    if (ref_census.rbatch || ref_census.rdecl)
+        fail(k->name, tag, "reference body reached the record batch");
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    /* S4: exactly one batch (or, forced, one declined ready()) per seamed
+     * memo-hit replay with attributes; nothing for a miss, a decline, a
+     * count of 0 or the reference. */
+    if (!k->nested) {
+        unsigned expect_batch = 0u, expect_decl = 0u;
+        if (expect_hit && k->expect_handled && k->count) {
+# if defined(ORACLE_RECORD_BATCH_DECLINE)
+            expect_decl = 1u;
+# else
+            expect_batch = 1u;
+# endif
+        }
+        s_batch_expected += expect_batch + expect_decl;
+        if (seam_census.rbatch != expect_batch ||
+                seam_census.rdecl != expect_decl)
+            fail(k->name, tag, "record-batch census differs");
+        if (seam_census.rbatch) {
+            if (k->kind)
+                ++s_batch_seen_di;
+            else
+                ++s_batch_seen_en;
+        }
+        s_batch_seen_decl += seam_census.rdecl;
+    }
+#endif
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
     if (!k->nested) {
         unsigned expect_batches = 0u, expect_declines = 0u;
@@ -941,6 +1654,26 @@ static void memo_case(attrib_case *k, const char *name, int expect_hit,
                 k->kind ? sub_005673f0 : sub_005672d0);
 }
 
+# if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY)
+#  if defined(ORACLE_ATTRIB_RECORDER)
+static void oracle_stale_closure(void *unused)
+{
+    (void)unused;
+    ++s_link_epoch;
+}
+#  endif
+/* New answers with no generation bump (no typed mutator does this): on the
+ * consumer, where the answers are computed, under the recorder. */
+static void oracle_stale_answers(void)
+{
+#  if defined(ORACLE_ATTRIB_RECORDER)
+    isaac_gl_record_worker_call(oracle_stale_closure, NULL);
+#  else
+    ++s_link_epoch;
+#  endif
+}
+# endif
+
 static char s_mutable_name[16];
 /* 64 printable bytes: one past the memoisable maximum (the shim cache's
  * own GL_VITA_LOCATION_NAME_MAX), so the object is never remembered. */
@@ -980,7 +1713,7 @@ static void probe_rejects(const attrib_case *k)
     census a, b;
 
     prepare(k, &s_cpu, s_stack_storage, &entry_esp);
-    install_recording_backend(1);
+    install_recording_backend(1, 0);
     trace_reset();
     memcpy(&before, &s_cpu, sizeof before);
     census_take(&a);
@@ -1050,6 +1783,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "0x7e-first startup fact does not hold\n");
         return 2;
     }
+#if defined(ORACLE_ATTRIB_RECORDER)
+    /* kage_vita_backend.c kvb_worker_ensure starts the render thread before
+     * gl_vita_backend_install (manual_kage_vita.c), so every install below
+     * already goes through the synchronous worker closure. */
+    if (!isaac_gl_record_worker_start(NULL) ||
+            !isaac_gl_record_worker_active()) {
+        fprintf(stderr, "GL recorder worker did not start\n");
+        return 2;
+    }
+    printf("=== recorder: real typed recorder + its consumer thread in "
+           "front of the recording backend (worker mode %s) ===\n",
+           ISAAC_GL_RECORD_WORKER_MODE_NAME);
+#endif
 
     printf("=== enable: counts 0..8, formats cycling 1..8 ===\n");
     for (i = 0u; i <= 8u; ++i) {
@@ -1302,6 +2048,91 @@ int main(int argc, char **argv)
     compare_both(&k);
 
 #if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+# if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    /* First in the memo section: no relink has run yet, every answer is of
+     * link epoch 0 (hash % 13, below the recorder's 16 shadow slots), so the
+     * recorder flavours compare real shadow contents, not unknown bits. */
+    printf("=== S4 record batch: memo hits of every shape ===\n");
+    /* Counts 1, 8 (above the frozen tables' 7) and 16 (the bound), each
+     * filled, hit by Enable in both spellings and hit by Disable. */
+    {
+        static const uint32_t counts[3] = { 1u, 8u, 16u };
+        static char batch_names[3][5][32];
+        static const char *const steps[5] = {
+            "fill", "hit", "hit-mem", "disable-hit", "disable-hit-mem" };
+        uint32_t c, s;
+
+        for (c = 0u; c < 3u; ++c) {
+            for (s = 0u; s < 5u; ++s)
+                snprintf(batch_names[c][s], sizeof batch_names[c][s],
+                         "batch-count-%u-%s", counts[c], steps[s]);
+            case_init(&k, batch_names[c][0], 0, counts[c]);
+            memo_case(&k, batch_names[c][0], 0, 0);
+            memo_case(&k, batch_names[c][1], 1, 0);
+            memo_case(&k, batch_names[c][2], 1, 1);
+            k.kind = 1;
+            memo_case(&k, batch_names[c][3], 1, 0);
+            memo_case(&k, batch_names[c][4], 1, 1);
+        }
+    }
+    /* The design's ColorOffset-like components {2,2,4,4,3,1,3}
+     * through formats {2,2,4,4,3,1,5}
+     * (k_format_components = {1,2,3,4,3,4,2,1}), a duplicated location (the
+     * same name twice) and two -1 locations, then the cancel pattern
+     * Enable -> Disable -> Enable. */
+    case_init(&k, "batch-mix-fill", 0, 7u);
+    k.formats[0] = 2u; k.formats[1] = 2u; k.formats[2] = 4u; k.formats[3] = 4u;
+    k.formats[4] = 3u; k.formats[5] = 1u; k.formats[6] = 5u;
+    k.names[3] = s_names[0];
+    k.names[1] = s_missing_names[0];
+    k.names[5] = s_missing_names[1];
+    k.stride = 92u;
+    memo_case(&k, "batch-mix-fill", 0, 0);
+    memo_case(&k, "batch-mix-enable-hit", 1, 0);
+    k.kind = 1;
+    memo_case(&k, "batch-mix-disable-hit", 1, 0);
+    k.kind = 0;
+    memo_case(&k, "batch-mix-enable-again", 1, 1);
+    /* Negative stride with the base at the top of the address space (the
+     * running pointer wraps), then stride 0 at base 0: arguments, not memo
+     * keys, so both still hit. */
+    k.stride = 0xfffffff0u;
+    k.base = 0xfffffff8u;
+    memo_case(&k, "batch-negative-stride-hit", 1, 0);
+    k.stride = 0u;
+    k.base = 0u;
+    memo_case(&k, "batch-stride0-base0-hit", 1, 0);
+    k.stride = 92u;
+    k.base = 0x98800000u;
+    /* A declined replay between two batches leaves the memo and both
+     * shadows alone. */
+    k.program = 0u;
+    k.expect_handled = 0; k.expect_rejected = 1;
+    memo_case(&k, "batch-decline-program-zero", 0, 0);
+    k.program = 7u;
+    k.expect_handled = 1; k.expect_rejected = 0;
+    memo_case(&k, "batch-hit-after-decline", 1, 0);
+    /* A relink between Enable and Disable (a real glLinkProgram FENCE
+     * record behind the recorder): the Disable misses (per-call lookups, no
+     * batch) and refills; the next Disable and Enable batch again with the
+     * new answers. */
+    memo_case(&k, "batch-enable-before-relink", 1, 0);
+    k.kind = 1;
+#  if defined(ORACLE_ATTRIB_RECORDER)
+    k.mutator = ORACLE_MUTATOR_LINK;
+    memo_case(&k, "batch-disable-after-relink-miss", 0, 0);
+    k.mutator = ORACLE_MUTATOR_NONE;
+#  else
+    ++s_link_epoch;
+    oracle_bump(1u);
+    memo_case(&k, "batch-disable-after-relink-miss", 0, 0);
+#  endif
+    memo_case(&k, "batch-disable-after-relink-hit", 1, 0);
+    k.kind = 0;
+    memo_case(&k, "batch-enable-after-relink-hit", 1, 0);
+    /* The memo section below starts from an emptied memo. */
+    oracle_bump(1u);
+# endif
     printf("=== location memo: fill, hit, miss, invalidation, reuse ===\n");
     /* Fill (full lookups, stream identical), then hits in both spellings
      * and from the Disable replay, which shares the entry. */
@@ -1342,15 +2173,28 @@ int main(int argc, char **argv)
     /* Relink: the backend bumps the generation before glLinkProgram and the
      * answers change; a stale hit would replay the old locations into the
      * enable/pointer calls and differ from the reference. */
-    ++s_link_epoch;
-    ++g_isaac_vita_gl_location_generation;
+#if defined(ORACLE_ATTRIB_RECORDER)
+    /* Here a real glLinkProgram FENCE record, executed on the consumer. */
+    k.mutator = ORACLE_MUTATOR_LINK;
     memo_case(&k, "memo-relink-miss", 0, 0);
+    k.mutator = ORACLE_MUTATOR_NONE;
+#else
+    ++s_link_epoch;
+    oracle_bump(1u);
+    memo_case(&k, "memo-relink-miss", 0, 0);
+#endif
     memo_case(&k, "memo-relink-hit", 1, 0);
     /* glDeleteProgram + glCreateProgram recycling the same name: two bumps,
      * same program word, new answers. */
-    ++s_link_epoch;
-    g_isaac_vita_gl_location_generation += 2u;
+#if defined(ORACLE_ATTRIB_RECORDER)
+    k.mutator = ORACLE_MUTATOR_REUSE;
     memo_case(&k, "memo-reuse-miss", 0, 0);
+    k.mutator = ORACLE_MUTATOR_NONE;
+#else
+    ++s_link_epoch;
+    oracle_bump(2u);
+    memo_case(&k, "memo-reuse-miss", 0, 0);
+#endif
     memo_case(&k, "memo-reuse-hit", 1, 0);
     /* Names the shim cache would not memoise either are never remembered:
      * every run of such an object does the full lookups. */
@@ -1388,7 +2232,7 @@ int main(int argc, char **argv)
      * identical to the reference) and refreshes the entry. */
     {
         unsigned before = s_memo_mismatches;
-        ++s_link_epoch;
+        oracle_stale_answers();
         memo_case(&k, "memo-verify-stale", 1, 0);
         if (s_memo_mismatches != before + k.count)
             fail("memo-verify-stale", "gpr",
@@ -1400,8 +2244,61 @@ int main(int argc, char **argv)
                  "VERIFY counted a mismatch on a refreshed entry");
     }
 # endif
+# if defined(ORACLE_ATTRIB_RECORDER)
+    printf("=== recorder: each FENCE mutator invalidates across the thread "
+           "===\n");
+    {
+        static char miss_names[ORACLE_MUTATOR_REUSE][48];
+        static char hit_names[ORACLE_MUTATOR_REUSE][48];
+        int m;
+
+        for (m = 1; m < ORACLE_MUTATOR_REUSE; ++m) {
+            snprintf(miss_names[m], sizeof miss_names[m],
+                     "memo-recorder-%s-miss", s_mutator_names[m]);
+            snprintf(hit_names[m], sizeof hit_names[m],
+                     "memo-recorder-%s-hit", s_mutator_names[m]);
+            k.mutator = m;
+            memo_case(&k, miss_names[m], 0, 0);
+            k.mutator = ORACLE_MUTATOR_NONE;
+            memo_case(&k, hit_names[m], 1, 0);
+        }
+    }
+    /* Two real static Shader objects (ORACLE_ALIAS_A/B): one slot of the
+     * legacy 16-entry fold evicts the other on every alternation (the fold
+     * keeps them together even at 64 entries); the (self >> 2) index of
+     * ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES=64 keeps both.  The
+     * slot printed is the one the replay uses (..._MEMO_SLOT); the legacy
+     * fold is printed beside it, masked to 16 entries. */
+    printf("=== recorder: memo slots of two real static Shader objects ===\n");
+    {
+        uint32_t slot_a = (uint32_t)(ISAAC_VITA_SHADER_ATTRIB_MEMO_SLOT(
+                                         ORACLE_ALIAS_A) - s_attrib_memo);
+        uint32_t slot_b = (uint32_t)(ISAAC_VITA_SHADER_ATTRIB_MEMO_SLOT(
+                                         ORACLE_ALIAS_B) - s_attrib_memo);
+        uint32_t fold_a = (uint32_t)(attrib_memo_slot(ORACLE_ALIAS_A) -
+                                     s_attrib_memo) & 15u;
+        uint32_t fold_b = (uint32_t)(attrib_memo_slot(ORACLE_ALIAS_B) -
+                                     s_attrib_memo) & 15u;
+
+        s_alias_collide = slot_a == slot_b;
+        printf("alias entries=%u slot(%08x)=%u slot(%08x)=%u %s; "
+               "legacy16=%u,%u\n",
+               (unsigned)ATTRIB_MEMO_ENTRIES, ORACLE_ALIAS_A, slot_a,
+               ORACLE_ALIAS_B, slot_b, s_alias_collide ? "collide" : "distinct",
+               fold_a, fold_b);
+        k.object_at = ORACLE_ALIAS_A;
+        memo_case(&k, "memo-alias-a-fill", 0, 0);
+        k.object_at = ORACLE_ALIAS_B;
+        memo_case(&k, "memo-alias-b-fill", 0, 0);
+        k.object_at = ORACLE_ALIAS_A;
+        memo_case(&k, "memo-alias-a-again", !s_alias_collide, 0);
+        k.object_at = ORACLE_ALIAS_B;
+        memo_case(&k, "memo-alias-b-again", !s_alias_collide, 0);
+        k.object_at = 0u;
+    }
+# endif
     /* Back to the frozen stream for the probes below. */
-    ++g_isaac_vita_gl_location_generation;
+    oracle_bump(1u);
 #endif
 
     printf("=== fast-path-only probes (translated body cannot run these) ===\n");
@@ -1458,6 +2355,74 @@ int main(int argc, char **argv)
         s_sparse_summary = sparse;
     }
 #endif
+#if defined(ORACLE_ATTRIB_RECORDER)
+    /* The protocol under test is the shipped one only if every generation
+     * write and every mutator ran on the consumer, every typed mutator was
+     * replayed exactly once (relink 1 + reuse 2 + the seven FENCE cases,
+     * + the S4 relink) and the value-returning FENCE answered through its
+     * wait. */
+# if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+#  define ORACLE_EXPECTED_MUTATORS 11u
+# else
+#  define ORACLE_EXPECTED_MUTATORS 10u
+# endif
+    isaac_gl_record_drain();
+    if (s_generation_off_thread != 0u || s_mutator_off_thread != 0u)
+        fail("recorder", "thread",
+             "a generation write or a mutator ran off the consumer thread");
+    if (s_mutator_calls != ORACLE_EXPECTED_MUTATORS)
+        fail("recorder", "mutators",
+             "typed mutators were not replayed exactly once each");
+    if (s_create_mismatch != 0u)
+        fail("recorder", "mutators",
+             "glCreateProgram did not return the consumer's answer");
+    isaac_gl_record_worker_stop();
+#endif
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    /* Every expected batch (or forced decline) happened and nothing else:
+     * the per-case census totals, the real API's own counters across the
+     * whole run, and one banner naming the published opcodes. */
+    if (s_batch_seen_en + s_batch_seen_di + s_batch_seen_decl !=
+            s_batch_expected || s_batch_expected == 0u)
+        fail("record-batch", "census", "batches != seamed memo-hit replays");
+# if defined(ORACLE_ATTRIB_RECORDER)
+    {
+        uint32_t stats[4];
+        isaac_gl_record_oracle_batch_stats(stats);
+        if (stats[0] != s_batch_seen_en || stats[1] != s_batch_seen_di)
+            fail("record-batch", "census",
+                 "recorder batch counters != per-case census");
+        printf("record batch: records(en,di)=%u,%u attributes=%u\n",
+               stats[0], stats[1], stats[2]);
+    }
+# endif
+    printf("record batch banner: calls=%u text=%s\n", s_banner_calls,
+           s_banner);
+#  if defined(ORACLE_RECORD_BATCH_DECLINE)
+    if (s_banner_calls != 0u)
+        fail("record-batch", "banner", "banner printed without a batch");
+#  else
+    {
+        static const char prefix[] =
+            "KAGE VITA GL RECORD ATTRIB BATCH: first enable count=";
+        if (s_banner_calls != 1u ||
+                strncmp(s_banner, prefix, sizeof prefix - 1u) != 0 ||
+                !strstr(s_banner, " op=79,80"))
+            fail("record-batch", "banner",
+                 "first-batch banner missing, repeated or malformed");
+    }
+#  endif
+#endif
+    /* The epoch check ran: location uses of the checked cases,
+     * the stale ones among them, the exempt (non-answer) cases. */
+    printf("location epoch check: uses=%u stale=%u exempt=%u", s_epoch_uses,
+           s_epoch_stale, s_epoch_exempt_cases);
+#if defined(ORACLE_ATTRIB_RECORDER)
+    printf(" primed=%u", s_primed_lookups);
+#endif
+    printf("\n");
+    if (s_epoch_uses == 0u)
+        fail("location-epoch", "census", "no location reached the backend");
     if (s_failures) {
         printf("Vita shader attrib fast path oracle: FAIL; failures=%u\n",
                s_failures);
@@ -1470,8 +2435,19 @@ int main(int argc, char **argv)
 #if defined(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
     printf("; memo-mismatches=%u", s_memo_mismatches);
 #endif
+#if defined(ORACLE_ATTRIB_RECORDER)
+    printf("; recorder(records,saved,mutators,gen-writes,skipped)=%u,%u,%u,%u,%u"
+           "; alias=%s",
+           s_records_total, s_records_saved, s_mutator_calls,
+           s_generation_writes, s_recorder_skipped,
+           s_alias_collide ? "collide" : "distinct");
+#endif
 #if defined(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE)
     printf("; direct(batch,decl)=%u,%u", s_direct_batches, s_direct_declines);
+#endif
+#if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    printf("; batch(en,di,decl)=%u,%u,%u", s_batch_seen_en, s_batch_seen_di,
+           s_batch_seen_decl);
 #endif
 #if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE_ATTRIB)
     printf("; sparse(en,di,ten,tdi,clocks)=%u,%u,%u,%u,%u",

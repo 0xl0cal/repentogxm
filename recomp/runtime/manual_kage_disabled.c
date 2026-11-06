@@ -10,6 +10,14 @@ int guest_kage_pc_handoff_ready(void)
     return 0;
 }
 
+#if defined(ISAAC_VITA_INTRO_PLAY) && ISAAC_VITA_INTRO_PLAY
+/* ISAAC_VITA_INTRO_PLAY (issue #14): no backend, never force the confirm. */
+int guest_kage_intro_skip_ready(void)
+{
+    return 0;
+}
+#endif
+
 int guest_kage_vsync_policy_allows(uint32_t refresh_hz)
 {
     uint32_t remainder;

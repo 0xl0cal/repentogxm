@@ -222,6 +222,255 @@ static size_t s_ledger_count;
 static size_t s_ledger_tombstones;
 static int s_ledger_fixed_capacity;
 static atomic_flag s_ledger_lock = ATOMIC_FLAG_INIT;
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+#include "host_vita_heap_free_prefilter.h"
+/* 0 only when every fixed-block free route of the free import would answer
+ * NOT_HANDLED without a side effect (host_vita_heap_free_prefilter.h has the
+ * argument).  Consults exactly the routes this TU is built with, which is
+ * exactly the set the free import calls. */
+static inline int vita_heap_free_prefilter_may_own(uint32_t pointer)
+{
+    uintptr_t value = (uintptr_t)pointer;
+    int may_own = 0;
+
+#ifdef ISAAC_VITA_OGG_EMERGENCY
+    may_own |= isaac_vita_heap_free_range_may_own(
+        &isaac_vita_ogg_emergency_free_range, value);
+#endif
+#ifdef ISAAC_VITA_ANM2_SCRATCH
+    may_own |= isaac_vita_heap_free_range_may_own(
+        &isaac_vita_anm2_scratch_free_range, value);
+#endif
+#ifdef ISAAC_VITA_TEXEL_SCRATCH
+    may_own |= isaac_vita_heap_free_range_may_own(
+        &isaac_vita_texel_scratch_free_range, value);
+#endif
+    (void)value;
+    return may_own;
+}
+#endif
+#if defined(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH) && ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH
+#if !defined(ISAAC_VITA_ROOM_ENTRY_SLAB) || !defined(ISAAC_VITA_HEAP_OVERFLOW_MSPACE)
+#error Heap slab reject fastpath requires the initialized slab/overflow domains
+#endif
+/* Init publishes this immutable forbidden range once; production never resets.
+ * Both raw and hybrid slab backing reject overlap with it. Not ownership. */
+static uintptr_t s_slab_forbidden_native_begin;
+static atomic_uintptr_t s_slab_forbidden_native_end;
+static int vita_heap_definitely_not_slab(const void *pointer)
+{
+    uintptr_t value = (uintptr_t)pointer;
+    uintptr_t end;
+    if (!pointer)
+        return 1;
+    end = atomic_load_explicit(&s_slab_forbidden_native_end, memory_order_acquire);
+    return end && value >= s_slab_forbidden_native_begin && value < end;
+}
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+#if !defined(ISAAC_VITA_HEAP_OVERFLOW_MSPACE)
+#error Heap stage profile instruments the overflow-mspace router only
+#endif
+#include "host_vita_heap_stage.h"
+uint64_t sceKernelGetProcessTimeWide(void);
+/* shortcut: unsynchronized counters; a concurrent caller on another thread can
+ * drop an increment or a span.  Profiling builds only; make atomic if the
+ * worker threads' heap traffic ever matters. */
+static IsaacVitaHeapStageCounters s_heap_stage;
+static uint32_t s_heap_stage_ordinal[ISAAC_VITA_HEAP_STAGE_TIMERS];
+/* shortcut: spans of 100 us or more (preemption) only count in `over`. */
+#define VITA_HEAP_STAGE_OUTLIER_US 100U
+static void vita_heap_stage_add(unsigned kind, uint64_t us)
+{
+    IsaacVitaHeapStageTimer *t = &s_heap_stage.timer[kind];
+    ++t->n;
+    if (us >= VITA_HEAP_STAGE_OUTLIER_US)
+        ++t->over;
+    else
+        t->us += (uint32_t)us;
+}
+/* Stage ordinal & 63: 0 = time this span; 32 on a whole-import span = time an
+ * empty bracket.  Returns 0 when not timed (a real stamp is never 0: +1). */
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+/* 1 while the current free import's whole span (F_ALL) is being timed: the
+ * ledger sub-spans below are then skipped so they never add clock reads to a
+ * timed a or g span. */
+static uint32_t s_heap_free_cost_whole_timed;
+#endif
+static uint64_t vita_heap_stage_begin(unsigned kind)
+{
+    const uint32_t phase = s_heap_stage_ordinal[kind]++ & 63U;
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    if (kind == ISAAC_VITA_HEAP_STAGE_F_ALL)
+        s_heap_free_cost_whole_timed = phase == 16U;
+#endif
+    if (phase == 32U && (kind == ISAAC_VITA_HEAP_STAGE_F_ALL ||
+                         kind == ISAAC_VITA_HEAP_STAGE_M_ALL)) {
+        const uint64_t t0 = sceKernelGetProcessTimeWide();
+        vita_heap_stage_add(ISAAC_VITA_HEAP_STAGE_EMPTY,
+                            sceKernelGetProcessTimeWide() - t0);
+    }
+    /* Whole-import spans time phase 16, inner stages phase 0: the free/malloc
+     * pre-route and slab ordinals advance in lockstep with the whole span, so
+     * timing both at phase 0 put their four clock reads inside every timed
+     * whole span (P2b: ~2 us of "unaccounted" time). */
+    return phase != ((kind == ISAAC_VITA_HEAP_STAGE_F_ALL ||
+                      kind == ISAAC_VITA_HEAP_STAGE_M_ALL) ? 16U : 0U)
+        ? 0U : sceKernelGetProcessTimeWide() + 1U;
+}
+static void vita_heap_stage_end(unsigned kind, uint64_t t0)
+{
+    if (t0)
+        vita_heap_stage_add(kind, sceKernelGetProcessTimeWide() + 1U - t0);
+}
+void isaac_vita_heap_stage_take(IsaacVitaHeapStageCounters *out)
+{
+    if (out)
+        *out = s_heap_stage;
+    memset(&s_heap_stage, 0, sizeof s_heap_stage);
+}
+/* Used without a trailing semicolon so the OFF token stream is unchanged. */
+#define VITA_HEAP_STAGE_BEGIN(k) \
+    const uint64_t vita_heap_stage_t0_##k = \
+        vita_heap_stage_begin(ISAAC_VITA_HEAP_STAGE_##k);
+#define VITA_HEAP_STAGE_END(k) \
+    vita_heap_stage_end(ISAAC_VITA_HEAP_STAGE_##k, vita_heap_stage_t0_##k);
+#define VITA_HEAP_COUNT(k) ++s_heap_stage.count[ISAAC_VITA_HEAP_COUNT_##k];
+#define VITA_HEAP_COUNT_IF(k, cond) \
+    if (cond) ++s_heap_stage.count[ISAAC_VITA_HEAP_COUNT_##k];
+#else
+#define VITA_HEAP_STAGE_BEGIN(k)
+#define VITA_HEAP_STAGE_END(k)
+#define VITA_HEAP_COUNT(k)
+#define VITA_HEAP_COUNT_IF(k, cond)
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+#if !defined(ISAAC_VITA_HEAP_STAGE_PROFILE) || \
+    !defined(ISAAC_VITA_HEAP_RANGE_LEASE) || \
+    !defined(ISAAC_VITA_HEAP_LEDGER_BACKSHIFT)
+#error Heap free cost profile splits the range-lease backshift ledger span of the stage profile
+#endif
+/* ph120.hg: the generic free's ledger span g split into k (lookup), e (lease
+ * scan + overflow-domain check) and r (remove: preflight scan + backshift),
+ * timed 1-in-64 on calls whose a and g spans are NOT timed, plus exact
+ * per-call work counts.  Measurement only: the ledger itself, its probe
+ * order and every decision are unchanged.  Same unsynchronized-counter
+ * shortcut as the stage profile above. */
+static IsaacVitaHeapFreeCost s_heap_free_cost;
+static uint32_t s_heap_free_cost_ordinal;
+/* Last find_slot / remove-preflight / backshift work, any caller.  The free
+ * path reads them right after its own call, under the allocator lock. */
+static size_t s_heap_free_cost_probes;
+static size_t s_heap_free_cost_scan;
+static size_t s_heap_free_cost_moves;
+void isaac_nv_free_watch_census_take(uint32_t out[ISAAC_VITA_HEAP_NV_CENSUS])
+    __attribute__((weak));
+static uint64_t vita_heap_free_cost_begin(uint64_t ledger_t0)
+{
+    const uint32_t phase = s_heap_free_cost_ordinal++ & 63U;
+
+    /* The ledger span is timed at phase 0 of the same ordinal; 32 keeps the
+     * sub-spans off it, and the whole-span flag keeps them off a. */
+    return phase != 32U || ledger_t0 || s_heap_free_cost_whole_timed
+        ? 0U : sceKernelGetProcessTimeWide() + 1U;
+}
+static uint64_t vita_heap_free_cost_mark(unsigned kind, uint64_t t0)
+{
+    uint64_t t1;
+
+    if (!t0)
+        return 0U;
+    t1 = sceKernelGetProcessTimeWide() + 1U;
+    {
+        IsaacVitaHeapStageTimer *t = &s_heap_free_cost.timer[kind];
+        const uint64_t us = t1 - t0;
+
+        ++t->n;
+        if (us >= VITA_HEAP_STAGE_OUTLIER_US)
+            ++t->over;
+        else
+            t->us += (uint32_t)us;
+    }
+    return t1;
+}
+static void vita_heap_free_cost_add(uint32_t *sum, uint32_t *max, size_t v)
+{
+    const uint32_t value = v > UINT32_MAX ? UINT32_MAX : (uint32_t)v;
+
+    *sum += value;
+    if (max && value > *max)
+        *max = value;
+}
+void isaac_vita_heap_free_cost_take(IsaacVitaHeapFreeCost *out)
+{
+    if (out) {
+        *out = s_heap_free_cost;
+        out->ledger_live = (uint32_t)s_ledger_count;
+        out->ledger_capacity = (uint32_t)s_ledger_capacity;
+        if (isaac_nv_free_watch_census_take)
+            isaac_nv_free_watch_census_take(out->nv);
+        else
+            memset(out->nv, 0, sizeof out->nv);
+    }
+    else if (isaac_nv_free_watch_census_take) {
+        uint32_t discard[ISAAC_VITA_HEAP_NV_CENSUS];
+
+        isaac_nv_free_watch_census_take(discard);
+    }
+    memset(&s_heap_free_cost, 0, sizeof s_heap_free_cost);
+}
+/* Used without a trailing semicolon, like the stage macros. */
+#define VITA_HEAP_COST_RECORD_FIND(probes) s_heap_free_cost_probes = (probes);
+#define VITA_HEAP_COST_RECORD_SCAN(probes) s_heap_free_cost_scan = (probes);
+#define VITA_HEAP_COST_RECORD_MOVE() ++s_heap_free_cost_moves;
+#define VITA_HEAP_COST_BEGIN() \
+    uint64_t vita_heap_free_cost_t = \
+        vita_heap_free_cost_begin(vita_heap_stage_t0_F_LEDGER);
+#define VITA_HEAP_COST_LOOKUP() \
+    vita_heap_free_cost_t = vita_heap_free_cost_mark( \
+        ISAAC_VITA_HEAP_COST_K, vita_heap_free_cost_t); \
+    ++s_heap_free_cost.lookups; \
+    vita_heap_free_cost_add(&s_heap_free_cost.lookup_probes, \
+                            &s_heap_free_cost.lookup_probe_max, \
+                            s_heap_free_cost_probes);
+#define VITA_HEAP_COST_LEASE() \
+    if (s_heap_lease_count) ++s_heap_free_cost.lease_scans;
+#define VITA_HEAP_COST_CHECKED() \
+    vita_heap_free_cost_t = vita_heap_free_cost_mark( \
+        ISAAC_VITA_HEAP_COST_E, vita_heap_free_cost_t); \
+    s_heap_free_cost_moves = 0U;
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+static int vita_heap_free_cost_prefilter(int may_own)
+{
+    if (may_own)
+        ++s_heap_free_cost.prefilter_maybe;
+    else
+        ++s_heap_free_cost.prefilter_skip;
+    return may_own;
+}
+#endif
+#define VITA_HEAP_FREE_PREFILTER_COUNTED(may_own) \
+    vita_heap_free_cost_prefilter(may_own)
+#define VITA_HEAP_COST_REMOVED() \
+    (void)vita_heap_free_cost_mark( \
+        ISAAC_VITA_HEAP_COST_R, vita_heap_free_cost_t); \
+    ++s_heap_free_cost.removes; \
+    vita_heap_free_cost_add(&s_heap_free_cost.remove_scan, \
+                            &s_heap_free_cost.remove_scan_max, \
+                            s_heap_free_cost_scan); \
+    vita_heap_free_cost_add(&s_heap_free_cost.remove_moves, NULL, \
+                            s_heap_free_cost_moves);
+#else
+#define VITA_HEAP_FREE_PREFILTER_COUNTED(may_own) (may_own)
+#define VITA_HEAP_COST_RECORD_FIND(probes)
+#define VITA_HEAP_COST_RECORD_SCAN(probes)
+#define VITA_HEAP_COST_RECORD_MOVE()
+#define VITA_HEAP_COST_BEGIN()
+#define VITA_HEAP_COST_LOOKUP()
+#define VITA_HEAP_COST_LEASE()
+#define VITA_HEAP_COST_CHECKED()
+#define VITA_HEAP_COST_REMOVED()
+#endif
 #ifdef ISAAC_VITA_HEAP_RANGE_LEASE
 /* One byte retains the allocation's birth phase after it becomes prior; the
  * separate current bitset is the only sidecar cleared at a floor rollover. */
@@ -800,6 +1049,16 @@ static void vita_heap_floor_lifetime_account_remove_locked(
 static void vita_heap_floor_lifetime_slot_insert_locked(
     size_t slot, size_t requested_size, uint32_t token)
 {
+#if defined(ISAAC_VITA_HEAP_LEAN_IMPORT)
+    /* Lean: floor attribution is measurement-only (stage-memory records, the
+     * HEAP_CENSUS receipt, test snapshots); skip its two sidecar cache lines.
+     * Sidecars stay zero, so remove/backshift/rehash/retag read token 0, and
+     * accounting_valid_locked reports the totals invalid. */
+    (void)slot;
+    (void)requested_size;
+    (void)token;
+    return;
+#endif
     vita_heap_floor_lifetime_slot_store(
         slot, token, s_ledger_floor_phase, s_ledger_floor_current);
     vita_heap_floor_lifetime_account_add_locked(requested_size, token);
@@ -808,6 +1067,11 @@ static void vita_heap_floor_lifetime_slot_insert_locked(
 static uint32_t vita_heap_floor_lifetime_slot_remove_locked(
     size_t slot, size_t requested_size)
 {
+#if defined(ISAAC_VITA_HEAP_LEAN_IMPORT)
+    (void)slot;
+    (void)requested_size;
+    return 0U;
+#endif
     uint32_t token = vita_heap_floor_lifetime_slot_token(
         slot, s_ledger_floor_phase, s_ledger_floor_current);
 
@@ -818,6 +1082,12 @@ static uint32_t vita_heap_floor_lifetime_slot_remove_locked(
 static void vita_heap_floor_lifetime_requested_size_replace_locked(
     size_t slot, size_t old_size, size_t new_size)
 {
+#if defined(ISAAC_VITA_HEAP_LEAN_IMPORT)
+    (void)slot;
+    (void)old_size;
+    (void)new_size;
+    return;
+#endif
     uint32_t token = vita_heap_floor_lifetime_slot_token(
         slot, s_ledger_floor_phase, s_ledger_floor_current);
 
@@ -1174,6 +1444,7 @@ static size_t vita_heap_find_slot(const uintptr_t *table, size_t capacity,
     if (!capacity) {
         *found = 0;
         VITA_HEAP_TEST_RECORD_FIND(0U);
+        VITA_HEAP_COST_RECORD_FIND(0U)
         return SIZE_MAX;
     }
     mask = capacity - 1U;
@@ -1183,11 +1454,13 @@ static size_t vita_heap_find_slot(const uintptr_t *table, size_t capacity,
         if (current == key) {
             *found = 1;
             VITA_HEAP_TEST_RECORD_FIND(probes + 1U);
+            VITA_HEAP_COST_RECORD_FIND(probes + 1U)
             return slot;
         }
         if (current == 0U) {
             *found = 0;
             VITA_HEAP_TEST_RECORD_FIND(probes + 1U);
+            VITA_HEAP_COST_RECORD_FIND(probes + 1U)
 #ifdef ISAAC_VITA_HEAP_LEDGER_BACKSHIFT
             return slot;
 #else
@@ -1203,6 +1476,7 @@ static size_t vita_heap_find_slot(const uintptr_t *table, size_t capacity,
     }
     *found = 0;
     VITA_HEAP_TEST_RECORD_FIND(capacity);
+    VITA_HEAP_COST_RECORD_FIND(capacity)
 #ifdef ISAAC_VITA_HEAP_LEDGER_BACKSHIFT
     return SIZE_MAX;
 #else
@@ -1378,6 +1652,7 @@ static size_t vita_heap_find_slot(const vita_heap_ledger_entry *table,
     if (!capacity) {
         *found = 0;
         VITA_HEAP_TEST_RECORD_FIND(0U);
+        VITA_HEAP_COST_RECORD_FIND(0U)
         return SIZE_MAX;
     }
     mask = capacity - 1U;
@@ -1387,11 +1662,13 @@ static size_t vita_heap_find_slot(const vita_heap_ledger_entry *table,
         if (current == key) {
             *found = 1;
             VITA_HEAP_TEST_RECORD_FIND(probes + 1U);
+            VITA_HEAP_COST_RECORD_FIND(probes + 1U)
             return slot;
         }
         if (current == 0U) {
             *found = 0;
             VITA_HEAP_TEST_RECORD_FIND(probes + 1U);
+            VITA_HEAP_COST_RECORD_FIND(probes + 1U)
 #ifdef ISAAC_VITA_HEAP_LEDGER_BACKSHIFT
             return slot;
 #else
@@ -1407,6 +1684,7 @@ static size_t vita_heap_find_slot(const vita_heap_ledger_entry *table,
     }
     *found = 0;
     VITA_HEAP_TEST_RECORD_FIND(capacity);
+    VITA_HEAP_COST_RECORD_FIND(capacity)
 #ifdef ISAAC_VITA_HEAP_LEDGER_BACKSHIFT
     return SIZE_MAX;
 #else
@@ -1533,6 +1811,7 @@ static int vita_heap_ledger_remove_preflight_table(
     mask = capacity - 1U;
     scan = (slot + 1U) & mask;
     for (probes = 0U; probes < capacity; ++probes) {
+        VITA_HEAP_COST_RECORD_SCAN(probes + 1U)
         if (table[scan].base == 0U)
             return 1;
         if (table[scan].base == VITA_HEAP_LEDGER_TOMBSTONE)
@@ -1558,6 +1837,7 @@ static void vita_heap_ledger_remove_commit_table(
         size_t home = vita_heap_hash(key) & mask;
 
         if (((scan - home) & mask) > ((hole - home) & mask)) {
+            VITA_HEAP_COST_RECORD_MOVE()
             table[hole] = table[scan];
             if (phases && current_bits) {
                 uint32_t token = vita_heap_floor_lifetime_slot_token(
@@ -2064,8 +2344,10 @@ static int vita_heap_build_forbidden_ranges(
     ranges_out->fixed_image.end = fixed_end;
     ranges_out->guest_stack.begin = (uintptr_t)stack_floor;
     ranges_out->guest_stack.end = (uintptr_t)stack_ceiling;
-    /* guest_stack_init uses newlib, so the stack is expected to lie inside
-     * retained_newlib.  Both are independently forbidden to the new mspace. */
+    /* The guest stack lies inside retained_newlib (guest_stack_init's
+     * memalign path) or in its own USER_RW block outside it
+     * (ISAAC_VITA_GUEST_STACK_MEMBLOCK); nothing here requires either.  Both
+     * ranges are independently forbidden to the new mspace. */
     if (vita_heap_ranges_overlap(&ranges_out->retained_newlib,
                                  &ranges_out->fixed_image) ||
         vita_heap_ranges_overlap(&ranges_out->guest_stack,
@@ -2167,6 +2449,11 @@ static int vita_heap_initialize_locked(
         return 0;
     }
     s_heap_init_state = VITA_HEAP_INIT_READY;
+#if defined(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH) && ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH
+    s_slab_forbidden_native_begin = ranges.retained_newlib.begin;
+    atomic_store_explicit(&s_slab_forbidden_native_end,
+                          ranges.retained_newlib.end, memory_order_release);
+#endif
     return 1;
 }
 
@@ -2181,6 +2468,11 @@ int isaac_vita_guest_heap_init(uint32_t stack_floor, uint32_t stack_ceiling)
         (uintptr_t)(void *)&_end, (size_t)_newlib_heap_size_user,
         stack_floor, stack_ceiling);
     vita_heap_unlock();
+#if defined(ISAAC_VITA_HEAP_LEAN_IMPORT)
+    /* Device proof that the lean ledger path is the one linked. */
+    isaac_vita_log("guest heap lean import: floor-lifetime sidecars off "
+                   "(init=%d)", result);
+#endif
     return result;
 }
 
@@ -2248,7 +2540,10 @@ static void *vita_heap_guest_malloc_with_reason(
         *failure_reason = "none";
     vita_heap_router_result_set(
         router_result, VITA_HEAP_ROUTER_OK, &telemetry);
+    VITA_HEAP_STAGE_BEGIN(M_LOCK)
     vita_heap_lock();
+    VITA_HEAP_STAGE_END(M_LOCK)
+    VITA_HEAP_STAGE_BEGIN(M_RESERVE)
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (!vita_heap_new_allocation_ready_locked()) {
         if (failure_reason)
@@ -2270,6 +2565,8 @@ static void *vita_heap_guest_malloc_with_reason(
         vita_heap_unlock_with_telemetry(&telemetry);
         return NULL;
     }
+    VITA_HEAP_STAGE_END(M_RESERVE)
+    VITA_HEAP_STAGE_BEGIN(M_NATIVE)
     result = malloc(size);
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (result && vita_heap_pointer_is_overflow_locked(result)) {
@@ -2287,6 +2584,7 @@ static void *vita_heap_guest_malloc_with_reason(
         vita_heap_telemetry_native_failure_locked();
         result = isaac_vita_heap_overflow_mspace_malloc(size);
         overflow_result = result != NULL;
+        VITA_HEAP_COUNT_IF(MALLOC_POOL, overflow_result)
         if (!result)
             vita_heap_telemetry_pool_failure_locked(&telemetry);
         if (!result && vita_heap_overflow_is_terminal_locked()) {
@@ -2300,6 +2598,8 @@ static void *vita_heap_guest_malloc_with_reason(
     if (!result && failure_reason)
         *failure_reason = "native-malloc-failed";
 #endif
+    VITA_HEAP_STAGE_END(M_NATIVE)
+    VITA_HEAP_STAGE_BEGIN(M_LEDGER)
 #ifdef ISAAC_VITA_HEAP_RANGE_LEASE
     if (result && !vita_heap_ledger_insert((uintptr_t)result, size)) {
 #else
@@ -2325,7 +2625,10 @@ static void *vita_heap_guest_malloc_with_reason(
     if (!result && *router_result == VITA_HEAP_ROUTER_OK)
         vita_heap_router_result_set(
             router_result, VITA_HEAP_ROUTER_OUT_OF_MEMORY, &telemetry);
+    VITA_HEAP_STAGE_END(M_LEDGER)
+    VITA_HEAP_STAGE_BEGIN(M_POST)
     vita_heap_unlock_with_telemetry(&telemetry);
+    VITA_HEAP_STAGE_END(M_POST)
     return result;
 }
 
@@ -2893,10 +3196,12 @@ static int vita_heap_guest_free_impl(
     size_t old_size;
 #endif
 
+    VITA_HEAP_STAGE_BEGIN(F_OBS)
 #if defined(__GNUC__)
     if (pointer && isaac_nv_guest_buffer_freed)
         isaac_nv_guest_buffer_freed(pointer);
 #endif
+    VITA_HEAP_STAGE_END(F_OBS)
     vita_heap_telemetry_event_init(
         &telemetry, VITA_HEAP_TELEMETRY_OP_FREE, 0U);
     if (!router_result)
@@ -2904,7 +3209,11 @@ static int vita_heap_guest_free_impl(
     vita_heap_router_result_set(
         router_result, VITA_HEAP_ROUTER_OK, &telemetry);
 
+    VITA_HEAP_STAGE_BEGIN(F_LOCK)
     vita_heap_lock();
+    VITA_HEAP_STAGE_END(F_LOCK)
+    VITA_HEAP_STAGE_BEGIN(F_LEDGER)
+    VITA_HEAP_COST_BEGIN()
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (s_heap_init_state != VITA_HEAP_INIT_READY) {
         vita_heap_router_result_set(
@@ -2923,7 +3232,9 @@ static int vita_heap_guest_free_impl(
         vita_heap_unlock_with_telemetry(&telemetry);
         return 0;
     }
+    VITA_HEAP_COST_LOOKUP()
 #ifdef ISAAC_VITA_HEAP_RANGE_LEASE
+    VITA_HEAP_COST_LEASE()
     if (vita_heap_base_is_leased((uintptr_t)pointer)) {
         vita_heap_router_result_set(
             router_result, VITA_HEAP_ROUTER_FOREIGN, &telemetry);
@@ -2936,16 +3247,21 @@ static int vita_heap_guest_free_impl(
     old_size = s_ledger[slot].requested_size;
     telemetry.request = vita_heap_telemetry_size_u32(old_size);
 #endif
+    VITA_HEAP_COST_CHECKED()
     if (!vita_heap_ledger_remove_slot(slot)) {
         vita_heap_router_result_set(
             router_result, VITA_HEAP_ROUTER_TERMINAL, &telemetry);
         vita_heap_unlock_with_telemetry(&telemetry);
         return 0;
     }
+    VITA_HEAP_COST_REMOVED()
     /* Ownership is invalidated before entering the native allocator. */
+    VITA_HEAP_STAGE_END(F_LEDGER)
+    VITA_HEAP_STAGE_BEGIN(F_NATIVE)
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (is_overflow) {
         int raw_freed = vita_heap_overflow_free_locked(pointer);
+        VITA_HEAP_COUNT(FREE_POOL)
 
         if (!raw_freed)
             vita_heap_telemetry_poison_locked();
@@ -2961,7 +3277,10 @@ static int vita_heap_guest_free_impl(
     else
 #endif
     free(pointer);
+    VITA_HEAP_STAGE_END(F_NATIVE)
+    VITA_HEAP_STAGE_BEGIN(F_POST)
     vita_heap_unlock_with_telemetry(&telemetry);
+    VITA_HEAP_STAGE_END(F_POST)
     return 1;
 }
 
@@ -2974,6 +3293,16 @@ static isaac_vita_room_entry_slab_result vita_heap_room_slab_free_route(
     vita_heap_telemetry_event heap_event;
     isaac_vita_room_entry_slab_result result;
 
+#if defined(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH) && ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH
+    if (vita_heap_definitely_not_slab(pointer)) {
+        /* Same NOT_OWNED decision as slab_free_locked; generic free still runs
+         * its Vorbis observer, lock, exact ledger/lease/domain validation. */
+        VITA_HEAP_COUNT(FREE_SLAB_FAST)
+        if (decision)
+            memset(decision, 0, sizeof *decision);
+        return ISAAC_VITA_ROOM_ENTRY_SLAB_NOT_OWNED;
+    }
+#endif
     isaac_vita_room_entry_slab_event_init(&slab_event);
     vita_heap_telemetry_event_init(
         &heap_event, VITA_HEAP_TELEMETRY_OP_FREE, 0U);
@@ -4951,6 +5280,11 @@ int isaac_vita_guest_heap_test_storage_reset(void)
     s_ledger_count = 0U;
     s_ledger_tombstones = 0U;
     s_ledger_fixed_capacity = 0;
+#if defined(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH) && ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH
+    /* Test-only reset is quiescent, as required by the existing reset API. */
+    atomic_store_explicit(&s_slab_forbidden_native_end, 0U, memory_order_release);
+    s_slab_forbidden_native_begin = 0U;
+#endif
     s_ledger_storage_poisoned = 0;
     s_realloc_moves = 0U;
 #if defined(ISAAC_VITA_ROOM_ENTRY_SLAB) && \
@@ -5287,15 +5621,33 @@ static void vita_heap_callnewh(CPU *__restrict c)
     vita_heap_cdecl_return(c);
 }
 
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+static void vita_heap_free_body(CPU *__restrict c);
 static void vita_heap_free(CPU *__restrict c)
+{
+    VITA_HEAP_STAGE_BEGIN(F_ALL)
+    vita_heap_free_body(c);
+    VITA_HEAP_STAGE_END(F_ALL)
+}
+static void vita_heap_free_body(CPU *__restrict c)
+#else
+static void vita_heap_free(CPU *__restrict c)
+#endif
 {
     KAGE_VITA_DEEP_SCOPE(KVD_HEAP_FREE);
     uint32_t pointer = vita_heap_arg(c, 0U);
+    VITA_HEAP_COUNT(FREE)
+    VITA_HEAP_COUNT_IF(FREE_NULL, !pointer)
+    VITA_HEAP_STAGE_BEGIN(F_PRE)
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (isaac_vita_guest_heap_terminal()) {
         guest_fault(c, pointer, "guest heap overflow domain is corrupted");
         return;
     }
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+    if (VITA_HEAP_FREE_PREFILTER_COUNTED(
+            vita_heap_free_prefilter_may_own(pointer))) {
 #endif
 #ifdef ISAAC_VITA_OGG_EMERGENCY
     {
@@ -5319,6 +5671,7 @@ static void vita_heap_free(CPU *__restrict c)
             if (isaac_nv_guest_buffer_freed)
                 isaac_nv_guest_buffer_freed((void *)(uintptr_t)pointer);
 #endif
+            VITA_HEAP_COUNT(FREE_OGG)
             vita_heap_cdecl_return(c);
             return;
         }
@@ -5334,6 +5687,7 @@ static void vita_heap_free(CPU *__restrict c)
         return;
     }
     if (scratch_result == ISAAC_VITA_ANM2_SCRATCH_HANDLED) {
+        VITA_HEAP_COUNT(FREE_ANM2)
         vita_heap_cdecl_return(c);
         return;
     }
@@ -5349,19 +5703,26 @@ static void vita_heap_free(CPU *__restrict c)
             return;
         }
         if (scratch_result == ISAAC_VITA_TEXEL_SCRATCH_HANDLED) {
+            VITA_HEAP_COUNT(FREE_TEXEL)
             vita_heap_cdecl_return(c);
             return;
         }
     }
 #endif
+#if defined(ISAAC_VITA_HEAP_FREE_PREFILTER)
+    }
+#endif
+    VITA_HEAP_STAGE_END(F_PRE)
 #ifdef ISAAC_VITA_ROOM_ENTRY_SLAB
     {
         isaac_vita_room_entry_slab_decision room;
         isaac_vita_room_entry_slab_result slab_result;
         uint32_t free_return_rva = vita_heap_import_return_rva(c);
 
+        VITA_HEAP_STAGE_BEGIN(F_SLAB)
         slab_result = vita_heap_room_slab_free_route(
             (void *)(uintptr_t)pointer, free_return_rva, &room);
+        VITA_HEAP_STAGE_END(F_SLAB)
         if (slab_result == ISAAC_VITA_ROOM_ENTRY_SLAB_TERMINAL ||
             isaac_vita_guest_heap_terminal()) {
             guest_fault(c, pointer, "room-entry slab is corrupted");
@@ -5372,6 +5733,7 @@ static void vita_heap_free(CPU *__restrict c)
             return;
         }
         if (slab_result == ISAAC_VITA_ROOM_ENTRY_SLAB_HANDLED) {
+            VITA_HEAP_COUNT(FREE_SLAB)
             vita_heap_cdecl_return(c);
             return;
         }
@@ -5406,6 +5768,7 @@ static void vita_heap_calloc(CPU *__restrict c)
 {
     KAGE_VITA_DEEP_SCOPE_BYTES(KVD_HEAP_ALLOC,
         (uint64_t)vita_heap_arg(c, 0U) * vita_heap_arg(c, 1U));
+    VITA_HEAP_COUNT(CALLOC)
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     vita_heap_router_result router_result;
     size_t count = (size_t)vita_heap_arg(c, 0U);
@@ -5433,9 +5796,22 @@ static void vita_heap_calloc(CPU *__restrict c)
     vita_heap_cdecl_return(c);
 }
 
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+static void vita_heap_malloc_body(CPU *__restrict c);
 static void vita_heap_malloc(CPU *__restrict c)
 {
+    VITA_HEAP_STAGE_BEGIN(M_ALL)
+    vita_heap_malloc_body(c);
+    VITA_HEAP_STAGE_END(M_ALL)
+}
+static void vita_heap_malloc_body(CPU *__restrict c)
+#else
+static void vita_heap_malloc(CPU *__restrict c)
+#endif
+{
     KAGE_VITA_DEEP_SCOPE_BYTES(KVD_HEAP_ALLOC, vita_heap_arg(c, 0U));
+    VITA_HEAP_COUNT(MALLOC)
+    VITA_HEAP_STAGE_BEGIN(M_PRE)
 #if defined(ISAAC_VITA_ANM2_SCRATCH) || \
     defined(ISAAC_VITA_TEXEL_OOM_DIAGNOSTIC) || \
     defined(ISAAC_VITA_TEXEL_SCRATCH) || \
@@ -5468,6 +5844,7 @@ static void vita_heap_malloc(CPU *__restrict c)
             return;
         }
         if (scratch_result == ISAAC_VITA_ANM2_SCRATCH_HANDLED) {
+            VITA_HEAP_COUNT(MALLOC_ANM2)
             c->eax = (uint32_t)(uintptr_t)scratch.pointer;
             vita_heap_cdecl_return(c);
             return;
@@ -5501,6 +5878,7 @@ static void vita_heap_malloc(CPU *__restrict c)
             return;
         }
         if (scratch_result == ISAAC_VITA_TEXEL_SCRATCH_HANDLED) {
+            VITA_HEAP_COUNT(MALLOC_TEXEL)
             c->eax = (uint32_t)(uintptr_t)scratch.pointer;
             vita_heap_cdecl_return(c);
             return;
@@ -5538,6 +5916,7 @@ static void vita_heap_malloc(CPU *__restrict c)
                 return;
             }
             if (slab_result == ISAAC_VITA_ROOM_ENTRY_SLAB_HANDLED) {
+                VITA_HEAP_COUNT(MALLOC_SLAB)
                 c->eax = (uint32_t)(uintptr_t)room.pointer;
                 vita_heap_cdecl_return(c);
                 return;
@@ -5547,6 +5926,7 @@ static void vita_heap_malloc(CPU *__restrict c)
         }
     }
 #endif
+    VITA_HEAP_STAGE_END(M_PRE)
 #if defined(ISAAC_VITA_TEXEL_OOM_DIAGNOSTIC) || \
     defined(ISAAC_VITA_OGG_EMERGENCY) || \
     defined(ISAAC_VITA_HEAP_OVERFLOW_MSPACE)
@@ -5587,6 +5967,7 @@ static void vita_heap_malloc(CPU *__restrict c)
 #endif
     }
 #endif
+    VITA_HEAP_COUNT_IF(MALLOC_NULL, !result)
 #ifdef ISAAC_VITA_TEXEL_OOM_DIAGNOSTIC
     if (!result) {
         size_t ledger_capacity;
@@ -5657,6 +6038,7 @@ static void vita_heap_realloc(CPU *__restrict c)
     KAGE_VITA_DEEP_SCOPE_BYTES(KVD_HEAP_ALLOC, vita_heap_arg(c, 1U));
     uint32_t pointer = vita_heap_arg(c, 0U);
     size_t size = (size_t)vita_heap_arg(c, 1U);
+    VITA_HEAP_COUNT(REALLOC)
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (isaac_vita_guest_heap_terminal()) {
         guest_fault(c, pointer, "guest heap overflow domain is corrupted");

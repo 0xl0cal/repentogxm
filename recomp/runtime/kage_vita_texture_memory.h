@@ -47,16 +47,38 @@
 #define KAGE_VITA_TEXEL_MEMBLOCK_MAX_RETAINED_MAX  0x00bd8000U
 #define KAGE_VITA_TEXEL_MEMBLOCK_PAGE_BYTES        0x00001000U
 
-/* Diagnostic hardware A/B only.  The 8 MiB request needs one additional
- * page so Vita3K and hardware both retain a page-aligned USER_RW span, but
- * that padding is not guest-visible capacity.  Production keeps the frozen
- * 0x00bd6000 maximum unless the source-scoped diagnostic definition is set
- * on host_vita_texel_scratch.c. */
+/* The Chinese TeamMeatFontExtended12_0.png needs 16 MiB of transient RGBA
+ * backing (issue #4, hardware log); UpheavalExtended_1.png in repentance_zh.a
+ * is 4096x2048 RGBA and needs 32 MiB.  The older 9,194-PNG census above missed
+ * these: its 0x00bd6000 cap forced the first request into the exhausted guest
+ * heap and left the font with a NULL image.  ISAAC_VITA_TEXEL_SCRATCH_32M
+ * covers both atlas sizes in the existing single-lease scratch and reserves
+ * it before vitaGL (entry_vita.c); it does not enlarge unrelated pools that
+ * also use the historical probe constants above.
+ *
+ * Add one page to power-of-two memblock requests to avoid size-derived
+ * over-alignment in Vita3K.  Padding is never guest-visible capacity.
+ *
+ * Capacity selection is source-scoped (host_vita_texel_scratch.c and, for
+ * the early reserve, entry_vita.c).  With neither definition set the frozen
+ * 0x00bd6000 maximum stays, lazily reserved at the first accepted request.
+ * The 8 MiB diagnostic remains deliberately smaller. */
+#define KAGE_VITA_TEXEL_SCRATCH_FONT_BYTES        0x02000000U
+#define KAGE_VITA_TEXEL_SCRATCH_FONT_MEMBLOCK_BYTES \
+    (KAGE_VITA_TEXEL_SCRATCH_FONT_BYTES + KAGE_VITA_TEXEL_MEMBLOCK_PAGE_BYTES)
+#if defined(ISAAC_VITA_TEXEL_SCRATCH_8M) && defined(ISAAC_VITA_TEXEL_SCRATCH_32M)
+#error ISAAC_VITA_TEXEL_SCRATCH_8M and ISAAC_VITA_TEXEL_SCRATCH_32M are exclusive
+#endif
 #if defined(ISAAC_VITA_TEXEL_SCRATCH_8M)
 #define KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES \
     KAGE_VITA_TEXEL_MEMBLOCK_8M_BYTES
 #define KAGE_VITA_TEXEL_SCRATCH_REQUEST_MAX_BYTES \
     KAGE_VITA_TEXEL_OOM_REQUEST
+#elif defined(ISAAC_VITA_TEXEL_SCRATCH_32M)
+#define KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES \
+    KAGE_VITA_TEXEL_SCRATCH_FONT_MEMBLOCK_BYTES
+#define KAGE_VITA_TEXEL_SCRATCH_REQUEST_MAX_BYTES \
+    KAGE_VITA_TEXEL_SCRATCH_FONT_BYTES
 #else
 #define KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES \
     KAGE_VITA_TEXEL_MEMBLOCK_MAX_BYTES

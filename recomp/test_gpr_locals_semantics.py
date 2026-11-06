@@ -239,6 +239,52 @@ CASES = [
      "48"              # dec eax
      "8906"            # mov [esi], eax
      "c3", None, {"esi": "BUF + 0x2800"}),
+    ("eflags_roundtrip",
+     # libtheora's CPUID-presence probe (oc_cpu_flags_get): flip EFLAGS.ID
+     # through popfd, read it back through pushfd, then restore.
+     "9c"              # pushfd
+     "58"              # pop eax
+     "8bd8"            # mov ebx, eax
+     "3500002000"      # xor eax, 0x200000
+     "50"              # push eax
+     "9d"              # popfd
+     "9c"              # pushfd
+     "58"              # pop eax
+     "9d"              # popfd
+     "33c3"            # xor eax, ebx      -> 0x200000
+     "8906"            # mov [esi], eax
+     # every modelled arithmetic flag set from a popped value, read by setcc
+     "68c5080000"      # push 0x8c5 (CF PF ZF SF OF)
+     "9d"              # popfd
+     "0f92c1"          # setb cl
+     "0f94c2"          # setz dl
+     "0f98c3"          # sets bl
+     "0f90c4"          # seto ah
+     "0f9ac5"          # setp ch
+     "884e04"          # mov [esi+4], cl
+     "885605"          # mov [esi+5], dl
+     "885e06"          # mov [esi+6], bl
+     "886607"          # mov [esi+7], ah
+     "886e08"          # mov [esi+8], ch
+     "9c"              # pushfd
+     "58"              # pop eax
+     "25c5082000"      # and eax, 0x2008c5 -> 0x8c5
+     "89460c"          # mov [esi+0xc], eax
+     # all cleared, then DF alone
+     "6a02"            # push 2
+     "9d"              # popfd
+     "9c"              # pushfd
+     "58"              # pop eax
+     "25c5082000"      # and eax, 0x2008c5 -> 0
+     "894610"          # mov [esi+0x10], eax
+     "6800040000"      # push 0x400 (DF)
+     "9d"              # popfd
+     "9c"              # pushfd
+     "58"              # pop eax
+     "2500040000"      # and eax, 0x400 -> 0x400
+     "894614"          # mov [esi+0x14], eax
+     "fc"              # cld
+     "c3", None, {"esi": "BUF + 0x2900"}),
 ]
 
 

@@ -71,10 +71,40 @@ host_flags="-std=gnu11 -O1 -g -Wall -Wextra -Werror -fno-omit-frame-pointer -fsa
     -o "$work/host-vita-heap-overflow-mspace-oracle"
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-    "$work/host-vita-heap-overflow-mspace-oracle"
+    "$work/host-vita-heap-overflow-mspace-oracle" \
+    > "$work/host-vita-heap-overflow-mspace-oracle.log"
+cat "$work/host-vita-heap-overflow-mspace-oracle.log"
+if ! grep -Fxq 'overflow mspace oracle: pool_bytes=8212480' \
+        "$work/host-vita-heap-overflow-mspace-oracle.log"; then
+    echo "default overflow pool receipt drifted" >&2
+    exit 1
+fi
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
     "$work/host-vita-heap-overflow-mspace-oracle" --internal-stranded
+
+# Pool-size knob (ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES) at its 24 MiB-class
+# value: the same oracle; its fake kernel and receipts scale with the macro.
+"$host_cc" $host_flags \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_TESTING=1 \
+    -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U \
+    -I"$fake_include" -I"$root/runtime" \
+    "$root/runtime/host_vita_heap_overflow_mspace.c" \
+    "$root/runtime/host_vita_heap_overflow_mspace_oracle.c" \
+    -o "$work/host-vita-heap-overflow-mspace-oracle-24m"
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+    "$work/host-vita-heap-overflow-mspace-oracle-24m" \
+    > "$work/host-vita-heap-overflow-mspace-oracle-24m.log"
+cat "$work/host-vita-heap-overflow-mspace-oracle-24m.log"
+if ! grep -Fxq 'overflow mspace oracle: pool_bytes=25153536' \
+        "$work/host-vita-heap-overflow-mspace-oracle-24m.log"; then
+    echo "24 MiB-class overflow pool receipt drifted" >&2
+    exit 1
+fi
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+    "$work/host-vita-heap-overflow-mspace-oracle-24m" --internal-stranded
 
 arm_flags="-std=gnu11 -O2 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=softfp -mthumb -ffunction-sections -fdata-sections -Wall -Wextra -Werror"
 
@@ -98,6 +128,19 @@ fi
 "$cc" $arm_flags -I"$root/runtime" \
     -c "$root/runtime/host_vita_heap_overflow_mspace.c" \
     -o "$work/overflow-mspace.production.o"
+
+# The pool-size knob must reach the ARM production object (its static asserts
+# hold at 0x017fd000U and the object differs from the default one); the
+# identity/allow-list checks below stay on the default objects.
+"$cc" $arm_flags -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U \
+    -I"$root/runtime" \
+    -c "$root/runtime/host_vita_heap_overflow_mspace.c" \
+    -o "$work/overflow-mspace.production-24m.o"
+if cmp -s "$work/overflow-mspace.production.o" \
+          "$work/overflow-mspace.production-24m.o"; then
+    echo "pool-size knob did not change the overflow-mspace ARM object" >&2
+    exit 1
+fi
 
 undefined_names () {
     "$nm" -u "$1" | awk '$1 == "U" { print $2 }' | LC_ALL=C sort

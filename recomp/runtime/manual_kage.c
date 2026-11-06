@@ -70,6 +70,15 @@ int guest_kage_pc_handoff_ready(void)
            kage_pc_backend_ready();
 }
 
+#if defined(ISAAC_VITA_INTRO_PLAY) && ISAAC_VITA_INTRO_PLAY
+/* ISAAC_VITA_INTRO_PLAY is a Vita knob; the PC discovery path keeps its
+ * automatic Intro confirm (no decoder worker there). */
+int guest_kage_intro_skip_ready(void)
+{
+    return guest_kage_pc_handoff_ready();
+}
+#endif
+
 static int require_pc_mode(CPU *__restrict c, uint32_t rva,
                            const char *disabled_fault)
 {

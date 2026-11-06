@@ -25,6 +25,11 @@ enum manager_storage_result {
     MANAGER_STORAGE_HASH_MISMATCH = -4,
     MANAGER_STORAGE_TOO_LARGE = -5,
     MANAGER_STORAGE_CAPACITY = -6,
+#if defined(MANAGER_SETTINGS_UI)
+    /* Text primitives only: the path does not exist (stat_path returned 1).
+     * Positive like SYNC_WARNING so `result < 0` still means failure. */
+    MANAGER_STORAGE_ABSENT = 2,
+#endif
 };
 
 enum manager_storage_node_kind {
@@ -71,6 +76,11 @@ struct manager_save_slot {
     int slot;
     int present;
     uint64_t size;
+#if defined(ISAAC_VITA_MANAGER_SAVE_GAMESTATE)
+    /* gamestateN.dat (the per-slot run state) next to the persistent file. */
+    int gamestate_present;
+    uint64_t gamestate_size;
+#endif
 };
 
 enum manager_save_backup_origin {
@@ -85,6 +95,12 @@ struct manager_save_backup {
     uint64_t size;
     char label[MANAGER_STORAGE_LABEL_CAPACITY];
     char path[MANAGER_STORAGE_PATH_CAPACITY];
+#if defined(ISAAC_VITA_MANAGER_SAVE_GAMESTATE)
+    /* A LOCAL backup "<prefix>N-NNNN.dat" may carry the slot's run state as
+     * "<prefix>N-NNNN.gamestate.dat". Dated and sync backups never do. */
+    int has_gamestate;
+    uint64_t gamestate_size;
+#endif
 };
 
 int manager_storage_list_mods(const struct manager_storage_io *io,
@@ -105,4 +121,65 @@ int manager_storage_restore_backup(const struct manager_storage_io *io,
                                    const struct manager_save_backup *backup);
 int manager_storage_recover(const struct manager_storage_io *io);
 
+#if defined(MANAGER_SETTINGS_UI)
+/* Manager-owned text files (the settings store):
+ * port.ini lives directly under MANAGER_STORAGE_ROOT; its
+ * sidecars are <name>.tmp (O_EXCL in-flight temp) and <name>.rollback
+ * (in-flight marker, exists only during a promotion); previous versions are
+ * archived as MANAGER_STORAGE_BACKUP_ROOT "/<prefix>-NNNN<ext>" and a
+ * quarantined file as "/<prefix>-recovered-NNNN<ext>".  Renames onto an
+ * existing path are never issued.  The runtime opens only <name>. */
+#define MANAGER_STORAGE_PORT_INI_NAME "port.ini"
+#define MANAGER_STORAGE_PORT_INI_PATH \
+    MANAGER_STORAGE_ROOT "/" MANAGER_STORAGE_PORT_INI_NAME
+#define MANAGER_STORAGE_TEXT_INDEX_MAX 9999u
+#define MANAGER_STORAGE_TEXT_MAX_BYTES (64u * 1024u)
+
+/* Whole file into buffer[0..capacity-1), NUL-terminated, *length set.
+ * OK, ABSENT, CONFLICT (not a regular file), TOO_LARGE (more than
+ * capacity-1 bytes; nothing is kept), IO_ERROR, INVALID. */
+int manager_storage_read_text(const struct manager_storage_io *io,
+                              const char *path, char *buffer,
+                              size_t capacity, size_t *length);
+/* Like read_text but a longer file is cut at capacity-1 bytes and reported
+ * through *truncated (may be NULL) instead of TOO_LARGE. */
+int manager_storage_read_head(const struct manager_storage_io *io,
+                              const char *path, char *buffer,
+                              size_t capacity, size_t *length,
+                              int *truncated);
+/* Section 1.3 write protocol for MANAGER_STORAGE_ROOT "/<name>": recover
+ * the name's sidecars, reserve the archive index, O_EXCL temp -> write ->
+ * sync -> close -> SHA-256 readback, <name> -> <name>.rollback (when it
+ * existed) -> sync, temp -> <name> -> re-hash -> sync, rollback -> archive
+ * -> sync.  Any failure restores the previous file and removes the temp.
+ * OK, SYNC_WARNING (only the post-archive sync failed), CAPACITY (no free
+ * archive index), CONFLICT (a sidecar or <name> is not a regular file, or
+ * the temp name is taken by a file that appeared after the recovery step),
+ * HASH_MISMATCH, TOO_LARGE, IO_ERROR (any other failure, a refused O_EXCL
+ * open with no temp in the way included), INVALID. */
+int manager_storage_write_text_atomic(const struct manager_storage_io *io,
+                                      const char *name, const void *bytes,
+                                      size_t length);
+/* DEFAULTS: <name> -> next archive index (one rename) -> sync; leaves no
+ * sidecar.  ABSENT when there was no file. */
+int manager_storage_archive_and_remove(const struct manager_storage_io *io,
+                                       const char *name);
+/* First free MANAGER_STORAGE_BACKUP_ROOT "/<prefix>-NNNN<ext>" above the
+ * newest existing index (0000 when none), so an archive written here is
+ * always the newest; CAPACITY past MANAGER_STORAGE_TEXT_INDEX_MAX. */
+int manager_storage_find_free_named(const struct manager_storage_io *io,
+                                    const char *prefix, const char *extension,
+                                    char *path, size_t capacity,
+                                    unsigned int *selected);
+/* Highest existing "/<prefix>-NNNN<ext>" in the backup root: OK with
+ * *index and path, ABSENT when there is none (or no backup root). */
+int manager_storage_newest_named(const struct manager_storage_io *io,
+                                 const char *prefix, const char *extension,
+                                 unsigned int *index, char *path,
+                                 size_t capacity);
+/* Folded into manager_storage_recover: a stranded port.ini.rollback wins
+ * (any port.ini is quarantined to port-recovered-NNNN.ini first), then a
+ * stale port.ini.tmp is removed.  Archives are never touched. */
+int manager_storage_recover_port(const struct manager_storage_io *io);
+#endif
 #endif

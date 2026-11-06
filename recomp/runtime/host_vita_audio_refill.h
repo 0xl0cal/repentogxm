@@ -37,6 +37,14 @@
 #define ISAAC_VITA_AUDIO_STREAM_BUFFER_DATA_RETURN 0x005be117U
 #define ISAAC_VITA_AUDIO_STREAM_QUEUE_RETURN      0x005be126U
 #define ISAAC_VITA_AUDIO_STB_GET_SAMPLES_RVA      0x005bdf80U
+/* StreamSource::IsPlaying (0x005be7e0, vtable +0x38): alGetSourcei(this+0x30,
+ * AL_SOURCE_STATE, &local) returns to 0x005be808 (guest_0177.c
+ * GPUSH(0x5be808U)); the result is `state == AL_PLAYING`.  It is the only
+ * AL_SOURCE_STATE query in the PE and is called by QueueData (0x5be135),
+ * Stop (0x5bf0b0/0x5bf0c3) and the MusicManager slot update (0x3a194b /
+ * 0x3a195c).  The alGetError right after it returns to 0x005be811
+ * (ISAAC_VITA_AUDIO_A005_IS_PLAYING_RETURN in host_vita_audio.h). */
+#define ISAAC_VITA_AUDIO_STREAM_IS_PLAYING_RETURN 0x005be808U
 
 /* Generated call sites push the BARE RVA as the return marker
  * (guest_0177.c: gpush_generated(c, 0x5bf136U), 0x5be117U, 0x5be126U); only
@@ -53,7 +61,9 @@
 #define ISAAC_VITA_AUDIO_AL_BUFFERS_PROCESSED     0x1016
 #define ISAAC_VITA_AUDIO_AL_BUFFERS_QUEUED        0x1015
 #define ISAAC_VITA_AUDIO_AL_SOURCE_STATE          0x1010
+#define ISAAC_VITA_AUDIO_AL_INITIAL               0x1011
 #define ISAAC_VITA_AUDIO_AL_PLAYING               0x1012
+#define ISAAC_VITA_AUDIO_AL_STOPPED               0x1014
 
 /* Default spacing between two granted stream refills.  One translated 64 KiB
  * decode is on the order of 20 ms, so one grant per 20 ms keeps at most one
@@ -111,6 +121,17 @@ void isaac_vita_audio_refill_note_queue(
     uint32_t source, uint32_t return_address, int32_t source_state);
 void isaac_vita_audio_refill_note_play(void);
 
+/* The guest's own alSourceStop is remembered per source by both the replay
+ * counter and the starvation shield: a source the guest stopped itself is
+ * neither a replay nor shielded until its next alSourcePlay.  One macro so
+ * the array and its note exist exactly when one of the two consumers does
+ * (with both OFF the objects are unchanged). */
+#if defined(ISAAC_VITA_AUDIO_REFILL_REPLAYS) || \
+    defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+#define ISAAC_VITA_AUDIO_REFILL_STOP_TRACKING 1
+void isaac_vita_audio_refill_note_stop(uint32_t source);
+#endif
+
 #if defined(ISAAC_VITA_AUDIO_REFILL_REPLAYS)
 /* Replay counter (defined together with ISAAC_VITA_NATIVE_VORBIS_ASYNC so
  * the option-OFF objects stay byte-identical).  StreamSource::QueueData
@@ -124,15 +145,77 @@ void isaac_vita_audio_refill_note_play(void);
  * manager hands out names < 128) are counted as plays only.  Gate:
  * replays=0. */
 #define ISAAC_VITA_AUDIO_STREAM_PLAY_RETURN       0x005be144U
-#define ISAAC_VITA_AUDIO_AL_INITIAL               0x1011
-#define ISAAC_VITA_AUDIO_AL_STOPPED               0x1014
 /* Replaces note_play: every alSourcePlay counts as a play; a play returning
  * to the QueueData site with the source AL_STOPPED, buffers queued and no
  * guest alSourceStop since its previous play counts as a replay. */
 void isaac_vita_audio_refill_note_play_state(
     uint32_t source, uint32_t return_address, int32_t source_state,
     int32_t queued);
-void isaac_vita_audio_refill_note_stop(uint32_t source);
+#endif
+
+#if defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD) || \
+    defined(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+/* Age of the source's last stream refill (alSourceQueueBuffers returning to
+ * 0x5be126) in milliseconds; UINT32_MAX when the source never refilled or
+ * lies beyond the per-source table. */
+uint32_t isaac_vita_audio_refill_last_refill_age_ms(uint32_t source);
+#endif
+
+#if defined(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+/* ISAAC_VITA_AUDIO_STARVATION_SHIELD.  The MusicManager per-slot update
+ * (0x003a18f0) computes active = stream->IsPlaying() || slot.paused and,
+ * once a slot is inactive while its stream still owns an AL source, logs
+ * "music stopped playing" and resets the slot (sub_0056e9a0): the track is
+ * gone for good.  On the Vita the refills run from the main loop, so a load
+ * stall longer than the queued PCM (<= 4 x 16384 frames, far less with the
+ * ASYNC partial slots) drains the source to AL_STOPPED and the next slot
+ * update drops it before QueueData could restart it.  The shield answers
+ * that one IsPlaying query (return marker 0x5be808) for a LIVE stream
+ * source with AL_PLAYING while the source is merely starved.
+ *
+ * "Live" is decided by the adapter (host_vita_audio.c): the source belongs
+ * to a StreamSourceOgg still in the manager's active list (a Stop() removes
+ * the object from that list BEFORE alSourceStop, so an intentional stop is
+ * never shielded) whose eof byte (+0x8c) is clear (a non-looping track that
+ * really ended keeps reporting not-playing).  This module adds the registry
+ * view: the source refilled from the stream site at least once, no guest
+ * alSourceStop since its last play, and the name fits the table.
+ *
+ * OpenAL Soft 1.19.1 reports every queued buffer of a stopped source as
+ * processed (alSource.c GetSourceiv: no voice and state != AL_INITIAL ->
+ * Current = NULL), so "unplayed buffers are queued" cannot be read from
+ * AL_BUFFERS_PROCESSED.  It is bookkept here instead: buffers the stream
+ * site queued while the source was already AL_STOPPED were never played
+ * ("fresh"); an alSourcePlay from STOPPED restarts at the head of the queue
+ * and consumes them.  Decision for a live, registered, stopped source:
+ *   fresh > 0  -> REPLAY: the adapter alSourcePlay()s (the same restart
+ *                 QueueData itself performs when IsPlaying is false) and
+ *                 answers AL_PLAYING;
+ *   fresh == 0 -> STARVED: answer AL_PLAYING only; the next Update sees the
+ *                 drained queue, refills one slot and its QueueData IsPlaying
+ *                 lands here again with fresh == 1.
+ * Everything else (unregistered source, guest-stopped source) is PASS: the
+ * truthful state is returned. */
+enum isaac_vita_audio_shield_verdict {
+    ISAAC_VITA_AUDIO_SHIELD_PASS = 0,
+    ISAAC_VITA_AUDIO_SHIELD_STARVED = 1,
+    ISAAC_VITA_AUDIO_SHIELD_REPLAY = 2
+};
+/* Called by the adapter for a live stream source found AL_STOPPED at the
+ * IsPlaying site; queued/processed are the real counts (receipt only).
+ * REPLAY obliges the caller to alSourcePlay(source) before answering.
+ * Counters and the bounded receipt ("KAGE VITA AUDIO SHIELD: ...", first 8
+ * events then every 64th) are updated here. */
+int isaac_vita_audio_shield_decide(uint32_t source, int32_t queued,
+                                   int32_t processed);
+/* After alSourceQueueBuffers returning to the stream site, with the source
+ * state read after the queue: AL_STOPPED marks the count as fresh. */
+void isaac_vita_audio_shield_note_queue(uint32_t source, int32_t source_state,
+                                        int32_t count);
+/* Every alSourcePlay (guest or shield) consumes the fresh buffers. */
+void isaac_vita_audio_shield_note_play(uint32_t source);
+/* One summary line for the process-final audio log. */
+void isaac_vita_audio_shield_log_final(void);
 #endif
 #endif
 

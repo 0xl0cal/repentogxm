@@ -30,6 +30,96 @@ void isaac_vita_archive_cache_oracle_clearerr(FILE *stream);
 #define ISAAC_VITA_ARCHIVE_CACHE_PREFIX \
     ISAAC_VITA_NATIVE_DATA_ROOT "/resources/packed/"
 
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+/* A descriptor the kernel dropped across a suspend refuses sceIoClose
+ * (ENODEV; Adrenaline user/msfs.c fakes that close into success).  Vita
+ * newlib's __vita_fd_drop then frees the entry's filename but returns the
+ * error without releasing anything, and __vita_release_descriptor keeps
+ * __vita_fdmap[fd]: one of the 253 newlib fds (3..255) is gone for the
+ * process lifetime per dead FILE closed.  Every newlib fclose of this module
+ * goes through a close hook that lets newlib's own release run once more on
+ * a valid dummy handle, which returns the slot exactly as a successful close
+ * would; the caller still sees the refused close's result and errno. */
+#if defined(ISAAC_VITA_ARCHIVE_CACHE_ORACLE)
+int isaac_vita_archive_cache_oracle_close_r(void *reent, int fd);
+isaac_vita_archive_newlib_fd *isaac_vita_archive_cache_oracle_fd_entry(int fd);
+int32_t isaac_vita_archive_cache_oracle_dummy_open(void);
+#define archive_fd_close_r(reent, fd) \
+    isaac_vita_archive_cache_oracle_close_r((reent), (fd))
+#define archive_fd_entry(fd) isaac_vita_archive_cache_oracle_fd_entry(fd)
+#define archive_fd_dummy_open() isaac_vita_archive_cache_oracle_dummy_open()
+#else
+#include <reent.h>
+#include <psp2/io/fcntl.h>
+_Static_assert(sizeof(isaac_vita_archive_newlib_fd) == 20U,
+               "newlib DescriptorTranslation layout drifted");
+extern isaac_vita_archive_newlib_fd *__vita_fdmap[];
+/* newlib stdio.c: the close hook fopen installs (fp->_file -> _close_r). */
+int __sclose(struct _reent *reent, void *cookie);
+#define archive_fd_close_r(reent, fd) \
+    _close_r((struct _reent *)(reent), (fd))
+#define archive_fd_entry(fd) (__vita_fdmap[(fd)])
+/* newlib opens tty0: itself for stdio (_init_vita_io). */
+#define archive_fd_dummy_open() sceIoOpen("tty0:", SCE_O_RDONLY, 0)
+#endif
+
+static uint32_t s_fd_repaired;
+static uint32_t s_fd_leaked;
+
+int isaac_vita_archive_fd_close_repair(void *reent, int *reent_errno, int fd)
+{
+    isaac_vita_archive_newlib_fd *entry;
+    int result = archive_fd_close_r(reent, fd);
+    int error;
+    int32_t dummy;
+
+    if (result == 0 || fd < 3 || fd >= ISAAC_VITA_ARCHIVE_NEWLIB_FD_COUNT)
+        return result;
+    entry = archive_fd_entry(fd);
+    /* 0 is VITA_DESCRIPTOR_FILE; a kept FILE entry still has ref_count 1. */
+    if (!entry || entry->type != 0U || entry->ref_count != 1)
+        return result;
+    error = *reent_errno;
+    dummy = archive_fd_dummy_open();
+    if (dummy >= 0) {
+        entry->sce_uid = dummy;
+        entry->filename = NULL; /* already freed by the refused close */
+        if (archive_fd_close_r(reent, fd) == 0) {
+            ++s_fd_repaired;
+            *reent_errno = error;
+            return result;
+        }
+    }
+    ++s_fd_leaked;
+    *reent_errno = error;
+    return result;
+}
+
+void isaac_vita_archive_fd_repair_counts(uint32_t *repaired, uint32_t *leaked)
+{
+    *repaired = s_fd_repaired;
+    *leaked = s_fd_leaked;
+}
+
+#if !defined(ISAAC_VITA_ARCHIVE_CACHE_ORACLE)
+static int archive_close_hook(struct _reent *reent, void *cookie)
+{
+    return isaac_vita_archive_fd_close_repair(
+        reent, &reent->_errno, ((FILE *)cookie)->_file);
+}
+
+static int archive_newlib_fclose(FILE *stream)
+{
+    if (stream->_close == __sclose && stream->_cookie == stream)
+        stream->_close = archive_close_hook;
+    return fclose(stream);
+}
+
+#undef archive_native_fclose
+#define archive_native_fclose archive_newlib_fclose
+#endif
+#endif
+
 typedef struct isaac_vita_archive_cache_idle {
     FILE *stream;
     char key[ISAAC_VITA_ARCHIVE_CACHE_KEY_CAPACITY];
@@ -50,6 +140,12 @@ static const char *archive_diag_kind_name(uint32_t kind)
         return "fseek";
     if (kind == ISAAC_VITA_ARCHIVE_DIAG_FREAD)
         return "fread";
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    if (kind == ISAAC_VITA_ARCHIVE_DIAG_CLOSE)
+        return "fclose";
+    if (kind == ISAAC_VITA_ARCHIVE_DIAG_FTELL)
+        return "ftell";
+#endif
     return "unknown";
 }
 

@@ -53,6 +53,27 @@
  * pristine Lua 5.3.3 and compares eax/esp/guest stack/Lua stack/error text
  * between the translated body and the wrap, a __gc-during-seam stress, the
  * VERIFY build).  Default OFF.
+ *
+ * Direct path (ISAAC_VITA_LUA_GETCLASS_DIRECT, needs NATIVE_GETCLASS; RENDER60
+ * S3.2 "getclass-direct"): the wraps call isaac_vita_lua_get{class,exact}_
+ * direct_try, the same replay with each Lua C API call replaced by that API
+ * function's pristine lapi.c body (inlined; lua_lock/api_check are empty in
+ * this build) and the two lua_rawgetp lookups -- registry[classKey] and
+ * mt[identityKey] -- served from a validated node memo (slot picked by the
+ * class key, collision-free over the corpus's 76 keys, resp. by the
+ * metatable pointer; a slot remembers its Table* and key, and its node is
+ * used only when it lies on a node boundary inside the table's current
+ * node array and still holds the light-userdata key, which makes it
+ * exactly luaH_get's answer).  Kept as
+ * the API path does it: every stack slot written and L->top after each
+ * step; every lua_pushstring as luaS_new(L, guest .rdata pointer) + push +
+ * luaC_checkGC (same string cache and string table evolution, same GC
+ * points, same debt); after a GC point stack addresses are derived again
+ * from L->ci->func and tables re-read from their slots.  The proof is the
+ * host oracle's direct variants (recomp/test_vita_lua_getclass.py): every
+ * case run translated vs direct wrap vs API try, with GC debt, total bytes,
+ * string-cache and dead-slot snapshots compared, and a stack-moving __gc
+ * stress.  Default OFF; OFF compiles the API path only.
  */
 #ifndef ISAAC_HOST_VITA_LUA_GETCLASS_H
 #define ISAAC_HOST_VITA_LUA_GETCLASS_H
@@ -126,6 +147,26 @@ void isaac_vita_lua_getclass_stats_log(void);
 #if defined(ISAAC_VITA_LUA_NATIVE_GETCLASS_WRAP)
 void __wrap_sub_003f8e30(CPU *__restrict c);
 void __wrap_sub_003f8c80(CPU *__restrict c);
+#endif
+
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+/* Node memo counters of the direct path, in [getclass stats] as
+ * memo(class hit/miss/stale,identity hit/miss/stale). */
+enum isaac_lgc_memo_counter {
+    ISAAC_LGC_MEMO_CLASS_HIT = 0,
+    ISAAC_LGC_MEMO_CLASS_MISS,
+    ISAAC_LGC_MEMO_CLASS_STALE,      /* slot matched, node no longer valid */
+    ISAAC_LGC_MEMO_IDENTITY_HIT,
+    ISAAC_LGC_MEMO_IDENTITY_MISS,
+    ISAAC_LGC_MEMO_IDENTITY_STALE,
+    ISAAC_LGC_MEMO_COUNT
+};
+
+int isaac_vita_lua_getclass_direct_try(CPU *__restrict c);
+int isaac_vita_lua_getexact_direct_try(CPU *__restrict c);
+void isaac_vita_lua_getclass_direct_memo(uint32_t out[ISAAC_LGC_MEMO_COUNT]);
+/* Oracle: forget every memo slot (the next lookups miss). */
+void isaac_vita_lua_getclass_direct_memo_flush(void);
 #endif
 
 #endif /* ISAAC_HOST_VITA_LUA_GETCLASS_H */

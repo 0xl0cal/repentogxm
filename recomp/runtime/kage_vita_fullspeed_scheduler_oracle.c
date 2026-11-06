@@ -9,14 +9,64 @@
 static uint64_t s_now;
 static uint32_t s_log_calls;
 static uint32_t s_disable_log_calls;
+static uint32_t s_gate_log_calls;
+static uint32_t s_gate_log_truncated;
+static char s_gate_record[384];
 static uint32_t s_delay_fail;
+/* CADENCE30 banners carrying " render-cost=excludes-present". */
+static uint32_t s_render_cost_banner_calls;
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+static uint32_t s_test_single_clip;
+#endif
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+/* Last CADENCE30 banner, for the " fps_lock=%u" suffix pin (as long as the
+ * log record: the floor-debt suffixes push it past 256 bytes). */
+static char s_banner[384];
+#endif
 #if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
 static uint32_t s_test_service_us = 500u;
 static uint32_t s_test_overshoot_us, s_test_variable_wake, s_test_waits;
 static uint32_t s_test_backward_wait;
+#else
+/* Floor-debt scenarios only (run_debt and its wake-overshoot cases):
+ * run_debt_tick names the scheduler wait that is sleeping, so a
+ * scenario can give the loop-head wait and the Game::Update pace wait
+ * different wake overshoots, add one extra overshoot to the next pace wait,
+ * or make the next head sleep return with the clock 1 us before it started
+ * (wait_until then returns 2).  The site is NONE everywhere else, so every
+ * other transcript keeps its exact sleep. */
+# define DEBT_WAIT_NONE 0u
+# define DEBT_WAIT_HEAD 1u
+# define DEBT_WAIT_PACE 2u
+static uint32_t s_debt_wait_site;
+static uint32_t s_debt_head_os_us, s_debt_pace_os_us;
+static uint32_t s_debt_pace_extra_us, s_debt_pace_extra_hits;
+static uint32_t s_debt_head_backward, s_debt_head_backward_hits;
+/* pace sleeps so far, and the overshoot (+ extra) the last one added */
+static uint32_t s_debt_pace_sleeps, s_debt_pace_wake_us;
 #endif
 
 #define ORACLE_MAX_GAME_UPDATES 1024u
+#define KAGE_ORACLE_STR2(x) #x
+#define KAGE_ORACLE_STR(x) KAGE_ORACLE_STR2(x)
+
+/* Game::Update start contract the checks below hold the scheduler to.
+ * Stock (and FLOOR_DEBT=OBSERVE): starts at least one Game floor period
+ * (33,333 1/3 us) apart, at most 30 in any sliding second.  FLOOR_DEBT=ON
+ * (debt kept): the floors are still one period apart, but a start
+ * may come up to the cap earlier than one period after the previous start,
+ * so the per-pair gap bound drops by the cap and 31 starts fit in a sliding
+ * second (31 * 33,333 - 16,666 > 1,000,000 for any legal cap; long-run UPS
+ * stays <= 30).  The cumulative form, oracle_start_spacing_holds, is the
+ * claim the per-pair and per-second bounds follow from. */
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2
+# define ORACLE_FLOOR_DEBT_CAP_US ((uint32_t)ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US)
+# define ORACLE_MAX_UPDATES_PER_SECOND 31u
+#else
+# define ORACLE_FLOOR_DEBT_CAP_US 0u
+# define ORACLE_MAX_UPDATES_PER_SECOND 30u
+#endif
+#define ORACLE_MIN_UPDATE_GAP_US (33333u - ORACLE_FLOOR_DEBT_CAP_US)
 
 uint64_t isaac_vita_get_process_time(void) { return s_now; }
 int sceKernelDelayThread(unsigned int delay_us)
@@ -35,6 +85,26 @@ int sceKernelDelayThread(unsigned int delay_us)
             (s_test_variable_wake ? multipliers[s_test_waits % 6u] : 1u);
         ++s_test_waits;
     }
+#else
+    if (s_debt_wait_site == DEBT_WAIT_HEAD) {
+        if (s_debt_head_backward) {
+            s_debt_head_backward = 0u;
+            ++s_debt_head_backward_hits;
+            --s_now;
+            return 0;
+        }
+        s_now += s_debt_head_os_us;
+    } else if (s_debt_wait_site == DEBT_WAIT_PACE) {
+        ++s_debt_pace_sleeps;
+        s_debt_pace_wake_us = s_debt_pace_os_us;
+        s_now += s_debt_pace_os_us;
+        if (s_debt_pace_extra_us) {
+            s_now += s_debt_pace_extra_us;
+            s_debt_pace_wake_us += s_debt_pace_extra_us;
+            s_debt_pace_extra_us = 0u;
+            ++s_debt_pace_extra_hits;
+        }
+    }
 #endif
     s_now += delay_us;
     return 0;
@@ -43,10 +113,11 @@ int sceKernelDelayThread(unsigned int delay_us)
 void isaac_vita_log(const char *format, ...)
 {
     va_list arguments;
-    char record[256];
+    char record[384];
+    int length;
 
     va_start(arguments, format);
-    (void)vsnprintf(record, sizeof record, format, arguments);
+    length = vsnprintf(record, sizeof record, format, arguments);
     va_end(arguments);
     if (strstr(record, "KAGE VITA CADENCE30:") == record &&
             strstr(record,
@@ -54,8 +125,21 @@ void isaac_vita_log(const char *format, ...)
                    "max_catchup=4 stale_catchup=1 max_full_skip=4 "
                    "parity=4a264 frame=1a30dc") != NULL)
         ++s_log_calls;
+    if (strstr(record, "KAGE VITA CADENCE30:") == record &&
+            strstr(record, " render-cost=excludes-present") != NULL)
+        ++s_render_cost_banner_calls;
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+    if (strstr(record, "KAGE VITA CADENCE30:") == record)
+        memcpy(s_banner, record, sizeof s_banner);
+#endif
     if (strstr(record, "KAGE VITA CADENCE30 DISABLE:") == record)
         ++s_disable_log_calls;
+    if (strstr(record, "KAGE VITA CADENCE30 GATE:") == record) {
+        ++s_gate_log_calls;
+        if (length < 0 || (size_t)length >= sizeof record)
+            ++s_gate_log_truncated;
+        memcpy(s_gate_record, record, sizeof s_gate_record);
+    }
 }
 
 #define CHECK(condition) do { \
@@ -89,6 +173,80 @@ typedef struct OracleGame {
     uint32_t wrapper_ticks_since_present;
 } OracleGame;
 
+/* Display wait inside Present: it lands between the Present seam and Render
+ * return, as vglSwapBuffers does inside kage_pc_backend_present.  NONE (the
+ * default) adds nothing, so every other transcript here is unchanged. */
+#define PRESENT_WAIT_NONE 0u
+/* Every fifth Present waits for the next 60-Hz edge; the others take 100 us. */
+#define PRESENT_WAIT_EDGE 1u
+/* Every fifth Present waits s_present_wait_us; the others take 100 us. */
+#define PRESENT_WAIT_FIXED 2u
+/* No vblank: the GPU runs frames back to back at s_present_wait_us each and
+ * Present N waits until frame N-2 has finished (two frames in flight). */
+#define PRESENT_WAIT_QUEUE 3u
+/* As QUEUE, but a frame flips on the first 60-Hz edge after it finishes, one
+ * flip per edge, and Present N waits until frame N-2 has flipped. */
+#define PRESENT_WAIT_QUEUE_VBLANK 4u
+
+static uint32_t s_present_wait_kind;
+static uint32_t s_present_wait_edge_us;
+static uint32_t s_present_wait_us;
+static uint32_t s_present_wait_count;
+static uint64_t s_present_wait_gpu_done[4];
+static uint64_t s_present_wait_flip[4];
+static uint64_t s_present_wait_max_us;
+
+/* First 60-Hz edge (50000 units of 1/3 us, at phase edge_us) at or after
+ * at_us, rounded up to the next microsecond. */
+static uint64_t present_wait_edge_at_or_after(uint64_t at_us)
+{
+    uint64_t offset = (uint64_t)s_present_wait_edge_us * 3u;
+    uint64_t at = at_us * 3u;
+    uint64_t k = 0u;
+
+    if (at > offset)
+        k = (at - offset + 50000u - 1u) / 50000u;
+    return (offset + k * 50000u + 2u) / 3u;
+}
+
+static uint64_t present_wait_us(void)
+{
+    uint32_t n = s_present_wait_count;
+    uint64_t wait = 100u;
+
+    if (s_present_wait_kind == PRESENT_WAIT_NONE)
+        return 0u;
+    if (s_present_wait_kind == PRESENT_WAIT_QUEUE ||
+            s_present_wait_kind == PRESENT_WAIT_QUEUE_VBLANK) {
+        uint64_t start, done, flip;
+
+        wait = 0u;
+        if (n >= 2u && s_present_wait_flip[(n - 2u) & 3u] > s_now)
+            wait = s_present_wait_flip[(n - 2u) & 3u] - s_now;
+        start = s_now + wait;
+        if (n != 0u && s_present_wait_gpu_done[(n - 1u) & 3u] > start)
+            start = s_present_wait_gpu_done[(n - 1u) & 3u];
+        done = start + s_present_wait_us;
+        flip = done;
+        if (s_present_wait_kind == PRESENT_WAIT_QUEUE_VBLANK) {
+            flip = present_wait_edge_at_or_after(done);
+            if (n != 0u && flip <= s_present_wait_flip[(n - 1u) & 3u])
+                flip = present_wait_edge_at_or_after(
+                    s_present_wait_flip[(n - 1u) & 3u] + 1u);
+        }
+        s_present_wait_gpu_done[n & 3u] = done;
+        s_present_wait_flip[n & 3u] = flip;
+    } else if (n % 5u == 4u) {
+        wait = s_present_wait_kind == PRESENT_WAIT_EDGE ?
+            present_wait_edge_at_or_after(s_now + 1u) - s_now :
+            s_present_wait_us;
+    }
+    ++s_present_wait_count;
+    if (wait > s_present_wait_max_us)
+        s_present_wait_max_us = wait;
+    return wait;
+}
+
 static int run_one_tick(
     OracleGame *game, uint32_t full_update_us, uint32_t nonfull_update_us,
     uint32_t render_us, uint32_t interpolation_enabled,
@@ -98,6 +256,10 @@ static int run_one_tick(
 
     kage_vita_fullspeed_scheduler_note_loop_head();
     kage_vita_fullspeed_scheduler_note_service();
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+    if (s_test_single_clip)
+        kage_vita_fullspeed_scheduler_note_video_service();
+#endif
 #if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
     s_now += s_test_service_us;
 #else
@@ -132,6 +294,7 @@ static int run_one_tick(
             interpolation_enabled);
         s_now += render_us;
         kage_vita_fullspeed_scheduler_note_present();
+        s_now += present_wait_us();
         kage_vita_fullspeed_scheduler_note_render_return();
 #if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
         if (result->present_time_count >= ORACLE_MAX_GAME_UPDATES * 2u)
@@ -173,6 +336,33 @@ static uint32_t maximum_game_updates_per_second(
     return maximum;
 }
 
+/* For every pair of starts i < j: s_j - s_i >= (j - i) * T - cap, in 1/3-us
+ * units, allowing the 2 units a wake rounds up to the next microsecond.
+ * Every floor is at least one period after the previous one and a start is
+ * never before its floor nor more than the cap after the anchor of the next
+ * floor, which gives the bound.  It needs an exact sleep and a monotonic
+ * clock, so the full-head advance oracle (wake overshoot) skips it. */
+static int oracle_start_spacing_holds(const uint64_t *times, uint32_t count)
+{
+#if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
+    (void)times;
+    (void)count;
+#else
+    uint32_t i, j;
+
+    for (i = 0u; i < count; ++i)
+        for (j = i + 1u; j < count; ++j) {
+            if (times[j] < times[i])
+                return 0;
+            if (3u * (times[j] - times[i]) +
+                    3u * (uint64_t)ORACLE_FLOOR_DEBT_CAP_US + 2u <
+                    (uint64_t)(j - i) * KAGE_VITA_FULLSPEED_GAME_TICK_UNITS)
+                return 0;
+        }
+#endif
+    return 1;
+}
+
 static ScenarioResult run_scenario(
     uint32_t duration_us, uint32_t render_us,
     uint32_t interpolation_enabled, uint32_t stall_at_tick,
@@ -206,6 +396,61 @@ static ScenarioResult run_scenario(
     return result;
 }
 
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+/* Stand-in for kage_vita_backend_render_admit (GL render thread one frame
+ * behind).  Called only where an interpolated frame would otherwise render. */
+static int s_render_admit = 1;
+static uint32_t s_render_admit_calls, s_render_admit_denials;
+int kage_vita_backend_render_admit(void)
+{
+    ++s_render_admit_calls;
+    if (s_render_admit)
+        return 1;
+    ++s_render_admit_denials;
+    return 0;
+}
+
+static ScenarioResult run_scenario(
+    uint32_t duration_us, uint32_t render_us,
+    uint32_t interpolation_enabled, uint32_t stall_at_tick,
+    uint32_t stall_us);
+
+static int check_render_admission(void)
+{
+    ScenarioResult admitted, behind;
+    const KageVitaFullspeedSnapshot *a, *b;
+    uint32_t admitted_calls;
+
+    s_render_admit = 1;
+    s_render_admit_calls = s_render_admit_denials = 0u;
+    admitted = run_scenario(10000000u, 5000u, 1u, 0u, 0u);
+    admitted_calls = s_render_admit_calls;
+    s_render_admit = 0;
+    s_render_admit_calls = s_render_admit_denials = 0u;
+    behind = run_scenario(10000000u, 5000u, 1u, 0u, 0u);
+    s_render_admit = 1;
+    a = &admitted.scheduler;
+    b = &behind.scheduler;
+    /* Admitted: asked once per interpolated render, all rendered. */
+    CHECK(admitted_calls > 0u);
+    CHECK(a->nonfull_phases - a->nonfull_skips == admitted_calls);
+    /* Behind: no interpolated frame renders, every refusal counted. */
+    CHECK(b->nonfull_phases - b->nonfull_skips == 0u);
+    CHECK(s_render_admit_denials == s_render_admit_calls &&
+          s_render_admit_calls > 0u);
+    CHECK(b->render_skips == b->nonfull_skips + b->late_full_skips);
+    /* The update cadence is not hurt and full phases are not skipped more. */
+    CHECK(b->game_updates >= a->game_updates);
+    CHECK(b->late_full_skips <= a->late_full_skips);
+    CHECK(behind.maximum_game_updates_per_second <=
+          ORACLE_MAX_UPDATES_PER_SECOND); /* as check_scenario */
+    printf("Vita GL render admission: PASS (admitted %u interpolated renders; "
+           "behind: %u refused, %u vs %u Game updates)\n",
+           (unsigned)admitted_calls, (unsigned)s_render_admit_denials,
+           (unsigned)b->game_updates, (unsigned)a->game_updates);
+    return 1;
+}
+#endif
 static int check_scenario(uint32_t render_us, uint32_t interpolation_enabled)
 {
     ScenarioResult result = run_scenario(
@@ -234,13 +479,16 @@ static int check_scenario(uint32_t render_us, uint32_t interpolation_enabled)
     CHECK(s->manager_entries == s->wrapper_ticks);
     CHECK(s->game_updates == (s->wrapper_ticks + 1u) / 2u);
     CHECK(result.game_update_time_count == s->game_updates);
-    CHECK(result.maximum_game_updates_per_second <= 30u);
+    CHECK(result.maximum_game_updates_per_second <=
+          ORACLE_MAX_UPDATES_PER_SECOND);
     if (result.game_update_time_count > 1u) {
         uint32_t i;
         for (i = 1u; i < result.game_update_time_count; ++i)
             CHECK(result.game_update_times[i] -
-                  result.game_update_times[i - 1u] >= 33333u);
+                  result.game_update_times[i - 1u] >= ORACLE_MIN_UPDATE_GAP_US);
     }
+    CHECK(oracle_start_spacing_holds(
+        result.game_update_times, result.game_update_time_count));
     CHECK(s->full_phases == s->game_updates);
     CHECK(s->nonfull_phases == s->wrapper_ticks - s->full_phases);
     CHECK(s->interpolation_phases ==
@@ -315,13 +563,16 @@ static int check_large_stall(void)
     CHECK(s->manager_entries == s->wrapper_ticks);
     CHECK(s->game_updates == (s->wrapper_ticks + 1u) / 2u);
     CHECK(result.game_update_time_count == s->game_updates);
-    CHECK(result.maximum_game_updates_per_second <= 30u);
+    CHECK(result.maximum_game_updates_per_second <=
+          ORACLE_MAX_UPDATES_PER_SECOND);
     if (result.game_update_time_count > 1u) {
         uint32_t i;
         for (i = 1u; i < result.game_update_time_count; ++i)
             CHECK(result.game_update_times[i] -
-                  result.game_update_times[i - 1u] >= 33333u);
+                  result.game_update_times[i - 1u] >= ORACLE_MIN_UPDATE_GAP_US);
     }
+    CHECK(oracle_start_spacing_holds(
+        result.game_update_times, result.game_update_time_count));
     CHECK(s->render_calls == s->presents);
     CHECK(s->runtime_disables == 0u);
     CHECK(s->duplicate_tick_violations == 0u);
@@ -907,7 +1158,8 @@ static int check_manager_counter_rebase_hostile_cases(void)
     CHECK(snapshot.duplicate_tick_violations == 1u);
     CHECK(snapshot.runtime_disables == 1u);
 
-    /* A rebase must be consumed by the same tick's paired full Game update. */
+    /* Even a valid Continue rebase cannot authorize an interpolation change
+     * without a paired full Game update. Retain this existing rejection. */
     start_manager_counter_rebase_tick(0x20000000u);
     kage_vita_fullspeed_scheduler_note_manager_counter_rebase(
         0x10000000u, 1u, 2u);
@@ -1037,6 +1289,226 @@ static int check_game_pointer_hostile_cases(void)
     CHECK(snapshot.game_pointer_violations == 1u);
     CHECK(snapshot.sequence_violations == 1u);
     CHECK(snapshot.runtime_disables == 1u);
+    return 1;
+}
+
+/* Exercise the production state machine, including the NEXT head's audit.
+ * Constants copied from the existing rebase fixtures above; 15815 is the
+ * restored frame printed by owner-video-game.log's Continue callback. */
+static void complete_cutscene_render(uint32_t counter)
+{
+    kage_vita_fullspeed_scheduler_note_render_entry();
+    kage_vita_fullspeed_scheduler_note_render_body(0x10000000u, counter, 1u);
+    s_now += 5000u;
+    kage_vita_fullspeed_scheduler_note_present();
+    kage_vita_fullspeed_scheduler_note_render_return();
+}
+
+static int check_continue_cutscene_gameplay(uint32_t publish, uint32_t restore,
+                                           uint32_t duty)
+{
+    OracleGame game = {0x10000000u, 2u, 0x20000000u, 7u, 0u};
+    ScenarioResult result;
+    KageVitaFullspeedSnapshot before, after;
+    uint32_t tick, expected_presents;
+    uint64_t gameplay_start, elapsed;
+
+    memset(&result, 0, sizeof result);
+    s_now = 0u;
+    s_delay_fail = 0u;
+    s_gate_log_calls = s_gate_log_truncated = 0u;
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+    kage_vita_fullspeed_scheduler_set_duty((uint8_t)duty);
+#endif
+    start_manager_counter_rebase_tick(publish ? 0u : game.game_pointer);
+    kage_vita_fullspeed_scheduler_note_manager_counter_rebase(
+        game.manager_pointer, 1u, game.manager_counter);
+    if (publish) {
+        game.game_pointer = 0x30000000u;
+        game.game_frame = 0u;
+        kage_vita_fullspeed_scheduler_note_game_pointer_publish(
+            game.manager_pointer, game.manager_counter, 0u, game.game_pointer);
+    }
+    if (restore) game.game_frame = 15815u;
+    ++game.manager_counter;
+    CHECK(kage_vita_fullspeed_scheduler_plan_render(
+        game.manager_pointer, game.manager_counter, 1u,
+        game.game_pointer, game.game_frame));
+    complete_cutscene_render(game.manager_counter);
+
+    /* 120 ordinary cutscene ticks, no Game calls. This crosses the receipt's
+     * lifetime and exercises both phases and all configured presentation locks. */
+    for (tick = 0u; tick < 120u; ++tick) {
+        kage_vita_fullspeed_scheduler_note_loop_head();
+        kage_vita_fullspeed_scheduler_note_service();
+        kage_vita_fullspeed_scheduler_note_manager_dispatch();
+        kage_vita_fullspeed_scheduler_note_manager_entry(
+            game.manager_pointer, game.manager_counter, 1u,
+            game.game_pointer, game.game_frame);
+        ++game.manager_counter;
+        if (kage_vita_fullspeed_scheduler_plan_render(
+                game.manager_pointer, game.manager_counter, 1u,
+                game.game_pointer, game.game_frame))
+            complete_cutscene_render(game.manager_counter);
+        CHECK(kage_vita_fullspeed_scheduler_bypass_limiter());
+    }
+    kage_vita_fullspeed_scheduler_snapshot(&before);
+    CHECK(before.game_updates == 0u);
+    CHECK(before.full_phases == 61u && before.nonfull_phases == 60u);
+    CHECK(before.manager_counter_rebases == 1u);
+    CHECK(before.game_pointer_rebinds == publish);
+    CHECK(before.runtime_disables == 0u);
+
+    gameplay_start = s_now;
+    for (tick = 0u; tick < 240u; ++tick)
+        (void)run_one_tick(&game, 2500u, 500u, 5000u, 1u, &result);
+    elapsed = s_now - gameplay_start;
+    kage_vita_fullspeed_scheduler_snapshot(&after);
+    CHECK(after.game_updates == 120u);
+    CHECK(after.full_phases - before.full_phases == 120u);
+    CHECK(after.nonfull_phases - before.nonfull_phases == 120u);
+    expected_presents = 120u + (duty ? 120u / duty : 0u);
+    CHECK(after.presents - before.presents == expected_presents);
+    CHECK(after.nonfull_skips - before.nonfull_skips == 240u - expected_presents);
+    CHECK(after.late_full_skips == 0u);
+    CHECK(result.game_update_time_count == 120u);
+    CHECK(maximum_game_updates_per_second(result.game_update_times, 120u) <=
+          ORACLE_MAX_UPDATES_PER_SECOND);
+    for (tick = 1u; tick < 120u; ++tick)
+        CHECK(result.game_update_times[tick] - result.game_update_times[tick-1u] >=
+              ORACLE_MIN_UPDATE_GAP_US);
+    CHECK(elapsed >= 3950000u && elapsed <= 4050000u);
+    CHECK(game.game_frame == (restore ? 15815u : (publish ? 0u : 7u)) + 120u);
+    CHECK(after.sequence_violations == 0u && after.parity_violations == 0u);
+    CHECK(after.game_frame_violations == 0u && after.game_pointer_violations == 0u);
+    CHECK(after.clock_resets == 0u && after.runtime_disables == 0u);
+    CHECK(result.limiter_fallbacks == 0u && result.limiter_bypasses == 240u);
+    CHECK(s_gate_log_calls == 0u);
+    /* Finish the last gameplay tick as well. */
+    kage_vita_fullspeed_scheduler_note_loop_head();
+    CHECK(kage_vita_fullspeed_scheduler_bypass_limiter());
+    return 1;
+}
+
+static int check_continue_cutscene_faults(void)
+{
+    KageVitaFullspeedSnapshot snapshot;
+    uint32_t mode;
+    for (mode = 0u; mode < 12u; ++mode) {
+        uint32_t manager = 0x10000000u, counter = 3u;
+        uint32_t game = 0x20000000u, interpolation = 1u;
+        s_now = 100u;
+        s_delay_fail = 0u;
+        s_gate_log_calls = s_gate_log_truncated = s_disable_log_calls = 0u;
+        start_manager_counter_rebase_tick(mode == 7u ? 0u : game);
+        if (mode != 6u)
+            kage_vita_fullspeed_scheduler_note_manager_counter_rebase(manager, 1u, 2u);
+        if (mode == 0u) manager += 4u;
+        if (mode == 1u) counter += 1u;
+        if (mode == 2u) game += 4u;
+        if (mode == 3u) interpolation = 0u;
+        if (mode == 4u) kage_vita_fullspeed_scheduler_note_game_update_begin(2u, game, 7u);
+        if (mode == 5u) kage_vita_fullspeed_scheduler_note_game_update_end(game, 7u);
+        if (mode == 7u) game = 0u;
+        if (mode == 8u) s_now = 99u;
+        if (mode >= 10u) {
+            /* The accepted Continue receipt must not hide an incomplete
+             * Render, nor a Game begin added after admission without its end. */
+            CHECK(kage_vita_fullspeed_scheduler_plan_render(
+                manager, counter, interpolation, game, 15815u));
+            if (mode == 10u)
+                kage_vita_fullspeed_scheduler_note_render_entry();
+            else {
+                complete_cutscene_render(counter);
+                kage_vita_fullspeed_scheduler_note_game_update_begin(2u, game, 15815u);
+            }
+            kage_vita_fullspeed_scheduler_note_loop_head();
+        } else if (mode == 9u) {
+            /* No Render gate: an input token alone cannot exempt the next
+             * head's required-stage / Continue audit. */
+            kage_vita_fullspeed_scheduler_note_loop_head();
+        } else if (mode == 6u) {
+            /* Start on an even phase to test a full-frame restore without
+             * either Continue token, rather than a wrong final counter. */
+            start_game_pointer_tick(game, 7u);
+            CHECK(kage_vita_fullspeed_scheduler_plan_render(manager, 1u, 0u, game, 15815u));
+        } else {
+            CHECK(kage_vita_fullspeed_scheduler_plan_render(
+                manager, counter, interpolation, game, 15815u));
+        }
+        kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+        CHECK(snapshot.runtime_disables == 1u);
+        CHECK(s_disable_log_calls == 1u);
+        CHECK(!kage_vita_fullspeed_scheduler_bypass_limiter());
+        CHECK(s_gate_log_truncated == 0u);
+        if (mode != 5u && mode < 9u) {
+            static const char *reasons[] = {"manager-identity", "counter", "game-identity",
+                "interpolation", "game-pair", "", "game-frame", "continue-no-game", "clock"};
+            CHECK(s_gate_log_calls == 1u);
+            CHECK(strstr(s_gate_record, reasons[mode]) != NULL);
+            CHECK(strstr(s_gate_record, "saved/current mgr=") != NULL);
+        }
+        /* Fail-open repeats must not flood either first-failure record. */
+        (void)kage_vita_fullspeed_scheduler_plan_render(manager, counter, interpolation, game, 15815u);
+        CHECK(s_gate_log_calls <= 1u && s_disable_log_calls == 1u);
+    }
+
+    /* A successfully consumed token cannot excuse a full-phase frame change
+     * on a subsequent cutscene tick. */
+    s_now = 0u;
+    start_manager_counter_rebase_tick(0x20000000u);
+    kage_vita_fullspeed_scheduler_note_manager_counter_rebase(0x10000000u, 1u, 2u);
+    CHECK(kage_vita_fullspeed_scheduler_plan_render(0x10000000u, 3u, 1u, 0x20000000u, 15815u));
+    complete_cutscene_render(3u);
+    kage_vita_fullspeed_scheduler_note_loop_head();
+    kage_vita_fullspeed_scheduler_note_service();
+    kage_vita_fullspeed_scheduler_note_manager_dispatch();
+    kage_vita_fullspeed_scheduler_note_manager_entry(0x10000000u, 3u, 1u, 0x20000000u, 15815u);
+    CHECK(kage_vita_fullspeed_scheduler_plan_render(0x10000000u, 4u, 1u, 0x20000000u, 15815u));
+    complete_cutscene_render(4u);
+    kage_vita_fullspeed_scheduler_note_loop_head();
+    kage_vita_fullspeed_scheduler_note_service();
+    kage_vita_fullspeed_scheduler_note_manager_dispatch();
+    kage_vita_fullspeed_scheduler_note_manager_entry(0x10000000u, 4u, 1u, 0x20000000u, 15815u);
+    CHECK(kage_vita_fullspeed_scheduler_plan_render(0x10000000u, 5u, 1u, 0x20000000u, 15816u));
+    kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+    CHECK(snapshot.game_frame_violations == 1u && snapshot.runtime_disables == 1u);
+
+    /* Exercise the real diagnostic formatter at full-width argument values.
+     * The platform's existing body buffer has 384 bytes. */
+    s_now = 0u;
+    s_gate_log_calls = s_gate_log_truncated = 0u;
+    kage_vita_fullspeed_scheduler_reset();
+    kage_vita_fullspeed_scheduler_note_loop_head();
+    kage_vita_fullspeed_scheduler_note_service();
+    kage_vita_fullspeed_scheduler_note_manager_dispatch();
+    kage_vita_fullspeed_scheduler_note_manager_entry(UINT32_MAX, UINT32_MAX, 1u, UINT32_MAX, UINT32_MAX);
+    CHECK(kage_vita_fullspeed_scheduler_plan_render(UINT32_MAX - 1u, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX));
+    CHECK(s_gate_log_calls == 1u && s_gate_log_truncated == 0u);
+    CHECK(strstr(s_gate_record, "mgr=ffffffff/fffffffe") != NULL);
+    CHECK(strstr(s_gate_record, "frame=4294967295/4294967295") != NULL);
+    /* Allow the other nine decimal digits of a saturated tick counter. */
+    CHECK(strlen(s_gate_record) + 9u < sizeof s_gate_record);
+    return 1;
+}
+
+static int check_continue_cutscene_late_render(void)
+{
+    KageVitaFullspeedSnapshot snapshot;
+    s_now = 0u;
+    s_delay_fail = 0u;
+    start_manager_counter_rebase_tick(0x20000000u);
+    kage_vita_fullspeed_scheduler_note_manager_counter_rebase(0x10000000u, 1u, 2u);
+    s_now = 20000u; /* Past the first 16.667-ms Render deadline. */
+    CHECK(!kage_vita_fullspeed_scheduler_plan_render(
+        0x10000000u, 3u, 1u, 0x20000000u, 15815u));
+    kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+    CHECK(snapshot.full_phases == 1u && snapshot.late_full_skips == 1u);
+    CHECK(snapshot.presents == 0u && snapshot.game_updates == 0u);
+    kage_vita_fullspeed_scheduler_note_loop_head();
+    kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+    CHECK(snapshot.sequence_violations == 0u && snapshot.runtime_disables == 0u);
+    CHECK(kage_vita_fullspeed_scheduler_bypass_limiter());
     return 1;
 }
 
@@ -1258,8 +1730,1729 @@ static int check_advanced_head_present_intervals(void)
 }
 #endif
 
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+/* port.ini fps_lock duty (port.ini design section 2):
+ * kage_vita_fullspeed_scheduler_set_duty(k) caps the non-full (interpolated)
+ * phase admission to every k-th one; k = 0 admits none.  The scenarios below
+ * run the cheap 5-ms room that presents 120 per 120 ticks today. */
+#define DUTY_TICKS 120u
+
+/* 120 wrapper ticks (2.5-ms full update, 0.5-ms non-full, 5-ms render) from
+ * a fresh reset with the duty last set; transcript[i] is 'F' (full phase
+ * presented), 'N' (non-full presented) or '_' (skipped). */
+static int run_duty_transcript(uint32_t interpolation_enabled,
+                               char transcript[DUTY_TICKS + 1u],
+                               KageVitaFullspeedSnapshot *snapshot)
+{
+    ScenarioResult result;
+    OracleGame game;
+    uint32_t tick;
+
+    memset(&result, 0, sizeof result);
+    memset(&game, 0, sizeof game);
+    game.manager_pointer = 0x10000000u;
+    game.game_pointer = 0x20000000u;
+    s_now = 0u;
+    s_log_calls = 0u;
+    s_delay_fail = 0u;
+    s_banner[0] = '\0';
+    kage_vita_fullspeed_scheduler_reset();
+    for (tick = 0u; tick < DUTY_TICKS; ++tick) {
+        int render = run_one_tick(&game, 2500u, 500u, 5000u,
+                                  interpolation_enabled, &result);
+        int full = (game.manager_counter & 1u) != 0u;
+
+        transcript[tick] = render ? (full ? 'F' : 'N') : '_';
+    }
+    transcript[DUTY_TICKS] = '\0';
+    kage_vita_fullspeed_scheduler_snapshot(snapshot);
+    return result.limiter_fallbacks == 0u;
+}
+
+/* Section 2 pattern: every full phase; the n-th non-full phase (n from 1)
+ * when n % k == 0; none when k == 0.  F N / F _ F N / F _ F _ F N / F _. */
+static void expected_duty_transcript(uint32_t k, char out[DUTY_TICKS + 1u])
+{
+    uint32_t tick;
+    uint32_t nonfull = 0u;
+
+    for (tick = 0u; tick < DUTY_TICKS; ++tick) {
+        if ((tick & 1u) == 0u) {
+            out[tick] = 'F';
+        } else {
+            ++nonfull;
+            out[tick] = (k != 0u && nonfull % k == 0u) ? 'N' : '_';
+        }
+    }
+    out[DUTY_TICKS] = '\0';
+}
+
+/* " fps_lock=%u" sits once, after the pinned "parity=4a264 frame=1a30dc". */
+static int check_banner_fps_lock(unsigned fps_lock)
+{
+    const char *parity = strstr(s_banner, "parity=4a264 frame=1a30dc");
+    const char *suffix = strstr(s_banner, " fps_lock=");
+    char want[24];
+
+    (void)snprintf(want, sizeof want, " fps_lock=%u", fps_lock);
+    CHECK(parity != NULL);
+    CHECK(suffix != NULL && suffix > parity);
+    CHECK(strstr(s_banner, want) != NULL);
+    CHECK(strstr(suffix + 1, " fps_lock=") == NULL);
+    return 1;
+}
+
+static int check_duty_lock(void)
+{
+    static const uint32_t k_values[4] = { 1u, 2u, 3u, 0u };
+    static const unsigned k_fps[4] = { 60u, 45u, 40u, 30u };
+    static const uint32_t k_presents[4] = { 120u, 90u, 80u, 60u };
+    static const uint32_t k_skips[4] = { 0u, 30u, 40u, 60u };
+    char baseline[DUTY_TICKS + 1u];
+    char transcript[DUTY_TICKS + 1u];
+    char expected[DUTY_TICKS + 1u];
+    KageVitaFullspeedSnapshot baseline_snapshot;
+    KageVitaFullspeedSnapshot snapshot;
+    KageVitaFullspeedSnapshot other;
+    unsigned i;
+
+    /* Default duty (never set): today's transcript; banner reports 60. */
+    CHECK(run_duty_transcript(1u, baseline, &baseline_snapshot));
+    expected_duty_transcript(1u, expected);
+    CHECK(strcmp(baseline, expected) == 0);
+    CHECK(baseline_snapshot.presents == 120u);
+    CHECK(baseline_snapshot.game_updates == 60u);
+    CHECK(baseline_snapshot.nonfull_skips == 0u);
+    CHECK(s_log_calls == 1u);
+    if (!check_banner_fps_lock(60u))
+        return 0;
+
+    for (i = 0u; i < 4u; ++i) {
+        kage_vita_fullspeed_scheduler_set_duty((uint8_t)k_values[i]);
+        CHECK(run_duty_transcript(1u, transcript, &snapshot));
+        expected_duty_transcript(k_values[i], expected);
+        if (strcmp(transcript, expected) != 0)
+            fprintf(stderr, "duty k=%u\n got  %s\n want %s\n",
+                    k_values[i], transcript, expected);
+        CHECK(strcmp(transcript, expected) == 0);
+        CHECK(snapshot.wrapper_ticks == DUTY_TICKS);
+        CHECK(snapshot.game_updates == 60u);
+        CHECK(snapshot.full_phases == 60u);
+        CHECK(snapshot.nonfull_phases == 60u);
+        CHECK(snapshot.interpolation_phases == 60u);
+        CHECK(snapshot.presents == k_presents[i]);
+        CHECK(snapshot.render_calls == k_presents[i]);
+        CHECK(snapshot.render_bodies == k_presents[i]);
+        CHECK(snapshot.nonfull_skips == k_skips[i]);
+        CHECK(snapshot.render_skips == k_skips[i]);
+        CHECK(snapshot.late_full_skips == 0u);
+        CHECK(snapshot.runtime_disables == 0u);
+        CHECK(snapshot.sequence_violations == 0u);
+        CHECK(snapshot.parity_violations == 0u);
+        CHECK(snapshot.duplicate_tick_violations == 0u);
+        CHECK(s_log_calls == 1u);
+        if (!check_banner_fps_lock(k_fps[i]))
+            return 0;
+        if (k_values[i] == 1u)
+            CHECK(strcmp(transcript, baseline) == 0);
+    }
+
+    /* k = 0 is the existing interpolation-off skip: same transcript and
+     * counters as the default duty with the guest byte at 0. */
+    kage_vita_fullspeed_scheduler_set_duty(1u);
+    CHECK(run_duty_transcript(0u, expected, &other));
+    kage_vita_fullspeed_scheduler_set_duty(0u);
+    CHECK(run_duty_transcript(1u, transcript, &snapshot));
+    CHECK(strcmp(transcript, expected) == 0);
+    CHECK(snapshot.wrapper_ticks == other.wrapper_ticks);
+    CHECK(snapshot.presents == other.presents);
+    CHECK(snapshot.game_updates == other.game_updates);
+    CHECK(snapshot.nonfull_skips == other.nonfull_skips);
+    CHECK(snapshot.render_skips == other.render_skips);
+
+    /* Out-of-range values clamp to 1 (today's behaviour). */
+    kage_vita_fullspeed_scheduler_set_duty(7u);
+    CHECK(run_duty_transcript(1u, transcript, &snapshot));
+    CHECK(strcmp(transcript, baseline) == 0);
+    if (!check_banner_fps_lock(60u))
+        return 0;
+    kage_vita_fullspeed_scheduler_set_duty(255u);
+    CHECK(run_duty_transcript(1u, transcript, &snapshot));
+    CHECK(strcmp(transcript, baseline) == 0);
+
+    /* reset/deactivate (the per-epoch clear) keep the boot-time duty. */
+    kage_vita_fullspeed_scheduler_set_duty(2u);
+    kage_vita_fullspeed_scheduler_deactivate();
+    kage_vita_fullspeed_scheduler_reset();
+    kage_vita_fullspeed_scheduler_deactivate();
+    CHECK(run_duty_transcript(1u, transcript, &snapshot));
+    expected_duty_transcript(2u, expected);
+    CHECK(strcmp(transcript, expected) == 0);
+    CHECK(snapshot.presents == 90u);
+    if (!check_banner_fps_lock(45u))
+        return 0;
+
+    kage_vita_fullspeed_scheduler_set_duty(1u);
+    return 1;
+}
+
+/* With the lock at 30 (k = 0) a wait failure disables the scheduler; from
+ * then on plan_render returns 1 on every phase and the lock is gone (the
+ * existing CADENCE30 DISABLE line is the receipt; no re-arm). */
+static int check_duty_fail_open(void)
+{
+    ScenarioResult result;
+    OracleGame game;
+    KageVitaFullspeedSnapshot snapshot;
+    uint32_t tick;
+    uint32_t presents = 0u;
+
+    memset(&result, 0, sizeof result);
+    memset(&game, 0, sizeof game);
+    game.manager_pointer = 0x10000000u;
+    game.game_pointer = 0x20000000u;
+    s_now = 0u;
+    s_log_calls = 0u;
+    s_disable_log_calls = 0u;
+    s_delay_fail = 0u;
+    kage_vita_fullspeed_scheduler_set_duty(0u);
+    kage_vita_fullspeed_scheduler_reset();
+    for (tick = 0u; tick < 20u; ++tick)
+        if (run_one_tick(&game, 2500u, 500u, 5000u, 1u, &result))
+            ++presents;
+    CHECK(presents == 10u);
+    kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+    CHECK(snapshot.nonfull_skips == 10u);
+    CHECK(snapshot.runtime_disables == 0u);
+    CHECK(result.limiter_fallbacks == 0u);
+
+    s_delay_fail = 1u;
+    kage_vita_fullspeed_scheduler_note_loop_head();
+    s_delay_fail = 0u;
+    kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+    CHECK(snapshot.runtime_disables == 1u);
+    CHECK(s_disable_log_calls == 1u);
+    CHECK(!kage_vita_fullspeed_scheduler_bypass_limiter());
+
+    presents = 0u;
+    for (tick = 0u; tick < 20u; ++tick)
+        if (run_one_tick(&game, 2500u, 500u, 5000u, 1u, &result))
+            ++presents;
+    CHECK(presents == 20u);
+    kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+    CHECK(snapshot.nonfull_skips == 10u);
+    CHECK(snapshot.runtime_disables == 1u);
+    CHECK(result.limiter_fallbacks == 20u);
+
+    kage_vita_fullspeed_scheduler_set_duty(1u);
+    return 1;
+}
+#endif
+
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+static int check_video_priority(void)
+{
+    /* Costs are synthetic stress inputs, not predictions of device FPS.
+     * Both 35-ms service and 51-ms Render are seen in the owner capture. */
+    const uint32_t render_costs[] = {1000u, 51000u};
+    const uint32_t gameplay_costs[] = {5000u, 19000u, 34000u, 55000u};
+    uint32_t duty, cost, tick;
+
+    for (duty = 0u; duty < 4u; ++duty) {
+        kage_vita_fullspeed_scheduler_set_duty((uint8_t)duty);
+        for (cost = 0u; cost < 2u; ++cost) {
+            OracleGame game = {0};
+            KageVitaFullspeedSnapshot snapshot;
+            ScenarioResult resumed = {0};
+            uint32_t expected = 0u, nonfull = 0u;
+            game.manager_pointer = 0x10000000u;
+            game.game_pointer = 0x20000000u;
+            game.game_frame = 15815u; /* captured File 2 save frame */
+            s_now = 0u;
+            s_delay_fail = 0u;
+            kage_vita_fullspeed_scheduler_reset();
+            for (tick = 0u; tick < 240u; ++tick) {
+                int render, wanted;
+                kage_vita_fullspeed_scheduler_note_loop_head();
+                kage_vita_fullspeed_scheduler_note_service();
+                s_now += tick % 17u ? 35000u : 200000u;
+                kage_vita_fullspeed_scheduler_note_video_service();
+                kage_vita_fullspeed_scheduler_note_manager_dispatch();
+                kage_vita_fullspeed_scheduler_note_manager_entry(
+                    game.manager_pointer, game.manager_counter, 1u,
+                    game.game_pointer, game.game_frame);
+                ++game.manager_counter;
+                wanted = (game.manager_counter & 1u) != 0u;
+                if (!wanted) {
+                    ++nonfull;
+                    wanted = duty != 0u && nonfull % duty == 0u;
+                }
+                render = kage_vita_fullspeed_scheduler_plan_render(
+                    game.manager_pointer, game.manager_counter, 1u,
+                    game.game_pointer, game.game_frame);
+                CHECK(render == wanted);
+                if (render) {
+                    ++expected;
+                    kage_vita_fullspeed_scheduler_note_render_entry();
+                    kage_vita_fullspeed_scheduler_note_render_body(
+                        game.manager_pointer, game.manager_counter, 1u);
+                    s_now += render_costs[cost];
+                    kage_vita_fullspeed_scheduler_note_present();
+                    kage_vita_fullspeed_scheduler_note_render_return();
+                }
+            }
+            kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+            CHECK(snapshot.presents == expected);
+            CHECK(snapshot.full_phases == 120u && snapshot.nonfull_phases == 120u);
+            CHECK(snapshot.late_full_skips == 0u && snapshot.game_updates == 0u);
+            CHECK(snapshot.runtime_disables == 0u && snapshot.sequence_violations == 0u);
+            /* Real gameplay resumes through its unchanged paced call seam. */
+            for (tick = 0u; tick < 240u; ++tick)
+                (void)run_one_tick(&game, 2500u, 500u, 5000u, 1u, &resumed);
+            CHECK(resumed.game_update_time_count == 120u);
+            CHECK(maximum_game_updates_per_second(resumed.game_update_times,
+                                                  resumed.game_update_time_count) <=
+                  ORACLE_MAX_UPDATES_PER_SECOND);
+            kage_vita_fullspeed_scheduler_snapshot(&snapshot);
+            CHECK(snapshot.runtime_disables == 0u);
+        }
+    }
+    kage_vita_fullspeed_scheduler_set_duty(1u);
+
+    /* A clip left alive during real gameplay must be completely inert on
+     * BOTH phases, including overdue interpolation. Compare actual schedules. */
+    for (cost = 0u; cost < 4u; ++cost) {
+        ScenarioResult without_clip, with_clip;
+        s_test_single_clip = 0u;
+        without_clip = run_scenario(3000000u, gameplay_costs[cost], 1u, 33u, 200000u);
+        s_test_single_clip = 1u;
+        with_clip = run_scenario(3000000u, gameplay_costs[cost], 1u, 33u, 200000u);
+        CHECK(memcmp(&without_clip, &with_clip, sizeof with_clip) == 0);
+    }
+    s_test_single_clip = 0u;
+
+    /* Receipt expires at the next head, including empty-service and a late
+     * internal-service attempt. No receipt bypasses the original late skip. */
+    for (uint32_t late_note = 0u; late_note < 2u; ++late_note) {
+        OracleGame game = {0};
+        game.manager_pointer = 0x10000000u;
+        s_now = 0u;
+        kage_vita_fullspeed_scheduler_reset();
+        for (tick = 0u; tick < 2u; ++tick) {
+            int render;
+            kage_vita_fullspeed_scheduler_note_loop_head();
+            kage_vita_fullspeed_scheduler_note_service();
+            s_now += 100000u;
+            if (!tick) kage_vita_fullspeed_scheduler_note_video_service();
+            kage_vita_fullspeed_scheduler_note_manager_dispatch();
+            kage_vita_fullspeed_scheduler_note_manager_entry(
+                game.manager_pointer, game.manager_counter, 1u, 0u, 0u);
+            if (tick && late_note) kage_vita_fullspeed_scheduler_note_video_service();
+            ++game.manager_counter;
+            render = kage_vita_fullspeed_scheduler_plan_render(
+                game.manager_pointer, game.manager_counter, 1u, 0u, 0u);
+            CHECK(render == (tick == 0u));
+            if (render) {
+                kage_vita_fullspeed_scheduler_note_render_entry();
+                kage_vita_fullspeed_scheduler_note_render_body(
+                    game.manager_pointer, game.manager_counter, 1u);
+                kage_vita_fullspeed_scheduler_note_present();
+                kage_vita_fullspeed_scheduler_note_render_return();
+            }
+        }
+    }
+    return 1;
+}
+#endif
+
+/* C2 transcripts: the display wait inside Present against the non-full
+ * admission test (ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT).  Each
+ * run warms up for 600 loops, then measures ten 120-loop windows, i.e. ten
+ * ph120 windows: 0.5-ms service, full_us Game::Update, 0.6-ms non-full
+ * phase, body_us Render body, then the modelled Present wait. */
+#define PRESENT_WAIT_WINDOWS 10u
+#define PRESENT_WAIT_TICKS 120u
+
+typedef struct PresentWaitRun {
+    uint32_t presents_min, presents_max, presents_total;
+    uint32_t updates_min, updates_max;
+    uint64_t wall_min_us, wall_max_us, wall_total_us;
+    uint32_t nonfull_skips, late_full_skips, forced_renders;
+    uint32_t runtime_disables, sequence_violations;
+    uint32_t max_updates_per_second;
+    uint64_t min_update_gap_us;
+    uint64_t max_wait_us;
+    uint32_t start_spacing_ok;
+} PresentWaitRun;
+
+static int run_present_wait(uint32_t kind, uint32_t edge_us, uint32_t wait_us,
+                            uint32_t full_us, uint32_t body_us,
+                            PresentWaitRun *out)
+{
+    static ScenarioResult result;
+    OracleGame game;
+    KageVitaFullspeedSnapshot before, after;
+    uint32_t window, tick, first, i;
+
+    memset(&result, 0, sizeof result);
+    memset(&game, 0, sizeof game);
+    memset(out, 0, sizeof *out);
+    game.manager_pointer = 0x10000000u;
+    game.game_pointer = 0x20000000u;
+    game.game_frame = 100u;
+    s_now = 1000u;
+    s_log_calls = 0u;
+    s_disable_log_calls = 0u;
+    s_delay_fail = 0u;
+    s_present_wait_kind = kind;
+    s_present_wait_edge_us = edge_us;
+    s_present_wait_us = wait_us;
+    s_present_wait_count = 0u;
+    memset(s_present_wait_gpu_done, 0, sizeof s_present_wait_gpu_done);
+    memset(s_present_wait_flip, 0, sizeof s_present_wait_flip);
+    kage_vita_fullspeed_scheduler_reset();
+    for (tick = 0u; tick < 600u; ++tick)
+        (void)run_one_tick(&game, full_us, 600u, body_us, 1u, &result);
+    first = result.game_update_time_count;
+    s_present_wait_max_us = 0u;
+    out->presents_min = out->updates_min = UINT32_MAX;
+    out->wall_min_us = UINT64_MAX;
+    for (window = 0u; window < PRESENT_WAIT_WINDOWS; ++window) {
+        uint64_t start = s_now;
+        uint32_t presents, updates;
+
+        kage_vita_fullspeed_scheduler_snapshot(&before);
+        for (tick = 0u; tick < PRESENT_WAIT_TICKS; ++tick)
+            (void)run_one_tick(&game, full_us, 600u, body_us, 1u, &result);
+        kage_vita_fullspeed_scheduler_snapshot(&after);
+        presents = after.presents - before.presents;
+        updates = after.game_updates - before.game_updates;
+        out->presents_total += presents;
+        if (presents < out->presents_min) out->presents_min = presents;
+        if (presents > out->presents_max) out->presents_max = presents;
+        if (updates < out->updates_min) out->updates_min = updates;
+        if (updates > out->updates_max) out->updates_max = updates;
+        out->wall_total_us += s_now - start;
+        if (s_now - start < out->wall_min_us) out->wall_min_us = s_now - start;
+        if (s_now - start > out->wall_max_us) out->wall_max_us = s_now - start;
+        out->nonfull_skips += after.nonfull_skips - before.nonfull_skips;
+        out->late_full_skips += after.late_full_skips - before.late_full_skips;
+        out->forced_renders += after.forced_renders - before.forced_renders;
+    }
+    out->runtime_disables = after.runtime_disables;
+    out->sequence_violations = after.sequence_violations;
+    out->max_updates_per_second = maximum_game_updates_per_second(
+        result.game_update_times + first, result.game_update_time_count - first);
+    out->min_update_gap_us = UINT64_MAX;
+    for (i = first > 0u ? first : 1u; i < result.game_update_time_count; ++i)
+        if (result.game_update_times[i] - result.game_update_times[i - 1u] <
+                out->min_update_gap_us)
+            out->min_update_gap_us =
+                result.game_update_times[i] - result.game_update_times[i - 1u];
+    out->max_wait_us = s_present_wait_max_us;
+    out->start_spacing_ok = (uint32_t)oracle_start_spacing_holds(
+        result.game_update_times + first, result.game_update_time_count - first);
+    s_present_wait_kind = PRESENT_WAIT_NONE;
+    return result.limiter_fallbacks == 0u &&
+        result.game_update_time_count < ORACLE_MAX_GAME_UPDATES;
+}
+
+typedef struct PresentWaitCase {
+    uint32_t kind, edge_us, wait_us, full_us, body_us;
+    uint32_t presents, presents_min, presents_max;
+    uint32_t nonfull_skips, late_full_skips;
+    uint64_t wall_us;
+} PresentWaitCase;
+
+/* Ten-window totals, measured with this oracle in the service-reserve
+ * configuration (the int2j recipe, head advance OFF); other configurations
+ * check the invariants, the tour transcript and the heavy row only.
+ *  - EDGE, 17 phases: every fifth Present waits for the next 60-Hz edge.
+ *    Phase 4500 (the 18th row) is the task transcript: a 10.566-ms wait,
+ *    100 presents per 120 loops with skip(a,l,n,f)=20,0,20,0 as in int2j
+ *    tour 3 (2026-09-17 issue re-check) and 120 with the knob, both at
+ *    exactly 2,000,000 us per window.
+ *  - FIXED: every fifth Present waits a fixed time.  The tour's windows fit
+ *    this better (rnd95 - rnd50 stays ~10.7 ms while rnd50 moves 5.5..7.3 ms;
+ *    an edge wait would keep rnd95 itself constant).  With the knob the frame
+ *    after a wait is admitted, a later wait lands on an interpolated frame
+ *    and the Game::Update after it starts late: 1200 presents but
+ *    20,184,200 us at 10.6 ms (29.73 UPS) against 1000 in 20,000,200.
+ *  - QUEUE: two frames in flight, no vblank.  Every Present waits at 12 ms
+ *    (unchanged); GPU-bound at 19 ms the knob costs 38 ms per 20 s.
+ *  - QUEUE_VBLANK 19 ms: the knob admits frames the GPU cannot finish,
+ *    1114 presents in 21.43 s (51.98 FPS, 27.99 UPS) against 1050 in
+ *    20.00 s (52.50 FPS, 30.00 UPS): presents per 120 loops rise while real
+ *    FPS and UPS fall.
+ *  - NONE, 19-ms body: interpolation stays discarded either way. */
+static const PresentWaitCase k_present_wait_cases[] = {
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+    { PRESENT_WAIT_EDGE, 0u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 1000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 2000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 3000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 4000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 5000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 6000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 7000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 8000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 9000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 10000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 11000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 12000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 13000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 14000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 15000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 16000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 4500u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 8000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 9000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 10000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20112200u },
+    { PRESENT_WAIT_FIXED, 0u, 11000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20232200u },
+    { PRESENT_WAIT_FIXED, 0u, 12000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20352200u },
+    { PRESENT_WAIT_FIXED, 0u, 13000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20472200u },
+    { PRESENT_WAIT_FIXED, 0u, 14000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20592200u },
+    { PRESENT_WAIT_FIXED, 0u, 15000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20712200u },
+    { PRESENT_WAIT_FIXED, 0u, 16000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20832200u },
+    { PRESENT_WAIT_FIXED, 0u, 17000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 18000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 19000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 20000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 10600u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20184200u },
+    { PRESENT_WAIT_QUEUE, 0u, 12000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000200u },
+    { PRESENT_WAIT_QUEUE, 0u, 17000u, 2500u, 6500u, 1188u, 118u, 119u, 0u, 12u, 20192730u },
+    { PRESENT_WAIT_QUEUE, 0u, 19000u, 2500u, 6500u, 1059u, 105u, 106u, 141u, 0u, 20121000u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 16000u, 3000u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000200u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 18000u, 3000u, 6500u, 1145u, 114u, 115u, 55u, 0u, 20916667u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 19000u, 3000u, 6500u, 1114u, 111u, 112u, 86u, 0u, 21433334u },
+    { PRESENT_WAIT_NONE, 0u, 0u, 2500u, 19000u, 600u, 60u, 60u, 600u, 0u, 20000200u },
+#else
+    { PRESENT_WAIT_EDGE, 0u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 1000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 2000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 3000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 4000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 5000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 6000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 7000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 8000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 9000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 10000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 11000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 12000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 13000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 14000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 15000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 16000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 4500u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 8000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 9000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 10000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 11000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 12000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 13000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 14000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 15000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 16000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 17000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 18000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 19000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 20000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_FIXED, 0u, 10600u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000200u },
+    { PRESENT_WAIT_QUEUE, 0u, 12000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000200u },
+    { PRESENT_WAIT_QUEUE, 0u, 17000u, 2500u, 6500u, 1188u, 118u, 119u, 0u, 12u, 20192730u },
+    { PRESENT_WAIT_QUEUE, 0u, 19000u, 2500u, 6500u, 1057u, 105u, 106u, 143u, 0u, 20083000u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 16000u, 3000u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000200u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 18000u, 3000u, 6500u, 1146u, 114u, 115u, 54u, 0u, 20915567u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 19000u, 3000u, 6500u, 1050u, 105u, 105u, 150u, 0u, 20000000u },
+    { PRESENT_WAIT_NONE, 0u, 0u, 2500u, 19000u, 600u, 60u, 60u, 600u, 0u, 20000200u },
+#endif
+};
+
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2 && \
+    ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US == 8000 && \
+    defined(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US) && \
+    ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US == 2000
+/* The same 39 cases with FLOOR_DEBT=ON, cap 8000 us, admit slack 2000 us,
+ * measured with this oracle in the service-reserve configuration (the only
+ * one pinned exactly).  Against k_present_wait_cases, presents and Game
+ * updates per second over the ten windows:
+ *  - inclusive cost: FIXED 9 ms 1000 -> 1200 presents at 30.00 UPS; QUEUE
+ *    17 ms 1188 -> 1177 presents, 58.83 FPS both, 29.71 -> 29.99 UPS;
+ *    QUEUE_VBLANK 18 ms 54.79 -> 55.00 FPS, 28.69 -> 30.00 UPS;
+ *  - C2 (render-cost=excludes-present): FIXED 10..16 ms keep 1200 presents
+ *    and go from 29.83..28.80 to 30.00 UPS; FIXED 17 ms 1000 -> 1200 at
+ *    30.00 UPS; FIXED 18 ms 1000 -> 1200 presents but 30.00 -> 29.83 UPS
+ *    (an admitted frame's Present wait overruns the cap: the one case here
+ *    where ON lowers UPS); QUEUE_VBLANK 19 ms 51.98 -> 52.60 FPS, 27.99 ->
+ *    30.00 UPS.
+ * Every other case presents the same; the walls lose the stock 200 us of
+ * clock quantisation (20,000,200 -> 20,000,000). */
+# define ORACLE_PRESENT_WAIT_DEBT_TABLE 1
+static const PresentWaitCase k_present_wait_debt_cases[] = {
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+    { PRESENT_WAIT_EDGE, 0u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 1000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 2000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 3000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 4000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 5000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 6000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 7000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 8000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 9000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 10000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 11000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 12000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 13000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 14000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 15000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 16000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 4500u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 8000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 9000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 10000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 11000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 12000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 13000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 14000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 15000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 16000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 17000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 18000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20112080u },
+    { PRESENT_WAIT_FIXED, 0u, 19000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 20000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 10600u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_QUEUE, 0u, 12000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_QUEUE, 0u, 17000u, 2500u, 6500u, 1177u, 117u, 118u, 23u, 0u, 20006566u },
+    { PRESENT_WAIT_QUEUE, 0u, 19000u, 2500u, 6500u, 1052u, 105u, 106u, 148u, 0u, 19988000u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 16000u, 3000u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 18000u, 3000u, 6500u, 1111u, 111u, 112u, 89u, 0u, 20000000u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 19000u, 3000u, 6500u, 1052u, 105u, 106u, 148u, 0u, 20001100u },
+    { PRESENT_WAIT_NONE, 0u, 0u, 2500u, 19000u, 600u, 60u, 60u, 600u, 0u, 20000000u },
+#else
+    { PRESENT_WAIT_EDGE, 0u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 1000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 2000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 3000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 4000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 5000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 6000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 7000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 8000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 9000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 10000u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 11000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 12000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 13000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 14000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 15000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 16000u, 0u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_EDGE, 4500u, 0u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 8000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 9000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 10000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 11000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 12000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 13000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 14000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 15000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 16000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 17000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 18000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 19000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 20000u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_FIXED, 0u, 10600u, 2500u, 6500u, 1000u, 100u, 100u, 200u, 0u, 20000000u },
+    { PRESENT_WAIT_QUEUE, 0u, 12000u, 2500u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_QUEUE, 0u, 17000u, 2500u, 6500u, 1177u, 117u, 118u, 23u, 0u, 20006566u },
+    { PRESENT_WAIT_QUEUE, 0u, 19000u, 2500u, 6500u, 1052u, 105u, 106u, 148u, 0u, 19988000u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 16000u, 3000u, 6500u, 1200u, 120u, 120u, 0u, 0u, 20000000u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 18000u, 3000u, 6500u, 1100u, 110u, 110u, 100u, 0u, 20000000u },
+    { PRESENT_WAIT_QUEUE_VBLANK, 5000u, 19000u, 3000u, 6500u, 1050u, 105u, 105u, 150u, 0u, 20000000u },
+    { PRESENT_WAIT_NONE, 0u, 0u, 2500u, 19000u, 600u, 60u, 60u, 600u, 0u, 20000000u },
+#endif
+};
+#endif
+
+static int check_present_wait(void)
+{
+#if defined(ORACLE_PRESENT_WAIT_DEBT_TABLE)
+    const PresentWaitCase *cases = k_present_wait_debt_cases;
+    const uint32_t count = (uint32_t)(sizeof k_present_wait_debt_cases /
+                                      sizeof k_present_wait_debt_cases[0]);
+#else
+    const PresentWaitCase *cases = k_present_wait_cases;
+    const uint32_t count =
+        (uint32_t)(sizeof k_present_wait_cases / sizeof k_present_wait_cases[0]);
+#endif
+    uint32_t i;
+
+    CHECK(count == 39u);
+    for (i = 0u; i < count; ++i) {
+        const PresentWaitCase *c = &cases[i];
+        PresentWaitRun run;
+        int exact;
+
+        s_render_cost_banner_calls = 0u;
+        CHECK(run_present_wait(c->kind, c->edge_us, c->wait_us, c->full_us,
+                               c->body_us, &run));
+        /* Everywhere: 60 Game updates per window, no replay above 30 UPS
+         * (31 starts per sliding second under FLOOR_DEBT=ON), no update
+         * closer than one floor (minus the cap under ON), the cumulative
+         * start contract, no fail-open, one banner. */
+        CHECK(run.updates_min == 60u && run.updates_max == 60u);
+        CHECK(run.max_updates_per_second <= ORACLE_MAX_UPDATES_PER_SECOND);
+        CHECK(run.min_update_gap_us >= ORACLE_MIN_UPDATE_GAP_US);
+        CHECK(run.start_spacing_ok);
+        CHECK(run.runtime_disables == 0u && run.sequence_violations == 0u);
+        CHECK(s_log_calls == 1u);
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+        CHECK(s_render_cost_banner_calls == 1u);
+#else
+        CHECK(s_render_cost_banner_calls == 0u);
+#endif
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2 && \
+    !defined(ORACLE_PRESENT_WAIT_DEBT_TABLE)
+        /* FLOOR_DEBT=ON with another cap or slack: invariants only. */
+        exact = 0;
+        (void)c;
+#elif defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE) && \
+    !(defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE)
+        exact = 1;
+#else
+        /* The tour transcript and the heavy row do not depend on the
+         * reserve or head-advance policy (measured in all seven harness
+         * configurations); the heavy row's wall does. */
+        exact = i == 17u;
+        if (i == count - 1u) {
+            CHECK(run.presents_total == c->presents);
+            CHECK(run.nonfull_skips == c->nonfull_skips);
+        }
+#endif
+        if (!exact)
+            continue;
+        if (run.presents_total != c->presents ||
+                run.presents_min != c->presents_min ||
+                run.presents_max != c->presents_max ||
+                run.nonfull_skips != c->nonfull_skips ||
+                run.late_full_skips != c->late_full_skips ||
+                run.wall_total_us != c->wall_us)
+            fprintf(stderr,
+                    "present-wait case %u kind=%u edge=%u wait=%u: presents "
+                    "%u [%u..%u] skip(n,f)=%u,%u wall %llu us\n",
+                    i, c->kind, c->edge_us, c->wait_us, run.presents_total,
+                    run.presents_min, run.presents_max, run.nonfull_skips,
+                    run.late_full_skips, (unsigned long long)run.wall_total_us);
+        CHECK(run.presents_total == c->presents);
+        CHECK(run.presents_min == c->presents_min);
+        CHECK(run.presents_max == c->presents_max);
+        CHECK(run.nonfull_skips == c->nonfull_skips);
+        CHECK(run.late_full_skips == c->late_full_skips);
+        CHECK(run.wall_total_us == c->wall_us);
+#if defined(ORACLE_PRESENT_WAIT_DEBT_TABLE)
+        {
+            /* Against the stock row: presents per second never lower (to
+             * 0.01/s), Game updates per second never lower (to 0.001/s)
+             * except the one C2 case named above. */
+            const PresentWaitCase *stock = &k_present_wait_cases[i];
+            double fps = run.presents_total * 1e6 / (double)run.wall_total_us;
+            double ups = 600.0 * 1e6 / (double)run.wall_total_us;
+            double stock_fps = stock->presents * 1e6 / (double)stock->wall_us;
+            double stock_ups = 600.0 * 1e6 / (double)stock->wall_us;
+
+            CHECK(stock->kind == c->kind && stock->edge_us == c->edge_us &&
+                  stock->wait_us == c->wait_us);
+            CHECK(fps >= stock_fps - 0.01);
+# if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+            if (i == 28u)
+                CHECK(ups < stock_ups - 0.1 && ups > 29.8);
+            else
+# endif
+                CHECK(ups >= stock_ups - 0.001);
+        }
+#endif
+    }
+    CHECK(cases[17].kind == PRESENT_WAIT_EDGE && cases[17].edge_us == 4500u);
+    return 1;
+}
+
+#if !(defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE)
+/* S5 floor-debt scenarios.  They run in every build
+ * without full-head advance, OFF included, and print one line per scenario
+ * with a digest of every Game::Update start and every Render decision of the
+ * measured window, so test_kage_vita_fullspeed_scheduler.py can prove
+ * OBSERVE identical to OFF and compare ON with OFF in one define set.
+ * Costs are synthetic stress inputs, not predictions of device FPS. */
+typedef struct DebtPhase {
+    uint32_t duration_us;
+    uint32_t service_us, service_jitter_us; /* full ticks, before the pace */
+    uint32_t full_us, nonfull_us;
+    uint32_t render_us, render_jitter_us;
+    uint32_t interpolation_enabled;
+    uint32_t menu; /* no Game::Update at all (menu, pause screen) */
+    /* Extra service before the pace of the n-th full tick of the phase
+     * (1-based, 0 = none), extra time inside the n-th Game::Update, and
+     * extra Render time on the n-th wrapper tick. */
+    uint32_t stall_full, stall_us;
+    uint32_t stall_update, stall_update_us;
+    uint32_t stall_render_tick, stall_render_us;
+    /* Wake overshoot of every loop-head and every pace sleep in the phase
+     * (sceKernelDelayThread above); a full tick whose pace comes right
+     * after its loop head; from the n-th full tick on (1-based,
+     * 0 = never), one extra overshoot on the next pace sleep; on the n-th
+     * full tick, a head sleep that returns with the clock 1 us before it
+     * started; before the n-th full tick's loop head, the clock set 1 us
+     * before the previous Render gate's reading (a loop-head clock reset). */
+    uint32_t head_os_us, pace_os_us;
+    uint32_t short_full; /* the n-th full tick has no service before its pace */
+    uint32_t pace_extra_full, pace_extra_us;
+    uint32_t head_back_full;
+    uint32_t clock_back_full;
+    /* The pace of the exact_full-th full tick starts exact_after_us after
+     * the Game::Update start of the exact_ref_full-th (its service is
+     * stretched to that instant; 0 = off). */
+    uint32_t exact_ref_full, exact_full, exact_after_us;
+} DebtPhase;
+
+typedef struct DebtRun {
+    uint32_t updates, presents, ticks;
+    /* From the last Game::Update start before the window to the last one in
+     * it: `updates` floor periods plus whatever the floor dropped. */
+    uint64_t wall_us;
+    uint32_t max_per_second;
+    uint32_t spacing_ok;
+    uint64_t digest;
+    uint32_t disables, violations, dropped;
+    /* whole run: the extra pace overshoot, backward head sleep and loop-head
+     * clock reset that really happened (a scenario must not pass because
+     * its trigger never fired) */
+    uint32_t pace_extra_hits, head_back_hits, clock_back_hits;
+    /* the measured phase's pace-wake overshoot: a boundary start that woke
+     * from a floor wait is that much after its floor */
+    uint32_t pace_os_us;
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    KageVitaFullspeedFloorDebtSnapshot debt; /* the window's paces */
+    /* the floor stamp of the take that opened the window (debt.floor_us is
+     * the closing one) */
+    uint64_t floor_start_us;
+#endif
+    /* the window's first Game::Update start, whether its pace slept, and
+     * the wake overshoot (+ extra) that sleep added */
+    uint64_t first_start_us;
+    uint32_t first_slept, first_wake_us;
+} DebtRun;
+
+static uint32_t s_debt_lcg;
+/* Clock reading of the latest Render gate (plan_render), the scheduler's
+ * last clock before the next loop head. */
+static uint64_t s_debt_last_gate_us;
+/* Armed by run_debt for one full tick: its pace starts at this instant. */
+static uint64_t s_debt_pace_at_us;
+
+static uint32_t debt_rand(uint32_t range)
+{
+    if (range == 0u)
+        return 0u;
+    s_debt_lcg = s_debt_lcg * 1664525u + 1013904223u;
+    return (s_debt_lcg >> 8) % (range + 1u);
+}
+
+static uint64_t debt_fnv(uint64_t hash, uint64_t value)
+{
+    uint32_t i;
+
+    for (i = 0u; i < 8u; ++i) {
+        hash ^= (value >> (8u * i)) & 0xffu;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+/* run_one_tick with a per-tick service before Game::Update and a per-tick
+ * Render cost, and no Present wait; otherwise the same seam sequence. */
+static int run_debt_tick(OracleGame *game, uint32_t service_us,
+                         uint32_t full_us, uint32_t nonfull_us,
+                         uint32_t render_us, uint32_t interpolation_enabled,
+                         uint32_t menu, ScenarioResult *result,
+                         uint64_t *start_us)
+{
+    int render;
+
+    s_debt_wait_site = DEBT_WAIT_HEAD;
+    kage_vita_fullspeed_scheduler_note_loop_head();
+    s_debt_wait_site = DEBT_WAIT_NONE;
+    kage_vita_fullspeed_scheduler_note_service();
+    s_now += service_us;
+    if (s_debt_pace_at_us) {
+        if (s_now < s_debt_pace_at_us)
+            s_now = s_debt_pace_at_us;
+        s_debt_pace_at_us = 0u;
+    }
+    kage_vita_fullspeed_scheduler_note_manager_dispatch();
+    kage_vita_fullspeed_scheduler_note_manager_entry(
+        game->manager_pointer, game->manager_counter,
+        interpolation_enabled, game->game_pointer, game->game_frame);
+    *start_us = 0u;
+    if ((game->manager_counter & 1u) == 0u && !menu) {
+        s_debt_wait_site = DEBT_WAIT_PACE;
+        kage_vita_fullspeed_scheduler_note_game_update_begin(
+            game->manager_counter, game->game_pointer, game->game_frame);
+        s_debt_wait_site = DEBT_WAIT_NONE;
+        if (result->game_update_time_count < ORACLE_MAX_GAME_UPDATES)
+            result->game_update_times[result->game_update_time_count++] =
+                s_now;
+        *start_us = s_now;
+        s_now += full_us;
+        ++game->game_frame;
+        kage_vita_fullspeed_scheduler_note_game_update_end(
+            game->game_pointer, game->game_frame);
+    } else {
+        s_now += nonfull_us;
+    }
+    ++game->manager_counter;
+    s_debt_last_gate_us = s_now;
+    render = kage_vita_fullspeed_scheduler_plan_render(
+        game->manager_pointer, game->manager_counter,
+        interpolation_enabled, game->game_pointer, game->game_frame);
+    if (render) {
+        kage_vita_fullspeed_scheduler_note_render_entry();
+        kage_vita_fullspeed_scheduler_note_render_body(
+            game->manager_pointer, game->manager_counter,
+            interpolation_enabled);
+        s_now += render_us;
+        kage_vita_fullspeed_scheduler_note_present();
+        kage_vita_fullspeed_scheduler_note_render_return();
+    }
+    if (kage_vita_fullspeed_scheduler_bypass_limiter())
+        ++result->limiter_bypasses;
+    else
+        ++result->limiter_fallbacks;
+    return render;
+}
+
+static void debt_clear_wake_hooks(void)
+{
+    s_debt_wait_site = DEBT_WAIT_NONE;
+    s_debt_head_os_us = s_debt_pace_os_us = 0u;
+    s_debt_pace_extra_us = s_debt_pace_extra_hits = 0u;
+    s_debt_head_backward = s_debt_head_backward_hits = 0u;
+    s_debt_pace_sleeps = s_debt_pace_wake_us = 0u;
+    s_debt_pace_at_us = 0u;
+}
+
+/* The phases run in order from a fresh reset; the last one is measured. */
+static int run_debt(const DebtPhase *phases, uint32_t count, uint32_t seed,
+                    DebtRun *out)
+{
+    static ScenarioResult result;
+    OracleGame game;
+    KageVitaFullspeedSnapshot before, after;
+    uint64_t last_start = 0u, window_prev_start = 0u;
+    uint32_t phase;
+
+    memset(&result, 0, sizeof result);
+    memset(&game, 0, sizeof game);
+    memset(&before, 0, sizeof before);
+    memset(out, 0, sizeof *out);
+    game.manager_pointer = 0x10000000u;
+    game.game_pointer = 0x20000000u;
+    game.game_frame = 100u;
+    s_now = 1000u;
+    s_log_calls = 0u;
+    s_disable_log_calls = 0u;
+    s_delay_fail = 0u;
+    s_present_wait_kind = PRESENT_WAIT_NONE;
+    s_debt_lcg = seed;
+    debt_clear_wake_hooks();
+    s_debt_last_gate_us = 0u;
+    out->digest = 1469598103934665603ull;
+    kage_vita_fullspeed_scheduler_reset();
+    for (phase = 0u; phase < count; ++phase) {
+        const DebtPhase *p = &phases[phase];
+        uint64_t end = s_now + p->duration_us;
+        uint64_t exact_ref_start = 0u;
+        uint32_t full_index = 0u, tick_index = 0u;
+        int window = phase + 1u == count;
+
+        s_debt_head_os_us = p->head_os_us;
+        s_debt_pace_os_us = p->pace_os_us;
+        if (window) {
+            out->pace_os_us = p->pace_os_us;
+            kage_vita_fullspeed_scheduler_snapshot(&before);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+            kage_vita_fullspeed_scheduler_floor_debt_take(&out->debt);
+            out->floor_start_us = out->debt.floor_us;
+            memset(&out->debt, 0, sizeof out->debt);
+#endif
+            window_prev_start = last_start;
+            result.game_update_time_count = 0u;
+        }
+        while (s_now < end) {
+            uint32_t full = (game.manager_counter & 1u) == 0u;
+            uint32_t service = 500u;
+            uint32_t render_us = p->render_us + debt_rand(p->render_jitter_us);
+            uint64_t start_us;
+            uint32_t pace_sleeps = s_debt_pace_sleeps;
+            int render;
+
+            ++tick_index;
+            if (full) {
+                ++full_index;
+                service = p->service_us + debt_rand(p->service_jitter_us);
+                if (full_index == p->short_full)
+                    service = 0u;
+                if (full_index == p->stall_full)
+                    service += p->stall_us;
+                if (full_index == p->pace_extra_full)
+                    s_debt_pace_extra_us = p->pace_extra_us;
+                if (full_index == p->head_back_full)
+                    s_debt_head_backward = 1u;
+                if (full_index == p->clock_back_full &&
+                        s_debt_last_gate_us > 1u) {
+                    s_now = s_debt_last_gate_us - 1u;
+                    ++out->clock_back_hits;
+                }
+                if (full_index == p->exact_full && exact_ref_start)
+                    s_debt_pace_at_us = exact_ref_start + p->exact_after_us;
+            }
+            if (tick_index == p->stall_render_tick)
+                render_us += p->stall_render_us;
+            render = run_debt_tick(&game, service,
+                                   p->full_us + (full && full_index ==
+                                       p->stall_update ? p->stall_update_us : 0u),
+                                   p->nonfull_us,
+                                   render_us, p->interpolation_enabled,
+                                   p->menu, &result, &start_us);
+            if (start_us)
+                last_start = start_us;
+            if (full && full_index == p->exact_ref_full)
+                exact_ref_start = start_us;
+            if (window) {
+                ++out->ticks;
+                if (start_us && out->updates == 0u) {
+                    out->first_start_us = start_us;
+                    out->first_slept = s_debt_pace_sleeps != pace_sleeps;
+                    out->first_wake_us = out->first_slept ?
+                        s_debt_pace_wake_us : 0u;
+                }
+                if (start_us) {
+                    ++out->updates;
+                    out->digest = debt_fnv(out->digest, start_us);
+                }
+                if (render)
+                    ++out->presents;
+                out->digest = debt_fnv(out->digest,
+                                       ((uint64_t)tick_index << 1) |
+                                       (uint64_t)(render != 0));
+            }
+        }
+    }
+    kage_vita_fullspeed_scheduler_snapshot(&after);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    kage_vita_fullspeed_scheduler_floor_debt_take(&out->debt);
+#endif
+    out->pace_extra_hits = s_debt_pace_extra_hits;
+    out->head_back_hits = s_debt_head_backward_hits;
+    debt_clear_wake_hooks();
+    out->wall_us = last_start - window_prev_start;
+    out->max_per_second = maximum_game_updates_per_second(
+        result.game_update_times, result.game_update_time_count);
+    out->spacing_ok = (uint32_t)oracle_start_spacing_holds(
+        result.game_update_times, result.game_update_time_count);
+    out->disables = after.runtime_disables;
+    out->violations = after.sequence_violations + after.parity_violations +
+        after.duplicate_tick_violations + after.game_frame_violations;
+    out->dropped = after.dropped_ticks - before.dropped_ticks;
+    return result.limiter_fallbacks == 0u && window_prev_start != 0u &&
+        out->updates > 1u &&
+        result.game_update_time_count < ORACLE_MAX_GAME_UPDATES;
+}
+
+/* One line per scenario: behaviour fields (equal OFF/OBSERVE) and, with the
+ * knob, the receipt. */
+static void print_debt_run(const char *name, const DebtRun *run)
+{
+    /* updates per second of the window, in thousandths */
+    uint32_t ups_milli = run->wall_us ?
+        (uint32_t)(((uint64_t)run->updates * 1000000000ull +
+                    run->wall_us / 2u) / run->wall_us) : 0u;
+
+    printf("Vita floor-debt scenario %s: updates=%u presents=%u ticks=%u "
+           "wall_us=%llu ups=%u.%03u drop=%u digest=%016llx",
+           name, run->updates, run->presents, run->ticks,
+           (unsigned long long)run->wall_us, ups_milli / 1000u,
+           ups_milli % 1000u, run->dropped,
+           (unsigned long long)run->digest);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    printf(" p=%u late=%u,%u,%u kept=%u over=%u,%u clamp=%u,%u stale=%u,%u,%u "
+           "gf=%u,%u,%d,%d slack=%u,%u",
+           run->debt.paces, run->debt.late, run->debt.late_us,
+           run->debt.late_max_us, run->debt.kept_us, run->debt.over,
+           run->debt.over_us, run->debt.clamp, run->debt.clamp_us,
+           run->debt.stale, run->debt.stale_grid,
+           run->debt.stale_us, run->debt.gf_n, run->debt.gf_pos,
+           (int)run->debt.gf_max_us, (int)run->debt.gf_min_us,
+           run->debt.slack_band, run->debt.slack_late);
+#endif
+    printf("\n");
+}
+
+/* Prints the scenario line and checks what holds in this build's mode. */
+static int check_debt_run(const char *name, const DebtRun *run)
+{
+    print_debt_run(name, run);
+    CHECK(run->disables == 0u && run->violations == 0u);
+    CHECK(run->spacing_ok);
+    CHECK(run->max_per_second <= ORACLE_MAX_UPDATES_PER_SECOND);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    {
+        const KageVitaFullspeedFloorDebtSnapshot *d = &run->debt;
+        uint32_t hist = 0u, i;
+        /* thirds of a microsecond; each pace rounds its lateness up by at
+         * most 2 units and a floor wake by at most 2 more; a boundary start
+         * that woke from a floor wait is the pace-wake overshoot after its
+         * floor (filed under neither late nor stale) */
+        uint64_t wall = 3u * run->wall_us;
+        uint64_t periods = (uint64_t)run->updates *
+            KAGE_VITA_FULLSPEED_GAME_TICK_UNITS;
+        uint64_t slop = 4u * (uint64_t)run->updates + 3u +
+            3u * (uint64_t)run->pace_os_us;
+
+        for (i = 0u; i < 7u; ++i)
+            hist += d->late_hist[i];
+        CHECK(hist == d->late);
+        CHECK(d->paces == run->updates);
+        CHECK(d->late + d->stale <= d->paces);
+        CHECK(d->stale_grid <= d->stale);
+        /* The cap is whole microseconds, so the rounded sums add up. */
+        CHECK(d->over <= d->late);
+        CHECK(d->late_us == d->kept_us + d->over_us);
+        CHECK(d->late_max_us <= 33334u);
+        CHECK(d->gf_n == run->updates);
+        /* The clamp's share of over.  With no pace late by
+         * more than the cap, min(late, cap) = late, so everything over is
+         * the clamp's (kept_us + clamp_us = sum min(late, cap)). */
+        CHECK(d->clamp <= d->over && d->clamp_us <= d->over_us);
+        if (d->late_max_us <= ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US)
+            CHECK(d->clamp == d->over && d->clamp_us == d->over_us);
+        /* The floor stamps of the two takes around the window
+         * give the identity exactly -- no wake, boundary or cap slop: each
+         * pace moves the floor one period plus the lateness it drops, and
+         * each rounded us sum and each stamp lose at most 2 units.  The
+         * design-draft control (NO_STALE_CUT) keeps debt from stale paces
+         * that its receipt files as stale, so it is pinned to its
+         * behavioural symptom instead. */
+#  if !defined(ISAAC_KAGE_VITA_FULLSPEED_ORACLE_NO_STALE_CUT)
+        {
+            uint64_t got, want = (uint64_t)d->paces *
+                KAGE_VITA_FULLSPEED_GAME_TICK_UNITS;
+
+            CHECK(run->floor_start_us != 0u && d->floor_us > run->floor_start_us);
+            /* The stamp is the floor the window's first pace meets, in
+             * whole us rounded down: a pace that slept wakes at the floor
+             * rounded up plus its overshoot, one that did not starts at or
+             * after it. */
+            if (run->first_slept) {
+                uint64_t woke = run->first_start_us - run->first_wake_us;
+                if (woke != run->floor_start_us &&
+                        woke != run->floor_start_us + 1u)
+                    fprintf(stderr, "floor stamp %llu, first pace woke at "
+                            "%llu\n", (unsigned long long)run->floor_start_us,
+                            (unsigned long long)woke);
+                CHECK(woke == run->floor_start_us ||
+                      woke == run->floor_start_us + 1u);
+            } else {
+                CHECK(run->first_start_us >= run->floor_start_us);
+            }
+            got = 3u * (d->floor_us - run->floor_start_us);
+# if ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 1
+            want += 3u * ((uint64_t)d->late_us + d->stale_us);
+# else
+            want += 3u * ((uint64_t)d->over_us + d->stale_us);
+# endif
+            if (got + 2u * (uint64_t)d->paces + 2u < want || got > want + 2u)
+                fprintf(stderr, "floor stamp identity: got %llu want %llu units "
+                        "(paces %u)\n", (unsigned long long)got,
+                        (unsigned long long)want, d->paces);
+            CHECK(got + 2u * (uint64_t)d->paces + 2u >= want && got <= want + 2u);
+        }
+#  endif
+# if ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 1
+        /* OBSERVE: the floor drops all lateness, as in stock builds. */
+        {
+            uint64_t want = periods + 3u * ((uint64_t)d->late_us + d->stale_us);
+            CHECK(wall + slop >= want && wall <= want + slop);
+        }
+# else
+        /* ON: the floor drops only what is over the cap and stale lateness;
+         * the boundary paces move one kept amount across the window. */
+        {
+            uint64_t want = periods + 3u * ((uint64_t)d->over_us + d->stale_us);
+            uint64_t cap = 3u * (uint64_t)ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US;
+            CHECK(wall + slop + cap >= want && wall <= want + slop + cap);
+        }
+# endif
+    }
+#endif
+    return 1;
+}
+
+/* Rooms: duration, service (+jitter), full update, non-full phase, Render
+ * (+jitter), interpolation, menu, stalls. */
+#define DEBT_ROOM(d, svc, svcj, full, rend, rendj, interp) \
+    { d, svc, svcj, full, 600u, rend, rendj, interp, 0u, 0u, 0u, 0u, 0u,       0u, 0u, \
+      0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u }
+/* Light room whose service and Render vary per tick: the device's ordinary
+ * late paces. */
+#define DEBT_JITTER(d) DEBT_ROOM(d, 500u, 2500u, 6000u, 5000u, 3000u, 1u)
+/* Interpolated frames fit with about 1 ms to spare while the floor sits
+ * one service time behind the full head's grid deadline (gf = -500 us); a
+ * floor more than ~0.5 ms ahead of the grid (gf > 0) refuses every one.
+ * The 0.5-ms update equals the 0.5-ms service, so the stock reserve (last
+ * update body) and the service reserve (pre-Game service) are the same. */
+#define DEBT_EDGE(d) DEBT_ROOM(d, 500u, 0u, 500u, 14500u, 0u, 1u)
+/* Render-bound, interpolation off: the grid falls behind until the stale
+ * wrapper drop fires, while every pace is late by less than one tick. */
+#define DEBT_HEAVY(d) DEBT_ROOM(d, 500u, 0u, 3000u, 42000u, 0u, 0u)
+/* A 26-ms loop: it catches up the grid without ever waiting on the floor, so
+ * whatever gf the heavy room left is carried, unchanged, into the next room. */
+#define DEBT_MEDIUM(d) DEBT_ROOM(d, 500u, 0u, 3000u, 22000u, 0u, 1u)
+
+static int run_debt_named(const char *name, const DebtPhase *phases,
+                          uint32_t count, uint32_t seed, DebtRun *run)
+{
+    if (!run_debt(phases, count, seed, run)) {
+        fprintf(stderr, "floor-debt scenario %s: run failed\n", name);
+        return 0;
+    }
+    if (!check_debt_run(name, run)) {
+        fprintf(stderr, "floor-debt scenario %s: check failed\n", name);
+        return 0;
+    }
+    return 1;
+}
+
+/* The window of an edge room after something else must equal the fresh
+ * room's: the same presents and updates, no lateness, gf never above 0. */
+static int check_debt_same_as_fresh(const char *name, const DebtRun *run,
+                                    const DebtRun *fresh)
+{
+    if (run->presents != fresh->presents || run->updates != fresh->updates)
+        fprintf(stderr, "floor-debt %s: presents %u updates %u, fresh %u %u\n",
+                name, run->presents, run->updates, fresh->presents,
+                fresh->updates);
+    CHECK(run->presents == fresh->presents);
+    CHECK(run->updates == fresh->updates);
+    CHECK(run->dropped == 0u);
+    /* every start one floor period after the previous one */
+    CHECK(3u * run->wall_us <= (uint64_t)run->updates *
+          KAGE_VITA_FULLSPEED_GAME_TICK_UNITS + 3u * run->updates);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    CHECK(run->debt.gf_pos == 0u && run->debt.gf_max_us <= 0);
+    /* clock quantisation only: the floor is in thirds of a microsecond */
+    CHECK(run->debt.late_max_us <= 2u && run->debt.stale == 0u);
+#endif
+    return 1;
+}
+
+/* The edge room with wake overshoot that differs between the loop-head
+ * sleep (150 us) and the pace sleep (250 us): a waited pace leaves
+ * gf = 250 - 150 - 500 = -400 us, below 0 (the wake-overshoot case of
+ * the grid clamp). */
+static DebtPhase debt_skew(uint32_t duration_us)
+{
+    DebtPhase p = DEBT_EDGE(duration_us);
+
+    p.head_os_us = 150u;
+    p.pace_os_us = 250u;
+    return p;
+}
+
+/* As check_debt_same_as_fresh for the skewed edge room: the same presents
+ * and updates as the fresh skewed room, no drop, gf never above 0, nothing
+ * stale.  Lateness is not compared: under ON the floor may legitimately sit
+ * at another phase behind the grid than in the fresh run. */
+static int check_debt_same_as_fresh_wake(const char *name, const DebtRun *run,
+                                         const DebtRun *fresh,
+                                         uint32_t extra_hits)
+{
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    if (run->presents != fresh->presents || run->updates != fresh->updates ||
+            run->debt.gf_pos != 0u || run->debt.gf_max_us > 0)
+        fprintf(stderr, "floor-debt %s: presents %u updates %u gf(n,pos,max) "
+                "%u,%u,%d, fresh %u %u\n", name, run->presents, run->updates,
+                run->debt.gf_n, run->debt.gf_pos, (int)run->debt.gf_max_us,
+                fresh->presents, fresh->updates);
+#else
+    if (run->presents != fresh->presents || run->updates != fresh->updates)
+        fprintf(stderr, "floor-debt %s: presents %u updates %u, fresh %u %u\n",
+                name, run->presents, run->updates, fresh->presents,
+                fresh->updates);
+#endif
+    CHECK(run->pace_extra_hits == extra_hits);
+    CHECK(run->presents == fresh->presents);
+    CHECK(run->updates == fresh->updates);
+    CHECK(run->dropped == 0u);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    CHECK(run->debt.gf_pos == 0u && run->debt.gf_max_us <= 0);
+    CHECK(run->debt.stale == 0u);
+#endif
+    return 1;
+}
+
+/* A scenario whose clock runs backwards: the window identity and the start
+ * spacing do not apply; only fail-open, violations and the trigger. */
+static int run_debt_clock_fault(const char *name, const DebtPhase *phases,
+                                uint32_t count, DebtRun *run)
+{
+    if (!run_debt(phases, count, 14u, run)) {
+        fprintf(stderr, "floor-debt scenario %s: run failed\n", name);
+        return 0;
+    }
+    print_debt_run(name, run);
+    CHECK(run->disables == 0u && run->violations == 0u);
+    CHECK(run->clock_back_hits + run->head_back_hits == 1u);
+    return 1;
+}
+
+static int check_floor_debt_scenarios(void)
+{
+    static const uint32_t stalls_us[4] = { 5000u, 20000u, 50000u, 150000u };
+    DebtRun fresh, run;
+    uint32_t i;
+    char name[64];
+
+    {
+        const DebtPhase phases[] = { DEBT_JITTER(1000000u),
+                                     DEBT_JITTER(10000000u) };
+        if (!run_debt_named("jitter", phases, 2u, 1u, &run))
+            return 0;
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2
+        /* ON: ordinary lateness below the cap is all kept: 30.00 UPS. */
+        CHECK(run.debt.late > 0u && run.debt.over == 0u &&
+              run.debt.stale == 0u);
+        CHECK(3u * run.wall_us <= (uint64_t)run.updates *
+              KAGE_VITA_FULLSPEED_GAME_TICK_UNITS +
+              3u * (uint64_t)ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US +
+              4u * run.updates);
+#endif
+    }
+    {
+        /* Service jitter up to 12 ms: some lateness is above the cap. */
+        const DebtPhase phases[] = {
+            DEBT_ROOM(1000000u, 500u, 12000u, 6000u, 5000u, 3000u, 1u),
+            DEBT_ROOM(10000000u, 500u, 12000u, 6000u, 5000u, 3000u, 1u) };
+        if (!run_debt_named("jitter-wide", phases, 2u, 2u, &run))
+            return 0;
+    }
+    {
+        const DebtPhase phases[] = { DEBT_EDGE(2000000u), DEBT_EDGE(4000000u) };
+        if (!run_debt_named("edge", phases, 2u, 3u, &fresh))
+            return 0;
+        /* the room really is at the edge: every interpolated frame fits */
+        CHECK(fresh.presents == fresh.ticks);
+    }
+    /* Stalls before a pace (service), inside Game::Update and inside an
+     * interpolated Render, each followed by the edge room. */
+    for (i = 0u; i < 4u; ++i) {
+        DebtPhase stall = DEBT_EDGE(1000000u);
+        DebtPhase render_stall = DEBT_EDGE(1000000u);
+        DebtPhase update_stall = DEBT_EDGE(1000000u);
+        DebtPhase window = DEBT_EDGE(2000000u);
+
+        stall.stall_full = 30u;
+        stall.stall_us = stalls_us[i];
+        render_stall.stall_render_tick = 60u;
+        render_stall.stall_render_us = stalls_us[i];
+        update_stall.stall_update = 30u;
+        update_stall.stall_update_us = stalls_us[i];
+        window.stall_full = 10u;
+        window.stall_us = stalls_us[i];
+        {
+            const DebtPhase phases[] = { stall, DEBT_EDGE(2000000u),
+                                         DEBT_EDGE(4000000u) };
+            (void)snprintf(name, sizeof name, "stall-%ums-edge",
+                           (unsigned)(stalls_us[i] / 1000u));
+            if (!run_debt_named(name, phases, 3u, 6u, &run) ||
+                    !check_debt_same_as_fresh(name, &run, &fresh))
+                return 0;
+        }
+        {
+            const DebtPhase phases[] = { render_stall, DEBT_EDGE(2000000u),
+                                         DEBT_EDGE(4000000u) };
+            (void)snprintf(name, sizeof name, "render-stall-%ums-edge",
+                           (unsigned)(stalls_us[i] / 1000u));
+            if (!run_debt_named(name, phases, 3u, 7u, &run) ||
+                    !check_debt_same_as_fresh(name, &run, &fresh))
+                return 0;
+        }
+        {
+            /* Inside Game::Update: with no stale cut at all, the 150-ms one
+             * leaves the floor 3.4 ms ahead of the grid for good and this
+             * room never presents an interpolated frame again. */
+            const DebtPhase phases[] = { update_stall, DEBT_EDGE(2000000u),
+                                         DEBT_EDGE(4000000u) };
+            (void)snprintf(name, sizeof name, "update-stall-%ums-edge",
+                           (unsigned)(stalls_us[i] / 1000u));
+            if (!run_debt_named(name, phases, 3u, 7u, &run) ||
+                    !check_debt_same_as_fresh(name, &run, &fresh))
+                return 0;
+        }
+        {
+            /* The stall's own window: one pace late by exactly the stall. */
+            const DebtPhase phases[] = { DEBT_EDGE(1000000u), window };
+
+            (void)snprintf(name, sizeof name, "stall-%ums",
+                           (unsigned)(stalls_us[i] / 1000u));
+            if (!run_debt_named(name, phases, 2u, 8u, &run))
+                return 0;
+        }
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+        if (stalls_us[i] < 33334u) {
+            uint32_t cap = ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US;
+            uint32_t kept = stalls_us[i] < cap ? stalls_us[i] : cap;
+
+            /* + clock quantisation (the floor is in thirds of a us) */
+            CHECK(run.debt.late_max_us >= stalls_us[i] &&
+                  run.debt.late_max_us <= stalls_us[i] + 2u);
+            CHECK(run.debt.over == (stalls_us[i] > cap ? 1u : 0u));
+            CHECK(run.debt.kept_us >= kept &&
+                  run.debt.kept_us <= kept + run.debt.late);
+            CHECK(run.debt.stale == 0u);
+        } else {
+            /* one tick or more: the stale cut keeps nothing */
+            CHECK(run.debt.stale == 1u && run.debt.stale_grid == 0u);
+            CHECK(run.debt.stale_us >= stalls_us[i] &&
+                  run.debt.stale_us <= stalls_us[i] + 2u);
+            CHECK(run.debt.late_max_us <= 1u);
+        }
+#endif
+    }
+    /* Render-bound windows with stale wrapper drops, then the edge room. */
+    for (i = 0u; i < 16u; ++i) {
+        const DebtPhase phases[] = { DEBT_HEAVY(2000000u + 2100u * i),
+                                     DEBT_EDGE(2000000u), DEBT_EDGE(4000000u) };
+        (void)snprintf(name, sizeof name, "heavy-edge-%u", i);
+        if (!run_debt_named(name, phases, 3u, 4u, &run) ||
+                !check_debt_same_as_fresh(name, &run, &fresh))
+            return 0;
+    }
+    /* The same through a room that never waits on the floor: here a floor
+     * left ahead of the grid would stick (stale cut). */
+    for (i = 0u; i < 16u; ++i) {
+        const DebtPhase phases[] = { DEBT_HEAVY(2000000u + 2100u * i),
+                                     DEBT_MEDIUM(1000000u),
+                                     DEBT_EDGE(2000000u), DEBT_EDGE(4000000u) };
+        (void)snprintf(name, sizeof name, "heavy-medium-edge-%u", i);
+        if (!run_debt_named(name, phases, 4u, 4u, &run) ||
+                !check_debt_same_as_fresh(name, &run, &fresh))
+            return 0;
+    }
+    {
+        /* The heavy room itself: drops happen and every pace is late. */
+        const DebtPhase phases[] = { DEBT_HEAVY(1000000u), DEBT_HEAVY(4000000u) };
+        if (!run_debt_named("heavy", phases, 2u, 5u, &run))
+            return 0;
+        CHECK(run.dropped > 0u);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+        /* The grid rule: paces after a drop keep nothing and are filed as
+         * stale_grid.  The floor never gets ahead of the grid (with neither
+         * the grid rule nor the grid clamp: gf > 0 on 4 of 86). */
+        CHECK(run.debt.gf_pos == 0u && run.debt.gf_max_us <= 0);
+        CHECK(run.debt.stale_grid > 0u);
+#endif
+    }
+    {
+        /* A pause / menu: no Game::Update for two seconds, then the room. */
+        DebtPhase menu = DEBT_JITTER(2000000u);
+
+        menu.menu = 1u;
+        {
+            const DebtPhase phases[] = { DEBT_JITTER(1000000u), menu,
+                                         DEBT_JITTER(3000000u) };
+
+            if (!run_debt_named("pause-resume", phases, 3u, 9u, &run))
+                return 0;
+        }
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+        /* the first pace after the menu is stale (two seconds late) */
+        CHECK(run.debt.stale == 1u && run.debt.stale_us >= 1900000u);
+#endif
+    }
+    {
+        /* An interpolated frame predicted to end just after the floor. */
+        const DebtPhase phases[] = {
+            DEBT_ROOM(2000000u, 500u, 0u, 500u, 16000u, 0u, 1u),
+            DEBT_ROOM(4000000u, 500u, 0u, 500u, 16000u, 0u, 1u) };
+        if (!run_debt_named("slack", phases, 2u, 10u, &run))
+            return 0;
+    }
+    {
+        /* ... and one predicted to end well after it: refused everywhere. */
+        const DebtPhase phases[] = {
+            DEBT_ROOM(2000000u, 500u, 0u, 500u, 17500u, 0u, 1u),
+            DEBT_ROOM(4000000u, 500u, 0u, 500u, 17500u, 0u, 1u) };
+        if (!run_debt_named("refuse", phases, 2u, 11u, &run))
+            return 0;
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+        CHECK(run.debt.slack_band == 0u);
+#endif
+    }
+    {
+        /* Grid clamp: a wake overshoot on a pace sleep that is
+         * larger than the head sleep's plus the service.  In the skewed edge
+         * room every pace is late or on time; the 10th full tick has no
+         * service, so its pace comes 500 us before its floor and waits, and
+         * that sleep wakes 250 + extra us late.  The realign moves the 60-Hz
+         * grid by the whole wait, so the floor sits gf = 250 + extra - 150 -
+         * 0 us ahead of the next full head's grid deadline and the next
+         * pace is late by gf + 650 us.  Stock re-anchors it at the clock.
+         * ON must not keep the part of that lateness that lies before the
+         * pace's own grid deadline (the grid clamp): otherwise gf stays above
+         * 0 until the next stale event, no pace waits or realigns again, and
+         * from gf > 417 us (no slack) or > 2417 us (slack 2000 us) the edge
+         * room refuses every interpolated frame for good. */
+        static const uint32_t extras_us[4] = { 1500u, 3000u, 6000u, 12000u };
+        DebtRun skew_fresh;
+        DebtPhase trigger = debt_skew(1000000u);
+
+        {
+            const DebtPhase phases[] = { debt_skew(2000000u),
+                                         debt_skew(4000000u) };
+            if (!run_debt_named("wake-skew-edge", phases, 2u, 13u,
+                                &skew_fresh))
+                return 0;
+        }
+        trigger.short_full = 10u;
+        {
+            /* no extra: gf = +100 us after the trigger (mild) */
+            const DebtPhase phases[] = { trigger, debt_skew(2000000u),
+                                         debt_skew(4000000u) };
+            if (!run_debt_named("wake-skew-short-edge", phases, 3u, 13u,
+                                &run) ||
+                    !check_debt_same_as_fresh_wake("wake-skew-short-edge",
+                                                   &run, &skew_fresh, 0u))
+                return 0;
+        }
+        trigger.pace_extra_full = 10u;
+        for (i = 0u; i < 4u; ++i) {
+            trigger.pace_extra_us = extras_us[i];
+            {
+                const DebtPhase phases[] = { trigger, debt_skew(2000000u),
+                                             debt_skew(4000000u) };
+                (void)snprintf(name, sizeof name, "wake-extra-%uus-edge",
+                               (unsigned)extras_us[i]);
+                if (!run_debt_named(name, phases, 3u, 13u, &run) ||
+                        !check_debt_same_as_fresh_wake(name, &run,
+                                                       &skew_fresh, 1u))
+                    return 0;
+            }
+        }
+        /* Mutant MA (OBSERVE skips the clamp): the same
+         * trigger inside the measured window, so the receipt sees the clamp
+         * bind.  The 10th full tick has no service, so its pace waits for
+         * its floor, wakes 250 + extra us late, and the realign moves the
+         * grid by that whole wake.  The next pace (head overshoot 150 us,
+         * service 500 us) is late by 750 + extra us (+1: the floor is in
+         * thirds of a us) while its own grid deadline leaves room for
+         * exactly 150 + 500 = 650 us, so it keeps 650 and the clamp takes
+         * min(late, cap) - 650: 101, 1601 and 7350 us at cap 8000 (3350 at
+         * cap 4000).  OBSERVE and ON both reach this pace through the same
+         * waited pace, so the pin is the same in both modes; their other
+         * late paces differ (OBSERVE 39, ON 59 of 60, MEASURED) and none of
+         * them binds the clamp. */
+        trigger = debt_skew(2000000u);
+        trigger.short_full = 10u;
+        for (i = 0u; i < 3u; ++i) {
+            static const uint32_t window_extras_us[3] = { 0u, 1500u, 12000u };
+            uint32_t extra = window_extras_us[i];
+
+            trigger.pace_extra_full = extra ? 10u : 0u;
+            trigger.pace_extra_us = extra;
+            {
+                const DebtPhase phases[] = { debt_skew(2000000u), trigger };
+                (void)snprintf(name, sizeof name, "wake-extra-%uus-in-window",
+                               (unsigned)extra);
+                if (!run_debt_named(name, phases, 2u, 13u, &run))
+                    return 0;
+            }
+            CHECK(run.pace_extra_hits == (extra ? 1u : 0u));
+            CHECK(run.dropped == 0u);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+            {
+                uint32_t late_max = run.debt.late_max_us;
+                uint32_t capped = late_max < ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US ?
+                    late_max : ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US;
+
+                if (run.debt.clamp != 1u || capped < 650u ||
+                        run.debt.clamp_us != capped - 650u ||
+                        late_max < 750u + extra || late_max > 751u + extra)
+                    fprintf(stderr, "floor-debt %s: clamp(c,us) %u,%u late max "
+                            "%u, want 1,min(late max, cap) - 650 and late max "
+                            "%u..%u\n", name, run.debt.clamp,
+                            run.debt.clamp_us, late_max, 750u + extra,
+                            751u + extra);
+                CHECK(late_max >= 750u + extra && late_max <= 751u + extra);
+                CHECK(run.debt.clamp == 1u &&
+                      run.debt.clamp_us == capped - 650u);
+                CHECK(run.debt.stale == 0u);
+            }
+#endif
+        }
+    }
+    {
+        /* The grid rule's head sites, read from
+         * the receipt.  The 10th full tick of the measured phase stalls
+         * 25 ms before its pace, after (a) a loop-head clock reset
+         * (kage_vita_fullspeed_scheduler.c, note_loop_head: now_us <
+         * s_last_clock_us) or (b) a head sleep that returned with the clock
+         * before it started (wait_until returns 2).  Either moved the grid
+         * to the clock; the pace is late by less than one Game tick, and the
+         * grid rule files it as stale_grid. */
+        DebtPhase reset = DEBT_EDGE(1000000u), back = DEBT_EDGE(1000000u);
+
+        reset.clock_back_full = 10u;
+        reset.stall_full = 10u;
+        reset.stall_us = 25000u;
+        back.head_back_full = 10u;
+        back.stall_full = 10u;
+        back.stall_us = 25000u;
+        {
+            const DebtPhase phases[] = { DEBT_EDGE(1000000u), reset };
+            if (!run_debt_clock_fault("head-clock-reset", phases, 2u, &run))
+                return 0;
+            CHECK(run.clock_back_hits == 1u);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+            CHECK(run.debt.stale == 1u && run.debt.stale_grid == 1u);
+#endif
+        }
+        {
+            const DebtPhase phases[] = { DEBT_EDGE(1000000u), back };
+            if (!run_debt_clock_fault("head-wait-backward", phases, 2u, &run))
+                return 0;
+            CHECK(run.head_back_hits == 1u);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+            CHECK(run.debt.stale == 1u && run.debt.stale_grid == 1u);
+#endif
+        }
+    }
+    {
+        /* The rule-A boundary.  The 10th pace is
+         * stale (50-ms stall, anchored at the clock: floor F11 = start10 +
+         * 33,333 1/3 us), the 11th waits for F11 (anchor F11, so F12 =
+         * start10 + 66,666 2/3 us), and the 12th starts exactly 100,000 us
+         * after the 10th: late by exactly one Game tick (100,000 units),
+         * which rule A files as stale.  One microsecond earlier it is late. */
+        DebtPhase tick = DEBT_EDGE(1000000u);
+
+        tick.stall_full = 10u;
+        tick.stall_us = 50000u;
+        tick.exact_ref_full = 10u;
+        tick.exact_full = 12u;
+        tick.exact_after_us = 100000u;
+        {
+            const DebtPhase phases[] = { DEBT_EDGE(1000000u), tick };
+            if (!run_debt_named("rule-a-one-tick", phases, 2u, 15u, &run))
+                return 0;
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+            CHECK(run.debt.stale == 2u && run.debt.stale_grid == 0u);
+            CHECK(run.debt.late_max_us < 33333u);
+#endif
+        }
+        tick.exact_after_us = 99999u;
+        {
+            const DebtPhase phases[] = { DEBT_EDGE(1000000u), tick };
+            if (!run_debt_named("rule-a-below-tick", phases, 2u, 15u, &run))
+                return 0;
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+            /* 99,997 units late: ceil(99,997 / 3) = 33,333 us */
+            CHECK(run.debt.stale == 1u && run.debt.late_max_us == 33333u);
+#endif
+        }
+    }
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+    {
+        /* port.ini fps_lock 30 / 40 / 45 (k = 0 / 3 / 2) in the jitter room. */
+        static const uint8_t k_values[3] = { 0u, 3u, 2u };
+        static const unsigned k_fps[3] = { 30u, 40u, 45u };
+
+        for (i = 0u; i < 3u; ++i) {
+            const DebtPhase phases[] = { DEBT_JITTER(1000000u),
+                                         DEBT_JITTER(10000000u) };
+
+            kage_vita_fullspeed_scheduler_set_duty(k_values[i]);
+            s_banner[0] = '\0';
+            (void)snprintf(name, sizeof name, "jitter-fps%u", k_fps[i]);
+            if (!run_debt_named(name, phases, 2u, 12u, &run))
+                return 0;
+            if (!check_banner_fps_lock(k_fps[i]))
+                return 0;
+# if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2
+            CHECK(run.debt.over == 0u && run.debt.stale == 0u);
+            CHECK(3u * run.wall_us <= (uint64_t)run.updates *
+                  KAGE_VITA_FULLSPEED_GAME_TICK_UNITS +
+                  3u * (uint64_t)ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US +
+                  4u * run.updates);
+# endif
+        }
+        kage_vita_fullspeed_scheduler_set_duty(1u);
+    }
+#endif
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    {
+        /* The reader and the per-epoch clear both zero the receipt. */
+        KageVitaFullspeedFloorDebtSnapshot zero, taken;
+        static ScenarioResult scratch;
+        OracleGame game;
+        uint64_t start_us;
+        uint32_t tick, round;
+
+        memset(&zero, 0, sizeof zero);
+        memset(&scratch, 0, sizeof scratch);
+        memset(&game, 0, sizeof game);
+        game.manager_pointer = 0x10000000u;
+        game.game_pointer = 0x20000000u;
+        s_now = 1000u;
+        kage_vita_fullspeed_scheduler_reset();
+        for (round = 0u; round < 2u; ++round) {
+            for (tick = 0u; tick < 40u; ++tick)
+                (void)run_debt_tick(&game, 500u + 700u * (tick % 3u), 6000u,
+                                    600u, 5000u, 1u, 0u, &scratch, &start_us);
+            if (round == 0u) {
+                uint64_t stamp;
+
+                kage_vita_fullspeed_scheduler_floor_debt_take(&taken);
+                CHECK(taken.paces >= 19u && taken.gf_n >= 19u);
+                stamp = taken.floor_us;
+                /* the struct has padding before floor_us: zero the
+                 * destination so memcmp sees zero padding however the
+                 * compiler copies the struct */
+                memset(&taken, 0, sizeof taken);
+                kage_vita_fullspeed_scheduler_floor_debt_take(&taken);
+                /* the floor stamp is not a sum: with no pace in between,
+                 * the second take reads the same live floor */
+                CHECK(stamp != 0u && taken.floor_us == stamp);
+                taken.floor_us = 0u;
+            } else {
+                kage_vita_fullspeed_scheduler_reset();
+                memset(&taken, 0, sizeof taken);
+                kage_vita_fullspeed_scheduler_floor_debt_take(&taken);
+                CHECK(taken.floor_us == 0u); /* no live floor after reset */
+            }
+            CHECK(memcmp(&taken, &zero, sizeof zero) == 0);
+        }
+    }
+#endif
+    return 1;
+}
+#endif
+
 int main(void)
 {
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+    if (!check_render_admission())
+        return 1;
+#endif
     if (!check_scenario(5000u, 1u) ||
             !check_scenario(10000u, 1u) ||
             !check_scenario(19000u, 1u) ||
@@ -1304,8 +3497,26 @@ int main(void)
             !check_manager_counter_rebase_hostile_cases() ||
             !check_game_pointer_publish_transition() ||
             !check_game_pointer_hostile_cases() ||
+            !check_continue_cutscene_faults() ||
+            !check_continue_cutscene_late_render() ||
             !check_wait_failure_fail_open())
         return 1;
+    for (uint32_t publish = 0u; publish < 2u; ++publish)
+        for (uint32_t restore = 0u; restore < 2u; ++restore) {
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+            for (uint32_t duty = 0u; duty < 4u; ++duty)
+#else
+            for (uint32_t duty = 1u; duty < 2u; ++duty)
+#endif
+                if (!check_continue_cutscene_gameplay(publish, restore, duty))
+                    return 1;
+        }
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+    kage_vita_fullspeed_scheduler_set_duty(1u);
+#endif
+    puts("Vita Continue->cutscene->gameplay: PASS (authenticated rebase, optional publication, "
+         "restore/no-restore, next-head audit, expired-token/identity/pair/frame/clock rejection, "
+         "bounded first-failure gate receipt, 120 updates per 240 gameplay ticks)");
 #if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
     if (!check_advanced_head_transitions() || !check_advanced_head_faults() ||
             !check_advanced_head_present_intervals())
@@ -1313,12 +3524,96 @@ int main(void)
     puts("Vita full-head advance: PASS (current identity/refusal, pause rollback, "
          "head/floor wait and clock faults, deactivate/reset, actual Game/Present intervals)");
 #endif
+#if defined(ISAAC_VITA_RUNTIME_SETTINGS)
+    if (!check_duty_lock() || !check_duty_fail_open())
+        return 1;
+    puts("Vita cadence30 fps-lock duty: PASS (k=1/2/3/0 -> 120/90/80/60 "
+         "presents per 120 ticks at 60 updates with exact F/N/_ transcripts; "
+         "k=1 == default; k=0 == interpolation-off; clamp; reset/deactivate "
+         "keep k; fail-open stops the lock; banner fps_lock after the parity "
+         "pin)");
+#endif
+#if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+    if (!check_video_priority())
+        return 1;
+    puts("Vita video Render priority: PASS (late cinematic service, 30/40/45/60 locks, "
+         "Game resumes <=30 UPS, retained-clip gameplay schedule identical, expired/late receipt refused)");
+#endif
+    if (!check_present_wait())
+        return 1;
+#if !(defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE)
+    if (!check_floor_debt_scenarios())
+        return 1;
+# if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2
+    puts("Vita floor-debt scenarios: PASS (mode=on cap="
+         KAGE_ORACLE_STR(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US) "us; "
+         "start contract start[j]-start[i] >= (j-i)*T - cap, <=31/s; "
+         "jitter kept, 30.00 UPS; floor drops only over+stale; "
+         "stale cut: heavy/stall/render-stall/update-stall -> edge room == fresh, gf <= 0; "
+         "receipt zeroed by reader and reset)");
+# elif defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 1
+    puts("Vita floor-debt scenarios: PASS (mode=observe cap="
+         KAGE_ORACLE_STR(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US) "us; "
+         "stock start contract; wall == n*T + late + stale; "
+         "stale cut: heavy/stall/render-stall/update-stall -> edge room == fresh, gf <= 0; "
+         "receipt zeroed by reader and reset)");
+# else
+    puts("Vita floor-debt scenarios: PASS (mode=off; stock start contract; "
+         "heavy/stall/render-stall/update-stall -> edge room == fresh)");
+# endif
+#endif
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2
+# define ORACLE_GAP_TEXT "start[j]-start[i] >= (j-i)*33.333 ms - cap, <=31 starts/s"
+#else
+# define ORACLE_GAP_TEXT "<=30 UPS, >=33.333-ms gaps"
+#endif
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+    puts("Vita cadence30 Present-wait admission: PASS (render-cost=excludes-present; "
+         "every-5th-Present edge wait at int2j timings 120 presents/120 loops, "
+         "skip n=0, 2,000,000 us/window; 60 updates/window, " ORACLE_GAP_TEXT
+         ", no fail-open in 39 cases)");
+#else
+    puts("Vita cadence30 Present-wait admission: PASS (inclusive render cost; "
+         "every-5th-Present edge wait at int2j timings 100 presents/120 loops, "
+         "skip n=20, 2,000,000 us/window; 60 updates/window, " ORACLE_GAP_TEXT
+         ", no fail-open in 39 cases)");
+#endif
+#if defined(ORACLE_PRESENT_WAIT_DEBT_TABLE) && defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+    puts("Vita cadence30 Present-wait costs (service reserve, floor-debt on cap 8000us "
+         "admit-slack 2000us): pinned 39 cases; fixed 10.6-ms wait 1200 presents in "
+         "20,000,000 us (30.00 UPS); fixed 18-ms wait 1200 presents in 20,112,080 us "
+         "(29.83 UPS, stock 1000 in 20,000,200); never fewer presents/s than stock");
+#else
+    puts("Vita cadence30 Present-wait costs (service reserve, floor-debt on cap 8000us "
+         "admit-slack 2000us): pinned 39 cases; fixed 9-ms wait 1200 presents in "
+         "20,000,000 us (stock 1000); vblank queue 18 ms 1100 presents in 20,000,000 us "
+         "(30.00 UPS, stock 28.69); never fewer presents/s or UPS than stock");
+#endif
+#elif defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE) && \
+    !(defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && \
+    !(defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2)
+#if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+    puts("Vita cadence30 Present-wait costs (service reserve): pinned 39 cases; "
+         "fixed 10.6-ms wait 1200 presents in 20,184,200 us (29.73 UPS); "
+         "GPU-bound vblank queue 19 ms 1114 presents in 21,433,334 us (27.99 UPS)");
+#else
+    puts("Vita cadence30 Present-wait costs (service reserve): pinned 39 cases; "
+         "fixed 10.6-ms wait 1000 presents in 20,000,200 us (30.00 UPS); "
+         "GPU-bound vblank queue 19 ms 1050 presents in 20,000,000 us (30.00 UPS)");
+#endif
+#endif
     puts(
         "Vita cadence30 scheduler oracle: PASS "
         "(60-Hz monotonic wrapper; native 30-Hz Game parity; "
         "native interpolated Render at 5/10 ms; late nonfull discard and "
         "full-phase Render at 27/40/55 ms; one-tick stale wrapper debt; "
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2
+        "no stale simulation replay and <=31 Game update starts per sliding "
+        "second (floor debt on); "
+#else
         "no stale simulation replay and <=30 Game updates/second; "
+#endif
         "game-owned interpolation transitions; "
         "exact Continue counter normalization; "
         "exact null-to-new Game publication; "

@@ -13,7 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence, cast
 
 
 TARGET = "isaac_first_arm_fault"
@@ -24,20 +24,100 @@ STOCK_REFERENCE_CACHE_KEY = "ISAAC_VITA_VITAGL_STOCK_REFERENCE"
 DISPLAY_RASTER_CACHE_KEY = "ISAAC_VITA_DISPLAY_RASTER_720"
 TYPED_STATE_CACHE_KEY = "ISAAC_VITA_GL_TYPED_STATE_CACHE"
 GAME_LOG_BATCH_CACHE_KEY = "ISAAC_VITA_GAME_LOG_BATCH"
+GAME_LOG_ASYNC_CACHE_KEY = "ISAAC_VITA_GAME_LOG_ASYNC"
 ARCHIVE_VALIDATION_RECEIPT_CACHE_KEY = (
     "ISAAC_VITA_ARCHIVE_VALIDATION_RECEIPT"
 )
+ARCHIVE_VALIDATION_SIDECAR_CACHE_KEY = (
+    "ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR"
+)
+ARCHIVE_READ_TRAIL_CACHE_KEY = "ISAAC_VITA_ARCHIVE_READ_TRAIL"
+UNIFORM_SET_RECEIPT_CACHE_KEY = "ISAAC_VITA_UNIFORM_SET_RECEIPT"
+SHADER_SAMPLER_FASTPATH_CACHE_KEY = "ISAAC_VITA_SHADER_SAMPLER_FASTPATH"
+SHADER_SAMPLER_FASTPATH_SOURCE = "host_vita_shader_sampler_fastpath.c"
+KAGE_BIND_PACKET_CACHE_KEY = "ISAAC_VITA_KAGE_BIND_PACKET"
+KAGE_BIND_PACKET_SOURCE = "host_vita_kage_bind_packet.c"
+HEAP_SLAB_REJECT_FASTPATH_CACHE_KEY = "ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH"
+HEAP_STAGE_PROFILE_CACHE_KEY = "ISAAC_VITA_HEAP_STAGE_PROFILE"
+NATIVE_VORBIS_FREE_WATCH_CACHE_KEY = "ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH"
+# W-heap: free prefilter range records, the Vorbis free-watch
+# live mask and the free ledger cost profile.  No new unit; define scope only.
+HEAP_FREE_PREFILTER_CACHE_KEY = "ISAAC_VITA_HEAP_FREE_PREFILTER"
+HEAP_FREE_COST_PROFILE_CACHE_KEY = "ISAAC_VITA_HEAP_FREE_COST_PROFILE"
+NATIVE_VORBIS_FREE_WATCH_MASK_CACHE_KEY = (
+    "ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK"
+)
+# Stage-1 inline GL recorder: three runtime owners, static storage only.
+GL_THREAD_RECORD_CACHE_KEY = "ISAAC_VITA_GL_THREAD_RECORD"
+GL_THREAD_RECORD_SOURCES = (
+    "gl_record_backend.c", "gl_record_ring.c", "gl_record_locations.c",
+)
+# vitaGL owner check: one audited owner (trampolines + bounded logger, no
+# allocation); needs the render-thread worker, which adds no unit itself.
+GL_THREAD_WORKER_CACHE_KEY = "ISAAC_VITA_GL_THREAD_WORKER"
+GL_OWNER_CHECK_CACHE_KEY = "ISAAC_VITA_GL_OWNER_CHECK"
+GL_OWNER_CHECK_SOURCE = "gl_owner_check.c"
+# Recorder admission cache without the overlay: the recorder's own
+# sceKernelFreeMemBlock wrap, one ordinary audited owner (no allocator, no
+# stdio), added only when the debug overlay does not own the wrap.
+GL_ADMISSION_STANDALONE_CACHE_KEY = "ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_STANDALONE"
+GL_RECORD_FREE_WRAP_SOURCE = "gl_record_free_wrap.c"
+HEAP_LEAN_IMPORT_CACHE_KEY = "ISAAC_VITA_HEAP_LEAN_IMPORT"
 RENDERFRAME_FASTPATH_CACHE_KEY = "ISAAC_VITA_RENDERFRAME_FASTPATH"
 CONTINUE_PROFILE_CACHE_KEY = "ISAAC_VITA_CONTINUE_PROFILE"
 EXIT_MENU_PROFILE_CACHE_KEY = "ISAAC_VITA_EXIT_MENU_PROFILE"
 PNG_DECODE_PROFILE_CACHE_KEY = "ISAAC_VITA_PNG_DECODE_PROFILE"
+# Static WAV/OGG load window profile (ph120.sfx/sfxn): one diagnostic unit
+# nested under KAGE, refused by CMake without PHASE_PROFILE or AUDIO.
+STATIC_SFX_PROFILE_CACHE_KEY = "ISAAC_VITA_STATIC_SFX_PROFILE"
+STATIC_SFX_PROFILE_SOURCE = "host_vita_static_sfx_profile.c"
+# Backdrop watergfx guard (issue 5.4/5.17): the two generated owners gain a
+# definition and one log-helper unit joins the translated runtime; CMake adds
+# it outside if(ISAAC_VITA_KAGE) and refuses the knob only for scaffolds.
+BACKDROP_WATERGFX_GUARD_CACHE_KEY = "ISAAC_VITA_BACKDROP_WATERGFX_GUARD"
+BACKDROP_WATERGFX_GUARD_SOURCE = "kage_vita_backdrop_watergfx.c"
+# PS Vita trophies (recomp/vita/TROPHIES.md): the TryUnlock owner units,
+# entry_vita.c and kage_vita_backend.c gain a definition; the trophy runtime
+# is the only new object.  CMake adds it inside the non-scaffold block and
+# refuses the knob without ISAAC_VITA_KAGE.
+TROPHIES_CACHE_KEY = "ISAAC_VITA_TROPHIES"
+TROPHIES_SOURCE = "host_vita_trophies.c"
+# On-screen debug overlay (debug builds): one runtime unit, added inside the
+# runtime-settings CMake block (itself inside if(ISAAC_VITA_KAGE)); CMake
+# refuses it without KAGE or RUNTIME_SETTINGS.  Its other owners (parser,
+# loader, backend, scheduler, Lua bridge) are already in the closure and
+# only gain a definition; it calls no raw allocator.
+DEBUG_OVERLAY_CACHE_KEY = "ISAAC_VITA_DEBUG_OVERLAY"
+DEBUG_OVERLAY_SOURCE = "host_vita_debug_overlay.c"
 PNG_NATIVE_UNFILTER_CACHE_KEY = "ISAAC_VITA_PNG_NATIVE_UNFILTER"
 PNG_INFLATE_FLUSH_FASTPATH_CACHE_KEY = (
     "ISAAC_VITA_PNG_INFLATE_FLUSH_FASTPATH"
 )
 PNG_CRC32_FASTPATH_CACHE_KEY = "ISAAC_VITA_PNG_CRC32_FASTPATH"
 ARCHIVE_MINIZ_FASTPATH_CACHE_KEY = "ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH"
+NATIVE_INFLATE_CACHE_KEY = "ISAAC_VITA_NATIVE_INFLATE"
+NATIVE_INFLATE_VENDOR_RELATIVE = Path("recomp/runtime/vendor/zlib114")
+# The native inflate seam compiles zlib 1.1.4 leaves unmodified behind a
+# second forced include that renames every zlib symbol with the iz_ prefix (or
+# routes the two counted leaves to the hooks); CMake attaches exactly one
+# prefix header per unit after the poison header.  The headers may only
+# rename: an allocator name on either side of a rename is refused.
+NATIVE_INFLATE_RUNTIME_UNITS = {
+    "host_vita_native_inflate.c": "izlib114_prefix.h",
+    "host_vita_native_inflate_hooks.c": "izlib114_prefix.h",
+    "host_vita_native_inflate_zlib114_codes.c": "izlib114_prefix_codes.h",
+}
+NATIVE_INFLATE_VENDOR_UNITS = {
+    "inffast.c": "izlib114_prefix.h",
+    "adler32.c": "izlib114_prefix.h",
+    "infutil.c": "izlib114_prefix_util.h",
+}
+NATIVE_INFLATE_PREFIX_HEADERS = (
+    "izlib114_prefix.h", "izlib114_prefix_codes.h", "izlib114_prefix_util.h",
+)
+NATIVE_INFLATE_PREFIX_ROOT_HEADER = "izlib114_prefix.h"
 LUA_CACHE_KEY = "ISAAC_VITA_LUA"
+LUA_CORE_ARM_CACHE_KEY = "ISAAC_VITA_LUA_CORE_ARM"
 LUA_SOURCE_DIR_CACHE_KEY = "ISAAC_LUA53_SOURCE_DIR"
 LUA_TARGET = "isaac_lua53"
 LUA_ARCHIVE_NAME = "libisaac_lua53.a"
@@ -55,12 +135,21 @@ LUA_REQUIRED_COMPILE_OPTIONS = (
     "-Wall", "-Wextra",
 )
 LUA_REQUIRED_FINAL_SYMBOL = "lua_newstate"
+# ISAAC_VITA_LUA_GC_FINALIZER_PACE: isaac_lua53 compiles a derived lgc.c from
+# the build tree in place of the pristine one (lua53_gc_finalizer_pace.py).
+LUA_GC_FINALIZER_PACE_CACHE_KEY = "ISAAC_VITA_LUA_GC_FINALIZER_PACE"
+LUA_GC_FINALIZER_MAX_CACHE_KEY = "ISAAC_VITA_LUA_GC_FINALIZER_MAX"
+LUA_GC_FINALIZER_COST_CACHE_KEY = "ISAAC_VITA_LUA_GC_FINALIZER_COST"
+LUA_GC_SWEEP_COST_CACHE_KEY = "ISAAC_VITA_LUA_GC_SWEEP_COST"
+LUA_GC_FINALIZER_PACE_DIR = "lua53-gc-finalizer-pace"
+LUA_GC_FINALIZER_PACE_SOURCE = "lgc.c"
 LUA_DISCARDED_ALLOCATOR_SYMBOLS = frozenset(("l_alloc", "luaL_newstate"))
 SAVE_CHECKSUM_FASTPATH_CACHE_KEY = "ISAAC_VITA_SAVE_CHECKSUM_FASTPATH"
 SAVE_READER_FASTPATH_CACHE_KEY = "ISAAC_VITA_SAVE_READER_FASTPATH"
 SAVE_READ32_FUSED_CACHE_KEY = "ISAAC_VITA_SAVE_READ32_FUSED"
 SAVE_READER_DIRECT_EDGES_CACHE_KEY = "ISAAC_VITA_SAVE_READER_DIRECT_EDGES"
 SYNC_IMPORT_FASTPATH_CACHE_KEY = "ISAAC_VITA_SYNC_IMPORT_FASTPATH"
+GUEST_STACK_MEMBLOCK_CACHE_KEY = "ISAAC_VITA_GUEST_STACK_MEMBLOCK"
 MEMSET_THUNK_FASTPATH_CACHE_KEY = "ISAAC_VITA_MEMSET_THUNK_FASTPATH"
 KAGE_MUTEX_SEAM_CACHE_KEY = "ISAAC_VITA_KAGE_MUTEX_SEAM"
 KAGE_MUTEX_SEAM_ROOTS = (
@@ -84,6 +173,39 @@ AUDIO_STREAM_RECEIPT_CACHE_KEY = "ISAAC_VITA_AUDIO_STREAM_RECEIPT"
 SIM_CADENCE_RECEIPT_CACHE_KEY = "ISAAC_VITA_SIM_CADENCE_RECEIPT"
 STABLE30_PRESENTATION_CACHE_KEY = "ISAAC_VITA_STABLE_30_PRESENTATION"
 STABLE30_BUILD_ID_MACRO = "ISAAC_VITA_STABLE30_BUILD_ID"
+RUNTIME_SETTINGS_CACHE_KEY = "ISAAC_VITA_RUNTIME_SETTINGS"
+# The manager-only knob:
+# it adds units to isaac_manager alone, so the eboot closure never changes
+# and no eboot compile record may carry its per-target definition.  The gate
+# never inspects isaac_manager (compile records are gathered for the eboot
+# closure only); the key is still part of the fail-closed feature view and
+# mirrors the CMake FATAL on the runtime knob.
+MANAGER_SETTINGS_UI_CACHE_KEY = "ISAAC_VITA_MANAGER_SETTINGS_UI"
+MANAGER_SETTINGS_UI_DEFINITION = "MANAGER_SETTINGS_UI"
+# The manager UI2 game skin: like the settings
+# page it adds units to isaac_manager alone - the skin and its archive /
+# PNG / BMFont / tinfl / sceIo readers - so no eboot compile record may
+# carry its per-target definition or be one of its units.  Read fail-closed
+# by its own verifier; ON mirrors the CMake FATAL on the UI2 knob.
+MANAGER_UI2_GAME_SKIN_CACHE_KEY = "ISAAC_VITA_MANAGER_UI2_GAME_SKIN"
+MANAGER_UI2_GAME_SKIN_DEFINITION = "MANAGER_UI2_GAME_SKIN"
+MANAGER_UI2_CACHE_KEY = "ISAAC_VITA_MANAGER_UI2"
+# The manager trophy import row: a per-target definition on
+# isaac_manager only, no unit of its own; ON mirrors the CMake FATAL on UI2.
+MANAGER_TROPHY_IMPORT_CACHE_KEY = "ISAAC_VITA_MANAGER_TROPHY_IMPORT"
+MANAGER_TROPHY_IMPORT_DEFINITION = "MANAGER_TROPHY_IMPORT"
+# The manager debug overlay SETTINGS row: same shape.
+MANAGER_DEBUG_OVERLAY_ROW_CACHE_KEY = "ISAAC_VITA_MANAGER_DEBUG_OVERLAY_ROW"
+MANAGER_DEBUG_OVERLAY_ROW_DEFINITION = "MANAGER_DEBUG_OVERLAY_ROW"
+MANAGER_UI2_GAME_SKIN_UNITS: frozenset[str] = frozenset((
+    "manager_skin_game.c",
+    "manager_arch.c",
+    "manager_png.c",
+    "manager_bmfont.c",
+    "manager_tinfl.c",
+    "manager_blob_vita.c",
+))
+FULLSPEED_SCHEDULER_CACHE_KEY = "ISAAC_VITA_FULLSPEED_SCHEDULER"
 SIM_CADENCE_RECEIPT_BUILD_ID_MACRO = (
     "ISAAC_VITA_SIM_CADENCE_RECEIPT_BUILD_ID"
 )
@@ -108,33 +230,81 @@ RENDER_SURFACE_NATIVE_OUTPUT_SIZE = 1_116_121
 RENDER_SURFACE_NATIVE_OUTPUT_SHA256 = (
     "b53d55930fbf7adba71008843591a654e0ae782a06ce057310fb2de1547511a1"
 )
-DIRECT_DEFAULT_DEFINITION_OWNERS = frozenset(
+DIRECT_DEFAULT_DEFINITION_OWNERS: frozenset[str] = frozenset(
     ("gl_vita_backend.c", "kage_vita_generated_hooks.c")
 )
-STOCK_REFERENCE_DEFINITION_OWNERS = frozenset(("kage_vita_backend.c",))
-DISPLAY_RASTER_DEFINITION_OWNERS = frozenset(
+STOCK_REFERENCE_DEFINITION_OWNERS: frozenset[str] = frozenset(
+    ("kage_vita_backend.c",)
+)
+DISPLAY_RASTER_DEFINITION_OWNERS: frozenset[str] = frozenset(
     ("gl_vita_backend.c", "kage_vita_backend.c")
 )
-TYPED_STATE_CACHE_BASE_DEFINITION_OWNERS = frozenset(("gl_vita_backend.c",))
-GAME_LOG_BATCH_BASE_DEFINITION_OWNERS = frozenset(("host_vita_crt.c",))
-SYNC_IMPORT_FASTPATH_DEFINITION_OWNERS = frozenset(("guest.c",))
-TEXTURE_CHURN_PROFILE_DEFINITION_OWNERS = frozenset(
+TYPED_STATE_CACHE_BASE_DEFINITION_OWNERS: frozenset[str] = frozenset(
+    ("gl_vita_backend.c",)
+)
+GAME_LOG_BATCH_BASE_DEFINITION_OWNERS: frozenset[str] = frozenset(
+    ("host_vita_crt.c",)
+)
+SYNC_IMPORT_FASTPATH_DEFINITION_OWNERS: frozenset[str] = frozenset(("guest.c",))
+GAME_LOG_ASYNC_DEFINITION_OWNERS: frozenset[str] = frozenset(
+    (
+        "host_vita_crt.c",
+        "host_vita_filesystem.c",
+        "host_vita_startup.c",
+        "host_vita_find.c",
+        "entry_vita.c",
+        "host_vita_log_async.c",
+        "host_vita_game_log.c",
+    )
+)
+GUEST_STACK_MEMBLOCK_DEFINITION_OWNERS: frozenset[str] = frozenset(
+    ("guest.c", "entry_vita.c")
+)
+TEXTURE_CHURN_PROFILE_DEFINITION_OWNERS: frozenset[str] = frozenset(
     ("gl_vita_backend.c", "kage_vita_phase_profile.c")
 )
-AUDIO_STREAM_RECEIPT_DEFINITION_OWNERS = frozenset(
+AUDIO_STREAM_RECEIPT_DEFINITION_OWNERS: frozenset[str] = frozenset(
     ("host_vita_audio_cooperative.c",)
 )
-SIM_CADENCE_RECEIPT_RUNTIME_DEFINITION_OWNERS = frozenset(
+SIM_CADENCE_RECEIPT_RUNTIME_DEFINITION_OWNERS: frozenset[str] = frozenset(
     ("kage_vita_backend.c", "kage_vita_sim_cadence_receipt.c")
 )
-STABLE30_RUNTIME_DEFINITION_OWNERS = frozenset((
+STABLE30_RUNTIME_DEFINITION_OWNERS: frozenset[str] = frozenset((
     "kage_vita_backend.c",
     "kage_vita_generated_hooks.c",
     "kage_vita_stable30.c",
 ))
-WORLD_SEAM_DIAG_RUNTIME_DEFINITION_OWNERS = frozenset(
+WORLD_SEAM_DIAG_RUNTIME_DEFINITION_OWNERS: frozenset[str] = frozenset(
     ("gl_vita_backend.c", "kage_vita_world_seam_diag.c")
 )
+# port.ini runtime settings: the
+# entry hook, the scheduler duty term, the shared parser TU and the loader.
+# The scheduler owner is part of the closure only when the scheduler itself
+# is compiled; the loader receives ISAAC_VITA_FULLSPEED_SCHEDULER=1 through
+# the nested CMake block exactly then.
+RUNTIME_SETTINGS_DEFINITION_OWNERS: frozenset[str] = frozenset((
+    "entry_vita.c",
+    "kage_vita_fullspeed_scheduler.c",
+    "host_vita_settings_parse.c",
+    "host_vita_runtime_settings.c",
+))
+RUNTIME_SETTINGS_SCHEDULER_OWNER = "kage_vita_fullspeed_scheduler.c"
+RUNTIME_SETTINGS_LOADER = "host_vita_runtime_settings.c"
+# Runtime-settings sub-knob: the options.ini MaxRenderScale normalizer is
+# one extra loader-side unit, selected inside the runtime-settings CMake
+# block (CMake refuses it without ISAAC_VITA_RUNTIME_SETTINGS=ON).
+RENDER_SCALE_DEFAULT_CACHE_KEY = "ISAAC_VITA_RENDER_SCALE_DEFAULT"
+RENDER_SCALE_DEFAULT_SOURCE = "host_vita_render_scale.c"
+# The loader substitutes the build raster for an unset display_raster
+# (by design) and receives the width alone through the runtime-settings
+# CMake block; it must be the same width the two graphics owners get from
+# the scaled-raster block, or the native width when that block is off.
+RUNTIME_SETTINGS_RASTER_WIDTH_MACRO = "ISAAC_VITA_DISPLAY_RASTER_WIDTH"
+RUNTIME_SETTINGS_NATIVE_RASTER_WIDTH = "960"
+RUNTIME_SETTINGS_SOURCES: frozenset[str] = frozenset((
+    "host_vita_settings_parse.c",
+    "host_vita_runtime_settings.c",
+))
 RAW_SYMBOLS = frozenset(
     ("malloc", "calloc", "realloc", "free", "memalign",
      "aligned_alloc", "strdup")
@@ -197,6 +367,32 @@ LUA_EXPECTED_RAW_RELOCATIONS = _counter(
     (
         (1, "l_alloc", "free", "R_ARM_THM_CALL"),
         (1, "l_alloc", "realloc", "R_ARM_THM_JUMP24"),
+    )
+)
+# ISAAC_VITA_LUA_CORE_ARM compiles the archive with -marm: the same two dead
+# l_alloc edges (lauxlib.c:1000-1008, free(ptr) then the realloc tail call)
+# encoded in ARM state, bl -> R_ARM_CALL and b -> R_ARM_JUMP24.
+LUA_EXPECTED_RAW_RELOCATIONS_ARM = _counter(
+    (
+        (1, "l_alloc", "free", "R_ARM_CALL"),
+        (1, "l_alloc", "realloc", "R_ARM_JUMP24"),
+    )
+)
+
+
+def lua_expected_raw_relocations(core_arm: bool) -> collections.Counter[RelocKey]:
+    return (LUA_EXPECTED_RAW_RELOCATIONS_ARM if core_arm
+            else LUA_EXPECTED_RAW_RELOCATIONS).copy()
+
+
+# ISAAC_VITA_GUEST_STACK_MEMBLOCK replaces the newlib stack backing with a
+# dedicated USER_RW memblock; these three guest.c edges exist only in the OFF
+# build (EXPECTED_FIXED["guest.c"] below keeps the canonical OFF table).
+GUEST_STACK_NEWLIB_RELOCATIONS = _counter(
+    (
+        (1, "guest_stack_free", "free", "R_ARM_THM_CALL"),
+        (1, "guest_stack_init", "free", "R_ARM_THM_CALL"),
+        (1, "guest_stack_init", "memalign", "R_ARM_THM_CALL"),
     )
 )
 
@@ -296,7 +492,7 @@ _HEAP_CONSTPROP_BASES = frozenset(
         "vita_heap_guest_realloc_impl", "vita_heap_ledger_reserve",
     )
 )
-_HEAP_MUTUALLY_EXCLUSIVE_FUNCTIONS = (
+_HEAP_MUTUALLY_EXCLUSIVE_FUNCTIONS: tuple[frozenset[str], ...] = (
     frozenset(("vita_heap_guest_calloc_impl",
                "vita_heap_guest_calloc_impl.constprop.N")),
     frozenset(("vita_heap_guest_free_impl",
@@ -379,6 +575,17 @@ def _feature(cache: Mapping[str, str], name: str) -> bool:
     return value == "ON"
 
 
+def _count_feature(cache: Mapping[str, str], name: str) -> bool:
+    """A CMake STRING knob holding a whole number; > 0 selects the source."""
+    try:
+        value = cache[name].strip()
+    except KeyError as exc:
+        raise GateError(f"CMake cache is missing {name}") from exc
+    if not value.isdigit():
+        raise GateError(f"CMake cache {name} is not a whole number: {value!r}")
+    return int(value) > 0
+
+
 def lua_source_records(
     lua_source: Path, manifest: Path
 ) -> tuple[tuple[str, str], ...]:
@@ -451,6 +658,193 @@ def lua_source_set_sha256(records: Sequence[tuple[str, str]]) -> str:
         for name, sha256 in records
     ]
     return hashlib.sha256(_canonical_bytes(identity)).hexdigest()
+
+
+def lua_derived_sources(
+    cache: Mapping[str, str],
+    *,
+    build_dir: Path,
+    lua_source: Path,
+    derive=None,
+) -> dict[Path, Path]:
+    """Pristine Lua sources an ON knob replaces, after proving the bytes.
+
+    ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON: the build-owned
+    <build>/lua53-gc-finalizer-pace/lgc.c must be exactly
+    lua53_gc_finalizer_pace.derive(pristine lgc.c, MAX, COST, SWEEP_COST) for
+    the cached constants; the pristine file itself was already authenticated
+    against the manifest by lua_source_records.  OFF returns {} and the
+    closure stays the pristine 33 sources.
+    """
+
+    if not _feature(cache, LUA_GC_FINALIZER_PACE_CACHE_KEY):
+        return {}
+    values: dict[str, int] = {}
+    for key in (LUA_GC_FINALIZER_MAX_CACHE_KEY, LUA_GC_FINALIZER_COST_CACHE_KEY,
+                LUA_GC_SWEEP_COST_CACHE_KEY):
+        text = cache.get(key)
+        if text is None:
+            raise GateError(f"CMake cache is missing {key}")
+        if not text.strip().isdigit():
+            raise GateError(f"CMake cache {key} is not a whole number: {text!r}")
+        values[key] = int(text.strip())
+    if derive is None:
+        import lua53_gc_finalizer_pace as pace  # same directory as this gate
+
+        def derive(pristine: bytes, max_per_call: int, cost: int,
+                   sweep_cost: int) -> bytes:
+            try:
+                return pace.derive(pristine, max_per_call, cost, sweep_cost)
+            except pace.DeriveError as exc:
+                raise GateError(f"cannot derive the paced lgc.c: {exc}") from exc
+    pristine = (lua_source.resolve() / "src" / LUA_GC_FINALIZER_PACE_SOURCE).resolve()
+    derived_path = build_dir.resolve() / LUA_GC_FINALIZER_PACE_DIR / LUA_GC_FINALIZER_PACE_SOURCE
+    if derived_path.is_symlink() or not derived_path.is_file():
+        raise GateError(
+            f"derived Lua source is not a regular non-symlink file: {derived_path}"
+        )
+    derived_path = derived_path.resolve()
+    try:
+        pristine_bytes = pristine.read_bytes()
+        derived_bytes = derived_path.read_bytes()
+    except OSError as exc:
+        raise GateError(f"cannot read the paced lgc.c inputs: {exc}") from exc
+    expected = derive(
+        pristine_bytes,
+        values[LUA_GC_FINALIZER_MAX_CACHE_KEY],
+        values[LUA_GC_FINALIZER_COST_CACHE_KEY],
+        values[LUA_GC_SWEEP_COST_CACHE_KEY],
+    )
+    if derived_bytes != expected:
+        raise GateError(
+            "derived lgc.c differs from the derivation of the pristine source: "
+            f"{hashlib.sha256(derived_bytes).hexdigest()} != "
+            f"{hashlib.sha256(expected).hexdigest()}"
+        )
+    return {pristine: derived_path}
+
+
+# ISAAC_VITA_LUA_INTEGER2STR: isaac_lua53 compiles a derived lobject.c from the
+# build tree in place of the pristine one (lua53_integer2str.py): luaO_tostring
+# formats integers with a digit loop instead of snprintf("%lld").
+LUA_INTEGER2STR_CACHE_KEY = "ISAAC_VITA_LUA_INTEGER2STR"
+LUA_INTEGER2STR_DIR = "lua53-integer2str"
+LUA_INTEGER2STR_SOURCE = "lobject.c"
+
+
+def lua_derived_source_pair(
+    *,
+    build_dir: Path,
+    lua_source: Path,
+    directory: str,
+    source: str,
+    expected_of,
+) -> tuple[Path, Path]:
+    """One pristine -> derived Lua source pair, after proving the bytes.
+
+    <build>/<directory>/<source> must be a regular non-symlink file whose
+    bytes equal expected_of(pristine bytes); the pristine file itself was
+    already authenticated against the manifest by lua_source_records.
+    """
+
+    pristine = (lua_source.resolve() / "src" / source).resolve()
+    derived_path = build_dir.resolve() / directory / source
+    if derived_path.is_symlink() or not derived_path.is_file():
+        raise GateError(
+            f"derived Lua source is not a regular non-symlink file: {derived_path}"
+        )
+    derived_path = derived_path.resolve()
+    try:
+        pristine_bytes = pristine.read_bytes()
+        derived_bytes = derived_path.read_bytes()
+    except OSError as exc:
+        raise GateError(f"cannot read the derived {source} inputs: {exc}") from exc
+    expected = expected_of(pristine_bytes)
+    if derived_bytes != expected:
+        raise GateError(
+            f"derived {source} differs from the derivation of the pristine "
+            f"source: {hashlib.sha256(derived_bytes).hexdigest()} != "
+            f"{hashlib.sha256(expected).hexdigest()}"
+        )
+    return pristine, derived_path
+
+
+def lua_integer2str_sources(
+    cache: Mapping[str, str],
+    *,
+    build_dir: Path,
+    lua_source: Path,
+    derive=None,
+) -> dict[Path, Path]:
+    """ISAAC_VITA_LUA_INTEGER2STR=ON: the build-owned
+    <build>/lua53-integer2str/lobject.c must be exactly
+    lua53_integer2str.derive(pristine lobject.c).  OFF returns {}."""
+
+    if not _feature(cache, LUA_INTEGER2STR_CACHE_KEY):
+        return {}
+    if derive is None:
+        import lua53_integer2str as integer2str  # same directory as this gate
+
+        def derive(pristine: bytes) -> bytes:
+            try:
+                return integer2str.derive(pristine)
+            except integer2str.DeriveError as exc:
+                raise GateError(
+                    f"cannot derive the integer2str lobject.c: {exc}"
+                ) from exc
+    pristine, derived_path = lua_derived_source_pair(
+        build_dir=build_dir, lua_source=lua_source,
+        directory=LUA_INTEGER2STR_DIR, source=LUA_INTEGER2STR_SOURCE,
+        expected_of=derive,
+    )
+    return {pristine: derived_path}
+
+
+# Every knob that swaps pristine Lua sources for derived ones, with the
+# function that verifies its pairs.  lua_derived_sources is the
+# ISAAC_VITA_LUA_GC_FINALIZER_PACE one (it predates the registry and keeps
+# its name).  A new derivation adds one row here.
+LUA_DERIVATIONS = (
+    (LUA_GC_FINALIZER_PACE_CACHE_KEY, lua_derived_sources),
+    (LUA_INTEGER2STR_CACHE_KEY, lua_integer2str_sources),
+)
+
+
+def lua_derived_source_map(
+    cache: Mapping[str, str],
+    *,
+    build_dir: Path,
+    lua_source: Path,
+    derivations=None,
+) -> dict[Path, Path]:
+    """The union of every enabled derivation's pristine -> derived pairs.
+
+    Two derivations may not replace the same pristine file or claim the same
+    derived file; each knob owns its files outright (a combined edit of one
+    file would need its own derivation script and row).  All OFF returns {}
+    and the closure stays the pristine 33 sources.
+    """
+
+    result: dict[Path, Path] = {}
+    owner: dict[Path, str] = {}
+    derived_owner: dict[Path, str] = {}
+    for name, sources in (LUA_DERIVATIONS if derivations is None else derivations):
+        pairs = sources(cache, build_dir=build_dir, lua_source=lua_source)
+        for pristine, derived in pairs.items():
+            pristine = Path(pristine).resolve()
+            derived = Path(derived).resolve()
+            if pristine in owner:
+                raise GateError(
+                    f"{name} and {owner[pristine]} both replace {pristine.name}"
+                )
+            if derived in derived_owner:
+                raise GateError(
+                    f"{name} and {derived_owner[derived]} both claim {derived}"
+                )
+            owner[pristine] = name
+            derived_owner[derived] = name
+            result[pristine] = derived
+    return result
 
 
 def lua_gate_paths(
@@ -581,7 +975,7 @@ def expected_sources(
     if len(generated_sources) != len(set(generated_sources)):
         raise GateError("generated source override aliases another physical source")
 
-    runtime = set(BASE_RUNTIME)
+    runtime: set[str] = set(BASE_RUNTIME)
     optional = (
         (LUA_CACHE_KEY, "host_vita_lua.c"),
         ("ISAAC_VITA_HEAP_LEDGER_MEMBLOCK", "host_vita_heap_ledger_memblock.c"),
@@ -594,13 +988,131 @@ def expected_sources(
         ("ISAAC_VITA_FIOS_CACHE", "host_vita_fios_cache.c"),
         ("ISAAC_VITA_ASYNC_SAVE_WRITE", "host_vita_async_write.c"),
         ("ISAAC_VITA_LOG_ASYNC", "host_vita_log_async.c"),
+        ("ISAAC_VITA_GAME_LOG_ASYNC", "host_vita_game_log.c"),
         ("ISAAC_VITA_ANM2_SCRATCH", "host_vita_anm2_scratch.c"),
         ("ISAAC_VITA_TEXEL_SCRATCH", "host_vita_texel_scratch.c"),
+        ("ISAAC_VITA_NATIVE_THEORA", "host_vita_native_theora.c"),
+        ("ISAAC_VITA_NATIVE_THEORA_RGB", "host_vita_native_yuv.c"),
+        ("ISAAC_VITA_INFLATE_TABLE_MEMO", "host_vita_inflate_table_memo.c"),
+        (GUEST_STACK_MEMBLOCK_CACHE_KEY, "guest_stack_memblock.c"),
+        # Fixed tables only, no allocator calls.
+        ("ISAAC_VITA_ACCESS_NEGATIVE_CACHE", "host_vita_access_cache.c"),
+        # Static buffers and sceIo only, no allocator calls.
+        ("ISAAC_VITA_LAUNCH_ARGS_FILE", "host_vita_launch_args.c"),
     )
     for feature, name in optional:
         if _feature(cache, feature):
             runtime.add(name)
+    native_inflate = _feature(cache, NATIVE_INFLATE_CACHE_KEY)
+    if native_inflate:
+        runtime.update(NATIVE_INFLATE_RUNTIME_UNITS)
+    if _feature(cache, LUA_CACHE_KEY):
+        # CMakeLists.txt, inside if(ISAAC_VITA_LUA)
+        if (_feature(cache, "ISAAC_VITA_LUA_GCCOLLECT_CLAMP") or
+                _feature(cache, "ISAAC_VITA_LUA_GC_PROFILE")):
+            runtime.add("host_vita_lua_gc.c")
+        if _feature(cache, "ISAAC_VITA_LUA_NATIVE_GETCLASS"):
+            runtime.add("host_vita_lua_getclass.c")
+            # --wrap replays of the LuaBridge binding bodies: guest memory and
+            # the pinned Lua C API only (no allocator calls of its own).
+            if _feature(cache, "ISAAC_VITA_LUA_BINDING_REPLAY"):
+                runtime.add("host_vita_lua_binding_replay.c")
+        elif _feature(cache, "ISAAC_VITA_LUA_BINDING_REPLAY"):
+            raise GateError(
+                "ISAAC_VITA_LUA_BINDING_REPLAY requires "
+                "ISAAC_VITA_LUA_NATIVE_GETCLASS=ON"
+            )
+        # Profiling counters and --wrap of luaC_step/luaM_realloc_; no
+        # allocator calls of its own.
+        if _feature(cache, "ISAAC_VITA_LUA_COST_PROFILE"):
+            runtime.add("host_vita_lua_cost.c")
+            # ISAAC_VITA_LUA_INTEGER2STR's boot self-test (profile builds
+            # only): snprintf and the archive's digit loop on static
+            # buffers; no allocator calls of its own.
+            if _feature(cache, LUA_INTEGER2STR_CACHE_KEY):
+                runtime.add("host_vita_lua_integer2str_selftest.c")
+        # --wrap=luaL_loadfilex read-error retry (device run D4A4Pc,
+        # 2026-10-26) and its test-only sceIoOpen/Read/Close probe: static
+        # counters, stat() and the pristine call; no allocator calls of its
+        # own.
+        if _feature(cache, "ISAAC_VITA_LUA_LOADFILE_RETRY"):
+            runtime.add("host_vita_lua_loadfile.c")
+    # Seams whose unit CMake adds once the generated corpus is present
+    # (if(EXISTS "${ISAAC_GENERATED_SOURCE}") inside the knob block).
+    for feature, name in (
+        ("ISAAC_VITA_KAGE_QUAD_FASTPATH", "host_vita_kage_quad_fastpath.c"),
+        # --wrap seam over two translated roots; reads and writes guest
+        # memory only (no allocator calls).
+        ("ISAAC_VITA_GFUEL_SEED_NATIVE", "host_vita_gfuel_seed_native.c"),
+        # --wrap seam over sub_0033af30 (or chained behind the G FUEL
+        # profiling wrapper); reads and writes guest memory only (no
+        # allocator calls).
+        ("ISAAC_VITA_HASCOLLECTIBLE_NATIVE", "host_vita_hascoll_native.c"),
+        # --wrap seam over Level::Init; guest memory, the translated
+        # SoundEffect::Load, newlib mallinfo and the OpenAL pool snapshot
+        # (readings, not allocator calls) only.
+        ("ISAAC_VITA_SFX_FLOOR_PRELOAD", "host_vita_sfx_floor_preload.c"),
+        # Root-seam replay of sub_0049df90; reads and writes guest memory
+        # only (no allocator calls).
+        ("ISAAC_VITA_CAMERA_RING_NATIVE", "host_vita_camera_ring_native.c"),
+        # Profiling --wrap timers; counters only, never guest state or the
+        # allocator.
+        ("ISAAC_VITA_UPDATE_PROBE", "host_vita_update_probe.c"),
+        # --wrap of the ImageManager release observer; guest memory and
+        # vitaGL free-size queries only (no allocator calls).
+        ("ISAAC_VITA_IMAGE_RETAIN", "host_vita_image_retain.c"),
+        # --wrap seams over sub_0025af60 / sub_0055f610; guest memory and
+        # guest_call only (no allocator calls).
+        ("ISAAC_VITA_RENDER_CHAIN_NATIVE", "host_vita_render_chain_native.c"),
+        ("ISAAC_VITA_SHADER_ATTRIB_FASTPATH", "host_vita_shader_attrib_fastpath.c"),
+        (SHADER_SAMPLER_FASTPATH_CACHE_KEY, SHADER_SAMPLER_FASTPATH_SOURCE),
+        # --wrap seam over sub_005671d0; guest memory and the recorder's
+        # static bind-packet staging only (no allocator calls).
+        (KAGE_BIND_PACKET_CACHE_KEY, KAGE_BIND_PACKET_SOURCE),
+    ):
+        if _feature(cache, feature):
+            runtime.add(name)
+    if (_feature(cache, "ISAAC_VITA_KAGE_QUAD_FASTPATH") and
+            not _feature(cache, FLOOR_THUNK_FASTPATH_CACHE_KEY)):
+        raise GateError(
+            "ISAAC_VITA_KAGE_QUAD_FASTPATH requires "
+            f"{FLOOR_THUNK_FASTPATH_CACHE_KEY}=ON"
+        )
+    # Count knobs: the theora seams compile their unit only for a value > 0.
+    counted = (
+        ("ISAAC_VITA_THEORA_PRECACHE_FRAMES", "host_vita_theora_precache.c"),
+        ("ISAAC_VITA_THEORA_WORKER_PUMP", "host_vita_theora_worker_pump.c"),
+    )
+    for feature, name in counted:
+        if _count_feature(cache, feature):
+            runtime.add(name)
     kage = _feature(cache, "ISAAC_VITA_KAGE")
+    heap_slab_reject = _feature(cache, HEAP_SLAB_REJECT_FASTPATH_CACHE_KEY)
+    if heap_slab_reject and (
+            not _feature(cache, "ISAAC_VITA_ROOM_ENTRY_SLAB") or
+            not _feature(cache, "ISAAC_VITA_HEAP_OVERFLOW_MSPACE")):
+        raise GateError(
+            f"{HEAP_SLAB_REJECT_FASTPATH_CACHE_KEY} requires ROOM_ENTRY_SLAB and HEAP_OVERFLOW_MSPACE")
+    if _feature(cache, HEAP_STAGE_PROFILE_CACHE_KEY) and (
+            not _feature(cache, "ISAAC_VITA_PHASE_PROFILE") or
+            not _feature(cache, "ISAAC_VITA_HEAP_OVERFLOW_MSPACE")):
+        raise GateError(
+            f"{HEAP_STAGE_PROFILE_CACHE_KEY} requires PHASE_PROFILE and HEAP_OVERFLOW_MSPACE")
+    if _feature(cache, NATIVE_VORBIS_FREE_WATCH_CACHE_KEY) and \
+            not _feature(cache, "ISAAC_VITA_NATIVE_VORBIS"):
+        raise GateError(f"{NATIVE_VORBIS_FREE_WATCH_CACHE_KEY} requires NATIVE_VORBIS")
+    if _feature(cache, NATIVE_VORBIS_FREE_WATCH_MASK_CACHE_KEY) and \
+            not _feature(cache, NATIVE_VORBIS_FREE_WATCH_CACHE_KEY):
+        raise GateError(
+            f"{NATIVE_VORBIS_FREE_WATCH_MASK_CACHE_KEY} requires NATIVE_VORBIS_FREE_WATCH")
+    if _feature(cache, HEAP_FREE_COST_PROFILE_CACHE_KEY) and \
+            not _feature(cache, HEAP_STAGE_PROFILE_CACHE_KEY):
+        raise GateError(
+            f"{HEAP_FREE_COST_PROFILE_CACHE_KEY} requires HEAP_STAGE_PROFILE")
+    _feature(cache, HEAP_FREE_PREFILTER_CACHE_KEY)
+    if _feature(cache, HEAP_LEAN_IMPORT_CACHE_KEY) and \
+            not _feature(cache, "ISAAC_VITA_HEAP_OVERFLOW_MSPACE"):
+        raise GateError(f"{HEAP_LEAN_IMPORT_CACHE_KEY} requires HEAP_OVERFLOW_MSPACE")
     audio = _feature(cache, "ISAAC_VITA_AUDIO")
     audio_stream_receipt = _feature(cache, AUDIO_STREAM_RECEIPT_CACHE_KEY)
     coloroffset_gpu = _feature(cache, COLOROFFSET_GPU_CACHE_KEY)
@@ -608,12 +1120,28 @@ def expected_sources(
     continue_profile = _feature(cache, CONTINUE_PROFILE_CACHE_KEY)
     exit_menu_profile = _feature(cache, EXIT_MENU_PROFILE_CACHE_KEY)
     png_decode_profile = _feature(cache, PNG_DECODE_PROFILE_CACHE_KEY)
+    static_sfx_profile = _feature(cache, STATIC_SFX_PROFILE_CACHE_KEY)
+    backdrop_watergfx_guard = _feature(
+        cache, BACKDROP_WATERGFX_GUARD_CACHE_KEY
+    )
+    trophies = _feature(cache, TROPHIES_CACHE_KEY)
     png_native_unfilter = _feature(cache, PNG_NATIVE_UNFILTER_CACHE_KEY)
     png_inflate_flush_fastpath = _feature(
         cache, PNG_INFLATE_FLUSH_FASTPATH_CACHE_KEY
     )
     png_crc32_fastpath = _feature(cache, PNG_CRC32_FASTPATH_CACHE_KEY)
     archive_miniz_fastpath = _feature(cache, ARCHIVE_MINIZ_FASTPATH_CACHE_KEY)
+    inflate_table_memo = _feature(cache, "ISAAC_VITA_INFLATE_TABLE_MEMO")
+    uniform_set_receipt = _feature(cache, UNIFORM_SET_RECEIPT_CACHE_KEY)
+    shader_sampler_fastpath = _feature(cache, SHADER_SAMPLER_FASTPATH_CACHE_KEY)
+    gl_thread_record = _feature(cache, GL_THREAD_RECORD_CACHE_KEY)
+    gl_thread_worker = _feature(cache, GL_THREAD_WORKER_CACHE_KEY)
+    gl_owner_check = _feature(cache, GL_OWNER_CHECK_CACHE_KEY)
+    archive_read_trail = _feature(cache, ARCHIVE_READ_TRAIL_CACHE_KEY)
+    archive_validation_sidecar = _feature(
+        cache, ARCHIVE_VALIDATION_SIDECAR_CACHE_KEY
+    )
+    game_log_async = _feature(cache, GAME_LOG_ASYNC_CACHE_KEY)
     save_checksum_fastpath = _feature(
         cache, SAVE_CHECKSUM_FASTPATH_CACHE_KEY
     )
@@ -640,6 +1168,17 @@ def expected_sources(
     )
     sim_cadence_receipt = _feature(cache, SIM_CADENCE_RECEIPT_CACHE_KEY)
     stable30_presentation = _feature(cache, STABLE30_PRESENTATION_CACHE_KEY)
+    runtime_settings = _feature(cache, RUNTIME_SETTINGS_CACHE_KEY)
+    # The manager settings page adds sources to isaac_manager only; it is
+    # read fail-closed and checked against the runtime knob, never selects
+    # an eboot source.
+    manager_settings_ui = _feature(cache, MANAGER_SETTINGS_UI_CACHE_KEY)
+    render_scale_default = _feature(cache, RENDER_SCALE_DEFAULT_CACHE_KEY)
+    debug_overlay = _feature(cache, DEBUG_OVERLAY_CACHE_KEY)
+    gl_admission_standalone = _feature(cache, GL_ADMISSION_STANDALONE_CACHE_KEY)
+    # The one condition under which CMake links the overlay (and so its
+    # sceKernelFreeMemBlock wrap): the KAGE branch's runtime-settings block.
+    overlay_in_runtime = kage and runtime_settings and debug_overlay
     world_seam_diag = _feature(cache, WORLD_SEAM_DIAG_CACHE_KEY)
     # The lookup cache changes compile definitions on existing owners only,
     # but its CMake selection is still part of this fail-closed feature view.
@@ -692,6 +1231,125 @@ def expected_sources(
             f"{ARCHIVE_MINIZ_FASTPATH_CACHE_KEY} requires "
             "ISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON"
         )
+    if inflate_table_memo and not archive_miniz_fastpath:
+        raise GateError(
+            "ISAAC_VITA_INFLATE_TABLE_MEMO requires "
+            f"{ARCHIVE_MINIZ_FASTPATH_CACHE_KEY}=ON"
+        )
+    # The three knob-selected borrow units mirror their CMake FATAL_ERROR
+    # guards: each needs the translated KAGE target, the read trail also the
+    # CRT archive file cache and the phase profiler, the sidecar the archive
+    # validation receipt it wraps.
+    if uniform_set_receipt and not kage:
+        raise GateError(
+            f"{UNIFORM_SET_RECEIPT_CACHE_KEY} requires ISAAC_VITA_KAGE=ON"
+        )
+    # The sampler adds one ordinary poisoned/audited runtime owner, never an
+    # allocator exemption. Mirror CMake's required native dispatch and reject
+    # the conflicting wrap/observer modes before accepting the source closure.
+    if shader_sampler_fastpath and (
+            not kage or not _feature(cache, "ISAAC_VITA_GL_SHIM_FASTDISPATCH") or
+            not _feature(cache, "ISAAC_VITA_SHADER_ATTRIB_FASTPATH") or
+            uniform_set_receipt or _feature(cache, "ISAAC_VITA_GUEST_SAMPLER") or
+            _feature(cache, "ISAAC_VITA_STALL_PROBE")):
+        raise GateError(
+            f"{SHADER_SAMPLER_FASTPATH_CACHE_KEY} requires KAGE + "
+            "GL_SHIM_FASTDISPATCH + SHADER_ATTRIB_FASTPATH; "
+            "UNIFORM_SET_RECEIPT/GUEST_SAMPLER/STALL_PROBE must be OFF"
+        )
+    # The bind packet adds one ordinary poisoned/audited owner (static
+    # staging in the recorder, no allocator). Mirror CMake's FATAL.
+    if _feature(cache, KAGE_BIND_PACKET_CACHE_KEY) and (
+            not kage or not _feature(cache, "ISAAC_VITA_GL_SHIM_FASTDISPATCH") or
+            not _feature(cache, "ISAAC_VITA_SHADER_ATTRIB_FASTPATH") or
+            not _feature(cache, GL_THREAD_RECORD_CACHE_KEY) or
+            not _feature(cache, GL_THREAD_WORKER_CACHE_KEY) or
+            uniform_set_receipt or _feature(cache, "ISAAC_VITA_STALL_PROBE")):
+        raise GateError(
+            f"{KAGE_BIND_PACKET_CACHE_KEY} requires KAGE + "
+            "GL_SHIM_FASTDISPATCH + SHADER_ATTRIB_FASTPATH + GL_THREAD_RECORD + "
+            "GL_THREAD_WORKER; UNIFORM_SET_RECEIPT/STALL_PROBE must be OFF"
+        )
+    if _feature(cache, "ISAAC_VITA_GUEST_SAMPLER") and (
+            not kage or not _feature(cache, "ISAAC_VITA_PHASE_PROFILE")):
+        raise GateError(
+            "ISAAC_VITA_GUEST_SAMPLER requires ISAAC_VITA_KAGE=ON and "
+            "ISAAC_VITA_PHASE_PROFILE=ON"
+        )
+    # The recorder adds three ordinary poisoned/audited owners (fixed static
+    # ring and memo, no allocator calls), never an exemption. Mirror CMake.
+    if gl_thread_record:
+        if not kage or _feature(cache, "ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE"):
+            raise GateError(
+                f"{GL_THREAD_RECORD_CACHE_KEY} requires ISAAC_VITA_KAGE=ON and "
+                "ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE=OFF"
+            )
+        runtime.update(GL_THREAD_RECORD_SOURCES)
+    if gl_thread_worker and not gl_thread_record:
+        raise GateError(
+            f"{GL_THREAD_WORKER_CACHE_KEY} requires {GL_THREAD_RECORD_CACHE_KEY}=ON")
+    if gl_owner_check:
+        if not gl_thread_worker:
+            raise GateError(
+                f"{GL_OWNER_CHECK_CACHE_KEY} requires {GL_THREAD_WORKER_CACHE_KEY}=ON")
+        runtime.add(GL_OWNER_CHECK_SOURCE)
+    if gl_admission_standalone:
+        if not gl_thread_worker:
+            raise GateError(
+                f"{GL_ADMISSION_STANDALONE_CACHE_KEY} requires {GL_THREAD_WORKER_CACHE_KEY}=ON")
+        if not overlay_in_runtime:
+            runtime.add(GL_RECORD_FREE_WRAP_SOURCE)
+    if archive_read_trail and not kage:
+        raise GateError(
+            f"{ARCHIVE_READ_TRAIL_CACHE_KEY} requires ISAAC_VITA_KAGE=ON"
+        )
+    if archive_read_trail and not _feature(
+            cache, "ISAAC_VITA_ARCHIVE_FILE_CACHE"):
+        raise GateError(
+            f"{ARCHIVE_READ_TRAIL_CACHE_KEY} requires "
+            "ISAAC_VITA_ARCHIVE_FILE_CACHE=ON"
+        )
+    if archive_read_trail and not _feature(cache, "ISAAC_VITA_PHASE_PROFILE"):
+        raise GateError(
+            f"{ARCHIVE_READ_TRAIL_CACHE_KEY} requires "
+            "ISAAC_VITA_PHASE_PROFILE=ON"
+        )
+    # The static SFX window profile mirrors its CMake guards: nested under
+    # if(ISAAC_VITA_KAGE), FATAL without the phase profiler ("Room
+    # diagnostics") and without ISAAC_VITA_AUDIO (it wraps the OpenAL
+    # upload/create path).
+    if static_sfx_profile and not kage:
+        raise GateError(
+            f"{STATIC_SFX_PROFILE_CACHE_KEY} requires ISAAC_VITA_KAGE=ON"
+        )
+    if static_sfx_profile and not _feature(cache, "ISAAC_VITA_PHASE_PROFILE"):
+        raise GateError(
+            f"{STATIC_SFX_PROFILE_CACHE_KEY} requires "
+            "ISAAC_VITA_PHASE_PROFILE=ON"
+        )
+    if static_sfx_profile and not audio:
+        raise GateError(
+            f"{STATIC_SFX_PROFILE_CACHE_KEY} requires ISAAC_VITA_AUDIO=ON"
+        )
+    if archive_validation_sidecar and not _feature(
+            cache, ARCHIVE_VALIDATION_RECEIPT_CACHE_KEY):
+        raise GateError(
+            f"{ARCHIVE_VALIDATION_SIDECAR_CACHE_KEY} requires "
+            f"{ARCHIVE_VALIDATION_RECEIPT_CACHE_KEY}=ON"
+        )
+    if archive_validation_sidecar and not kage:
+        raise GateError(
+            f"{ARCHIVE_VALIDATION_SIDECAR_CACHE_KEY} requires "
+            "ISAAC_VITA_KAGE=ON"
+        )
+    if game_log_async and not _feature(cache, "ISAAC_VITA_ARCHIVE_FILE_CACHE"):
+        raise GateError(
+            f"{GAME_LOG_ASYNC_CACHE_KEY} requires ISAAC_VITA_ARCHIVE_FILE_CACHE=ON"
+        )
+    if game_log_async and not _feature(cache, "ISAAC_VITA_LOG_ASYNC"):
+        raise GateError(
+            f"{GAME_LOG_ASYNC_CACHE_KEY} requires ISAAC_VITA_LOG_ASYNC=ON"
+        )
     if texture_churn_profile and not kage:
         raise GateError(
             f"{TEXTURE_CHURN_PROFILE_CACHE_KEY} requires ISAAC_VITA_KAGE=ON"
@@ -719,6 +1377,31 @@ def expected_sources(
         raise GateError(
             f"{STABLE30_PRESENTATION_CACHE_KEY} and "
             "ISAAC_VITA_FULLSPEED_SCHEDULER are exclusive"
+        )
+    if runtime_settings and not kage:
+        raise GateError(
+            f"{RUNTIME_SETTINGS_CACHE_KEY} requires ISAAC_VITA_KAGE=ON"
+        )
+    if runtime_settings and _feature(cache, "ISAAC_VITA_IO_PROFILE"):
+        raise GateError(
+            f"{RUNTIME_SETTINGS_CACHE_KEY} requires ISAAC_VITA_IO_PROFILE=OFF"
+        )
+    if manager_settings_ui and not runtime_settings:
+        raise GateError(
+            f"{MANAGER_SETTINGS_UI_CACHE_KEY} requires "
+            f"{RUNTIME_SETTINGS_CACHE_KEY}=ON"
+        )
+    if render_scale_default and not runtime_settings:
+        raise GateError(
+            f"{RENDER_SCALE_DEFAULT_CACHE_KEY} requires "
+            f"{RUNTIME_SETTINGS_CACHE_KEY}=ON"
+        )
+    if debug_overlay and not kage:
+        raise GateError(f"{DEBUG_OVERLAY_CACHE_KEY} requires ISAAC_VITA_KAGE=ON")
+    if debug_overlay and not runtime_settings:
+        raise GateError(
+            f"{DEBUG_OVERLAY_CACHE_KEY} requires "
+            f"{RUNTIME_SETTINGS_CACHE_KEY}=ON"
         )
     if world_seam_diag and not kage:
         raise GateError(
@@ -753,6 +1436,14 @@ def expected_sources(
         runtime.add("host_vita_save_reader_direct.c")
     if memset_thunk_fastpath:
         runtime.add("host_vita_memset_thunk_direct.c")
+    if backdrop_watergfx_guard:
+        # The two owners (sub_00498850, sub_0056c7e0) are generated units
+        # already in the closure; the log helper is the only new object.
+        runtime.add(BACKDROP_WATERGFX_GUARD_SOURCE)
+    if trophies:
+        # The TryUnlock owner units are generated units already in the
+        # closure; the trophy runtime is the only new object.
+        runtime.add(TROPHIES_SOURCE)
     if kage_mutex_seam:
         if not _feature(cache, "ISAAC_VITA_SYNC_INLINE_FASTPATH"):
             raise GateError(
@@ -795,6 +1486,15 @@ def expected_sources(
         runtime.update(KAGE_RUNTIME)
         if audio:
             runtime.update(("host_vita_audio.c", "host_vita_openal_pool.c"))
+            if (_feature(cache, "ISAAC_VITA_AUDIO_WORKER") or
+                    _feature(cache, "ISAAC_VITA_AUDIO_REFILL_RECEIPT")):
+                runtime.add("host_vita_audio_refill.c")
+            if _feature(cache, "ISAAC_VITA_NATIVE_VORBIS"):
+                runtime.add("host_vita_native_vorbis.c")
+                # CMake nests the read-ahead under NATIVE_VORBIS; its worker
+                # buffers are USER_RW memblocks (no allocator calls).
+                if _feature(cache, "ISAAC_VITA_OGG_READAHEAD"):
+                    runtime.add("host_vita_ogg_readahead.c")
         if _feature(cache, "ISAAC_VITA_IO_PROFILE"):
             runtime.add("kage_vita_io_profile.c")
         if _feature(cache, "ISAAC_VITA_STALL_PROBE"):
@@ -803,6 +1503,28 @@ def expected_sources(
             )
         if _feature(cache, "ISAAC_VITA_PHASE_PROFILE"):
             runtime.add("kage_vita_phase_profile.c")
+            # CMake nests the guest sampler under KAGE > PHASE_PROFILE; its
+            # one TU uses fixed tables only (no allocator calls).
+            if _feature(cache, "ISAAC_VITA_GUEST_SAMPLER"):
+                runtime.add("kage_vita_guest_sampler.c")
+            # Same nesting; fixed static windows, no allocator calls.
+            if _feature(cache, "ISAAC_VITA_GPU_FRAME_PROFILE"):
+                runtime.add("kage_vita_gpu_frame_profile.c")
+            if archive_read_trail:
+                # CMake nests the trail under KAGE > PHASE_PROFILE; the
+                # pure accumulator is the only new object of that knob.
+                runtime.add("host_vita_archive_trail.c")
+        if static_sfx_profile:
+            # CMake nests the profile directly under KAGE (its PHASE_PROFILE
+            # and AUDIO requirements are the FATALs mirrored above); the
+            # profile TU is the only new object.  Its other owners,
+            # host_vita_audio.c and the phase profiler, are already in the
+            # closure and only gain a definition.
+            runtime.add(STATIC_SFX_PROFILE_SOURCE)
+        if uniform_set_receipt:
+            runtime.add("host_vita_uniform_set_receipt.c")
+        if archive_validation_sidecar:
+            runtime.add("host_vita_archive_sidecar.c")
         if sim_cadence_receipt:
             runtime.add("kage_vita_sim_cadence_receipt.c")
         if world_seam_diag:
@@ -811,6 +1533,12 @@ def expected_sources(
             runtime.add("kage_vita_fullspeed_scheduler.c")
         if stable30_presentation:
             runtime.add("kage_vita_stable30.c")
+        if runtime_settings:
+            runtime.update(RUNTIME_SETTINGS_SOURCES)
+            if render_scale_default:
+                runtime.add(RENDER_SCALE_DEFAULT_SOURCE)
+            if overlay_in_runtime:
+                runtime.add(DEBUG_OVERLAY_SOURCE)
         if renderframe_fastpath:
             runtime.add("host_vita_renderframe_fastpath.c")
         if continue_profile:
@@ -832,12 +1560,30 @@ def expected_sources(
                 "host_vita_archive_miniz_native.c",
                 "host_vita_archive_miniz_guest.c",
             ))
+            for feature, name in (
+                ("ISAAC_VITA_ARCHIVE_XOR_FASTPATH", "host_vita_archive_xor.c"),
+                ("ISAAC_VITA_WAV_BUFFERED_REWIND", "host_vita_wav_buffered_rewind.c"),
+                ("ISAAC_VITA_ROOM_GRID_INIT_NATIVE", "host_vita_room_grid_init.c"),
+                ("ISAAC_VITA_PNG_PREMULTIPLY_NATIVE", "host_vita_png_premultiply.c"),
+                ("ISAAC_VITA_PNG_TEXEL_INIT_ELISION", "host_vita_png_texel_init.c"),
+            ):
+                if _feature(cache, feature):
+                    runtime.add(name)
         if _feature(cache, "ISAAC_VITA_NATIVE_PNG"):
             # the native PNG decoder inflates with the in-tree tinfl
             runtime.update((
                 "host_vita_native_png.c",
                 "host_vita_archive_miniz_native.c",
             ))
+            if _feature(cache, "ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT"):
+                runtime.add("host_vita_native_png_libdeflate.c")
+            if _feature(cache, "ISAAC_VITA_NATIVE_PNG_REUSE"):
+                runtime.add("host_vita_png_reuse.c")
+            if _feature(cache, "ISAAC_VITA_NATIVE_PNG_ADLER_NEON"):
+                runtime.update((
+                    "host_vita_native_png_adler.c",
+                    "host_vita_native_png_miniz.c",
+                ))
         if coloroffset_gpu:
             runtime.add("gl_vita_coloroffset_source.c")
         if _feature(cache, "ISAAC_VITA_RAW_GXM_PROBE"):
@@ -855,6 +1601,11 @@ def expected_sources(
         for name in ("main.c", "fixed_image.c", "platform.c")
     }
     sources.update((runtime_root / name).resolve() for name in runtime)
+    if native_inflate:
+        vendor_root = source_root / NATIVE_INFLATE_VENDOR_RELATIVE
+        sources.update(
+            (vendor_root / name).resolve() for name in NATIVE_INFLATE_VENDOR_UNITS
+        )
     before_generated = len(sources)
     sources.update(generated_sources)
     if len(sources) != before_generated + len(generated_sources):
@@ -953,7 +1704,7 @@ def verify_direct_default_compile_scope(
     if active and stock_reference:
         if first_frame:
             raise GateError("stock vitaGL reference forbids first-frame probe")
-        expected = frozenset()
+        expected: frozenset[str] = frozenset()
     else:
         if active and not first_frame:
             raise GateError(
@@ -1016,7 +1767,9 @@ def verify_stock_reference_compile_scope(
                     f"definition: {values}"
                 )
             actual.add(source.name)
-    expected = STOCK_REFERENCE_DEFINITION_OWNERS if active else frozenset()
+    expected: frozenset[str] = (
+        STOCK_REFERENCE_DEFINITION_OWNERS if active else frozenset()
+    )
     if actual != expected:
         raise GateError(
             "stock-reference compile-definition scope changed: "
@@ -1051,13 +1804,320 @@ def verify_display_raster_compile_scope(
                     f"definition: {values}"
                 )
             actual.add(source.name)
-    expected = DISPLAY_RASTER_DEFINITION_OWNERS if active else frozenset()
+    expected: frozenset[str] = (
+        DISPLAY_RASTER_DEFINITION_OWNERS if active else frozenset()
+    )
     if actual != expected:
         raise GateError(
             "display-raster compile-definition scope changed: "
             f"missing={sorted(expected - actual)}, "
             f"extra={sorted(actual - expected)}"
         )
+
+
+def _verify_heap_define_scope(
+    records: Mapping[Path, Mapping[str, object]], cache: Mapping[str, str],
+    key: str, label: str, owners: set[str],
+) -> None:
+    active = _feature(cache, key)
+    actual: set[str] = set()
+    for record in records.values():
+        source = record.get("source")
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        if not isinstance(source, Path) or not isinstance(definitions, dict):
+            raise GateError(f"{label} compile record is malformed")
+        if key in undefinitions:
+            raise GateError(f"{label} policy is undefined")
+        values = definitions.get(key, [])
+        if values:
+            if values != ["1"]:
+                raise GateError(f"{label} definition is non-canonical")
+            actual.add(source.name)
+    expected = owners if active else set()
+    if actual != expected:
+        raise GateError(f"{label} compile-definition scope changed: {actual} != {expected}")
+
+
+def verify_heap_slab_reject_compile_scope(
+    records: Mapping[Path, Mapping[str, object]], cache: Mapping[str, str],
+) -> None:
+    _verify_heap_define_scope(records, cache, HEAP_SLAB_REJECT_FASTPATH_CACHE_KEY,
+                              "heap slab reject", {"host_vita_heap.c"})
+
+
+def verify_heap_stage_profile_compile_scope(
+    records: Mapping[Path, Mapping[str, object]], cache: Mapping[str, str],
+) -> None:
+    _verify_heap_define_scope(records, cache, HEAP_STAGE_PROFILE_CACHE_KEY,
+                              "heap stage profile",
+                              {"host_vita_heap.c", "kage_vita_phase_profile.c"})
+
+
+def verify_native_vorbis_free_watch_compile_scope(
+    records: Mapping[Path, Mapping[str, object]], cache: Mapping[str, str],
+) -> None:
+    _verify_heap_define_scope(records, cache, NATIVE_VORBIS_FREE_WATCH_CACHE_KEY,
+                              "native vorbis free watch", {"host_vita_native_vorbis.c"})
+
+
+def verify_heap_free_prefilter_compile_scope(
+    records: Mapping[Path, Mapping[str, object]], cache: Mapping[str, str],
+) -> None:
+    """The heap reads range records only the block modules define under the
+    knob: heap + OGG emergency always, ANM2/texel scratch with their knobs."""
+    owners = {"host_vita_heap.c", "host_vita_ogg_emergency.c"}
+    if _feature(cache, "ISAAC_VITA_ANM2_SCRATCH"):
+        owners.add("host_vita_anm2_scratch.c")
+    if _feature(cache, "ISAAC_VITA_TEXEL_SCRATCH"):
+        owners.add("host_vita_texel_scratch.c")
+    _verify_heap_define_scope(records, cache, HEAP_FREE_PREFILTER_CACHE_KEY,
+                              "heap free prefilter", owners)
+
+
+def verify_native_vorbis_free_watch_mask_compile_scope(
+    records: Mapping[Path, Mapping[str, object]], cache: Mapping[str, str],
+) -> None:
+    _verify_heap_define_scope(records, cache, NATIVE_VORBIS_FREE_WATCH_MASK_CACHE_KEY,
+                              "native vorbis free watch mask",
+                              {"host_vita_native_vorbis.c"})
+
+
+def verify_heap_free_cost_profile_compile_scope(
+    records: Mapping[Path, Mapping[str, object]], cache: Mapping[str, str],
+) -> None:
+    """Heap + phase profile; the Vorbis unit too when the live mask is on
+    (its live-slot census feeds ph120.hv)."""
+    owners = {"host_vita_heap.c", "kage_vita_phase_profile.c"}
+    if _feature(cache, NATIVE_VORBIS_FREE_WATCH_MASK_CACHE_KEY):
+        owners.add("host_vita_native_vorbis.c")
+    _verify_heap_define_scope(records, cache, HEAP_FREE_COST_PROFILE_CACHE_KEY,
+                              "heap free cost profile", owners)
+
+
+def verify_runtime_settings_compile_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+) -> None:
+    """ISAAC_VITA_RUNTIME_SETTINGS=1 reaches exactly the owner set (minus
+    the scheduler when no scheduler is compiled), never a generated unit,
+    the loader carries ISAAC_VITA_FULLSPEED_SCHEDULER=1 exactly when the
+    scheduler option is ON (the nested CMake definition), and the loader's
+    ISAAC_VITA_DISPLAY_RASTER_WIDTH is the one width the graphics owners
+    receive (960 when the scaled-raster block defines none)."""
+    active = _feature(cache, RUNTIME_SETTINGS_CACHE_KEY)
+    scheduler = _feature(cache, FULLSPEED_SCHEDULER_CACHE_KEY)
+    actual: set[str] = set()
+    loader_scheduler: list[str] | None = None
+    loader_width: list[str] | None = None
+    owner_widths: dict[str, list[str]] = {}
+    for record in records.values():
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        source = record.get("source")
+        if (not isinstance(definitions, dict) or
+                not isinstance(undefinitions, list) or
+                not isinstance(source, Path)):
+            raise GateError("compile record is missing source definitions")
+        if RUNTIME_SETTINGS_CACHE_KEY in undefinitions:
+            raise GateError(
+                f"runtime-settings policy is undefined by {source}"
+            )
+        values = definitions.get(RUNTIME_SETTINGS_CACHE_KEY, [])
+        if values:
+            if values != ["1"]:
+                raise GateError(
+                    f"{source.name} has a non-canonical runtime-settings "
+                    f"definition: {values}"
+                )
+            actual.add(source.name)
+        if source.name == RUNTIME_SETTINGS_LOADER:
+            scheduler_values = definitions.get(
+                FULLSPEED_SCHEDULER_CACHE_KEY, []
+            )
+            loader_scheduler = (
+                list(scheduler_values)
+                if isinstance(scheduler_values, list) else []
+            )
+            width_values = definitions.get(
+                RUNTIME_SETTINGS_RASTER_WIDTH_MACRO, []
+            )
+            loader_width = (
+                list(width_values) if isinstance(width_values, list) else []
+            )
+        elif source.name in DISPLAY_RASTER_DEFINITION_OWNERS:
+            width_values = definitions.get(
+                RUNTIME_SETTINGS_RASTER_WIDTH_MACRO, []
+            )
+            if isinstance(width_values, list) and width_values:
+                owner_widths[source.name] = list(width_values)
+    expected: set[str] = set()
+    if active:
+        expected = set(RUNTIME_SETTINGS_DEFINITION_OWNERS)
+        if not scheduler:
+            expected.discard(RUNTIME_SETTINGS_SCHEDULER_OWNER)
+    if actual != expected:
+        raise GateError(
+            "runtime-settings compile-definition scope changed: "
+            f"missing={sorted(expected - actual)}, "
+            f"extra={sorted(actual - expected)}"
+        )
+    if active:
+        expected_scheduler = ["1"] if scheduler else []
+        if loader_scheduler != expected_scheduler:
+            raise GateError(
+                f"{RUNTIME_SETTINGS_LOADER} fullspeed-scheduler definition "
+                f"scope changed: {loader_scheduler} != {expected_scheduler}"
+            )
+        expected_widths = {tuple(values) for values in owner_widths.values()}
+        if len(expected_widths) > 1:
+            raise GateError(
+                "display-raster width differs between the graphics owners: "
+                f"{owner_widths}"
+            )
+        expected_width = (
+            list(next(iter(expected_widths))) if expected_widths
+            else [RUNTIME_SETTINGS_NATIVE_RASTER_WIDTH]
+        )
+        if loader_width != expected_width:
+            raise GateError(
+                f"{RUNTIME_SETTINGS_LOADER} display-raster width definition "
+                f"scope changed: {loader_width} != {expected_width} "
+                f"(graphics owners: {owner_widths})"
+            )
+    elif loader_width:
+        raise GateError(
+            f"{RUNTIME_SETTINGS_LOADER} carries a display-raster width while "
+            f"{RUNTIME_SETTINGS_CACHE_KEY} is OFF: {loader_width}"
+        )
+
+
+def verify_manager_settings_ui_compile_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+) -> None:
+    """The manager settings page reaches no eboot unit: whatever the knob's
+    value, no compile record of the eboot closure defines or undefines
+    MANAGER_SETTINGS_UI (the definition is per-target on isaac_manager,
+    whose records are not part of the closure this gate certifies)."""
+    _feature(cache, MANAGER_SETTINGS_UI_CACHE_KEY)
+    for record in records.values():
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        source = record.get("source")
+        if (not isinstance(definitions, dict) or
+                not isinstance(undefinitions, list) or
+                not isinstance(source, Path)):
+            raise GateError("compile record is missing source definitions")
+        if MANAGER_SETTINGS_UI_DEFINITION in definitions or \
+                MANAGER_SETTINGS_UI_DEFINITION in undefinitions:
+            raise GateError(
+                "manager settings page definition reached an eboot unit: "
+                f"{source.name}"
+            )
+
+
+def verify_manager_ui2_game_skin_compile_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+) -> None:
+    """The manager game skin reaches no eboot unit: whatever the knob's
+    value, no compile record of the eboot closure defines or undefines
+    MANAGER_UI2_GAME_SKIN or compiles one of its units (they are added to
+    isaac_manager only, whose records are not part of this closure).  ON
+    requires the UI2 knob, as the CMake FATAL does."""
+    game_skin = _feature(cache, MANAGER_UI2_GAME_SKIN_CACHE_KEY)
+    if game_skin and not _feature(cache, MANAGER_UI2_CACHE_KEY):
+        raise GateError(
+            f"{MANAGER_UI2_GAME_SKIN_CACHE_KEY} requires "
+            f"{MANAGER_UI2_CACHE_KEY}=ON"
+        )
+    for record in records.values():
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        source = record.get("source")
+        if (not isinstance(definitions, dict) or
+                not isinstance(undefinitions, list) or
+                not isinstance(source, Path)):
+            raise GateError("compile record is missing source definitions")
+        if MANAGER_UI2_GAME_SKIN_DEFINITION in definitions or \
+                MANAGER_UI2_GAME_SKIN_DEFINITION in undefinitions:
+            raise GateError(
+                "manager game skin definition reached an eboot unit: "
+                f"{source.name}"
+            )
+        if source.name in MANAGER_UI2_GAME_SKIN_UNITS:
+            raise GateError(
+                f"manager game skin unit reached the eboot closure: {source}"
+            )
+
+
+def _verify_manager_ui2_row_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+    cache_key: str,
+    definition: str,
+    label: str,
+) -> None:
+    """A manager UI2 row knob (no unit of its own) reaches no eboot unit: no
+    compile record of the eboot closure defines or undefines its per-target
+    definition.  ON requires the UI2 knob, as the CMake FATAL does."""
+    if _feature(cache, cache_key) and not _feature(cache, MANAGER_UI2_CACHE_KEY):
+        raise GateError(f"{cache_key} requires {MANAGER_UI2_CACHE_KEY}=ON")
+    for record in records.values():
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        source = record.get("source")
+        if (not isinstance(definitions, dict) or
+                not isinstance(undefinitions, list) or
+                not isinstance(source, Path)):
+            raise GateError("compile record is missing source definitions")
+        if definition in definitions or definition in undefinitions:
+            raise GateError(
+                f"{label} definition reached an eboot unit: {source.name}"
+            )
+
+
+def verify_manager_debug_overlay_row_compile_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+) -> None:
+    """MANAGER_DEBUG_OVERLAY_ROW stays on isaac_manager (the game's own
+    debug overlay knob is a different, eboot-side definition)."""
+    _verify_manager_ui2_row_scope(
+        records, cache, MANAGER_DEBUG_OVERLAY_ROW_CACHE_KEY,
+        MANAGER_DEBUG_OVERLAY_ROW_DEFINITION, "manager debug overlay row",
+    )
+
+
+def verify_manager_trophy_import_compile_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+) -> None:
+    """The manager trophy import row reaches no eboot unit: no compile
+    record of the eboot closure defines or undefines MANAGER_TROPHY_IMPORT
+    (the definition is per-target on isaac_manager).  ON requires the UI2
+    knob, as the CMake FATAL does."""
+    trophy_import = _feature(cache, MANAGER_TROPHY_IMPORT_CACHE_KEY)
+    if trophy_import and not _feature(cache, MANAGER_UI2_CACHE_KEY):
+        raise GateError(
+            f"{MANAGER_TROPHY_IMPORT_CACHE_KEY} requires "
+            f"{MANAGER_UI2_CACHE_KEY}=ON"
+        )
+    for record in records.values():
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        source = record.get("source")
+        if (not isinstance(definitions, dict) or
+                not isinstance(undefinitions, list) or
+                not isinstance(source, Path)):
+            raise GateError("compile record is missing source definitions")
+        if MANAGER_TROPHY_IMPORT_DEFINITION in definitions or \
+                MANAGER_TROPHY_IMPORT_DEFINITION in undefinitions:
+            raise GateError(
+                "manager trophy import definition reached an eboot unit: "
+                f"{source.name}"
+            )
 
 
 def verify_typed_state_cache_compile_scope(
@@ -1087,7 +2147,9 @@ def verify_typed_state_cache_compile_scope(
                     f"definition: {values}"
                 )
             actual.add(source.name)
-    expected = set(TYPED_STATE_CACHE_BASE_DEFINITION_OWNERS) if active else set()
+    expected: set[str] = (
+        set(TYPED_STATE_CACHE_BASE_DEFINITION_OWNERS) if active else set()
+    )
     if active and phase_profile:
         expected.add("kage_vita_phase_profile.c")
     if actual != expected:
@@ -1125,12 +2187,49 @@ def verify_game_log_batch_compile_scope(
                     f"definition: {values}"
                 )
             actual.add(source.name)
-    expected = set(GAME_LOG_BATCH_BASE_DEFINITION_OWNERS) if active else set()
+    expected: set[str] = (
+        set(GAME_LOG_BATCH_BASE_DEFINITION_OWNERS) if active else set()
+    )
     if active and continue_profile:
         expected.add("kage_vita_continue_profile.c")
     if actual != expected:
         raise GateError(
             "game-log-batch compile-definition scope changed: "
+            f"missing={sorted(expected - actual)}, "
+            f"extra={sorted(actual - expected)}"
+        )
+
+
+def verify_game_log_async_compile_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+) -> None:
+    active = _feature(cache, GAME_LOG_ASYNC_CACHE_KEY)
+    actual: set[str] = set()
+    for record in records.values():
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        source = record.get("source")
+        if (not isinstance(definitions, dict) or
+                not isinstance(undefinitions, list) or
+                not isinstance(source, Path)):
+            raise GateError("compile record is missing source definitions")
+        if GAME_LOG_ASYNC_CACHE_KEY in undefinitions:
+            raise GateError(
+                f"game-log-async compile policy is undefined by {source}"
+            )
+        values = definitions.get(GAME_LOG_ASYNC_CACHE_KEY, [])
+        if values:
+            if values != ["1"]:
+                raise GateError(
+                    f"{source.name} has a non-canonical game-log-async "
+                    f"definition: {values}"
+                )
+            actual.add(source.name)
+    expected: set[str] = set(GAME_LOG_ASYNC_DEFINITION_OWNERS) if active else set()
+    if actual != expected:
+        raise GateError(
+            "game-log-async compile-definition scope changed: "
             f"missing={sorted(expected - actual)}, "
             f"extra={sorted(actual - expected)}"
         )
@@ -1162,12 +2261,51 @@ def verify_sync_import_fastpath_compile_scope(
                     f"definition: {values}"
                 )
             actual.add(source.name)
-    expected = (
+    expected: frozenset[str] = (
         SYNC_IMPORT_FASTPATH_DEFINITION_OWNERS if active else frozenset()
     )
     if actual != expected:
         raise GateError(
             "sync-import compile-definition scope changed: "
+            f"missing={sorted(expected - actual)}, "
+            f"extra={sorted(actual - expected)}"
+        )
+
+
+def verify_guest_stack_memblock_compile_scope(
+    records: Mapping[Path, Mapping[str, object]],
+    cache: Mapping[str, str],
+) -> None:
+    """ISAAC_VITA_GUEST_STACK_MEMBLOCK=1 reaches exactly the stack owner and
+    the boot receipt when ON and no source when OFF (OFF identity)."""
+    active = _feature(cache, GUEST_STACK_MEMBLOCK_CACHE_KEY)
+    actual: set[str] = set()
+    for record in records.values():
+        definitions = record.get("definitions")
+        undefinitions = record.get("undefinitions", [])
+        source = record.get("source")
+        if (not isinstance(definitions, dict) or
+                not isinstance(undefinitions, list) or
+                not isinstance(source, Path)):
+            raise GateError("compile record is missing source definitions")
+        if GUEST_STACK_MEMBLOCK_CACHE_KEY in undefinitions:
+            raise GateError(
+                f"guest-stack-memblock compile policy is undefined by {source}"
+            )
+        values = definitions.get(GUEST_STACK_MEMBLOCK_CACHE_KEY, [])
+        if values:
+            if values != ["1"]:
+                raise GateError(
+                    f"{source.name} has a non-canonical guest-stack-memblock "
+                    f"definition: {values}"
+                )
+            actual.add(source.name)
+    expected: frozenset[str] = (
+        GUEST_STACK_MEMBLOCK_DEFINITION_OWNERS if active else frozenset()
+    )
+    if actual != expected:
+        raise GateError(
+            "guest-stack-memblock compile-definition scope changed: "
             f"missing={sorted(expected - actual)}, "
             f"extra={sorted(actual - expected)}"
         )
@@ -2131,6 +3269,10 @@ def verify_floor_thunk_fastpath_compile_scope(
 
     if active:
         expected.add("host_vita_floor_thunk_direct.c")
+        # The KAGE quad replay TU writes the floor import receipts, so CMake
+        # gives it the floor option too (and refuses the quad knob without it).
+        if _feature(cache, "ISAAC_VITA_KAGE_QUAD_FASTPATH"):
+            expected.add("host_vita_kage_quad_fastpath.c")
         if root_count != 1 or seam_count != 1:
             raise GateError(
                 "floor-thunk generated owner/seam census changed: "
@@ -2170,7 +3312,7 @@ def verify_texture_churn_profile_compile_scope(
                     f"definition: {values}"
                 )
             actual.add(source.name)
-    expected = (
+    expected: set[str] = (
         set(TEXTURE_CHURN_PROFILE_DEFINITION_OWNERS) if active else set()
     )
     if actual != expected:
@@ -2207,7 +3349,7 @@ def verify_audio_stream_receipt_compile_scope(
                     f"definition: {values}"
                 )
             actual.add(source.name)
-    expected = (
+    expected: set[str] = (
         set(AUDIO_STREAM_RECEIPT_DEFINITION_OWNERS) if active else set()
     )
     if actual != expected:
@@ -2641,7 +3783,9 @@ TRANSLATED_CPU_HOT_LAYOUT_CACHE_KEY = "ISAAC_VITA_TRANSLATED_CPU_HOT_LAYOUT"
 TRANSLATED_CPU_LAYOUT_HEADER_RELATIVE = Path(
     "isaac-generated-overrides/translated-cpu/guest_hot_layout.h"
 )
-_GENERATED_UNIT_RE = re.compile(r"^guest_[0-9]{4}\.c$")
+# Every generated C unit (numbered, stubs and table) carries the layout
+# header: CMake forces it on the whole generated corpus.
+_GENERATED_UNIT_RE = re.compile(r"^guest_(?:[0-9]{4}|stubs|table)\.c$")
 
 
 def translated_cpu_layout_header(cache: Mapping[str, str],
@@ -2662,9 +3806,119 @@ def translated_cpu_layout_header(cache: Mapping[str, str],
     return header
 
 
+_PREFIX_DIRECTIVE_RE = re.compile(r"^#[ \t]*([a-z]+)(?:[ \t]+(.*?))?[ \t]*$")
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _native_inflate_rename_name(path: Path, name: str) -> None:
+    if not _IDENTIFIER_RE.match(name) and not name.isdigit():
+        raise GateError(
+            f"native inflate prefix header {path} renames a non-identifier: {name!r}"
+        )
+    if name in RAW_SYMBOLS:
+        raise GateError(
+            f"native inflate prefix header {path} names the allocator name {name!r}"
+        )
+    if (name in FEATURE_VIEW_MACROS or name == DIRECT_DEFAULT_CACHE_KEY or
+            name.startswith("__STDC_WANT_") or
+            name in ("ISAAC_VITA_RAW_ALLOCATOR_GATE",
+                     "ISAAC_VITA_RAW_ALLOCATOR_EXEMPT")):
+        raise GateError(
+            f"native inflate prefix header {path} touches the feature-view/gate "
+            f"macro {name!r}"
+        )
+
+
+def verify_native_inflate_prefix_header(path: Path) -> None:
+    """A prefix header is an include guard plus `#define zlib_name iz_name`
+    renames (the codes/util variants include the root header, undefine and
+    re-route two leaves to the hooks, and set NO_MEMCPY); nothing else may
+    run ahead of the translation unit."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise GateError(
+            f"cannot inspect native inflate prefix header {path}: {exc}"
+        ) from exc
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    guard: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = _PREFIX_DIRECTIVE_RE.match(line)
+        if not match:
+            raise GateError(
+                f"native inflate prefix header {path} has a non-directive line: {raw!r}"
+            )
+        directive, rest = match.group(1), (match.group(2) or "")
+        if directive == "ifndef":
+            if guard is not None or not _IDENTIFIER_RE.match(rest):
+                raise GateError(
+                    f"native inflate prefix header {path} has an unexpected #ifndef: {raw!r}"
+                )
+            guard = rest
+        elif directive == "endif":
+            if rest:
+                raise GateError(
+                    f"native inflate prefix header {path} has trailing #endif text: {raw!r}"
+                )
+        elif directive == "include":
+            if (rest != f'"{NATIVE_INFLATE_PREFIX_ROOT_HEADER}"' or
+                    path.name == NATIVE_INFLATE_PREFIX_ROOT_HEADER):
+                raise GateError(
+                    f"native inflate prefix header {path} includes {rest} "
+                    f"(only the root prefix header may be included, and not by itself)"
+                )
+        elif directive == "undef":
+            _native_inflate_rename_name(path, rest)
+        elif directive == "define":
+            parts = rest.split()
+            if guard is not None and parts == [guard]:
+                continue
+            if len(parts) != 2:
+                raise GateError(
+                    f"native inflate prefix header {path} has a non-rename #define: {raw!r}"
+                )
+            name, value = parts
+            _native_inflate_rename_name(path, name)
+            _native_inflate_rename_name(path, value)
+            if name.isdigit():
+                raise GateError(
+                    f"native inflate prefix header {path} defines a number: {raw!r}"
+                )
+        else:
+            raise GateError(
+                f"native inflate prefix header {path} has an unexpected directive: {raw!r}"
+            )
+    if guard is None:
+        raise GateError(f"native inflate prefix header {path} lacks an include guard")
+
+
+def native_inflate_forced_includes(cache: Mapping[str, str],
+                                   source_root: Path) -> dict[Path, Path]:
+    """Resolved translation unit -> the prefix header CMake forces on it while
+    ISAAC_VITA_NATIVE_INFLATE is ON (empty while OFF, so any such include is a
+    closure violation)."""
+    if not _feature(cache, NATIVE_INFLATE_CACHE_KEY):
+        return {}
+    source_root = source_root.resolve()
+    vendor_root = source_root / NATIVE_INFLATE_VENDOR_RELATIVE
+    runtime_root = source_root / "recomp" / "runtime"
+    for name in NATIVE_INFLATE_PREFIX_HEADERS:
+        verify_native_inflate_prefix_header(vendor_root / name)
+    result: dict[Path, Path] = {}
+    for name, header in NATIVE_INFLATE_RUNTIME_UNITS.items():
+        result[(runtime_root / name).resolve()] = (vendor_root / header).resolve()
+    for name, header in NATIVE_INFLATE_VENDOR_UNITS.items():
+        result[(vendor_root / name).resolve()] = (vendor_root / header).resolve()
+    return result
+
+
 def compile_closure(compile_commands: Path, expected: set[Path],
                     poison_header: Path, require_objects: bool = True,
-                    layout_header: Path | None = None
+                    layout_header: Path | None = None,
+                    forced_includes: Mapping[Path, Path] | None = None
                     ) -> dict[Path, dict[str, object]]:
     try:
         entries = json.loads(compile_commands.read_text(encoding="utf-8"))
@@ -2730,6 +3984,8 @@ def compile_closure(compile_commands: Path, expected: set[Path],
         expected_includes = [poison_header]
         if layout_header is not None and _GENERATED_UNIT_RE.match(source.name):
             expected_includes.append(layout_header)
+        if forced_includes and source in forced_includes:
+            expected_includes.append(forced_includes[source])
         if includes != expected_includes:
             raise GateError(
                 f"{source.name} forced-include closure is {includes}, "
@@ -2786,7 +4042,16 @@ def _include_directories(tokens: Sequence[str], directory: Path) -> list[Path]:
     return result
 
 
-def verify_lua_compile_options(tokens: Sequence[str]) -> None:
+def lua_required_compile_options(core_arm: bool) -> tuple[str, ...]:
+    """ISAAC_VITA_LUA_CORE_ARM swaps exactly -mthumb for -marm, nothing else."""
+    if not core_arm:
+        return LUA_REQUIRED_COMPILE_OPTIONS
+    return tuple("-marm" if option == "-mthumb" else option
+                 for option in LUA_REQUIRED_COMPILE_OPTIONS)
+
+
+def verify_lua_compile_options(tokens: Sequence[str],
+                               core_arm: bool = False) -> None:
     if not tokens:
         raise GateError("Lua compile command is empty")
     options: list[str] = []
@@ -2804,10 +4069,11 @@ def verify_lua_compile_options(tokens: Sequence[str]) -> None:
             continue
         options.append(token)
         index += 1
-    if tuple(options) != LUA_REQUIRED_COMPILE_OPTIONS:
+    required = lua_required_compile_options(core_arm)
+    if tuple(options) != required:
         raise GateError(
             "Lua compile option sequence changed: "
-            f"{options} != {list(LUA_REQUIRED_COMPILE_OPTIONS)}"
+            f"{options} != {list(required)}"
         )
 
 
@@ -2841,8 +4107,17 @@ def lua_compile_closure(
     source_records: Sequence[tuple[str, str]],
     *,
     require_objects: bool = True,
+    core_arm: bool = False,
+    derived_sources: Mapping[Path, Path] | None = None,
 ) -> dict[Path, dict[str, object]]:
-    """Certify all and only the 33 pristine sources compiled into Lua."""
+    """Certify all and only the 33 pristine sources compiled into Lua.
+
+    derived_sources (lua_derived_source_map) maps a pristine source to the
+    verified derived file compiled in its place; the derived compile must
+    carry the identical option/definition/include policy and object basename,
+    and its record is returned under the pristine key with derived_source and
+    derived_sha256 added.
+    """
 
     try:
         entries = json.loads(compile_commands.read_text(encoding="utf-8"))
@@ -2854,11 +4129,26 @@ def lua_compile_closure(
     target_dir = (build_dir / "CMakeFiles" / f"{LUA_TARGET}.dir").resolve()
     target_prefix = f"CMakeFiles/{LUA_TARGET}.dir/"
     source_dir = (lua_source.resolve() / "src").resolve()
-    expected_order = [
+    pristine_order = [
         (source_dir / name).resolve()
         for name, unused_sha256 in source_records
         if name.endswith(".c")
     ]
+    replaced = {
+        Path(pristine).resolve(): Path(derived).resolve()
+        for pristine, derived in (derived_sources or {}).items()
+    }
+    if not set(replaced) <= set(pristine_order):
+        raise GateError(
+            "derived Lua source replaces a file outside the closure: "
+            f"{sorted(str(item) for item in set(replaced) - set(pristine_order))}"
+        )
+    for pristine, derived in replaced.items():
+        if derived.name != pristine.name:
+            raise GateError(
+                f"derived Lua source renames {pristine.name}: {derived.name}"
+            )
+    expected_order = [replaced.get(source, source) for source in pristine_order]
     expected = set(expected_order)
     if len(expected_order) != LUA_C_SOURCE_COUNT or len(expected) != len(expected_order):
         raise GateError("Lua source records are not the exact 33-C closure")
@@ -2907,7 +4197,7 @@ def lua_compile_closure(
                 f"Lua compile preprocessor policy changed for {source.name}: "
                 f"definitions={definitions}, undefinitions={undefinitions}"
             )
-        verify_lua_compile_options(tokens)
+        verify_lua_compile_options(tokens, core_arm)
         verify_lua_compile_io(
             tokens, directory, source, object_path
         )
@@ -2931,9 +4221,16 @@ def lua_compile_closure(
             f"missing={[str(item) for item in sorted(expected - actual)]}, "
             f"extra={[str(item) for item in sorted(actual - expected)]}"
         )
-    if [by_source[source]["object"].name for source in expected_order] != [
-            source.name + ".obj" for source in expected_order]:
+    object_names = [
+        cast(Path, by_source[source]["object"]).name for source in expected_order
+    ]
+    if object_names != [source.name + ".obj" for source in expected_order]:
         raise GateError("Lua compile object basenames changed")
+    for pristine, derived in replaced.items():
+        record = by_source.pop(derived)
+        record["derived_source"] = derived
+        record["derived_sha256"] = _sha256(derived)
+        by_source[pristine] = record
     return by_source
 
 
@@ -3081,7 +4378,7 @@ def verify_link_closure(build_ninja: Path,
     for path in linked:
         if _forbidden_source(path):
             raise GateError(f"forbidden object entered production link: {path}")
-    compiled = {record["object"] for record in records.values()}
+    compiled = {cast(Path, record["object"]) for record in records.values()}
     linked_set = set(linked)
     if linked_set != compiled:
         raise GateError(
@@ -3157,8 +4454,8 @@ def allocator_profile(
 ) -> str:
     heap_records = [
         record for record in records.values()
-        if isinstance(record.get("source"), Path) and
-        record["source"].name == "host_vita_heap.c"
+        if isinstance(source := record.get("source"), Path) and
+        source.name == "host_vita_heap.c"
     ]
     if len(heap_records) != 1:
         raise GateError(
@@ -3214,7 +4511,13 @@ def expected_relocations(record: Mapping[str, object]
     definitions = record["definitions"]
     assert isinstance(definitions, dict)
     if name in EXPECTED_FIXED:
-        return EXPECTED_FIXED[name].copy()
+        expected = EXPECTED_FIXED[name].copy()
+        if (name == "guest.c" and
+                definitions.get(GUEST_STACK_MEMBLOCK_CACHE_KEY) == ["1"]):
+            # The memblock-backed stack leaves no memalign/free edge in
+            # guest_stack_init/guest_stack_free (fail-closed, no fallback).
+            expected -= GUEST_STACK_NEWLIB_RELOCATIONS
+        return expected
     if name == "kage_vita_texture_memory.c":
         return (EXPECTED_TEXTURE_DIAGNOSTIC.copy()
                 if definitions.get("ISAAC_VITA_TEXEL_OOM_DIAGNOSTIC") == ["1"]
@@ -3313,10 +4616,11 @@ def verify_lua_archive_member_payload(
 
 
 def verify_lua_allocator_relocations(
-    source_name: str, actual: collections.Counter[RelocKey]
+    source_name: str, actual: collections.Counter[RelocKey],
+    core_arm: bool = False,
 ) -> None:
     expected = (
-        LUA_EXPECTED_RAW_RELOCATIONS
+        lua_expected_raw_relocations(core_arm)
         if source_name == "lauxlib.c" else collections.Counter()
     )
     if actual != expected:
@@ -3377,6 +4681,7 @@ def lua_archive_closure(
     source_records: Sequence[tuple[str, str]],
     compile_records: Mapping[Path, Mapping[str, object]],
     lua_source: Path,
+    core_arm: bool = False,
 ) -> dict[str, object]:
     """Prove source -> compile object -> exact archive member -> final ELF."""
 
@@ -3414,20 +4719,23 @@ def lua_archive_closure(
             member, member_payload, object_payload
         )
         actual_relocations = object_raw_relocations(readelf, object_path)
-        verify_lua_allocator_relocations(name, actual_relocations)
+        verify_lua_allocator_relocations(name, actual_relocations, core_arm)
         logical_source = f"{LUA_LOGICAL_SOURCE_PREFIX}/{name}"
         logical_object = _logical_object(logical_source)
-        member_rows.append(
-            {
-                "source": logical_source,
-                "source_sha256": source_sha256,
-                "object": logical_object,
-                "member": member,
-                "size": len(object_payload),
-                "sha256": hashlib.sha256(object_payload).hexdigest(),
-                "raw_relocations": _relocation_rows(actual_relocations),
-            }
-        )
+        row: dict[str, object] = {
+            "source": logical_source,
+            "source_sha256": source_sha256,
+            "object": logical_object,
+            "member": member,
+            "size": len(object_payload),
+            "sha256": hashlib.sha256(object_payload).hexdigest(),
+            "raw_relocations": _relocation_rows(actual_relocations),
+        }
+        derived_sha256 = compile_records[source].get("derived_sha256")
+        if derived_sha256 is not None:
+            # compiled from the verified derivation of the pristine source
+            row["derived_sha256"] = derived_sha256
+        member_rows.append(row)
     verify_lua_final_symbols(readelf, target)
     archive_record = _file_record(archive)
     return {
@@ -3442,7 +4750,7 @@ def lua_archive_closure(
             "required_final_symbol": LUA_REQUIRED_FINAL_SYMBOL,
             "discarded_final_symbols": sorted(LUA_DISCARDED_ALLOCATOR_SYMBOLS),
             "dead_raw_relocations": _relocation_rows(
-                LUA_EXPECTED_RAW_RELOCATIONS
+                lua_expected_raw_relocations(core_arm)
             ),
         },
     }
@@ -3689,14 +4997,22 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     ar: Path | None = None
     lua_source_manifest: tuple[tuple[str, str], ...] = ()
     lua_compile_records: dict[Path, dict[str, object]] = {}
+    lua_core_arm = False
     if lua_paths is not None:
         lua_source, lua_manifest, lua_archive, ar = lua_paths
         for path in (lua_manifest, lua_archive, ar):
             if not path.is_file():
                 raise GateError(f"Lua gate input is not a regular file: {path}")
         lua_source_manifest = lua_source_records(lua_source, lua_manifest)
+        # The one codegen knob of the pristine archive: it selects the ISA
+        # option and the matching dead-l_alloc relocation encoding.
+        lua_core_arm = _feature(cache, LUA_CORE_ARM_CACHE_KEY)
         lua_compile_records = lua_compile_closure(
-            compile_commands, lua_source, lua_source_manifest
+            compile_commands, lua_source, lua_source_manifest,
+            core_arm=lua_core_arm,
+            derived_sources=lua_derived_source_map(
+                cache, build_dir=compile_commands.parent, lua_source=lua_source
+            ),
         )
     generated_overrides = direct_default_overrides(
         cache, args.generated_source_override, compile_commands.parent
@@ -3707,13 +5023,29 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     records = compile_closure(
         compile_commands, expected, poison_header,
         layout_header=translated_cpu_layout_header(cache, compile_commands.parent),
+        forced_includes=native_inflate_forced_includes(cache, source_root),
     )
     verify_direct_default_compile_scope(records, cache)
     verify_stock_reference_compile_scope(records, cache)
     verify_display_raster_compile_scope(records, cache)
+    verify_runtime_settings_compile_scope(records, cache)
+    verify_heap_slab_reject_compile_scope(records, cache)
+    verify_heap_stage_profile_compile_scope(records, cache)
+    verify_native_vorbis_free_watch_compile_scope(records, cache)
+    verify_heap_free_prefilter_compile_scope(records, cache)
+    verify_native_vorbis_free_watch_mask_compile_scope(records, cache)
+    verify_heap_free_cost_profile_compile_scope(records, cache)
+    _verify_heap_define_scope(records, cache, HEAP_LEAN_IMPORT_CACHE_KEY,
+                              "heap lean import", {"host_vita_heap.c"})
+    verify_manager_settings_ui_compile_scope(records, cache)
+    verify_manager_ui2_game_skin_compile_scope(records, cache)
+    verify_manager_trophy_import_compile_scope(records, cache)
+    verify_manager_debug_overlay_row_compile_scope(records, cache)
     verify_typed_state_cache_compile_scope(records, cache)
     verify_game_log_batch_compile_scope(records, cache)
+    verify_game_log_async_compile_scope(records, cache)
     verify_sync_import_fastpath_compile_scope(records, cache)
+    verify_guest_stack_memblock_compile_scope(records, cache)
     verify_png_native_unfilter_compile_scope(records, cache)
     verify_png_inflate_flush_fastpath_compile_scope(records, cache)
     verify_png_crc32_fastpath_compile_scope(records, cache)
@@ -3761,14 +5093,25 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
             source_records=lua_source_manifest,
             compile_records=lua_compile_records,
             lua_source=lua_source,
+            core_arm=lua_core_arm,
         )
         closure["lua_archive"] = lua_archive_record
     source_rows = closure["sources"]
     assert isinstance(source_rows, list)
-    lua_object_count = (
-        int(lua_archive_record["member_count"])
-        if lua_archive_record is not None else 0
-    )
+    lua_object_count = 0
+    if lua_archive_record is not None:
+        member_count = lua_archive_record["member_count"]
+        assert isinstance(member_count, int)
+        lua_object_count = member_count
+    inputs: dict[str, object] = {
+        "generated_manifest": _file_record(generated_manifest),
+        "cmake_cache": _file_record(cmake_cache),
+        "compile_commands": _file_record(compile_commands),
+        "build_ninja": _file_record(build_ninja),
+        "poison_header": _file_record(poison_header),
+        "gate": _file_record(Path(__file__).resolve()),
+        "readelf": _file_record(readelf),
+    }
     result: dict[str, object] = {
         "schema": SCHEMA,
         "stage": "vita-raw-allocator-gate",
@@ -3784,29 +5127,21 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
         "object_count": len(linked) + lua_object_count,
         "closure_sha256": hashlib.sha256(_canonical_bytes(closure)).hexdigest(),
         "target": _file_record(target),
-        "inputs": {
-            "generated_manifest": _file_record(generated_manifest),
-            "cmake_cache": _file_record(cmake_cache),
-            "compile_commands": _file_record(compile_commands),
-            "build_ninja": _file_record(build_ninja),
-            "poison_header": _file_record(poison_header),
-            "gate": _file_record(Path(__file__).resolve()),
-            "readelf": _file_record(readelf),
-        },
+        "inputs": inputs,
         "closure": closure,
     }
     if lua_archive_record is not None:
         assert lua_manifest is not None
         assert lua_archive is not None
         assert ar is not None
-        result["inputs"].update({
+        inputs.update({
             "lua_manifest": _file_record(lua_manifest),
             "lua_archive": _file_record(lua_archive),
             "lua_ar": _file_record(ar),
         })
     if generated_overrides:
         override = generated_overrides[DIRECT_DEFAULT_SOURCE_NAME]
-        result["inputs"]["generated_source_override"] = {
+        inputs["generated_source_override"] = {
             "logical_source": f"generated/{DIRECT_DEFAULT_SOURCE_NAME}",
             **_file_record(override),
         }

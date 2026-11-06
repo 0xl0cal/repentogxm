@@ -146,7 +146,13 @@ void isaac_vita_log(const char *format, ...);
 #define KVGS_TOP              12U
 #define KVGS_THREAD_PRIORITY  96
 #define KVGS_THREAD_STACK     0x4000U
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+/* USER_1 belongs to the GL render thread; the sampler joins the workers on
+ * USER_2 so it never preempts the render thread. */
+#define KVGS_THREAD_AFFINITY  SCE_KERNEL_CPU_MASK_USER_2
+#else
 #define KVGS_THREAD_AFFINITY  SCE_KERNEL_CPU_MASK_USER_1
+#endif
 #define KVGS_TEXT_BEGIN_RVA   UINT32_C(0x00001000)
 /* Frozen PE: .text ends at 0x605b34, the IAT starts at 0x6060f8. */
 #define KVGS_TEXT_END_RVA     UINT32_C(0x00606000)
@@ -154,6 +160,14 @@ void isaac_vita_log(const char *format, ...);
 /* An indirect call whose published target is not a translated function:
  * an IAT import, a GL/dynamic token, i.e. native host code (vitaGL, CRT). */
 #define KVGS_RVA_EXTERNAL     UINT32_C(0x0ffffffe)
+#if defined(ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL)
+/* Profile-only.  The swp phase is the native present (PRESENT_ENTER ..
+ * PRESENT_RETURN); the KAGE present is an inline seam in 0x4B0600 with no
+ * guest return marker, so a stack scan there names a stale word (on the
+ * device 99.9-100 % of swp samples landed on MusicManager::Update 39fbf0).
+ * Name that time "present" in both views instead of scanning. */
+#define KVGS_RVA_PRESENT      UINT32_C(0x0ffffffd)
+#endif
 #define KVGS_REPORT_SPIN      200000U
 
 /* Key layout: bit 31 view (0 self, 1 caller), bits 30..28 phase, bits 27..0
@@ -168,6 +182,108 @@ void isaac_vita_log(const char *format, ...);
 _Static_assert(KAGE_VITA_GUEST_SAMPLER_PHASE_COUNT <= 8U,
                "the sampler key holds at most eight phases");
 
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+/* ISAAC_VITA_GUEST_SAMPLER_CHAIN (profiling builds, default OFF): an
+ * inclusive view of the render phase.  After the innermost marker the scan
+ * keeps walking up the whole guest stack and counts every function on the
+ * live call chain once per sample (ph120.hoti, top 36 per window), so a
+ * chain's total cost reads directly instead of being summed from flat self
+ * lists whose top 12 cover about half of the render samples.
+ *
+ * Chain link rule (keeps stale words in uninitialised locals out): a marker
+ * whose call is direct counts only when its target is the function the
+ * previous marker returns into, either exactly or through one forwarding
+ * thunk (`jmp rel32`, or `add/sub ecx,imm8; jmp rel32`, the MSVC this-adjust
+ * stub); any other direct marker is skipped (`skip`).  An indirect marker
+ * (vtable, function pointer, import) at A counts only when it is frame
+ * linked: [A-4] is the callee's saved EBP, it points above A (< 64 KiB) and
+ * [EBP+4] holds a return marker that is indirect or whose direct call
+ * reaches the function containing A; the walk then continues at EBP+4
+ * (`ind`).  Anything else is dropped (`indrej`).  Session P (2026-10-16)
+ * ran the first rule, which accepted every indirect marker: 64 % of its
+ * links were indirect and lock wrappers / the release observer showed
+ * 20-55 % inclusive at ~0.1 % self -- stale return words of frequent
+ * indirect calls (EnterCriticalSection, `call eax` observers).  The frame
+ * link drops those at the cost of callees that keep EBP free (FPO) or use
+ * the `push ebx; mov ebx,esp` aligned prologue: such a link is lost and the
+ * chain above it undercounts.  `us` = the walk's own wall time on the
+ * sampler core (sum, max per window).  A thunk
+ * the rule does not know truncates the chain upward (outer frames then
+ * undercount, never overcount).  Inclusive keys are caller-view keys with
+ * bit 26 set: real RVAs stay below 0x00606000 and the two sentinels have
+ * bit 27 set, so no key collides. */
+# define KVGS_CHAIN_PHASE      KAGE_VITA_GUEST_SAMPLER_RND
+# define KVGS_CHAIN_SCAN_WORDS 16384U
+# define KVGS_CHAIN_DEPTH      64U
+# define KVGS_CHAIN_TOP        36U
+# define KVGS_CHAIN_FRAME_SPAN 0x10000U
+# if defined(ISAAC_KAGE_VITA_GUEST_SAMPLER_ORACLE)
+uint64_t kvgs_oracle_now_us(void);
+#  define KVGS_NOW_US() kvgs_oracle_now_us()
+# else
+#  define KVGS_NOW_US() sceKernelGetProcessTimeWide()
+# endif
+# define KVGS_INCL_TAG         UINT32_C(0x04000000)
+# define KVGS_IS_INCL(rva)     (((rva) & UINT32_C(0x0c000000)) == KVGS_INCL_TAG)
+/* ph120.hotr keys: bit 25 tag, bit 24 = the sample is not translated code;
+ * root RVAs stay below 0x00800000, the sentinels have bit 27 set. */
+# define KVGS_ROOT_TAG         UINT32_C(0x02000000)
+# define KVGS_ROOT_EXT         UINT32_C(0x01000000)
+# define KVGS_IS_ROOT(rva)     (((rva) & UINT32_C(0x0e000000)) == KVGS_ROOT_TAG)
+#endif
+
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+# if !defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+#  error ISAAC_VITA_GUEST_SAMPLER_RESIDUAL extends the chain view (ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+# endif
+/* ISAAC_VITA_GUEST_SAMPLER_RESIDUAL (profiling builds, default OFF):
+ * what the chain view cannot say about the render
+ * residual.
+ *
+ * 1. Lua boundary.  The native Lua VM calls a translated C function (or the
+ *    guest allocator) with this word as its return address
+ *    (host_vita_lua.c:71 VITA_LUA_CALLBACK_RETURN; pushed after the state at
+ *    host_vita_lua.c:1004-1006 and after four arguments at :1460-1464), and
+ *    the import bridge leaves the translated call into the running Lua
+ *    import at [esp] (vita_lua_arg reads esp+4.., host_vita_lua.c:269-273).
+ *    So that caller's return marker sits 8 bytes above the word for a C
+ *    function and 20 for the allocator.  The chain rule above cannot cross
+ *    it (the marker's [A-4] is the state, not a saved EBP: indrej), so every
+ *    sample inside a translated LuaBridge binding lost its root.  Here the
+ *    walk links the word to that marker (lb; lbm = no return site at the
+ *    offset) and continues from the caller.  A sample whose innermost marker
+ *    already sits above such a word (the binding's own code) is marked too
+ *    (lbs).  Only a word at an address host_vita_lua.c published as live
+ *    counts, with the offset of its kind (kvgs_lua_live): the triple stays
+ *    below ESP after a callback returns, so frames that later reuse those
+ *    slots carry stale copies in their locals; those are counted (lbx) and
+ *    skipped like any other non-marker word.
+ * 2. ph120.hotr keys gain bit 23 (+800000) when the walk crossed a live
+ *    boundary at or below the innermost root, i.e. the sample is inside a
+ *    Lua callback that root's code started.  For root 0 (none found) the
+ *    bit means the walk crossed a boundary and then broke: +800000 alone is
+ *    still "no root", and bench_run.py counts it there.
+ *    Root RVAs stay below 0x00800000.
+ * 3. ph120.hotl: samples whose innermost root is the mod-callback invoker
+ *    sub_0040eef0, split by the next root out (which render pass runs the
+ *    callbacks) and by t/n/lt/ln (translated, native, and the same inside a
+ *    crossed boundary).
+ * 4. ph120.hotu: samples with no root, by the outermost function the walk
+ *    reached (where the chain broke), +1000000 = the sample is native.
+ * 5. ph120.hotw: the render watch list (kage_vita_render_watch.h) with every
+ *    count the window holds for it, whatever its rank. */
+# include "kage_vita_render_watch.h"
+# define KVGS_LUA_CALLBACK_RETURN  UINT32_C(0xfff15333)
+# define KVGS_LUA_CALLER_CFUNCTION 8U
+# define KVGS_LUA_CALLER_ALLOCATOR 20U
+# define KVGS_LUA_INVOKER_RVA      UINT32_C(0x0040eef0)
+# define KVGS_ROOT_LUA             UINT32_C(0x00800000)
+# define KVGS_UNROOTED_TAG         UINT32_C(0x0c000000)
+# define KVGS_IS_UNROOTED(rva)     (((rva) & UINT32_C(0x0e000000)) == KVGS_UNROOTED_TAG)
+# define KVGS_NO_BOUNDARY          UINT32_MAX
+# define KVGS_ROOT_COUNT           24U
+#endif
+
 typedef struct kvgs_entry {
     uint32_t key;
     uint32_t count;
@@ -181,10 +297,56 @@ typedef struct kvgs_buffer {
     uint32_t hash_full;
     uint32_t words_scanned;
     uint32_t deep;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+    uint32_t chain_samples;   /* render samples walked */
+    uint32_t chain_links;     /* accepted markers above the innermost */
+    uint32_t chain_ind;       /* of those, indirect (unchecked) */
+    uint32_t chain_thunk;     /* of those, matched through a thunk */
+    uint32_t chain_skip;      /* direct markers that did not link */
+    uint32_t chain_full;      /* walks stopped at KVGS_CHAIN_DEPTH */
+    uint32_t chain_ind_rejected; /* indirect markers without a frame link */
+    uint32_t chain_us;        /* walk wall time, sum (us) */
+    uint32_t chain_us_max;    /* walk wall time, longest (us) */
+#endif
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    uint32_t lua_links;       /* Lua boundary words linked to their caller */
+    uint32_t lua_miss;        /* boundary words with no caller marker */
+    uint32_t lua_self;        /* samples whose innermost marker is above one */
+    uint32_t lua_stale;       /* boundary-valued words at unpublished addresses */
+    /* sub_0040eef0 samples by next root out (s_chain_roots index, last =
+     * none) x {t, n, lt, ln}. */
+    uint32_t lua_split[KVGS_ROOT_COUNT + 1U][4];
+#endif
 } kvgs_buffer;
 
 volatile uint32_t g_kage_vita_guest_sampler_phase =
     KAGE_VITA_GUEST_SAMPLER_OTH;
+
+#if defined(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS)
+/* guest_entry_census.h: written by the main thread's body-entry hooks,
+ * printed and cleared by the reporter on the same thread.  The ids come from
+ * the guest_coverage.json CMake handed vita_render_watch.py at configure
+ * time; the corpus this TU is compiled against must have the same id space
+ * (function count here, sorted-RVA hash at start-up: a mismatch prints
+ * ids=STALE and suppresses ph120.fe rather than charge entries to the wrong
+ * functions). */
+# include "guest_coverage_generated.h"
+uint32_t g_guest_entry_census[GUEST_ENTRY_CENSUS_PHASES]
+                             [GUEST_ENTRY_CENSUS_COUNT];
+static const uint32_t s_census_rvas[GUEST_ENTRY_CENSUS_COUNT] =
+    GUEST_ENTRY_CENSUS_RVAS;
+_Static_assert(KAGE_VITA_GUEST_SAMPLER_PHASE_COUNT <= GUEST_ENTRY_CENSUS_PHASES,
+               "the census indexes every sampler phase");
+_Static_assert(GUEST_ENTRY_CENSUS_FUNCTION_COUNT ==
+                   GUEST_COVERAGE_FUNCTION_COUNT,
+               "guest_entry_census_ids.h was generated from another corpus");
+
+static uint32_t kvgs_census_stale(void)
+{
+    return strcmp(GUEST_ENTRY_CENSUS_FUNCTION_RVAS_SHA256,
+                  GUEST_COVERAGE_FUNCTION_RVAS_SHA256) != 0 ? 1U : 0U;
+}
+#endif
 
 static kvgs_buffer s_buffers[2];
 static uint32_t s_active;          /* buffer index the sampler writes */
@@ -327,11 +489,319 @@ static void kvgs_count(kvgs_buffer *buffer, uint32_t key)
     ++buffer->hash_full;
 }
 
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+static uint32_t kvgs_rel32_target(uint32_t at)
+{
+    uint32_t rel = (uint32_t)KVGS_IMAGE_BYTE(at) |
+                   (uint32_t)KVGS_IMAGE_BYTE(at + 1U) << 8 |
+                   (uint32_t)KVGS_IMAGE_BYTE(at + 2U) << 16 |
+                   (uint32_t)KVGS_IMAGE_BYTE(at + 3U) << 24;
+    return at + 4U + rel;
+}
+
+/* Does a direct call to `callee` arrive in `function`?  Exactly, or through
+ * one forwarding thunk at the callee: E9 rel32, or 83 C1/E9 ib E9 rel32. */
+static int kvgs_chain_reaches(uint32_t callee, uint32_t function, int *thunk)
+{
+    uint32_t jump = KVGS_RVA_UNKNOWN;
+
+    *thunk = 0;
+    if (callee == function)
+        return 1;
+    if (!s_text_present || callee >= KVGS_TEXT_END_RVA - 8U)
+        return 0;
+    if (KVGS_IMAGE_BYTE(callee) == 0xE9U)
+        jump = kvgs_rel32_target(callee + 1U);
+    else if (KVGS_IMAGE_BYTE(callee) == 0x83U &&
+             (KVGS_IMAGE_BYTE(callee + 1U) == 0xC1U ||
+              KVGS_IMAGE_BYTE(callee + 1U) == 0xE9U) &&
+             KVGS_IMAGE_BYTE(callee + 3U) == 0xE9U)
+        jump = kvgs_rel32_target(callee + 4U);
+    *thunk = 1;
+    return jump == function;
+}
+
+static void kvgs_chain_add(kvgs_buffer *buffer, uint32_t phase, uint32_t *seen,
+                           uint32_t *used, uint32_t rva)
+{
+    uint32_t i;
+
+    if (rva < KVGS_TEXT_BEGIN_RVA || rva >= KVGS_TEXT_END_RVA)
+        return;                       /* ind / ext / unknown: no inclusive row */
+    for (i = 0U; i < *used; ++i)
+        if (seen[i] == rva)
+            return;                   /* recursion: once per sample */
+    seen[(*used)++] = rva;
+    kvgs_count(buffer, KVGS_KEY(1U, phase, KVGS_INCL_TAG | rva));
+}
+
+/* ph120.hotr: exclusive cost by render chain.  Each walked sample is charged
+ * to the innermost function of this list that is on its chain (0 = none),
+ * split by whether the sample itself is translated code or not (ext / ind:
+ * native vitaGL, Lua, CRT).  Unlike ph120.hoti the rows sum to the phase, so
+ * "translated ms under Room::Render that is not under RenderFrame" reads
+ * directly.  Roots: the render ancestors of session P2b's chain view
+ * (2026-10-17), names from REPENTOGON / earlier reports where known. */
+static const uint32_t s_chain_roots[] = {
+    0x0048bc50u, 0x004b0600u, 0x002ce770u, 0x003ca670u, 0x003cad40u,
+    0x003dbfe0u, 0x0056d500u, 0x00564f50u, 0x00003e50u, 0x00005190u,
+    0x000051e0u, 0x00014a90u, 0x00560eb0u, 0x003ffe10u, 0x0040eef0u,
+    0x001e9810u, 0x005689d0u, 0x00504610u, 0x00508710u, 0x00006dd0u,
+    0x0055f610u, 0x0025af60u, 0x0055f990u, 0x00004b60u,
+};
+
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+_Static_assert(sizeof s_chain_roots / sizeof s_chain_roots[0] == KVGS_ROOT_COUNT,
+               "ph120.hotl indexes the chain roots");
+
+#define KVGS_WATCH_ITEM(rva) (rva),
+static const uint32_t s_watch[] = { KAGE_VITA_RENDER_WATCH(KVGS_WATCH_ITEM) };
+#undef KVGS_WATCH_ITEM
+_Static_assert(sizeof s_watch / sizeof s_watch[0] <= KAGE_VITA_RENDER_WATCH_MAX,
+               "kage_vita_render_watch.h holds at most 64 entries");
+
+static uint32_t kvgs_watch_count(void)
+{
+    return (uint32_t)(sizeof s_watch / sizeof s_watch[0]);
+}
+
+/* Published by host_vita_lua.c (kage_vita_guest_sampler.h): the guest
+ * addresses of the live boundary words, 0 = slot empty. */
+volatile uint32_t
+    g_kage_vita_guest_sampler_lua_cfunction[KAGE_VITA_GUEST_SAMPLER_LUA_CFUNCTION_SLOTS];
+volatile uint32_t g_kage_vita_guest_sampler_lua_allocator;
+
+static uint32_t kvgs_root_index(uint32_t rva)
+{
+    uint32_t r;
+
+    for (r = 0U; r < KVGS_ROOT_COUNT; ++r)
+        if (s_chain_roots[r] == rva)
+            return r;
+    return KVGS_ROOT_COUNT;
+}
+
+/* A KVGS_LUA_CALLBACK_RETURN word at `address` is a live boundary only when
+ * host_vita_lua.c published that address: the offset of the translated
+ * caller's return marker above it (8 for a C function: the state, then the
+ * word, pushed at host_vita_lua.c:1004-1005 over the import caller's marker
+ * at frame->saved_esp; 20 for the allocator: four arguments and the word over
+ * saved_esp, :1459-1464), or 0 for a stale word -- the same triple stays below
+ * ESP after its callback returned (taking it moved the root to
+ * the invoker and dropped the live frames above it). */
+static uint32_t kvgs_lua_live(uint32_t address)
+{
+    uint32_t k;
+
+    if (address == g_kage_vita_guest_sampler_lua_allocator)
+        return KVGS_LUA_CALLER_ALLOCATOR;
+    for (k = 0U; k < KAGE_VITA_GUEST_SAMPLER_LUA_CFUNCTION_SLOTS; ++k)
+        if (address == g_kage_vita_guest_sampler_lua_cfunction[k])
+            return KVGS_LUA_CALLER_CFUNCTION;
+    return 0U;
+}
+
+/* Live boundary at `address` with its caller marker `offset` bytes above:
+ * the marker's address (its word in *marker), or 0 when that word is not a
+ * validated return site (lbm). */
+static uint32_t kvgs_lua_caller(uint32_t address, uint32_t offset,
+                                uint32_t ceiling, uint32_t *marker)
+{
+    uint32_t at = address + offset;
+    uint32_t word;
+    uint32_t callee;
+
+    if (at < address || at > ceiling - 4U)
+        return 0U;
+    word = KVGS_STACK_WORD(at);
+    if (word - KVGS_TEXT_BEGIN_RVA < KVGS_TEXT_END_RVA - KVGS_TEXT_BEGIN_RVA &&
+            kvgs_validate_return_site(word, &callee)) {
+        *marker = word;
+        return at;
+    }
+    return 0U;
+}
+
+/* Residual root attribution; `lua_at` = seen index of the first crossed
+ * boundary (the entries before it run inside the Lua callback). */
+static void kvgs_chain_root(kvgs_buffer *buffer, uint32_t phase,
+                            const uint32_t *seen, uint32_t used, uint32_t self,
+                            uint32_t lua_at)
+{
+    uint32_t root = 0U;
+    uint32_t at = used;
+    uint32_t ext = (self < KVGS_TEXT_BEGIN_RVA || self >= KVGS_TEXT_END_RVA)
+                       ? KVGS_ROOT_EXT : 0U;
+    uint32_t lua;
+    uint32_t k;
+
+    for (k = 0U; k < used && !root; ++k)
+        if (kvgs_root_index(seen[k]) < KVGS_ROOT_COUNT) {
+            root = seen[k];
+            at = k;
+        }
+    lua = (lua_at != KVGS_NO_BOUNDARY && lua_at <= at) ? KVGS_ROOT_LUA : 0U;
+    kvgs_count(buffer, KVGS_KEY(1U, phase, KVGS_ROOT_TAG | ext | lua | root));
+    if (!root) {
+        kvgs_count(buffer, KVGS_KEY(1U, phase, KVGS_UNROOTED_TAG | ext |
+                                    (used ? seen[used - 1U] : 0U)));
+    } else if (root == KVGS_LUA_INVOKER_RVA) {
+        uint32_t outer = KVGS_ROOT_COUNT;
+        for (k = at + 1U; k < used && outer == KVGS_ROOT_COUNT; ++k)
+            outer = kvgs_root_index(seen[k]);
+        ++buffer->lua_split[outer][(lua ? 2U : 0U) + (ext ? 1U : 0U)];
+    }
+}
+#else
+static void kvgs_chain_root(kvgs_buffer *buffer, uint32_t phase,
+                            const uint32_t *seen, uint32_t used, uint32_t self)
+{
+    uint32_t root = 0U;
+    uint32_t ext = (self < KVGS_TEXT_BEGIN_RVA || self >= KVGS_TEXT_END_RVA)
+                       ? KVGS_ROOT_EXT : 0U;
+    uint32_t k;
+    uint32_t r;
+
+    for (k = 0U; k < used && !root; ++k)
+        for (r = 0U; r < sizeof s_chain_roots / sizeof s_chain_roots[0]; ++r)
+            if (seen[k] == s_chain_roots[r]) {
+                root = seen[k];
+                break;
+            }
+    kvgs_count(buffer, KVGS_KEY(1U, phase, KVGS_ROOT_TAG | ext | root));
+}
+#endif
+
+/* `first` is the scan index of the innermost marker, `value` its word and
+ * `self` the self-view callee already counted for it. */
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+static void kvgs_chain(kvgs_buffer *buffer, uint32_t phase, uint32_t esp,
+                       uint32_t ceiling, uint32_t first, uint32_t value,
+                       uint32_t self, int lua_below)
+#else
+static void kvgs_chain(kvgs_buffer *buffer, uint32_t phase, uint32_t esp,
+                       uint32_t ceiling, uint32_t first, uint32_t value,
+                       uint32_t self)
+#endif
+{
+    uint32_t seen[KVGS_CHAIN_DEPTH];
+    uint32_t used = 0U;
+    uint32_t current = kvgs_function_containing(value);
+    uint32_t i;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    uint32_t lua_at = KVGS_NO_BOUNDARY;
+#endif
+
+    ++buffer->chain_samples;
+    kvgs_chain_add(buffer, phase, seen, &used, self);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    if (lua_below) {
+        /* The innermost marker is the Lua caller's: self is the C function
+         * the VM called (guest_call published it), outside it the caller. */
+        ++buffer->lua_self;
+        lua_at = used;
+    }
+#endif
+    kvgs_chain_add(buffer, phase, seen, &used, current);
+    for (i = first + 1U; i < KVGS_CHAIN_SCAN_WORDS; ++i) {
+        uint32_t address = esp + i * 4U;
+        uint32_t callee;
+        int thunk;
+
+        if (address > ceiling - 4U || address < esp)
+            break;
+        value = KVGS_STACK_WORD(address);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+        if (value == KVGS_LUA_CALLBACK_RETURN) {
+            uint32_t offset = kvgs_lua_live(address);
+            uint32_t marker = 0U;
+            uint32_t caller;
+            if (!offset) {
+                ++buffer->lua_stale;   /* a returned callback's word */
+                continue;
+            }
+            caller = kvgs_lua_caller(address, offset, ceiling, &marker);
+            if (!caller) {
+                ++buffer->lua_miss;
+                continue;
+            }
+            ++buffer->lua_links;
+            if (lua_at == KVGS_NO_BOUNDARY)
+                lua_at = used;
+            current = kvgs_function_containing(marker);
+            if (used == KVGS_CHAIN_DEPTH) {
+                ++buffer->chain_full;
+                break;
+            }
+            kvgs_chain_add(buffer, phase, seen, &used, current);
+            i = (caller - esp) / 4U;   /* resume above the caller's marker */
+            continue;
+        }
+#endif
+        if (value - KVGS_TEXT_BEGIN_RVA >=
+                KVGS_TEXT_END_RVA - KVGS_TEXT_BEGIN_RVA)
+            continue;
+        if (!kvgs_validate_return_site(value, &callee))
+            continue;
+        if (callee == KVGS_RVA_UNKNOWN) {
+            /* Frame link: the callee's `push ebp` left the caller's EBP at
+             * [A-4]; the caller's return marker then sits at EBP+4 and must
+             * itself link to the function containing A. */
+            uint32_t saved = KVGS_STACK_WORD(address - 4U);
+            uint32_t next = saved + 4U;
+            uint32_t owner = kvgs_function_containing(value);
+            uint32_t next_value, next_callee;
+            int next_thunk;
+
+            if (saved <= address || saved - address >= KVGS_CHAIN_FRAME_SPAN ||
+                    (saved & 3U) != 0U || next > ceiling - 4U ||
+                    (next_value = KVGS_STACK_WORD(next)) - KVGS_TEXT_BEGIN_RVA >=
+                        KVGS_TEXT_END_RVA - KVGS_TEXT_BEGIN_RVA ||
+                    !kvgs_validate_return_site(next_value, &next_callee) ||
+                    (next_callee != KVGS_RVA_UNKNOWN &&
+                     (owner == KVGS_RVA_UNKNOWN ||
+                      !kvgs_chain_reaches(next_callee, owner, &next_thunk)))) {
+                ++buffer->chain_ind_rejected;
+                continue;
+            }
+            ++buffer->chain_ind;
+            ++buffer->chain_links;
+            current = owner;
+            if (used == KVGS_CHAIN_DEPTH) {
+                ++buffer->chain_full;
+                break;
+            }
+            kvgs_chain_add(buffer, phase, seen, &used, current);
+            i = (next - esp) / 4U - 1U;   /* the caller's marker is next */
+            continue;
+        } else if (current == KVGS_RVA_UNKNOWN ||
+                   !kvgs_chain_reaches(callee, current, &thunk)) {
+            ++buffer->chain_skip;
+            continue;
+        } else if (thunk) {
+            ++buffer->chain_thunk;
+        }
+        ++buffer->chain_links;
+        current = kvgs_function_containing(value);
+        if (used == KVGS_CHAIN_DEPTH) {
+            ++buffer->chain_full;
+            break;
+        }
+        kvgs_chain_add(buffer, phase, seen, &used, current);
+    }
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    kvgs_chain_root(buffer, phase, seen, used, self, lua_at);
+#else
+    kvgs_chain_root(buffer, phase, seen, used, self);
+#endif
+}
+#endif
+
 /* ----------------------------------------------------------- sampler ----- */
 
 static void kvgs_sample(void)
 {
-    CPU *c = __atomic_load_n(&s_cpu, __ATOMIC_ACQUIRE);
+    CPU *c;
     kvgs_buffer *buffer;
     uint32_t phase;
     uint32_t esp;
@@ -339,12 +809,19 @@ static void kvgs_sample(void)
     uint32_t ceiling;
     uint32_t i;
     int found = 0;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    int lua_below = 0;
+#endif
 
-    if (!c)
-        return;
-    /* busy must be visible before the buffer index is read, so a reporter
-     * that has already flipped the index either sees busy or is seen. */
+    /* busy must be visible before the buffer index and the CPU are read: a
+     * reporter that has already flipped the index either sees busy or is
+     * seen, and kage_vita_guest_sampler_stop, which nulls the CPU and then
+     * reads busy (SEQ_CST on both sides), either sees this sample in flight
+     * and waits for it or is seen here as a NULL CPU. */
     __atomic_store_n(&s_busy, 1U, __ATOMIC_SEQ_CST);
+    c = __atomic_load_n(&s_cpu, __ATOMIC_SEQ_CST);
+    if (!c)
+        goto done;
     buffer = &s_buffers[__atomic_load_n(&s_active, __ATOMIC_SEQ_CST) & 1U];
 
     phase = g_kage_vita_guest_sampler_phase;
@@ -358,6 +835,14 @@ static void kvgs_sample(void)
         ++buffer->bad_esp;
         goto done;
     }
+#if defined(ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL)
+    if (phase == KAGE_VITA_GUEST_SAMPLER_SWP) {
+        kvgs_count(buffer, KVGS_KEY(0U, phase, KVGS_RVA_PRESENT));
+        kvgs_count(buffer, KVGS_KEY(1U, phase, KVGS_RVA_PRESENT));
+        ++buffer->samples[phase];
+        goto done;
+    }
+#endif
     for (i = 0U; i < KVGS_STACK_SCAN_WORDS; ++i) {
         uint32_t address = esp + i * 4U;
         uint32_t value;
@@ -367,6 +852,16 @@ static void kvgs_sample(void)
             break;
         value = KVGS_STACK_WORD(address);
         ++buffer->words_scanned;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+        /* Below the innermost marker: a live boundary means the sample is
+         * in the C function the VM called; a stale word means nothing. */
+        if (value == KVGS_LUA_CALLBACK_RETURN && phase == KVGS_CHAIN_PHASE) {
+            if (kvgs_lua_live(address))
+                lua_below = 1;
+            else
+                ++buffer->lua_stale;
+        }
+#endif
         if (value - KVGS_TEXT_BEGIN_RVA >=
                 KVGS_TEXT_END_RVA - KVGS_TEXT_BEGIN_RVA)
             continue;
@@ -393,6 +888,22 @@ static void kvgs_sample(void)
         ++buffer->samples[phase];
         if (i >= KVGS_STACK_SCAN_WORDS_LEGACY)
             ++buffer->deep;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+        if (phase == KVGS_CHAIN_PHASE) {
+            uint64_t start = KVGS_NOW_US();
+            uint32_t spent;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+            kvgs_chain(buffer, phase, esp, ceiling, i, value, callee,
+                       lua_below);
+#else
+            kvgs_chain(buffer, phase, esp, ceiling, i, value, callee);
+#endif
+            spent = (uint32_t)(KVGS_NOW_US() - start);
+            buffer->chain_us += spent;
+            if (spent > buffer->chain_us_max)
+                buffer->chain_us_max = spent;
+        }
+#endif
         found = 1;
         break;
     }
@@ -452,6 +963,19 @@ void kage_vita_guest_sampler_start(CPU *c)
     if (s_started)
         return;
     s_started = 1U;
+#if defined(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS)
+    /* Before the thread: the census runs on the game thread's entry hooks
+     * whether or not the sampler thread starts. */
+    isaac_vita_log(
+        "KAGE VITA ENTRY CENSUS: build=%s entries=%u phases=%u ids=%s "
+        "census_rvas=%.16s corpus_rvas=%.16s generation=%.24s",
+        ISAAC_VITA_GUEST_SAMPLER_BUILD_ID, (unsigned)GUEST_ENTRY_CENSUS_COUNT,
+        (unsigned)KAGE_VITA_GUEST_SAMPLER_PHASE_COUNT,
+        kvgs_census_stale() ? "STALE" : "ok",
+        GUEST_ENTRY_CENSUS_FUNCTION_RVAS_SHA256,
+        GUEST_COVERAGE_FUNCTION_RVAS_SHA256,
+        GUEST_ENTRY_CENSUS_GENERATION_ID);
+#endif
     s_functions = guest_registered_addresses(&s_function_count);
     s_text_present = kvgs_text_present();
     memset(s_buffers, 0, sizeof s_buffers);
@@ -484,6 +1008,16 @@ void kage_vita_guest_sampler_start(CPU *c)
         (unsigned)s_function_count, (unsigned)KVGS_TEXT_BEGIN_RVA,
         (unsigned)KVGS_TEXT_END_RVA, s_text_present ? "call" : "range-only",
         (unsigned)c->stack_floor, (unsigned)c->stack_ceiling);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    isaac_vita_log(
+        "KAGE VITA GUEST SAMPLER RESIDUAL: build=%s watch=%u lua_return=0x%08x "
+        "caller_offsets=%u,%u live=published slots=%u invoker=%06x roots=%u",
+        ISAAC_VITA_GUEST_SAMPLER_BUILD_ID, (unsigned)kvgs_watch_count(),
+        (unsigned)KVGS_LUA_CALLBACK_RETURN, (unsigned)KVGS_LUA_CALLER_CFUNCTION,
+        (unsigned)KVGS_LUA_CALLER_ALLOCATOR,
+        (unsigned)KAGE_VITA_GUEST_SAMPLER_LUA_CFUNCTION_SLOTS,
+        (unsigned)KVGS_LUA_INVOKER_RVA, (unsigned)KVGS_ROOT_COUNT);
+#endif
 }
 #else
 /* ------------------------------------------------------ host oracle ------ */
@@ -547,6 +1081,35 @@ static void kvgs_top_insert(kvgs_top *top, uint32_t rva, uint32_t count)
     }
 }
 
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+typedef struct kvgs_chain_top {
+    uint32_t rva[KVGS_CHAIN_TOP];
+    uint32_t count[KVGS_CHAIN_TOP];
+    uint32_t used;
+} kvgs_chain_top;
+
+static void kvgs_chain_top_insert(kvgs_chain_top *top, uint32_t rva,
+                                  uint32_t count)
+{
+    uint32_t position = top->used;
+
+    if (position == KVGS_CHAIN_TOP) {
+        if (count <= top->count[KVGS_CHAIN_TOP - 1U])
+            return;
+        position = KVGS_CHAIN_TOP - 1U;
+    } else {
+        ++top->used;
+    }
+    while (position > 0U && top->count[position - 1U] < count) {
+        top->rva[position] = top->rva[position - 1U];
+        top->count[position] = top->count[position - 1U];
+        --position;
+    }
+    top->rva[position] = rva;
+    top->count[position] = count;
+}
+#endif
+
 static void kvgs_log_top(
     const char *record, const char *build_id, uint32_t window,
     uint32_t last_outer_loop, uint32_t phase, uint32_t samples,
@@ -574,6 +1137,11 @@ static void kvgs_log_top(
         else if (top->rva[i] == KVGS_RVA_EXTERNAL)
             part = sceClibSnprintf(line + length, sizeof line - (size_t)length,
                                    "%sext:%u", i ? "," : "", top->count[i]);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL)
+        else if (top->rva[i] == KVGS_RVA_PRESENT)
+            part = sceClibSnprintf(line + length, sizeof line - (size_t)length,
+                                   "%spresent:%u", i ? "," : "", top->count[i]);
+#endif
         else
             part = sceClibSnprintf(line + length, sizeof line - (size_t)length,
                                    "%s%x:%u", i ? "," : "", top->rva[i],
@@ -591,6 +1159,195 @@ static void kvgs_log_top(
     ISAAC_VITA_LOG_PRINTF("%s", line);
 }
 
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL) || \
+    defined(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS)
+/* A record split over as many lines as its items need: every line repeats
+ * the header and holds whole items only, under the 384-byte durable log
+ * bound; one call, one line.  The header is at most 12 + 10 + 5 + 32 + 5 + 10
+ * + 7 + 10 + 1 + 63 (rest) = 155 bytes and an item at most 95, so the first
+ * item always fits. */
+typedef struct kvgs_lines {
+    char line[384];
+    int head;
+    int length;
+    uint32_t items;
+} kvgs_lines;
+
+static void kvgs_lines_flush(kvgs_lines *out)
+{
+    out->line[out->length] = '\n';
+    out->line[out->length + 1] = '\0';
+    ISAAC_VITA_LOG_PRINTF("%s", out->line);
+    out->length = out->head;
+    out->items = 0U;
+}
+
+static int kvgs_lines_begin(kvgs_lines *out, const char *record,
+                            const char *build_id, uint32_t window,
+                            uint32_t last_outer_loop, const char *rest)
+{
+    int length = sceClibSnprintf(
+        out->line, sizeof out->line, "[kage-vita] %s bid=%.32s win=%u loops=%u %s",
+        record, build_id, window, last_outer_loop, rest);
+
+    out->items = 0U;
+    if (length < 0 || length > (int)sizeof out->line - 98)
+        return 0;
+    out->head = out->length = length;
+    return 1;
+}
+
+static void kvgs_lines_add(kvgs_lines *out, const char *item)
+{
+    size_t length = strlen(item);
+
+    if (length > 95U)
+        return;
+    if (out->items &&
+            (size_t)out->length + 1U + length > sizeof out->line - 2U)
+        kvgs_lines_flush(out);
+    if (out->items)
+        out->line[out->length++] = ',';
+    memcpy(out->line + out->length, item, length);
+    out->length += (int)length;
+    ++out->items;
+}
+
+static void kvgs_lines_end(kvgs_lines *out, int always)
+{
+    if (out->items || always)
+        kvgs_lines_flush(out);
+}
+#endif
+
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+static uint32_t kvgs_lookup(const kvgs_buffer *buffer, uint32_t key)
+{
+    uint32_t index = (key * UINT32_C(2654435761)) >> (32U - KVGS_SLOT_BITS);
+    uint32_t probe;
+
+    for (probe = 0U; probe < KVGS_PROBE_LIMIT; ++probe) {
+        const kvgs_entry *entry =
+            &buffer->slots[(index + probe) & (KVGS_SLOTS - 1U)];
+        if (entry->key == key)
+            return entry->count;
+        if (entry->key == 0U)
+            return 0U;
+    }
+    return 0U;
+}
+
+/* ph120.hotw / ph120.hotl / ph120.hcl for the render phase. */
+static void kvgs_report_residual(const kvgs_buffer *retired,
+                                 const char *build_id, uint32_t window,
+                                 uint32_t last_outer_loop)
+{
+    const uint32_t phase = KVGS_CHAIN_PHASE;
+    kvgs_lines out;
+    char rest[64];
+    char item[96];
+    uint32_t i;
+
+    /* w=rva:self/caller/incl/root/root_native/lua_root/lua_root_native */
+    sceClibSnprintf(rest, sizeof rest, "phase=%s samples=%u w=",
+                    s_phase_names[phase], retired->samples[phase]);
+    if (kvgs_lines_begin(&out, "ph120.hotw", build_id, window, last_outer_loop,
+                         rest)) {
+        for (i = 0U; i < kvgs_watch_count(); ++i) {
+            uint32_t rva = s_watch[i];
+            uint32_t v[7];
+            v[0] = kvgs_lookup(retired, KVGS_KEY(0U, phase, rva));
+            v[1] = kvgs_lookup(retired, KVGS_KEY(1U, phase, rva));
+            v[2] = kvgs_lookup(retired, KVGS_KEY(1U, phase, KVGS_INCL_TAG | rva));
+            v[3] = kvgs_lookup(retired, KVGS_KEY(1U, phase, KVGS_ROOT_TAG | rva));
+            v[4] = kvgs_lookup(retired, KVGS_KEY(1U, phase, KVGS_ROOT_TAG |
+                                                 KVGS_ROOT_EXT | rva));
+            v[5] = kvgs_lookup(retired, KVGS_KEY(1U, phase, KVGS_ROOT_TAG |
+                                                 KVGS_ROOT_LUA | rva));
+            v[6] = kvgs_lookup(retired, KVGS_KEY(1U, phase, KVGS_ROOT_TAG |
+                                                 KVGS_ROOT_EXT | KVGS_ROOT_LUA |
+                                                 rva));
+            if (!(v[0] | v[1] | v[2] | v[3] | v[4] | v[5] | v[6]))
+                continue;
+            sceClibSnprintf(item, sizeof item, "%x:%u/%u/%u/%u/%u/%u/%u",
+                            (unsigned)rva, (unsigned)v[0], (unsigned)v[1],
+                            (unsigned)v[2], (unsigned)v[3], (unsigned)v[4],
+                            (unsigned)v[5], (unsigned)v[6]);
+            kvgs_lines_add(&out, item);
+        }
+        kvgs_lines_end(&out, 1);
+    }
+    /* o=outer_root:t/n/lt/ln, outer 0 = no root outside the invoker */
+    sceClibSnprintf(rest, sizeof rest, "phase=%s samples=%u inv=%x o=",
+                    s_phase_names[phase], retired->samples[phase],
+                    (unsigned)KVGS_LUA_INVOKER_RVA);
+    if (kvgs_lines_begin(&out, "ph120.hotl", build_id, window, last_outer_loop,
+                         rest)) {
+        for (i = 0U; i <= KVGS_ROOT_COUNT; ++i) {
+            const uint32_t *v = retired->lua_split[i];
+            if (!(v[0] | v[1] | v[2] | v[3]))
+                continue;
+            sceClibSnprintf(item, sizeof item, "%x:%u/%u/%u/%u",
+                            (unsigned)(i < KVGS_ROOT_COUNT ? s_chain_roots[i] : 0U),
+                            (unsigned)v[0], (unsigned)v[1], (unsigned)v[2],
+                            (unsigned)v[3]);
+            kvgs_lines_add(&out, item);
+        }
+        kvgs_lines_end(&out, 1);
+    }
+    ISAAC_VITA_LOG_PRINTF(
+        "[kage-vita] ph120.hcl bid=%.32s win=%u lb=%u lbm=%u lbs=%u lbx=%u "
+        "watch=%u\n",
+        build_id, window, retired->lua_links, retired->lua_miss,
+        retired->lua_self, retired->lua_stale, kvgs_watch_count());
+}
+#endif
+
+#if defined(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS)
+/* ph120.fe: body entries of the watch list in this window, per phase
+ * (e=rva:entries, non-zero only; upd and rnd always print). */
+static void kvgs_report_census(const char *build_id, uint32_t window,
+                               uint32_t last_outer_loop)
+{
+    uint32_t phase;
+
+    if (kvgs_census_stale()) {
+        ISAAC_VITA_LOG_PRINTF(
+            "[kage-vita] ph120.fe bid=%.32s win=%u loops=%u ids=STALE\n",
+            build_id, window, last_outer_loop);
+        memset(g_guest_entry_census, 0, sizeof g_guest_entry_census);
+        return;
+    }
+    for (phase = 0U; phase < KAGE_VITA_GUEST_SAMPLER_PHASE_COUNT; ++phase) {
+        const uint32_t *counts = g_guest_entry_census[phase];
+        kvgs_lines out;
+        char rest[32];
+        char item[32];
+        uint32_t i;
+        uint32_t any = 0U;
+
+        for (i = 0U; i < GUEST_ENTRY_CENSUS_COUNT; ++i)
+            any |= counts[i];
+        if (!any && phase != KAGE_VITA_GUEST_SAMPLER_UPD &&
+                phase != KAGE_VITA_GUEST_SAMPLER_RND)
+            continue;
+        sceClibSnprintf(rest, sizeof rest, "phase=%s e=", s_phase_names[phase]);
+        if (!kvgs_lines_begin(&out, "ph120.fe", build_id, window,
+                              last_outer_loop, rest))
+            continue;
+        for (i = 0U; i < GUEST_ENTRY_CENSUS_COUNT; ++i) {
+            if (!counts[i])
+                continue;
+            sceClibSnprintf(item, sizeof item, "%x:%u",
+                            (unsigned)s_census_rvas[i], (unsigned)counts[i]);
+            kvgs_lines_add(&out, item);
+        }
+        kvgs_lines_end(&out, 1);
+    }
+    memset(g_guest_entry_census, 0, sizeof g_guest_entry_census);
+}
+#endif
+
 void kage_vita_guest_sampler_report(
     const char *build_id, uint32_t window, uint32_t last_outer_loop)
 {
@@ -600,6 +1357,9 @@ void kage_vita_guest_sampler_report(
     uint32_t phase;
     uint32_t total = 0U;
 
+#if defined(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS)
+    kvgs_report_census(build_id, window, last_outer_loop);
+#endif
     if (s_thread < 0)
         return;
     old = s_active & 1U;
@@ -623,10 +1383,40 @@ void kage_vita_guest_sampler_report(
             continue;
         memset(&self, 0, sizeof self);
         memset(&caller, 0, sizeof caller);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+        kvgs_chain_top incl;
+        kvgs_chain_top roots;
+        memset(&incl, 0, sizeof incl);
+        memset(&roots, 0, sizeof roots);
+#endif
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+        kvgs_chain_top unrooted;
+        memset(&unrooted, 0, sizeof unrooted);
+#endif
         for (i = 0U; i < KVGS_SLOTS; ++i) {
             const kvgs_entry *entry = &retired->slots[i];
             if (!entry->key || KVGS_KEY_PHASE(entry->key) != phase)
                 continue;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+            if (KVGS_KEY_VIEW(entry->key) && KVGS_IS_INCL(KVGS_KEY_RVA(entry->key))) {
+                kvgs_chain_top_insert(&incl, KVGS_KEY_RVA(entry->key) &
+                                      ~KVGS_INCL_TAG, entry->count);
+                continue;
+            }
+            if (KVGS_KEY_VIEW(entry->key) && KVGS_IS_ROOT(KVGS_KEY_RVA(entry->key))) {
+                kvgs_chain_top_insert(&roots, KVGS_KEY_RVA(entry->key) &
+                                      ~KVGS_ROOT_TAG, entry->count);
+                continue;
+            }
+#endif
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+            if (KVGS_KEY_VIEW(entry->key) &&
+                    KVGS_IS_UNROOTED(KVGS_KEY_RVA(entry->key))) {
+                kvgs_chain_top_insert(&unrooted, KVGS_KEY_RVA(entry->key) &
+                                      ~KVGS_UNROOTED_TAG, entry->count);
+                continue;
+            }
+#endif
             kvgs_top_insert(KVGS_KEY_VIEW(entry->key) ? &caller : &self,
                             KVGS_KEY_RVA(entry->key), entry->count);
         }
@@ -634,7 +1424,63 @@ void kage_vita_guest_sampler_report(
                      retired->samples[phase], &self);
         kvgs_log_top("ph120.hotc", build_id, window, last_outer_loop, phase,
                      retired->samples[phase], &caller);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+        /* Three records of twelve, same format as ph120.hot. */
+        for (i = 0U; i < incl.used; i += KVGS_TOP) {
+            kvgs_top part;
+            uint32_t k;
+            memset(&part, 0, sizeof part);
+            for (k = 0U; k < KVGS_TOP && i + k < incl.used; ++k) {
+                part.rva[k] = incl.rva[i + k];
+                part.count[k] = incl.count[i + k];
+                part.used = k + 1U;
+            }
+            kvgs_log_top("ph120.hoti", build_id, window, last_outer_loop, phase,
+                         retired->samples[phase], &part);
+        }
+        /* ph120.hotr: rva = root (0 = none), +1000000 = not translated. */
+        for (i = 0U; i < roots.used; i += KVGS_TOP) {
+            kvgs_top part;
+            uint32_t k;
+            memset(&part, 0, sizeof part);
+            for (k = 0U; k < KVGS_TOP && i + k < roots.used; ++k) {
+                part.rva[k] = roots.rva[i + k];
+                part.count[k] = roots.count[i + k];
+                part.used = k + 1U;
+            }
+            kvgs_log_top("ph120.hotr", build_id, window, last_outer_loop, phase,
+                         retired->samples[phase], &part);
+        }
+#endif
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+        /* ph120.hotu: rootless samples by the outermost function their walk
+         * reached (0 = none), +1000000 = the sample is native. */
+        for (i = 0U; i < unrooted.used; i += KVGS_TOP) {
+            kvgs_top part;
+            uint32_t k;
+            memset(&part, 0, sizeof part);
+            for (k = 0U; k < KVGS_TOP && i + k < unrooted.used; ++k) {
+                part.rva[k] = unrooted.rva[i + k];
+                part.count[k] = unrooted.count[i + k];
+                part.used = k + 1U;
+            }
+            kvgs_log_top("ph120.hotu", build_id, window, last_outer_loop, phase,
+                         retired->samples[phase], &part);
+        }
+        if (phase == KVGS_CHAIN_PHASE)
+            kvgs_report_residual(retired, build_id, window, last_outer_loop);
+#endif
     }
+#if defined(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+    /* Worst case: 26 + 32 + 10 * 10 + fixed text < 260 bytes. */
+    ISAAC_VITA_LOG_PRINTF(
+        "[kage-vita] ph120.hci bid=%.32s win=%u n=%u links=%u ind=%u "
+        "thunk=%u skip=%u full=%u indrej=%u us=%u,%u\n",
+        build_id, window, retired->chain_samples, retired->chain_links,
+        retired->chain_ind, retired->chain_thunk, retired->chain_skip,
+        retired->chain_full, retired->chain_ind_rejected, retired->chain_us,
+        retired->chain_us_max);
+#endif
     /* Worst case 361 bytes (32-char bid, eighteen ten-digit %u, newline)
      * under the 384-byte durable log bound; pinned by
      * test_kage_vita_guest_sampler.py. */
@@ -650,4 +1496,28 @@ void kage_vita_guest_sampler_report(
         retired->hash_full, retired->words_scanned, retired->deep, s_ticks,
         spins);
     memset(retired, 0, sizeof *retired);
+}
+
+/* --------------------------------------------------------------- stop ---- */
+
+void kage_vita_guest_sampler_stop(void)
+{
+    uint32_t spins = 0U;
+
+    if (s_thread < 0)
+        return;
+    /* The thread has no exit path (it is left to process exit, as before);
+     * unbinding the CPU is what makes the guest stack releasable.
+     * kvgs_sample publishes busy and then loads the CPU (SEQ_CST on both
+     * sides), so after this store either the sampler already sees NULL or
+     * busy is set and the bounded spin outlasts the sample in flight
+     * (microseconds; the bound only covers a descheduled sampler, like the
+     * reporter's). */
+    __atomic_store_n(&s_cpu, (CPU *)0, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&s_busy, __ATOMIC_SEQ_CST) &&
+           spins < KVGS_REPORT_SPIN)
+        ++spins;
+    isaac_vita_log("KAGE VITA GUEST SAMPLER: stopped ticks=%u busy_spins=%u",
+                   (unsigned)__atomic_load_n(&s_ticks, __ATOMIC_RELAXED),
+                   (unsigned)spins);
 }

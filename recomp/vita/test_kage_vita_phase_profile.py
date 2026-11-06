@@ -120,9 +120,12 @@ def verify_hot_path_instrumentation(runtime: Path) -> None:
                 f"{signature[:-1]} counter is absent or duplicated"
             )
         if "sceKernelGetProcessTimeWide" in body:
+            # Two knob-scoped clock pairs: TEXTURE_CHURN_PROFILE and (since
+            # the integration, red on f171a04) GL_TEXTURE_UPLOAD_LOG.
             if (signature != "vita_glTexImage2D(" or
-                    body.count("sceKernelGetProcessTimeWide") != 2 or
-                    body.count("ISAAC_VITA_TEXTURE_CHURN_PROFILE") != 2):
+                    body.count("sceKernelGetProcessTimeWide") != 4 or
+                    body.count("ISAAC_VITA_TEXTURE_CHURN_PROFILE") != 2 or
+                    body.count("ISAAC_VITA_GL_TEXTURE_UPLOAD_LOG") != 2):
                 raise AssertionError(
                     f"{signature[:-1]} acquired an unscoped per-call clock"
                 )
@@ -560,6 +563,26 @@ def main() -> int:
                 "-DISAAC_VITA_FULLSPEED_SCHEDULER=1",
             )
         )
+        # ISAAC_VITA_FULLSPEED_FLOOR_DEBT (S5): ph120.fd/ph120.fs right after
+        # ph120.w (records 6 -> 8; with import kinds 8 -> 10, ik/ih still
+        # last).  The PASS string gains "; fd/fs=<N>/<N>" only under the
+        # define, so every other leg's exact string stays frozen.
+        floor_debt_definitions = (
+            "-DISAAC_VITA_FULLSPEED_SCHEDULER=1",
+            "-DISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US=8000",
+            "-DISAAC_VITA_FULLSPEED_ADMIT_SLACK_US=2000",
+        )
+        completed_floor_debt = compile_and_run(
+            "scheduler-floor-debt-observe", floor_debt_definitions + (
+                "-DISAAC_VITA_FULLSPEED_FLOOR_DEBT=1",
+            )
+        )
+        completed_floor_debt_import_kinds = compile_and_run(
+            "scheduler-floor-debt-on-import-kinds", floor_debt_definitions + (
+                "-DISAAC_VITA_FULLSPEED_FLOOR_DEBT=2",
+                "-DISAAC_VITA_PROFILE_IMPORT_KINDS=1",
+            )
+        )
         completed_on = compile_and_run(
             "on", ("-DISAAC_VITA_GUEST_LOOKUP_CACHE=1",)
         )
@@ -797,6 +820,20 @@ def main() -> int:
             "-DISAAC_VITA_TEXTURE_CHURN_PROFILE=1",
         )
         completed_all_on = compile_and_run("all-on", all_on_definitions)
+        # ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH (OBSERVE 1 / ON 2): ph120.tl
+        # directly after ph120.a (records 3 -> 4), alone and on top of the
+        # all-on set so every later record index is shown to move with it.
+        # The PASS string gains "; tl=<N>" only under the define.
+        completed_clear_latch = {
+            mode: compile_and_run(
+                f"clear-latch-{mode}",
+                (f"-DISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE={mode}",))
+            for mode in (1, 2)
+        }
+        completed_all_on_clear_latch = compile_and_run(
+            "all-on-clear-latch", all_on_definitions + (
+                "-DISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE=2",)
+        )
         # ISAAC_VITA_HEAP_CENSUS: ph120.mem appended last (records 3 -> 4,
         # all-on 19 -> 20); the PASS string gains "; mem=<N>" only under the
         # define, so every other leg's exact string below stays frozen.  The
@@ -820,6 +857,112 @@ def main() -> int:
         # 3 -> 4); the PASS string gains "; kq=<N>" only under the define.
         completed_kage_quad = compile_and_run(
             "kage-quad", ("-DISAAC_VITA_KAGE_QUAD_FASTPATH=1",)
+        )
+        # ISAAC_VITA_GFUEL_SEED_NATIVE + ISAAC_VITA_CAMERA_RING_NATIVE:
+        # ph120.gf and ph120.cr appended (records 3 -> 5); the PASS string
+        # gains "; gf=<N>; cr=<N>" only under the defines.
+        completed_decomp_native = compile_and_run(
+            "decomp-native", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                              "-DISAAC_VITA_CAMERA_RING_NATIVE=1")
+        )
+        # ISAAC_VITA_UPDATE_PROBE: ph120.uz, sixteen ph120.ut and two
+        # ph120.uk appended (records 3 -> 22); PASS gains "; uz=; ut=; uk=".
+        completed_update_probe = compile_and_run(
+            "update-probe", ("-DISAAC_VITA_UPDATE_PROBE=1",)
+        )
+        # ISAAC_VITA_HEAP_STAGE_PROFILE: ph120.hc/hf/hm appended (3 -> 6),
+        # alone and after gf/gu/gl/gh/cr (8 -> 11).
+        completed_heap_stage = compile_and_run(
+            "heap-stage", ("-DISAAC_VITA_HEAP_STAGE_PROFILE=1",)
+        )
+        completed_heap_stage_decomp = compile_and_run(
+            "heap-stage-decomp", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                                  "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                                  "-DISAAC_VITA_HEAP_STAGE_PROFILE=1")
+        )
+        # ISAAC_VITA_HEAP_FREE_COST_PROFILE: ph120.hg/hv after hm (6 -> 8),
+        # alone and on the int4-probe-ram-heap set (40 -> 42).
+        completed_heap_free_cost = compile_and_run(
+            "heap-free-cost", ("-DISAAC_VITA_HEAP_STAGE_PROFILE=1",
+                               "-DISAAC_VITA_HEAP_FREE_COST_PROFILE=1")
+        )
+        completed_probe_heap_cost = compile_and_run(
+            "probe-heap-cost", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                                "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                                "-DISAAC_VITA_UPDATE_PROBE=1",
+                                "-DISAAC_VITA_HEAP_STAGE_PROFILE=1",
+                                "-DISAAC_VITA_HEAP_FREE_COST_PROFILE=1")
+        )
+        # The int4-probe-ram-heap record set: gf/gu/gl/gh, cr, uz + sixteen
+        # ut + two uk, then hc/hf/hm (3 + 4 + 1 + 19 + 3 = 30 records).
+        completed_probe_heap_decomp = compile_and_run(
+            "probe-heap-decomp", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                                  "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                                  "-DISAAC_VITA_UPDATE_PROBE=1",
+                                  "-DISAAC_VITA_HEAP_STAGE_PROFILE=1")
+        )
+        # ISAAC_VITA_RENDER_CHAIN_NATIVE: ph120.rn appended (records 3 -> 4).
+        completed_render_chain = compile_and_run(
+            "render-chain", ("-DISAAC_VITA_RENDER_CHAIN_NATIVE=1",)
+        )
+        # The session S record set: int4-probe-ram-heap + ph120.rn last
+        # (40 + 1 = 41 records).
+        completed_session_s = compile_and_run(
+            "session-s", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                          "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                          "-DISAAC_VITA_UPDATE_PROBE=1",
+                          "-DISAAC_VITA_HEAP_STAGE_PROFILE=1",
+                          "-DISAAC_VITA_RENDER_CHAIN_NATIVE=1")
+        )
+        # ISAAC_VITA_HASCOLLECTIBLE_NATIVE: ph120.hn appended (records
+        # 3 -> 4), alone and after ph120.rn in the session S set (one record
+        # more than session-s), which is the record set of the device
+        # measurement build.
+        completed_hascoll = compile_and_run(
+            "hascoll", ("-DISAAC_VITA_HASCOLLECTIBLE_NATIVE=1",)
+        )
+        completed_session_hascoll = compile_and_run(
+            "session-hascoll", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                                "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                                "-DISAAC_VITA_UPDATE_PROBE=1",
+                                "-DISAAC_VITA_HEAP_STAGE_PROFILE=1",
+                                "-DISAAC_VITA_RENDER_CHAIN_NATIVE=1",
+                                "-DISAAC_VITA_HASCOLLECTIBLE_NATIVE=1")
+        )
+        # ISAAC_VITA_GL_THREAD_WORKER on top of decomp-native: ph120.rt
+        # appended after cr (records 5 -> 6), "; rt=<N>" only under it.
+        completed_session_gl = compile_and_run(
+            "session-gl", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                           "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                           "-DISAAC_VITA_UPDATE_PROBE=1",
+                           "-DISAAC_VITA_HEAP_STAGE_PROFILE=1",
+                           "-DISAAC_VITA_GL_THREAD_WORKER=1")
+        )
+        completed_gl_worker = compile_and_run(
+            "gl-worker", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                          "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                          "-DISAAC_VITA_GL_THREAD_WORKER=1")
+        )
+        # ISAAC_VITA_GL_RECORD_OPCODE_CENSUS on the gl-worker set: ph120.ro
+        # plus three ph120.rop records after rw (records 12 -> 16), and
+        # "; ro=<N>; rop=<N>" only under it.
+        completed_gl_worker_census = compile_and_run(
+            "gl-worker-census", ("-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                                 "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                                 "-DISAAC_VITA_GL_THREAD_WORKER=1",
+                                 "-DISAAC_GL_RECORD_OPCODE_CENSUS=1")
+        )
+        # Measurement build M1 (render-budget batch 1): the
+        # opcode census and the Clear expiry latch in OBSERVE
+        # in one phase-profile TU.  ph120.tl after ph120.a and
+        # ph120.ro/rop after ph120.rw (records 16 -> 17).
+        completed_gl_worker_census_clear_latch = compile_and_run(
+            "gl-worker-census-clear-latch", (
+                "-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                "-DISAAC_VITA_GL_THREAD_WORKER=1",
+                "-DISAAC_GL_RECORD_OPCODE_CENSUS=1",
+                "-DISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE=1")
         )
         for suffix, extra_definitions in (
                 ("base", ()),
@@ -907,6 +1050,30 @@ def main() -> int:
             "phase profile oth+scheduler oracle returned unexpected output: "
             f"{completed_other_scheduler.stdout!r}"
         )
+    # ph120.fd 362 B / ph120.fs 239 B with every counter all-ones, the
+    # signed gf fields at INT32_MIN and the fs floor stamp at
+    # ffffffffffffffff; both after ph120.w and before ik/ih.
+    expected_floor_debt = (
+        "Vita phase profile host oracle: PASS "
+        "(records=8; max t/c/a/g/o/y/v/q/f/k/b/h/p/l/m/n/s/r="
+        "433/375/161/-/-/-/-/-/-/-/-/-/-/-/-/-/503/276; fd/fs=362/239; "
+        "limiter skips; log cost excluded)"
+    )
+    expected_floor_debt_import_kinds = (
+        "Vita phase profile host oracle: PASS "
+        "(records=10; max t/c/a/g/o/y/v/q/f/k/b/h/p/l/m/n/s/r="
+        "433/375/161/-/-/-/-/-/-/-/-/-/-/-/-/-/503/276; fd/fs=362/239; "
+        "ik/ih=332/305; limiter skips; log cost excluded)"
+    )
+    for expected, completed in (
+            (expected_floor_debt, completed_floor_debt),
+            (expected_floor_debt_import_kinds,
+             completed_floor_debt_import_kinds)):
+        if expected not in completed.stdout:
+            raise AssertionError(
+                "phase profile floor-debt oracle returned unexpected output: "
+                f"{completed.stdout!r}"
+            )
     if expected_on not in completed_on.stdout:
         raise AssertionError(
             f"phase profile ON oracle returned unexpected output: "
@@ -1239,6 +1406,163 @@ def main() -> int:
             "phase profile kage-quad oracle returned unexpected output: "
             f"{completed_kage_quad.stdout!r}"
         )
+    # ph120.gf (271 B all-ones, 15 ten-digit numbers), its profiling
+    # records gu (311 B, 18 numbers), gl/gh/gb (320 B, ten call sites) and
+    # gn (197 B, 10 numbers), and ph120.cr (211 B, 11 numbers): discarded
+    # once at the first loop head, taken at every window flush; the stub
+    # takes and window texts are pinned in the oracle.
+    expected_decomp_native = (
+        "Vita phase profile host oracle: PASS "
+        "(records=10; max t/c/a/g/o/y/v/q/f/k/b/h/p/l/m/n/s/r="
+        "433/375/161/-/-/-/-/-/-/-/-/-/-/-/-/-/-/-; gf=271; gu=311; gl=320; "
+        "gh=320; gn=197; gb=320; cr=211; "
+        "limiter skips; log cost excluded)"
+    )
+    if expected_decomp_native not in completed_decomp_native.stdout:
+        raise AssertionError(
+            "phase profile decomp-native oracle returned unexpected output: "
+            f"{completed_decomp_native.stdout!r}"
+        )
+    expected_update_probe = (
+        "Vita phase profile host oracle: PASS "
+        "(records=30; max t/c/a/g/o/y/v/q/f/k/b/h/p/l/m/n/s/r="
+        "433/375/161/-/-/-/-/-/-/-/-/-/-/-/-/-/-/-; uz=125; ut=351; uc=193; uk=379; "
+        "limiter skips; log cost excluded)"
+    )
+    if expected_update_probe not in completed_update_probe.stdout:
+        raise AssertionError(
+            "phase profile update-probe oracle returned unexpected output: "
+            f"{completed_update_probe.stdout!r}"
+        )
+    # ph120.hc (304 B all-ones), hf/hm (374 B, eight n/us/over spans).
+    heap_suffix = "hc=304; hf=374; hm=374; limiter skips; log cost excluded)"
+    expected_heap_stage = (
+        "Vita phase profile host oracle: PASS (records=6; max "
+        "t/c/a/g/o/y/v/q/f/k/b/h/p/l/m/n/s/r="
+        "433/375/161/-/-/-/-/-/-/-/-/-/-/-/-/-/-/-; " + heap_suffix)
+    expected_heap_stage_decomp = expected_decomp_native.replace(
+        "records=10", "records=13").replace(
+        "limiter skips; log cost excluded)", heap_suffix)
+    expected_probe_heap_decomp = expected_decomp_native.replace(
+        "records=10", "records=40").replace(
+        "limiter skips; log cost excluded)", "uz=125; ut=351; uc=193; uk=379; " + heap_suffix)
+    for completed, expected in (
+            (completed_heap_stage, expected_heap_stage),
+            (completed_heap_stage_decomp, expected_heap_stage_decomp),
+            (completed_probe_heap_decomp, expected_probe_heap_decomp)):
+        if expected not in completed.stdout:
+            raise AssertionError(
+                "phase profile heap-stage oracle returned unexpected output: "
+                f"{completed.stdout!r}"
+            )
+    # ph120.hg (343 B all-ones: three n/us/over sub-spans + ten counts) and
+    # ph120.hv (215 B, prefilter pair + seven Vorbis census numbers).
+    cost_suffix = heap_suffix.replace(
+        "hm=374; limiter", "hm=374; hg=343; hv=215; limiter")
+    assert cost_suffix != heap_suffix, cost_suffix
+    expected_heap_free_cost = expected_heap_stage.replace(
+        "records=6", "records=8").replace(heap_suffix, cost_suffix)
+    expected_probe_heap_cost = expected_probe_heap_decomp.replace(
+        "records=40", "records=42").replace(heap_suffix, cost_suffix)
+    assert "records=8" in expected_heap_free_cost, expected_heap_free_cost
+    assert "records=42" in expected_probe_heap_cost, expected_probe_heap_cost
+    for completed, expected in (
+            (completed_heap_free_cost, expected_heap_free_cost),
+            (completed_probe_heap_cost, expected_probe_heap_cost)):
+        if expected not in completed.stdout:
+            raise AssertionError(
+                "phase profile heap-free-cost oracle returned unexpected "
+                f"output: {completed.stdout!r}"
+            )
+    # ph120.rn (200 B all-ones, 10 numbers): same take/discard contract.
+    expected_render_chain = (
+        "Vita phase profile host oracle: PASS "
+        "(records=4; max t/c/a/g/o/y/v/q/f/k/b/h/p/l/m/n/s/r="
+        "433/375/161/-/-/-/-/-/-/-/-/-/-/-/-/-/-/-; rn=200; "
+        "limiter skips; log cost excluded)"
+    )
+    if expected_render_chain not in completed_render_chain.stdout:
+        raise AssertionError(
+            "phase profile render-chain oracle returned unexpected output: "
+            f"{completed_render_chain.stdout!r}"
+        )
+    # probe-heap-decomp is 30 records since update probe v2 (uk), 38 since
+    # v3 (eight uc) and 40 with the HasCollectible split (gn, gb); a replace
+    # that matches nothing would silently keep the stale count.
+    assert "records=40" in expected_probe_heap_decomp, expected_probe_heap_decomp
+    expected_session_s = expected_probe_heap_decomp.replace(
+        "records=40", "records=41").replace(
+        "hm=374; limiter", "hm=374; rn=200; limiter")
+    # ph120.hn (249 B all-ones, 12 numbers): same take/discard contract.
+    expected_hascoll = expected_render_chain.replace("rn=200", "hn=249")
+    assert expected_hascoll != expected_render_chain, expected_hascoll
+    if expected_hascoll not in completed_hascoll.stdout:
+        raise AssertionError(
+            "phase profile hascoll oracle returned unexpected output: "
+            f"{completed_hascoll.stdout!r}"
+        )
+    # The session S set plus ph120.hn: the session-s run's own output (checked
+    # against its expectation below) with one more record and hn= after rn=.
+    session_s_records = re.search(r"records=(\d+);", completed_session_s.stdout)
+    assert session_s_records, completed_session_s.stdout
+    expected_session_hascoll = completed_session_s.stdout.strip().replace(
+        f"records={session_s_records.group(1)};",
+        f"records={int(session_s_records.group(1)) + 1};").replace(
+        "rn=200; limiter", "rn=200; hn=249; limiter")
+    assert "hn=249" in expected_session_hascoll, expected_session_hascoll
+    if expected_session_hascoll != completed_session_hascoll.stdout.strip():
+        raise AssertionError(
+            "phase profile session-hascoll oracle returned unexpected output: "
+            f"{completed_session_hascoll.stdout!r}"
+        )
+    if expected_session_s not in completed_session_s.stdout:
+        raise AssertionError(
+            "phase profile session-s oracle returned unexpected output: "
+            f"{completed_session_s.stdout!r}"
+        )
+    # ph120.rt: 356 B all-ones (20 ten-digit numbers), ph120.rw: 265 B (14).
+    expected_gl_worker = expected_decomp_native.replace(
+        "records=10", "records=12").replace("cr=211; ", "cr=211; rt=356; rw=265; ")
+    # The int-glthread-s record set: session S without the render chain,
+    # with the worker (40 + rt + rw = 42 records since update probe v3 and
+    # the HasCollectible split).
+    expected_session_gl = expected_probe_heap_decomp.replace(
+        "records=40", "records=42").replace(
+        "hm=374; limiter", "hm=374; rt=356; rw=265; limiter")
+    if expected_session_gl not in completed_session_gl.stdout:
+        raise AssertionError(
+            "phase profile session-gl oracle returned unexpected output: "
+            f"{completed_session_gl.stdout!r}"
+        )
+    if expected_gl_worker not in completed_gl_worker.stdout:
+        raise AssertionError(
+            "phase profile gl-worker oracle returned unexpected output: "
+            f"{completed_gl_worker.stdout!r}"
+        )
+    # ph120.ro: 173 B all-ones (five ten-digit numbers); ph120.rop: 490 B
+    # (three all-ones slots of twelve), inside the 512-byte allowance.
+    expected_gl_worker_census = expected_gl_worker.replace(
+        "records=12", "records=16").replace("rw=265; ", "rw=265; ro=173; rop=490; ")
+    assert "ro=173; rop=490" in expected_gl_worker_census, expected_gl_worker_census
+    if expected_gl_worker_census not in completed_gl_worker_census.stdout:
+        raise AssertionError(
+            "phase profile gl-worker-census oracle returned unexpected output: "
+            f"{completed_gl_worker_census.stdout!r}"
+        )
+    # Census + latch together (M1): the census string plus one record and the
+    # 227-byte ph120.tl, which the PASS string lists right after the max list.
+    expected_gl_worker_census_clear_latch = expected_gl_worker_census.replace(
+        "records=16;", "records=17;").replace("; gf=", "; tl=227; gf=", 1)
+    assert "records=17;" in expected_gl_worker_census_clear_latch and \
+        "; tl=227; gf=" in expected_gl_worker_census_clear_latch and \
+        "ro=173; rop=490" in expected_gl_worker_census_clear_latch, \
+        expected_gl_worker_census_clear_latch
+    if expected_gl_worker_census_clear_latch not in \
+            completed_gl_worker_census_clear_latch.stdout:
+        raise AssertionError(
+            "phase profile gl-worker-census-clear-latch oracle returned "
+            f"unexpected output: {completed_gl_worker_census_clear_latch.stdout!r}"
+        )
     expected_all_on_census = expected_all_on.replace(
         "records=19", "records=20")
     if expected_all_on_census not in completed_all_on_census.stdout or \
@@ -1248,9 +1572,42 @@ def main() -> int:
             "phase profile all-ON + heap-census oracle returned unexpected "
             f"output: {completed_all_on_census.stdout!r}"
         )
+    # ph120.tl: 227 B all-ones (11 ten-digit numbers), mode 1 and 2 alike.
+    expected_clear_latch = expected_off.replace(
+        "records=3;", "records=4;").replace(
+        "; limiter skips", "; tl=227; limiter skips")
+    assert "tl=227" in expected_clear_latch, expected_clear_latch
+    for mode, completed in completed_clear_latch.items():
+        if expected_clear_latch not in completed.stdout:
+            raise AssertionError(
+                f"phase profile clear-latch-{mode} oracle returned unexpected "
+                f"output: {completed.stdout!r}"
+            )
+    all_on_records = re.search(r"records=(\d+);", completed_all_on.stdout)
+    assert all_on_records, completed_all_on.stdout
+    expected_all_on_clear_latch = completed_all_on.stdout.strip().replace(
+        f"records={all_on_records.group(1)};",
+        f"records={int(all_on_records.group(1)) + 1};").replace(
+        "; limiter skips", "; tl=227; limiter skips")
+    assert "tl=227" in expected_all_on_clear_latch, expected_all_on_clear_latch
+    if expected_all_on_clear_latch !=             completed_all_on_clear_latch.stdout.strip():
+        raise AssertionError(
+            "phase profile all-on-clear-latch oracle returned unexpected "
+            f"output: {completed_all_on_clear_latch.stdout!r}"
+        )
     print(expected_off)
+    print("[decomp-native] " + expected_decomp_native)
+    for mode, completed in completed_clear_latch.items():
+        print(f"[clear-latch-{mode}] " + completed.stdout.strip())
+    print("[all-on-clear-latch] " + completed_all_on_clear_latch.stdout.strip())
+    print("[gl-worker] " + expected_gl_worker)
+    print("[gl-worker-census] " + expected_gl_worker_census)
+    print("[gl-worker-census-clear-latch] " + expected_gl_worker_census_clear_latch)
+    print("[session-gl] " + expected_session_gl)
     print(expected_other)
     print(completed_other_scheduler.stdout.strip())
+    print("[floor-debt observe] " + expected_floor_debt)
+    print("[floor-debt on + import kinds] " + expected_floor_debt_import_kinds)
     print(expected_on)
     print(expected_dispatch)
     print(completed_import_kinds.stdout.strip())

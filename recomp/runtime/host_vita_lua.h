@@ -42,6 +42,13 @@ void isaac_vita_lua_abort_cpu(CPU *c);
  * arena is unavailable; the bridge then keeps the guest allocator. */
 int isaac_vita_lua_arena_reserve(void);
 
+#if defined(ISAAC_VITA_LUA_RECEIPT)
+/* Entry tail, before guest_stack_free: unbind the stack-owned CPU from the
+ * startup beat thread and wait (bounded) for a stack sample in flight; no
+ * beat load touches the CPU or the guest stack afterwards. */
+void isaac_vita_lua_beat_stop(void);
+#endif
+
 #if defined(ISAAC_VITA_LUA_NATIVE_INDEX)
 /* ISAAC_VITA_LUA_NATIVE_INDEX: emit the '[isaac-lua] native-index' counters
  * (hits by kind, fallbacks by reason, VERIFY runs/mismatches) now; the bridge

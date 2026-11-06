@@ -307,6 +307,22 @@ int32_t isaac_nv_oracle_pcm_ahead_frames(uint32_t f);
 /* Supplied by the oracle: 32-bit-addressable allocations for mirror memory. */
 void *isaac_nv_oracle_malloc(size_t bytes);
 void isaac_nv_oracle_free(void *pointer);
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+/* ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK: the live mask, the slots whose
+ * active flag is set (bit i = slot i), and observer entries that found an
+ * active slot without its live bit (must stay 0). */
+uint32_t isaac_nv_oracle_free_watch_live(void);
+uint32_t isaac_nv_oracle_active_bits(void);
+uint32_t isaac_nv_oracle_free_watch_violations(void);
+#endif
+#endif
+
+#if defined(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK) && \
+    (defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE) || \
+     defined(ISAAC_VITA_NATIVE_VORBIS_ORACLE))
+/* Copy and zero the free observer census: calls, sum and max of live-mask
+ * bits per call, calls with 0, 1, 2 and 3+ live bits (ph120.hv nv=). */
+void isaac_nv_free_watch_census_take(uint32_t out[7]);
 #endif
 
 #endif

@@ -106,7 +106,7 @@ SceUID sceKernelAllocMemBlock(const char *name, SceKernelMemBlockType type,
         return ORACLE_ANM2_SCRATCH_UID;
     }
     if (strcmp(name, "isaac_texel_scratch") == 0 &&
-        size == KAGE_VITA_TEXEL_MEMBLOCK_MAX_BYTES &&
+        size == KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES &&
         !s_texel_memblock_live) {
         s_texel_memblock_live = 1;
         return ORACLE_TEXEL_SCRATCH_UID;
@@ -280,7 +280,7 @@ int main(void)
             ORACLE_ANM2_SCRATCH_BASE <
                 (uintptr_t)stack + ORACLE_STACK_BYTES));
     CHECK(!((uintptr_t)stack < ORACLE_TEXEL_SCRATCH_BASE +
-                               KAGE_VITA_TEXEL_MEMBLOCK_MAX_BYTES &&
+                               KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES &&
             ORACLE_TEXEL_SCRATCH_BASE <
                 (uintptr_t)stack + ORACLE_STACK_BYTES));
 
@@ -378,7 +378,7 @@ int main(void)
           texel_snapshot.live_size == KAGE_VITA_TEXEL_PROBE_LARGE_REQUEST);
     CHECK(anm2_snapshot.base + ISAAC_VITA_ANM2_MEMBLOCK_BYTES <=
               texel_snapshot.base ||
-          texel_snapshot.base + KAGE_VITA_TEXEL_MEMBLOCK_MAX_BYTES <=
+          texel_snapshot.base + KAGE_VITA_TEXEL_SCRATCH_MEMBLOCK_BYTES <=
               anm2_snapshot.base);
 
     /* Exact bases are dispatched to their owners before the ordinary ledger;

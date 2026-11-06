@@ -37,6 +37,11 @@ import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
+# GUEST_GPR_FLUSH_MASK=1 corpora (gpr_flush_mask.py) spell some FLUSH
+# statements `GUEST_GPR_FLUSH_MASK(c, 0xMMU);`; the site shapes pinned here
+# read each one as the FLUSH it replaces (exactness of the masks:
+# test_gpr_flush_mask_proof.py).  Identity on an unmasked corpus.
+FLUSH_MASK_RE = re.compile(r"\bGUEST_GPR_FLUSH_MASK\(c, 0x[0-9a-f]{2}U\);")
 BODY_RE = re.compile(
     r"^void ((?:sub|guest_original)_[0-9a-f]{8})\(CPU \*__restrict c\)\n\{\n(.*?)^\}\n",
     re.M | re.S)
@@ -297,6 +302,7 @@ def main() -> int:
     iat_hi = (max(slots) + arguments.image_base + 4) & 0xFFFFFFFF
     for path in units:
         source = path.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+        source = FLUSH_MASK_RE.sub("GUEST_GPR_FLUSH(c);", source)
         for store in CONST_STORE_RE.finditer(source):
             width = int(store.group(1)) // 8
             address = int(store.group(2), 16)

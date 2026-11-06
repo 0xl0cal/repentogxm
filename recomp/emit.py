@@ -1167,13 +1167,32 @@ class Emitter:
 
         # ---- flags as a value -----------------------------------------
         if m == "pushfd":
+            # Bit 21 (ID) is the one non-arithmetic bit user code reads back:
+            # SDL's CPU_haveCPUID toggles it through popfd/pushfd to decide
+            # whether `cpuid` may be executed at all.  It lives in c->idf.
             return ["GPUSH((uint32_t)(0x2U |"
                     " (fl_cf(GUEST_FL) ? 0x1U : 0U) |"
                     " (fl_pf(GUEST_FL) ? 0x4U : 0U) |"
                     " (fl_zf(GUEST_FL) ? 0x40U : 0U) |"
                     " (fl_sf(GUEST_FL) ? 0x80U : 0U) |"
                     " (c->df ? 0x400U : 0U) |"
-                    " (fl_of(GUEST_FL) ? 0x800U : 0U))); "
+                    " (fl_of(GUEST_FL) ? 0x800U : 0U) |"
+                    " (c->idf ? 0x200000U : 0U))); "
+                    "GUEST_STACK_CALLSITE_BARRIER();"]
+        if m == "popfd":
+            # The inverse of pushfd for the same bits: CF PF ZF SF OF land in
+            # an explicit FLAG_PARTIAL snapshot (the sahf/stc shape), DF and
+            # ID in their CPU fields.  AF, TF, IF and IOPL are not modelled;
+            # MSVC never reads them back and ring 3 cannot change IF/IOPL.
+            return ["{ uint32_t _f = (uint32_t)(GPOP());",
+                    "  GUEST_FL->f_op = FLAG_PARTIAL; GUEST_FL->f_sz = 4;",
+                    "  GUEST_FL->f_cf = (uint8_t)(_f & 1U);"
+                    " GUEST_FL->f_pf = (uint8_t)((_f >> 2) & 1U);",
+                    "  GUEST_FL->f_zf = (uint8_t)((_f >> 6) & 1U);"
+                    " GUEST_FL->f_sf = (uint8_t)((_f >> 7) & 1U);",
+                    "  GUEST_FL->f_of = (uint8_t)((_f >> 11) & 1U);",
+                    "  c->df = (uint8_t)((_f >> 10) & 1U);"
+                    " c->idf = (uint8_t)((_f >> 21) & 1U); }",
                     "GUEST_STACK_CALLSITE_BARRIER();"]
         if m == "lahf":
             # AH := SF ZF 0 AF 0 PF 1 CF. AF is not modelled; MSVC emits lahf

@@ -12,8 +12,14 @@
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
 #include "host_vita_async_write.h"
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+#include "host_vita_game_log.h"
+#endif
 #include "host_vita_import_id.h"
 #include "host_vita_startup.h"
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+#include "host_vita_access_cache.h"
+#endif
 #if defined(ISAAC_VITA_LUA_RECEIPT)
 #include "platform.h"
 #endif
@@ -87,6 +93,26 @@ static int vita_filesystem_access_errno(int native_error)
     }
 }
 
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+/* An ancestor directory probe for the negative cache: only ENOENT/ENOTDIR
+ * prove that nothing below `path` exists. */
+static int vita_filesystem_probe_directory(const char *path)
+{
+    SceIoStat status;
+    int result;
+
+    memset(&status, 0, sizeof status);
+    result = sceIoGetstat(path, &status);
+    if (result >= 0)
+        return SCE_S_ISDIR(status.st_mode)
+            ? ISAAC_VITA_ACCESS_CACHE_DIR : ISAAC_VITA_ACCESS_CACHE_UNKNOWN;
+    if ((uint32_t)result == VITA_FILESYSTEM_SCE_ENOENT ||
+        (uint32_t)result == VITA_FILESYSTEM_SCE_ENOTDIR)
+        return ISAAC_VITA_ACCESS_CACHE_ABSENT;
+    return ISAAC_VITA_ACCESS_CACHE_UNKNOWN;
+}
+#endif
+
 static void vita_filesystem_remove(CPU *__restrict c)
 {
     uint32_t guest_path = vita_filesystem_arg(c, 0U);
@@ -102,6 +128,10 @@ static void vita_filesystem_remove(CPU *__restrict c)
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     /* A queued save image for this path must land before it is removed. */
     isaac_vita_async_write_sync_path(native_path);
+#endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* Pending log.txt bytes land before the file is removed. */
+    isaac_vita_game_log_sync_path(native_path, ISAAC_VITA_GAME_LOG_SYNC_REMOVE);
 #endif
 
     saved_errno = errno;
@@ -149,6 +179,10 @@ static void vita_filesystem_access(CPU *__restrict c)
     /* Existence checks must observe a save whose image is still queued. */
     isaac_vita_async_write_sync_path(native_path);
 #endif
+#if defined(ISAAC_VITA_GAME_LOG_ASYNC)
+    /* Existence checks observe every byte the lane has accepted. */
+    isaac_vita_game_log_sync_path(native_path, ISAAC_VITA_GAME_LOG_SYNC_ACCESS);
+#endif
 
     /* Vita newlib access() calls stat(), whose _stat_r() first allocates a
      * PATH_MAX realpath buffer.  At the Repentance Lua/mod startup frontier
@@ -156,6 +190,13 @@ static void vita_filesystem_access(CPU *__restrict c)
      * valid.  Query the same native metadata directly: this is allocation-
      * free and reproduces newlib access()'s directory/write-bit semantics. */
     memset(&status, 0, sizeof status);
+#if defined(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+    /* Below a mods directory known absent: what sceIoGetstat would answer. */
+    if (isaac_vita_access_cache_absent(native_path,
+                                       vita_filesystem_probe_directory))
+        result = (int)VITA_FILESYSTEM_SCE_ENOENT;
+    else
+#endif
     result = sceIoGetstat(native_path, &status);
     native_error = result;
     if (result < 0) {

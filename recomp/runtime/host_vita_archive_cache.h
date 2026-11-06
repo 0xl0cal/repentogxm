@@ -23,14 +23,24 @@ typedef struct isaac_vita_archive_cache_file {
  * not a per-call durable logger: packed-resource startup performs millions of
  * reads.  A fatal boundary can snapshot the newest tail, while only an actual
  * cursor anomaly is written immediately. */
+#if defined(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+/* Diagnostic build: every fread/fseek/ftell/fclose on every packed-archive
+ * FILE token is retained (any key), so a fatal shows the whole read run that
+ * led to it.  The CRT dumps from a static buffer of the same capacity. */
+#define ISAAC_VITA_ARCHIVE_DIAG_RING_CAPACITY 1024U
+#else
 #define ISAAC_VITA_ARCHIVE_DIAG_RING_CAPACITY 32U
+#endif
 #define ISAAC_VITA_ARCHIVE_DIAG_LOG_CAPACITY 384U
 
 typedef enum isaac_vita_archive_diag_kind {
     ISAAC_VITA_ARCHIVE_DIAG_OPEN = 1,
     ISAAC_VITA_ARCHIVE_DIAG_CACHE_RESET = 2,
     ISAAC_VITA_ARCHIVE_DIAG_FSEEK = 3,
-    ISAAC_VITA_ARCHIVE_DIAG_FREAD = 4
+    ISAAC_VITA_ARCHIVE_DIAG_FREAD = 4,
+    /* Verbose ring only. */
+    ISAAC_VITA_ARCHIVE_DIAG_CLOSE = 5,
+    ISAAC_VITA_ARCHIVE_DIAG_FTELL = 6
 } isaac_vita_archive_diag_kind;
 
 enum {
@@ -39,7 +49,9 @@ enum {
     ISAAC_VITA_ARCHIVE_DIAG_STREAM_ERROR = 1U << 2,
     ISAAC_VITA_ARCHIVE_DIAG_RELEVANT = 1U << 3,
     ISAAC_VITA_ARCHIVE_DIAG_FTELL_FAILED = 1U << 4,
-    ISAAC_VITA_ARCHIVE_DIAG_SCEIO_DIRECT = 1U << 5
+    ISAAC_VITA_ARCHIVE_DIAG_SCEIO_DIRECT = 1U << 5,
+    /* Verbose ring only: the call went through descriptor recovery. */
+    ISAAC_VITA_ARCHIVE_DIAG_RECOVERED = 1U << 6
 };
 
 typedef struct isaac_vita_archive_diag_event {
@@ -133,6 +145,31 @@ FILE *isaac_vita_archive_cache_reopen_native(const char *native_path,
 /* Close and forget the idle stream, if any.  This is also the shutdown edge.
  * Calling it more than once is harmless. */
 int isaac_vita_archive_cache_drop(void);
+
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+/* Vita newlib's DescriptorTranslation (vitasdk-softfp newlib 0da3cb1,
+ * lib_a-io.o __vita_fd_drop: sce_uid +0, type byte +4, ref_count +8,
+ * filename +12, memset 20; __vita_fdmap is 256 entries). */
+typedef struct isaac_vita_archive_newlib_fd {
+    int32_t sce_uid;
+    uint8_t type;
+    uint8_t reserved[3];
+    int32_t ref_count;
+    char *filename;
+    int32_t flags;
+} isaac_vita_archive_newlib_fd;
+
+#define ISAAC_VITA_ARCHIVE_NEWLIB_FD_COUNT 256
+
+/* newlib's fd close for `fd` (`reent` is passed through to _close_r, which
+ * stores its errno at `reent_errno`).  When the kernel refuses the close of
+ * a descriptor it dropped across a suspend, newlib keeps the fd forever; the
+ * release is then run again on a valid dummy handle.  Returns the first
+ * close's result and leaves its errno. */
+int isaac_vita_archive_fd_close_repair(void *reent, int *reent_errno, int fd);
+void isaac_vita_archive_fd_repair_counts(uint32_t *repaired,
+                                         uint32_t *leaked);
+#endif
 
 #ifdef __cplusplus
 }

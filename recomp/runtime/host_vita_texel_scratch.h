@@ -16,6 +16,14 @@ typedef struct isaac_vita_texel_scratch_decision {
     const char *fault;
 } isaac_vita_texel_scratch_decision;
 
+/* Reserve before vitaGL claims the remaining USER_RW memory. No logical
+ * lease is acquired. Returns one when ready, zero on refusal/failure; later
+ * malloc retains its existing retry/fallback and poisoned-state behavior.
+ * Defined only with ISAAC_VITA_TEXEL_SCRATCH_32M (entry_vita.c caller) or
+ * in the ISAAC_VITA_TEXEL_SCRATCH_ORACLE builds. */
+int isaac_vita_texel_scratch_reserve(
+    uint32_t guest_stack_floor, uint32_t guest_stack_ceiling);
+
 /* The owner is resolved from the complete frozen EBP chain at the imported
  * malloc boundary.  Only the synchronously uploaded ImagePng and
  * ProceduralImageBase owners are accepted.  A clean native reservation failure

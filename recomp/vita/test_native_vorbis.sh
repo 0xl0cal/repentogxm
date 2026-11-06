@@ -125,6 +125,59 @@ oracle_sources="$module $root/runtime/vita_native_vorbis_oracle.c $root/runtime/
     -DISAAC_VITA_NATIVE_VORBIS_ASYNC=1 \
     -I"$root/runtime" -I"$root/vita" $oracle_sources -lm \
     -o "$work/vita-native-vorbis-oracle-async"
+# ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH: same oracle, free observer prefilter on
+# (production and async); plus the Vita compile of the shipped async config.
+"$host_cc" $host_flags -DGUEST_IMAGE_BASE=0x27000000u \
+    -DISAAC_VITA_NATIVE_VORBIS_ORACLE=1 -DISAAC_VITA_NATIVE_VORBIS=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=1 \
+    -I"$root/runtime" -I"$root/vita" $oracle_sources -lm \
+    -o "$work/vita-native-vorbis-oracle-watch"
+"$host_cc" $host_flags -DGUEST_IMAGE_BASE=0x27000000u \
+    -DISAAC_VITA_NATIVE_VORBIS_ORACLE=1 -DISAAC_VITA_NATIVE_VORBIS=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_ASYNC=1 -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=1 \
+    -I"$root/runtime" -I"$root/vita" $oracle_sources -lm \
+    -o "$work/vita-native-vorbis-oracle-async-watch"
+"$cc" $production_flags -DISAAC_VITA_NATIVE_VORBIS_WORKER=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_ASYNC=1 -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=1 \
+    -I"$root/runtime" -I"$root/vita" -c "$module" -o "$work/nv-async-watch.o"
+# ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK: the observer scans the live-mask
+# bits only.  The oracle checks active => bit at every observer entry, live ==
+# active between files, and the per-file retire counts stay those of -watch.
+"$host_cc" $host_flags -DGUEST_IMAGE_BASE=0x27000000u \
+    -DISAAC_VITA_NATIVE_VORBIS_ORACLE=1 -DISAAC_VITA_NATIVE_VORBIS=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK=1 \
+    -I"$root/runtime" -I"$root/vita" $oracle_sources -lm \
+    -o "$work/vita-native-vorbis-oracle-watch-mask"
+"$host_cc" $host_flags -DGUEST_IMAGE_BASE=0x27000000u \
+    -DISAAC_VITA_NATIVE_VORBIS_ORACLE=1 -DISAAC_VITA_NATIVE_VORBIS=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_ASYNC=1 -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK=1 \
+    -DISAAC_VITA_HEAP_FREE_COST_PROFILE=1 \
+    -I"$root/runtime" -I"$root/vita" $oracle_sources -lm \
+    -o "$work/vita-native-vorbis-oracle-async-watch-mask"
+"$cc" $production_flags -DISAAC_VITA_NATIVE_VORBIS_WORKER=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_ASYNC=1 -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK=1 \
+    -I"$root/runtime" -I"$root/vita" -c "$module" -o "$work/nv-async-watch-mask.o"
+"$cc" $production_flags -DISAAC_VITA_NATIVE_VORBIS_WORKER=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_ASYNC=1 -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=1 \
+    -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK=1 \
+    -DISAAC_VITA_HEAP_FREE_COST_PROFILE=1 \
+    -I"$root/runtime" -I"$root/vita" -c "$module" -o "$work/nv-async-watch-mask-cost.o"
+if "$cc" $production_flags -DISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK=1 \
+        -I"$root/runtime" -I"$root/vita" -c "$module" \
+        -o "$work/nv-mask-nowatch.o" 2>/dev/null; then
+    echo "FREE_WATCH_MASK without FREE_WATCH must not compile" >&2
+    exit 1
+fi
+# the census entry point exists only in the profiling (COST) build
+if "$nm" "$work/nv-async-watch-mask.o" | grep -q "isaac_nv_free_watch_census_take"; then
+    echo "census take present without HEAP_FREE_COST_PROFILE" >&2
+    exit 1
+fi
+"$nm" "$work/nv-async-watch-mask-cost.o" | grep -q " T isaac_nv_free_watch_census_take\$" ||
+    { echo "census take missing with HEAP_FREE_COST_PROFILE" >&2; exit 1; }
 
 oggs=${ISAAC_NV_TEST_OGG:-}
 if [ -z "$oggs" ] && command -v ffmpeg >/dev/null 2>&1 &&
@@ -155,6 +208,10 @@ if [ -z "$oggs" ]; then
     "$work/vita-native-vorbis-oracle"
     "$work/vita-native-vorbis-oracle-verify"
     "$work/vita-native-vorbis-oracle-async"
+    "$work/vita-native-vorbis-oracle-watch"
+    "$work/vita-native-vorbis-oracle-async-watch"
+    "$work/vita-native-vorbis-oracle-watch-mask"
+    "$work/vita-native-vorbis-oracle-async-watch-mask"
     echo "native vorbis decode proofs: SKIP (no OGG input; set ISAAC_NV_TEST_OGG or install ffmpeg+libvorbis)"
 else
     # shellcheck disable=SC2086
@@ -163,6 +220,14 @@ else
     "$work/vita-native-vorbis-oracle-verify" $oggs
     # shellcheck disable=SC2086
     "$work/vita-native-vorbis-oracle-async" $oggs
-    echo "native vorbis decode proofs: PASS (production, verify, async)"
+    # shellcheck disable=SC2086
+    "$work/vita-native-vorbis-oracle-watch" $oggs
+    # shellcheck disable=SC2086
+    "$work/vita-native-vorbis-oracle-async-watch" $oggs
+    # shellcheck disable=SC2086
+    "$work/vita-native-vorbis-oracle-watch-mask" $oggs
+    # shellcheck disable=SC2086
+    "$work/vita-native-vorbis-oracle-async-watch-mask" $oggs
+    echo "native vorbis decode proofs: PASS (production, verify, async, watch, async-watch, watch-mask, async-watch-mask)"
 fi
 echo "native vorbis oracle: PASS ($work)"

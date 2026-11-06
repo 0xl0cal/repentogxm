@@ -28,6 +28,7 @@
 
 #define ISAAC_LOG_DIR  ISAAC_VITA_NATIVE_DATA_ROOT
 #define ISAAC_LOG_PATH ISAAC_LOG_DIR "/first-arm-fault.log"
+#define ISAAC_LOG_PREV_PATH ISAAC_LOG_DIR "/first-arm-fault.prev.log"
 
 /* Keep these in a direct executable object. Newlib references the heap symbol
  * weakly, so a definition hidden in a static archive is not extracted. */
@@ -133,11 +134,39 @@ uint64_t isaac_vita_get_process_time(void)
     return (uint64_t)sceKernelGetProcessTimeWide();
 }
 
+/* Keep the previous launch's log as first-arm-fault.prev.log.  Truncating
+ * on every start destroyed the only evidence of a crash as soon as the
+ * player launched again.  The outcome is reported in the fresh log, right
+ * after the logger receipt; a failed remove or rename never blocks logging,
+ * the log is then truncated in place exactly as before.  The remove code is
+ * always shown: 0x80010002 means there was no earlier .prev file. */
+static void log_rotate(char *receipt, unsigned int size)
+{
+    SceIoStat stat;
+    int remove_result;
+    int rename_result;
+
+    if (sceIoGetstat(ISAAC_LOG_PATH, &stat) < 0) {
+        snprintf(receipt, size, "none");
+        return;
+    }
+    remove_result = sceIoRemove(ISAAC_LOG_PREV_PATH);
+    rename_result = sceIoRename(ISAAC_LOG_PATH, ISAAC_LOG_PREV_PATH);
+    if (rename_result < 0) {
+        snprintf(receipt, size, "rename_fail:0x%08x remove=0x%08x",
+                 (unsigned)rename_result, (unsigned)remove_result);
+        return;
+    }
+    snprintf(receipt, size, "ok remove=0x%08x", (unsigned)remove_result);
+}
+
 void isaac_vita_log_reset(void)
 {
     SceUID fd;
+    char rotate[64];
 
     sceIoMkdir(ISAAC_LOG_DIR, 0777);
+    log_rotate(rotate, sizeof(rotate));
     fd = sceIoOpen(ISAAC_LOG_PATH,
                    SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd >= 0)
@@ -160,8 +189,18 @@ void isaac_vita_log_reset(void)
             (unsigned)ISAAC_VITA_LOG_ASYNC_LINE_MAX,
             (unsigned)ISAAC_VITA_LOG_ASYNC_PRINTF_BYTES,
             (unsigned)stats.thread_priority, 0x00040000u);
+#if defined(ISAAC_VITA_LOG_ASYNC_PRINTF_FILE) && ISAAC_VITA_LOG_ASYNC_PRINTF_FILE
+        isaac_vita_log(
+            "KAGE VITA LOG PRINTF FILE: sink=file+debug path=" ISAAC_LOG_PATH
+            " bounded_bytes=%u overlong=debug+receipt started=%d",
+            (unsigned)ISAAC_VITA_LOG_ASYNC_PRINTF_BYTES - 1u, started);
+#endif
     }
 #endif
+    /* rotate=ok|none|rename_fail:0x...; the second line of the log (the
+     * first without ISAAC_VITA_LOG_ASYNC). */
+    isaac_vita_log("KAGE VITA LOG ROTATE: rotate=%s prev=" ISAAC_LOG_PREV_PATH,
+                   rotate);
 }
 
 void isaac_vita_log(const char *format, ...)

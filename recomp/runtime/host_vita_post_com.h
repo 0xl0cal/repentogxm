@@ -73,4 +73,31 @@ int isaac_vita_post_com_import_counted(CPU *__restrict c, const char *name,
 extern uint32_t g_isaac_vita_post_com_time_get_time_calls;
 #endif
 
+#if defined(ISAAC_VITA_PHASE_PROFILE) && \
+    defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+/* ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH (OBSERVE = 1, ON = 2): cumulative
+ * counters of the KAGE Clear expiry-loop clock latch in
+ * vita_post_com_timeGetTime, same thread and window rule as the tgt counter
+ * above; the profiler prints the window deltas as ph120.tl right after
+ * ph120.a.  "Site" means the two loop call sites (return words 0x00564fd6 and
+ * 0x00561f6b); "eligible" means the latch key held there. */
+typedef struct IsaacVitaClearLatchCounters {
+    uint32_t site_calls;     /* n: calls from the two sites */
+    uint32_t hits;           /* h: eligible calls (ON: answered by the latch) */
+    uint32_t fresh;          /* f: key misses (a clock read that re-arms) */
+    uint32_t foreign_cpu;    /* s: site calls from a CPU other than the
+                                armed one (tripwire, single guest thread) */
+    uint32_t ticks;          /* t: OBSERVE, eligible calls whose fresh value
+                                differs from the latch */
+    uint32_t expiries;       /* x: site calls whose returned value expires
+                                the element ((ms - stamp) > 0x1388) */
+    uint32_t flips;          /* d: OBSERVE, eligible calls where the latch
+                                would decide differently from the fresh read */
+    uint32_t stamp_ahead;    /* w: eligible calls whose element stamp is
+                                newer than the latch (tripwire) */
+    uint32_t clock_reads;    /* clk: clock reads by the handler, all sites */
+} IsaacVitaClearLatchCounters;
+extern IsaacVitaClearLatchCounters g_isaac_vita_clear_latch_counters;
+#endif
+
 #endif

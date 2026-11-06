@@ -98,7 +98,16 @@
  *            fmt7: bits(v3*sv), fmt6 premultiplied: 6, fmt6 copy: c2,
  *            other: fmt-1 of the last attribute : (u16)base + 1) unless a
  *            tail callee ran (ecx/edx as the last one left them); pop edi;
- *            pop esi; mov esp,ebp; pop ebp; ret 0x18.  EBX untouched. */
+ *            pop esi; mov esp,ebp; pop ebp; ret 0x18.  EBX untouched.
+ *
+ * ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE (default OFF) replays the select
+ * sub_005607a0 itself (kq_select) instead of entering it: on device 73 % of
+ * fight quads are unbatched and the translated select plus its batch
+ * lookup sub_005603f0 were 3.3 % of render self time (hotprof-20261012).
+ * The lookup's hit path is answered natively; a miss enters the translated
+ * sub_005603f0 (SEH frame, allocation, free lists), the pair-vector growth
+ * the translated sub_0008d900, SetBlend and the select's two size getters
+ * go through guest_call as the listing's indirect calls do. */
 #include "host_vita_kage_quad_fastpath.h"
 
 #include <math.h>
@@ -422,6 +431,278 @@ static uint32_t kq_ring_reserve(CPU *__restrict c, uint32_t frame,
 }
 #endif
 
+#if defined(ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE)
+#if defined(ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE)
+#error ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE replays the select; OBSERVE never replays
+#endif
+void sub_005603f0(CPU *__restrict c);   /* batch find-or-create */
+void sub_0008d900(CPU *__restrict c);   /* (batch, image) pair-vector growth */
+
+/* Oracle hook (records a natively answered lookup the way its stand-in
+ * records the translated one); production expands it to nothing. */
+#if !defined(ISAAC_KAGE_QUAD_ORACLE_LOOKUP_HIT)
+# define ISAAC_KAGE_QUAD_ORACLE_LOOKUP_HIT(c, batch, edx) ((void)0)
+#endif
+
+/* The hit path of sub_005603f0 (00560432..0056048b -> 0056077b), reads
+ * only.  The slot's batch is a hit when its 16-byte blend descriptor equals
+ * the current one at Renderer+4, its group word equals [0x7c7a44] and
+ * sub_00567620(batch+0x14, group+0x1c) finds the two id vectors equal:
+ * equal counts ((int32)(end - begin) >> 2 each, sar), then the elements in
+ * order (a differing dword always holds a differing byte, so the byte tail
+ * at 00567666 cannot turn a mismatch into a match).  1 = hit, with the
+ * batch and the EDX sub_00567620 leaves (the first vector's cursor after
+ * the loop: begin + 4 * count); 0 = the translated body decides (a miss, or
+ * a count this replay does not bound). */
+static int kq_lookup_hit(uint32_t self, uint32_t slot, uint32_t *batch_out,
+                         uint32_t *edx_out)
+{
+    const uint32_t current = KQ_VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER) + 4U;
+    uint32_t batch = ld32(self + slot), group, a, b, k;
+    int32_t na, nb;
+
+    if (batch == 0U)
+        return 0;
+    for (k = 0U; k < 16U; k += 4U)
+        if (ld32(batch + k) != ld32(current + k))
+            return 0;
+    group = ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_BATCH_GROUP));
+    if (ld32(batch + ISAAC_VITA_KAGE_QUAD_BATCH_GROUP) != group)
+        return 0;
+    a = ld32(batch + ISAAC_VITA_KAGE_QUAD_BATCH_IDS);
+    b = ld32(group + ISAAC_VITA_KAGE_QUAD_GROUP_IDS);
+    na = (int32_t)(ld32(batch + ISAAC_VITA_KAGE_QUAD_BATCH_IDS + 4U) - a) >> 2;
+    nb = (int32_t)(ld32(group + ISAAC_VITA_KAGE_QUAD_GROUP_IDS + 4U) - b) >> 2;
+    if (na != nb || (uint32_t)na > ISAAC_VITA_KAGE_QUAD_LOOKUP_MAX_IDS)
+        return 0;
+    for (k = 0U; k < (uint32_t)na; ++k)
+        if (ld32(a + 4U * k) != ld32(b + 4U * k))
+            return 0;
+    *batch_out = batch;
+    *edx_out = a + 4U * (uint32_t)na;
+    return 1;
+}
+
+/* One `push arg; mov ecx, edi; call 0x5603f0` site of the select (G = the
+ * select's ESP).  A hit is answered with sub_005603f0's effects on what its
+ * caller reads: EAX = the batch, EDX as sub_00567620 left it, ESI/EDI/EBX/
+ * EBP restored by its pops, ESP back at G (ret 4); ECX - the security
+ * cookie it pops - is overwritten before any read after every site
+ * (005608b7, 005608d4, and 00560932/00560962 after 00560954) and is left
+ * as `mov ecx, edi` set it.  The hit path writes nothing above ESP but
+ * fs:[0], which it restores.  Everything else enters the translated body. */
+static void kq_lookup(CPU *__restrict c, uint32_t g, uint32_t arg,
+                      uint32_t return_word)
+{
+    uint32_t batch, edx;
+
+    st32(g - 4U, arg);
+    c->ecx = c->edi;
+    if (kq_lookup_hit(c->edi, (arg & 0xffU) ?
+                          ISAAC_VITA_KAGE_QUAD_OFF_SLOT_CUSTOM :
+                          ISAAC_VITA_KAGE_QUAD_OFF_SLOT_DEFAULT,
+                      &batch, &edx)) {
+        st32(g - 8U, return_word);
+        c->esp = g - 8U;
+        ISAAC_KAGE_QUAD_ORACLE_LOOKUP_HIT(c, batch, edx);
+        c->eax = batch;
+        c->edx = edx;
+        c->esp = g;
+        return;
+    }
+    kq_direct_call(c, g, return_word, 4U, sub_005603f0);
+}
+
+/* sub_005607a0 (005607a0..005609e5) entered as the PushQuad site 0055fb6f
+ * enters it: EAX = translucent, ECX = ESI = this, EDX = c1, EDI = quad,
+ * EBP = entry ESP-4, ESP = frame after `ret 4`.  Every register the x86
+ * hands a callee is set as the listing leaves it, every callee is entered
+ * as the listing enters it (guest_call for `call [eax+0x38]`/`call eax`,
+ * direct for `call rel32`), every write above the final ESP is the
+ * listing's, in its order.  The select's own frame (saved registers, the
+ * two descriptor copies, the flag bytes, the width spill) is read back by
+ * nothing but the select - callees are entered below it and do not write
+ * above their arguments - so those values live in locals; the one frame
+ * word a callee reads is the argument dword pushed from [G+0xc] (the bool
+ * byte over whatever the stack held), reproduced byte for byte. */
+static void kq_select(CPU *__restrict c, uint32_t frame, uint32_t translucent)
+{
+    /* push ebp; mov ebp,esp; and esp,-16; sub esp,0x28; push esi; push edi */
+    const uint32_t ebp = frame - 12U;
+    const uint32_t g = ((ebp & ~15U) - 0x28U) - 8U;
+    const uint32_t current = KQ_VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER) + 4U;
+    const uint32_t standard = KQ_VA(ISAAC_VITA_KAGE_QUAD_C_BLEND_DEFAULT);
+    const uint32_t self = c->ecx;
+    const uint32_t saved_esi = c->esi, saved_edi = c->edi;
+    const uint32_t saved_ebp = c->ebp;
+    uint32_t eax = translucent, edx = g + 0x20U, esi = 0xcU;
+    uint32_t group, flag = translucent, target, override_byte, i;
+    int is_default = 1;
+    float w, h, sw, sh;
+
+    /* 005607cb */
+    st8(g + 0xcU, (uint8_t)translucent);
+    /* 005607e0: current descriptor == {1,0,1,0}; eax/edx/esi as the loop
+     * leaves them. */
+    for (i = 0U; i < 16U; i += 4U) {
+        eax = ld32(current + i);
+        if (eax != ld32(standard + i)) {
+            is_default = 0;
+            break;
+        }
+        edx += 4U;
+        esi -= 4U;
+    }
+    /* 005607fd..00560863: the group object for [this+0x20] in 0..2. */
+    group = ld32(self + ISAAC_VITA_KAGE_QUAD_OFF_GROUP);
+    if (group != 3U) {
+        const uint32_t g0 = KQ_VA(ISAAC_VITA_KAGE_QUAD_G_GROUP_0);
+        const uint32_t g1 = KQ_VA(ISAAC_VITA_KAGE_QUAD_G_GROUP_1);
+        const uint32_t g2 = KQ_VA(ISAAC_VITA_KAGE_QUAD_G_GROUP_2);
+        uint32_t held = ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_BATCH_GROUP));
+        int known = 1;
+        edx = held;
+        if (held == g0)
+            eax = 0U;
+        else if (held == g1)
+            eax = 1U;
+        else if (held == g2)
+            eax = 2U;
+        else
+            known = 0;
+        if (!known || eax != group) {
+            if (group == 0U) {
+                st32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_BATCH_GROUP), g0);
+            } else if (group == 1U) {
+                st32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_BATCH_GROUP), g1);
+            } else {
+                eax = group == 2U ? g2 : held;
+                st32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_BATCH_GROUP), eax);
+            }
+        }
+    }
+    /* 0056086d */
+    st8(self + ISAAC_VITA_KAGE_QUAD_OFF_BLEND_RESET, 0U);
+    c->eax = eax;
+    c->edx = edx;
+    c->esi = esi;
+    c->edi = self;
+    c->ebp = ebp;
+    if (!translucent && is_default) {
+        /* 0056094b: no rebind on this path; al = [G+0xc] = 0 below. */
+        kq_lookup(c, g, ld32(g + 0xcU),
+                  ISAAC_VITA_KAGE_QUAD_RET_LOOKUP_DEFAULT);
+        st32(c->edi + ISAAC_VITA_KAGE_QUAD_OFF_BATCH, c->eax);
+    } else {
+        uint32_t batch;
+        if (translucent) {
+            if (is_default) {
+                /* 00560883..005608a8: SetBlend(descriptor by value). */
+                uint32_t descriptor =
+                    ld8(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PREMULTIPLY)) != 0U ?
+                    KQ_VA(ISAAC_VITA_KAGE_QUAD_C_BLEND_PREMULTIPLIED) :
+                    KQ_VA(ISAAC_VITA_KAGE_QUAD_C_BLEND_TRANSLUCENT);
+                stx(g - 0x10U, ldx(descriptor));
+                st32(g - 0x14U, ISAAC_VITA_KAGE_QUAD_RET_SET_BLEND);
+                c->esp = g - 0x14U;
+                c->ecx = KQ_VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER);
+                c->eax = ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER));
+                guest_call(c, ld32(c->eax + ISAAC_VITA_KAGE_QUAD_VT_SET_BLEND));
+                if (c->esp != g)
+                    guest_fault(c, KQ_VA(ISAAC_VITA_KAGE_QUAD_ROOT_RVA),
+                                "Image::PushQuad replay: SetBlend returned "
+                                "with a foreign ESP");
+                st8(c->edi + ISAAC_VITA_KAGE_QUAD_OFF_BLEND_RESET, 1U);
+            }
+            kq_lookup(c, g, ld32(g + 0xcU),
+                      ISAAC_VITA_KAGE_QUAD_RET_LOOKUP_TRANSLUCENT);
+        } else {
+            /* 005608c8: push 1; mov byte [esp+0xe], 1 (= [G+0xa]). */
+            flag = 1U;
+            kq_lookup(c, g, 1U, ISAAC_VITA_KAGE_QUAD_RET_LOOKUP_CUSTOM);
+        }
+        /* 005608d6: mov ecx, eax; the (batch, image) rebind. */
+        batch = c->eax;
+        c->ecx = batch;
+        st32(c->edi + ISAAC_VITA_KAGE_QUAD_OFF_BATCH, batch);
+        if (ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PREV_BATCH)) != batch) {
+            uint32_t prev = ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PREV_IMAGE));
+            uint32_t end;
+            if (prev != 0U
+#if defined(ISAAC_VITA_KAGE_QUAD_SELECT_VANILLA_SEAM)
+                    /* The generated 005608ea seam (gen_all
+                     * VITA_VANILLA_KAGE_INVALIDATE_*, CMake passes this
+                     * when ISAAC_VITA_VANILLA_KAGE_BUNDLE is ON): keep the
+                     * current image's just-selected batch reusable. */
+                    && prev != c->edi
+#endif
+               )
+                st32(prev + ISAAC_VITA_KAGE_QUAD_OFF_SLOT_CUSTOM, 0U);
+            end = ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PAIRS_END));
+            st32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PREV_IMAGE), c->edi);
+            st32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PREV_BATCH), batch);
+            if (end == ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PAIRS_CAP))) {
+                /* 00560939: push 0x7e7d34; push eax; mov ecx, 0x7e7d28;
+                 * call 0x8d900 (ret 8). */
+                c->eax = end;
+                c->ecx = KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PAIRS);
+                st32(g - 4U, KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PREV_BATCH));
+                st32(g - 8U, end);
+                kq_direct_call(c, g, ISAAC_VITA_KAGE_QUAD_RET_PAIRS_GROW, 8U,
+                               sub_0008d900);
+            } else {
+                st32(end, batch);
+                st32(end + 4U, c->edi);
+                st32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_PAIRS_END), end + 8U);
+                c->eax = end;
+            }
+        }
+    }
+    /* 0056091a: the low byte is all that is stored; EAX is rewritten by
+     * the getter load below. */
+    st8(c->edi + ISAAC_VITA_KAGE_QUAD_OFF_DIRTY, (uint8_t)flag);
+    /* 0056091d..005609db: GetWidth/GetHeight of the bound target (re-read
+     * before the second call) or of the Renderer; scale = minss(w/W, h/H)
+     * against the target's own size or 480x270. */
+    target = ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_CULL_TARGET));
+    override_byte = ld8(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_SIZE_OVERRIDE));
+    c->esi = target;
+    if (target != 0U)
+        kq_getter_call(c, g, ISAAC_VITA_KAGE_QUAD_RET_SELECT_WIDTH, target,
+                       ld32(ld32(target) + ISAAC_VITA_KAGE_QUAD_VT_GET_WIDTH));
+    else
+        kq_getter_call(c, g, ISAAC_VITA_KAGE_QUAD_RET_SELECT_WIDTH,
+                       KQ_VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER),
+                       ld32(ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER)) +
+                            ISAAC_VITA_KAGE_QUAD_VT_RENDERER_WIDTH));
+    w = (float)(int32_t)c->eax;
+    target = ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_CULL_TARGET));
+    if (target != 0U)
+        kq_getter_call(c, g, ISAAC_VITA_KAGE_QUAD_RET_SELECT_HEIGHT, target,
+                       ld32(ld32(target) + ISAAC_VITA_KAGE_QUAD_VT_GET_HEIGHT));
+    else
+        kq_getter_call(c, g, ISAAC_VITA_KAGE_QUAD_RET_SELECT_HEIGHT,
+                       KQ_VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER),
+                       ld32(ld32(KQ_VA(ISAAC_VITA_KAGE_QUAD_G_RENDERER)) +
+                            ISAAC_VITA_KAGE_QUAD_VT_RENDERER_HEIGHT));
+    h = (float)(int32_t)c->eax;
+    if (c->esi != 0U && override_byte == 0U) {
+        sw = w;
+        sh = h;
+    } else {
+        sw = ldf(KQ_VA(ISAAC_VITA_KAGE_QUAD_C_FALLBACK_WIDTH));
+        sh = ldf(KQ_VA(ISAAC_VITA_KAGE_QUAD_C_FALLBACK_HEIGHT));
+    }
+    stf(c->edi + ISAAC_VITA_KAGE_QUAD_OFF_SNAP_SCALE,
+        kq_minss((float)(w / sw), (float)(h / sh)));
+    /* 005609e0: pop edi; pop esi; mov esp,ebp; pop ebp; ret 4. */
+    c->edi = saved_edi;
+    c->esi = saved_esi;
+    c->ebp = saved_ebp;
+    c->esp = frame;
+}
+#endif
+
 int isaac_vita_kage_quad_try(CPU *__restrict c)
 {
     uint32_t esp, capacity, offset, frame;
@@ -661,9 +942,13 @@ int isaac_vita_kage_quad_try(CPU *__restrict c)
         c->esi = self;
         c->edi = quad;
         c->ebp = esp - 4U;
+#if defined(ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE)
+        kq_select(c, frame, translucent);
+#else
         st32(frame - 4U, translucent);
         kq_direct_call(c, frame, ISAAC_VITA_KAGE_QUAD_RET_BATCH_SELECT, 4U,
                        sub_005607a0);
+#endif
     }
 
     /* 0055fb78: the quad is copied into the frame; the snap rebuilds it. */

@@ -1,0 +1,8 @@
+# host oracle (host_vita_ogg_readahead_oracle.c) receipt lines, default geometry,
+# printed by the module's own report_if_due at the end of each scenario
+[suspend]
+log: KAGE VITA OGG READAHEAD STATS: reads=44 hits=43 eof=0 miss=0 hit_kb=688 miss_kb=0 miss_ms=0 waits=0 wait_ms=0 wait_to=0 busy=0 vseek=0 fseek=1 sync=2 sync_fail=2 pass=1 real_fail=0 foreign=0 reg=2 full=0 reg_fail=0 retired=2 fsync=0 live=0
+log: KAGE VITA OGG READAHEAD WORKER: fills=50 fill_kb=800 fill_ms=0 fill_err=1 short=0 open_fail=0 dropped=0
+[suspend-late-open]
+log: KAGE VITA OGG READAHEAD STATS: reads=20 hits=20 eof=0 miss=0 hit_kb=320 miss_kb=0 miss_ms=0 waits=0 wait_ms=0 wait_to=0 busy=0 vseek=0 fseek=1 sync=1 sync_fail=1 pass=0 real_fail=0 foreign=0 reg=1 full=0 reg_fail=0 retired=1 fsync=0 live=0
+log: KAGE VITA OGG READAHEAD WORKER: fills=23 fill_kb=368 fill_ms=0 fill_err=0 short=0 open_fail=0 dropped=0

@@ -36,6 +36,10 @@
 #include "host_vita_lua_gc.h"
 #define VITA_LUA_GC_HOOK 1
 #endif
+#if defined(ISAAC_VITA_LUA_COST_PROFILE)
+/* Profiling only: pcall / callback / GC split per window (host_vita_lua_cost.c). */
+#include "host_vita_lua_cost.h"
+#endif
 
 #if defined(ISAAC_VITA_LUA_RECEIPT) || \
     (defined(ISAAC_VITA_LUA_ARENA_MB) && ISAAC_VITA_LUA_ARENA_MB > 0)
@@ -65,6 +69,14 @@
 #define VITA_LUA_MAX_REQUIRE_DEPTH 8U
 #define VITA_LUA_ERROR_TEXT_MAX 255U
 #define VITA_LUA_CALLBACK_RETURN UINT32_C(0xfff15333)
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+/* Profile-only (kage_vita_guest_sampler.h): the guest address of every live
+ * VITA_LUA_CALLBACK_RETURN word, so the sampler's chain walk links only those
+ * and never a stale copy left below ESP by a callback that returned. */
+_Static_assert(VITA_LUA_MAX_CALLBACK_DEPTH ==
+                   KAGE_VITA_GUEST_SAMPLER_LUA_CFUNCTION_SLOTS,
+               "one published boundary per callback frame slot");
+#endif
 
 /* ISAAC_VITA_LUA_SCOPE_FASTPATH (default 1; the CMake option of the same name
  * passes =0): behaviour-identical fixed-overhead trims on the per-import and
@@ -427,6 +439,11 @@ static void vita_lua_callback_frame_pop(int slot)
     frame = &s_vita_lua_callbacks[slot];
     s_vita_lua_callback_top = frame->previous;
     frame->used = 0;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    /* Every route out of a callback frame ends here (normal return, the
+     * escape trampoline, recovery after a Lua raise). */
+    g_kage_vita_guest_sampler_lua_cfunction[slot] = 0U;
+#endif
 }
 
 /* A Lua API such as luaL_checkinteger can raise directly, bypassing our
@@ -714,7 +731,7 @@ int isaac_vita_lua_arena_reserve(void)
 }
 #endif
 
-#if defined(ISAAC_VITA_LUA_GC_PROFILE) || defined(ISAAC_VITA_HEAP_CENSUS)
+#if defined(ISAAC_VITA_LUA_GC_PROFILE) || defined(ISAAC_VITA_HEAP_CENSUS) || defined(ISAAC_VITA_DEBUG_OVERLAY)
 /* GC profile (host_vita_lua_gc.c): arena occupancy for the window line.
  * ISAAC_VITA_HEAP_CENSUS: the same three numbers as lua(l,pk,fb) of
  * ph120.mem (kage_vita_phase_profile.c), read outside every lock. */
@@ -767,7 +784,13 @@ __attribute__((weak)) unsigned kage_vita_loading_stage(void);
 __attribute__((weak)) unsigned kage_vita_loading_elapsed_seconds(void);
 __attribute__((weak)) unsigned kage_vita_loading_swap_count(void);
 
+/* Bound of the isaac_vita_lua_beat_stop busy spin: a sample is 96 raw loads,
+ * the bound only covers a descheduled beat thread (same shape as the sampler
+ * reporter's KVGS_REPORT_SPIN). */
+#define VITA_LUA_BEAT_STOP_SPIN  200000U
+
 static CPU *s_vita_lua_beat_cpu;
+static uint32_t s_vita_lua_beat_busy;    /* beat is inside one stack sample */
 static uint32_t s_vita_lua_beat_lua_calls;
 static uint32_t s_vita_lua_beat_last_import;
 static uint32_t s_vita_lua_beat_started;
@@ -814,6 +837,7 @@ static int vita_lua_beat_thread(SceSize args, void *argp)
     while (lines < VITA_LUA_BEAT_MAX_LINES) {
         uint64_t now;
         CPU *c;
+        uint32_t esp;
         uint32_t imports;
         uint32_t lua_calls;
         uint32_t last_import;
@@ -832,7 +856,6 @@ static int vita_lua_beat_thread(SceSize args, void *argp)
         loading = kage_vita_loading_active ? kage_vita_loading_active() : -1;
         if (loading == 0 && ++beats_after_finish > 2U)
             break;
-        c = __atomic_load_n(&s_vita_lua_beat_cpu, __ATOMIC_ACQUIRE);
         imports = __atomic_load_n(&g_host_import_calls, __ATOMIC_RELAXED);
         lua_calls = __atomic_load_n(&s_vita_lua_beat_lua_calls,
                                     __ATOMIC_RELAXED);
@@ -842,7 +865,15 @@ static int vita_lua_beat_thread(SceSize args, void *argp)
         if (last_name && strncmp(last_name, "Lua5.3.3r.dll!", 14U) == 0)
             last_name += 14;
         memset(returns, 0, sizeof returns);
+        /* busy brackets the CPU load and the raw stack loads:
+         * isaac_vita_lua_beat_stop nulls the CPU and then reads busy (SEQ_CST
+         * on both sides), so it either waits out this sample or is seen here
+         * as a NULL CPU (esp=0, no ret). */
+        __atomic_store_n(&s_vita_lua_beat_busy, 1U, __ATOMIC_SEQ_CST);
+        c = __atomic_load_n(&s_vita_lua_beat_cpu, __ATOMIC_SEQ_CST);
         count = vita_lua_beat_sample_stack(c, returns, VITA_LUA_BEAT_RETURNS);
+        esp = c ? *(volatile const uint32_t *)&c->esp : 0U;
+        __atomic_store_n(&s_vita_lua_beat_busy, 0U, __ATOMIC_SEQ_CST);
         for (i = count; i < VITA_LUA_BEAT_RETURNS; ++i)
             returns[i] = 0U;
         ++lines;
@@ -864,7 +895,7 @@ static int vita_lua_beat_thread(SceSize args, void *argp)
             lua_calls - last_lua_calls, last_name ? last_name : "-",
             vita_lua_active_load() != 0U ? 1 : 0,
             s_vita_lua_callback_top + 1,
-            c ? *(volatile const uint32_t *)&c->esp : 0U,
+            esp,
             returns[0], returns[1], returns[2], returns[3],
             returns[4], returns[5], returns[6], returns[7]
 #if defined(VITA_LUA_ARENA_ENABLED)
@@ -911,6 +942,33 @@ static void vita_lua_beat_note_import(CPU *c, uint32_t index)
 }
 #endif
 
+#if defined(ISAAC_VITA_LUA_RECEIPT)
+/* Entry tail (entry_vita.c), before guest_stack_free.  The beat thread holds
+ * the stack-owned CPU until two beats after the loading presenter finishes
+ * or VITA_LUA_BEAT_MAX_LINES, so a stop during loading reaches the tail with
+ * it alive and its raw loads of [esp, ceiling) gated only by
+ * c->stack_floor/ceiling -- an unmapped range once the stack is a dedicated
+ * memblock (ISAAC_VITA_GUEST_STACK_MEMBLOCK).  Unbind the CPU and wait
+ * (bounded) for a sample in flight; the thread keeps its own exit conditions
+ * and prints esp=0 ret=0 lines until then.  A receipt build without the Vita
+ * beat (host oracles) has nothing to stop. */
+void isaac_vita_lua_beat_stop(void)
+{
+#if defined(VITA_LUA_BEAT_ENABLED)
+    uint32_t spins = 0U;
+
+    if (!s_vita_lua_beat_started)
+        return;
+    __atomic_store_n(&s_vita_lua_beat_cpu, (CPU *)0, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&s_vita_lua_beat_busy, __ATOMIC_SEQ_CST) &&
+           spins < VITA_LUA_BEAT_STOP_SPIN)
+        ++spins;
+    isaac_vita_log("[isaac-lua] beat stopped: cpu unbound busy_spins=%u",
+                   (unsigned)spins);
+#endif
+}
+#endif
+
 static int vita_lua_call_guest(lua_State *state, uint32_t target)
 {
     KAGE_VITA_DEEP_SCOPE(KVD_LUA_CALLBACK);
@@ -951,10 +1009,17 @@ static int vita_lua_call_guest(lua_State *state, uint32_t target)
 #if defined(ISAAC_VITA_DEEP_PROFILE)
     const uint32_t deep_callback_mark = kage_vita_deep_depth();
 #endif
+#if defined(ISAAC_VITA_LUA_COST_PROFILE)
+    isaac_vita_lua_cost_cb_enter(target);
+#endif
 
     if (setjmp(frame->escape) == 0) {
         gpush(c, (uint32_t)(uintptr_t)state);
         gpush(c, VITA_LUA_CALLBACK_RETURN);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+        /* [c->esp] is the word just pushed; frame_pop clears it. */
+        g_kage_vita_guest_sampler_lua_cfunction[slot] = c->esp;
+#endif
         guest_call(c, target);
         if (c->fault) {
             vita_lua_restore_callback_cpu(frame);
@@ -989,6 +1054,9 @@ static int vita_lua_call_guest(lua_State *state, uint32_t target)
         }
 #endif
     }
+#if defined(ISAAC_VITA_LUA_COST_PROFILE)
+    isaac_vita_lua_cost_cb_leave();
+#endif
 #if defined(ISAAC_VITA_DEEP_PROFILE)
     kage_vita_deep_unwind(deep_callback_mark);
 #endif
@@ -1411,7 +1479,17 @@ static void *vita_lua_guest_allocator(void *opaque, void *pointer,
     gpush(c, (uint32_t)(uintptr_t)pointer);
     gpush(c, allocator->guest_ud);
     gpush(c, VITA_LUA_CALLBACK_RETURN);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    /* [c->esp] is the word just pushed.  Saved and restored like the
+     * indirect target, should an allocation ever nest. */
+    const uint32_t sampler_enclosing_allocator =
+        g_kage_vita_guest_sampler_lua_allocator;
+    g_kage_vita_guest_sampler_lua_allocator = c->esp;
+#endif
     guest_call(c, allocator->target);
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+    g_kage_vita_guest_sampler_lua_allocator = sampler_enclosing_allocator;
+#endif
     if (c->fault || c->esp != saved_esp - 16U) {
         (void)guest_stack_set(c, saved_esp, allocator->target);
         return NULL;
@@ -2054,6 +2132,24 @@ static void vita_lua_newstate_aux_import(CPU *__restrict c)
 #endif
                        );
 #endif
+#if defined(ISAAC_VITA_LUA_CORE_ARM)
+    {
+        /* Proof on the console: a Thumb function pointer has bit 0 set. */
+        void isaac_vita_log(const char *format, ...);
+        isaac_vita_log("[isaac-lua] core isa=%s lua_pushnil=0x%08x",
+                       ((uintptr_t)lua_pushnil & 1U) ? "thumb" : "arm",
+                       (unsigned)(uintptr_t)lua_pushnil);
+    }
+#endif
+#if defined(ISAAC_VITA_LUA_INTEGER2STR_SELFTEST)
+    {
+        /* ISAAC_VITA_LUA_INTEGER2STR profile builds: one timed comparison of
+         * the derived lobject.c's digit loop with snprintf on the console
+         * (runs once; host_vita_lua_integer2str_selftest.c). */
+        void isaac_vita_lua_integer2str_selftest(void);
+        isaac_vita_lua_integer2str_selftest();
+    }
+#endif
     if (state && !vita_lua_add_state(state, NULL)) {
         lua_close(state);
         state = NULL;
@@ -2422,6 +2518,59 @@ static void vita_lua_gc_import(CPU *__restrict c)
     VITA_LUA_END();
 }
 
+#if defined(ISAAC_VITA_LUA_CALL_ERROR_CATCH)
+/* The port has no C++ EH, so LuaBridge's throw on a failed call is fatal,
+ * while PC catches it per callback ("Error in \"PostUpdate\" call: %s") and
+ * plays on.  Return RVAs of the 50 lua_pcallk sites (nresults 1, no handler)
+ * whose failure branch builds luabridge::LuaException (0x3f88d0) and throws
+ * (0x40ed40), taken from generated-int3-off; the two other sites (0x402222,
+ * 0x40b3df) handle the status themselves and are left alone. */
+static const uint32_t s_vita_lua_throwing_pcall_returns[] = {
+    0x003fd66fu, 0x003fd82du, 0x003fe220u, 0x003fe3deu, 0x003fe830u,
+    0x003fe9eeu, 0x003fef1eu, 0x003ff360u, 0x003ff87du, 0x00400b0eu,
+    0x00400ccbu, 0x004024aau, 0x0040266cu, 0x00402de9u, 0x0040d421u,
+    0x0040ef41u, 0x0040f026u, 0x0040f178u, 0x0040f2b5u, 0x0040f3a6u,
+    0x0040f496u, 0x0040f5e8u, 0x0040f6d6u, 0x0040f828u, 0x0040f916u,
+    0x0040fa06u, 0x0040faf6u, 0x0040fc48u, 0x0040fd36u, 0x0040fe75u,
+    0x0040ff66u, 0x004100a5u, 0x004101abu, 0x00410388u, 0x00410476u,
+    0x0041057cu, 0x00410670u, 0x004107cfu, 0x0041097du, 0x00410a2bu,
+    0x00410b2cu, 0x00410bddu, 0x00410cf0u, 0x00410e01u, 0x00410f2au,
+    0x0041105bu, 0x00411123u, 0x004111efu, 0x004112d6u, 0x004113bbu,
+};
+static unsigned s_vita_lua_caught_errors;
+void isaac_vita_log(const char *format, ...);
+
+/* Error path only: answer the throwing site as if the callback returned nil
+ * (the callback itself was already aborted inside Lua, as on PC). */
+static int vita_lua_catch_call_error(CPU *__restrict c, lua_State *state,
+                                     int status)
+{
+    uint32_t ret = ld32(guest_stack_address(c, c->esp, 4U, 0U));
+    const char *text;
+    size_t i;
+
+    for (i = 0; i < sizeof s_vita_lua_throwing_pcall_returns /
+                        sizeof s_vita_lua_throwing_pcall_returns[0]; ++i)
+        if (s_vita_lua_throwing_pcall_returns[i] == ret)
+            break;
+    if (i == sizeof s_vita_lua_throwing_pcall_returns /
+                 sizeof s_vita_lua_throwing_pcall_returns[0])
+        return status;
+    text = lua_tostring(state, -1);
+    ++s_vita_lua_caught_errors;
+    /* shortcut: first 32 then every 1024th; a per-frame callback error
+     * would otherwise write one log line per frame. */
+    if (s_vita_lua_caught_errors <= 32u ||
+        (s_vita_lua_caught_errors & 1023u) == 0u)
+        isaac_vita_log("[isaac-lua] caught Lua error #%u status=%d ret=%08x: "
+                       "%.240s", s_vita_lua_caught_errors, status,
+                       (unsigned)ret, text ? text : "(non-string error)");
+    lua_pop(state, 1);
+    lua_pushnil(state);
+    return LUA_OK;
+}
+#endif
+
 static void vita_lua_pcallk_import(CPU *__restrict c)
 {
     KAGE_VITA_DEEP_SCOPE(KVD_LUA_PCALL);
@@ -2445,11 +2594,19 @@ static void vita_lua_pcallk_import(CPU *__restrict c)
 #if defined(ISAAC_VITA_LUA_GC_PROFILE)
     gc_depth_mark = isaac_vita_lua_gc_profile_depth();
 #endif
+#if defined(ISAAC_VITA_LUA_COST_PROFILE)
+    isaac_vita_lua_cost_mark cost_mark;
+    isaac_vita_lua_cost_pcall_enter(
+        ld32(guest_stack_address(c, c->esp, 4U, 0U)), &cost_mark);
+#endif
     result = lua_pcallk(
         state, (int32_t)vita_lua_arg(c, 1U),
         (int32_t)vita_lua_arg(c, 2U),
         vita_lua_index((int32_t)vita_lua_arg(c, 3U)),
         (lua_KContext)(int32_t)vita_lua_arg(c, 4U), NULL);
+#if defined(ISAAC_VITA_LUA_COST_PROFILE)
+    isaac_vita_lua_cost_pcall_leave(&cost_mark);
+#endif
 #if defined(ISAAC_VITA_DEEP_PROFILE)
     /* Lua errors can bypass ordinary C cleanup in callbacks/GC. Discard
      * those abandoned diagnostic scopes, keeping incomplete time explicit. */
@@ -2470,6 +2627,10 @@ static void vita_lua_pcallk_import(CPU *__restrict c)
     }
 #if defined(ISAAC_VITA_LUA_RECEIPT)
     vita_lua_receipt_pcall(state, result);
+#endif
+#if defined(ISAAC_VITA_LUA_CALL_ERROR_CATCH)
+    if (result != LUA_OK)
+        result = vita_lua_catch_call_error(c, state, result);
 #endif
     c->eax = (uint32_t)result;
     VITA_LUA_END();
@@ -2947,6 +3108,11 @@ void isaac_vita_lua_abort_cpu(CPU *c)
         if (s_vita_lua_callbacks[i].used &&
             s_vita_lua_callbacks[i].cpu == c)
             s_vita_lua_callbacks[i].used = 0;
+#if defined(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+        /* An unused frame slot has no live boundary. */
+        if (!s_vita_lua_callbacks[i].used)
+            g_kage_vita_guest_sampler_lua_cfunction[i] = 0U;
+#endif
     }
     for (i = 0U; i < VITA_LUA_MAX_REQUIRE_DEPTH; ++i) {
         if (s_vita_lua_requires[i].used &&

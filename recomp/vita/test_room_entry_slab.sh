@@ -82,6 +82,16 @@ for compiler in "$host_gcc" "$host_clang"; do
     ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
     UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
         "$work/room-entry-slab-$tag"
+    # Pool-size knob at its 24 MiB-class value: the slab's raw backing is
+    # RAW_MAX_BACKING_BYTES, only the nominal remainder receipt moves.
+    "$compiler" "${host_flags[@]}" \
+        -DISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=0x017fd000U \
+        "$root/runtime/host_vita_room_entry_slab.c" \
+        "$root/runtime/host_vita_room_entry_slab_oracle.c" \
+        -o "$work/room-entry-slab-24m-$tag"
+    ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+    UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+        "$work/room-entry-slab-24m-$tag"
 done
 
 cc="$VITASDK/bin/arm-vita-eabi-gcc"

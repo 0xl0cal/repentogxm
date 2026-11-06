@@ -61,8 +61,9 @@
  * pinned GL thread.  The module never frees a guest object natively and never
  * holds a reference of its own; it only defers the manager's self-erase.
  *
- * HEADROOM.  vglMemFree(RAM) + vglMemFree(VRAM) is sampled once per candidate
- * (two sceClibMspaceMallocStats walks), before any guest work.  Below the
+ * HEADROOM.  vglMemFree(RAM) + vglMemFree(VRAM) (+ PHYCONT with
+ * ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT) is sampled once per candidate
+ * (one sceClibMspaceMallocStats walk per pool), before any guest work.  Below the
  * headroom the resident set must not grow: the candidate is handed to the
  * real observer (freed exactly as OFF frees it) after at most
  * ISAAC_IR_HEADROOM_EVICT_MAX LRU tails were released through the guest
@@ -231,6 +232,14 @@ void isaac_vita_image_retain_report(const char *why);
 /* Snapshot the counters for ph120.ir. */
 void isaac_vita_image_retain_window(isaac_ir_window *out);
 
+#if defined(ISAAC_VITA_IMAGE_RETAIN_GHOST)
+# include "host_vita_image_retain_ghost.h"
+/* Sample vitaGL/kernel free memory into the window minimum (every present). */
+void isaac_vita_image_retain_ghost_sample(void);
+/* Cumulative ghost counters; the memory window is returned and reset. */
+void isaac_vita_image_retain_ghost_take(isaac_irg_stats *st, isaac_irg_mem *mem);
+#endif
+
 #if defined(ISAAC_VITA_IMAGE_RETAIN_WRAP)
 void __wrap_sub_0056d8c0(CPU *__restrict c);
 void __real_sub_0056d8c0(CPU *__restrict c);
@@ -264,6 +273,11 @@ void     isaac_ir_oracle_saturate_stats(void);
 /* The oracle supplies the free-memory model (RAM, VRAM). */
 extern uint32_t isaac_ir_oracle_free_ram(void);
 extern uint32_t isaac_ir_oracle_free_vram(void);
+# if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+extern uint32_t isaac_ir_oracle_free_phycont(void);
+/* Clock for the free-memory reading cache (microseconds). */
+extern uint64_t isaac_ir_oracle_now_us(void);
+# endif
 #endif
 
 #endif /* ISAAC_HOST_VITA_IMAGE_RETAIN_H */

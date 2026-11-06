@@ -64,6 +64,35 @@ _Static_assert(sizeof(archive_tinfl_state) ==
                    ISAAC_VITA_ARCHIVE_MINIZ_STATE_BYTES,
                "frozen tinfl state size changed");
 
+/* ISAAC_VITA_INFLATE_TABLE_MEMO: keep built Huffman tables across blocks of
+ * the archive stream (host_vita_inflate_table_memo.h).  Only the archive
+ * translation unit defines the knob; the PNG entry never compiles it. */
+#if defined(ISAAC_VITA_INFLATE_TABLE_MEMO) && ISAAC_VITA_INFLATE_TABLE_MEMO
+#if defined(ISAAC_MINIZ_ADLER32_UPDATE) || defined(ISAAC_MINIZ_MATCH_COPY) || \
+    defined(ISAAC_MINIZ_HISTORY_UNSAFE) || defined(ISAAC_MINIZ_FIXED_LIT_LOOKUP)
+#error The inflate table memo belongs to the archive tinfl entry only
+#endif
+#include "host_vita_inflate_table_memo.h"
+#define ISAAC_MINIZ_TABLE_MEMO 1
+_Static_assert(sizeof(archive_tinfl_huff_table) ==
+                   ISAAC_VITA_INFLATE_MEMO_TABLE_BYTES,
+               "inflate memo table stride differs from tinfl");
+_Static_assert(offsetof(archive_tinfl_huff_table, look_up) ==
+                   ISAAC_VITA_INFLATE_MEMO_CODE_SIZE_BYTES,
+               "inflate memo look_up offset differs from tinfl");
+_Static_assert(offsetof(archive_tinfl_huff_table, tree) +
+                   sizeof(((archive_tinfl_huff_table *)0)->tree) ==
+                   ISAAC_VITA_INFLATE_MEMO_TABLE_BYTES,
+               "inflate memo built span (look_up + tree) differs from tinfl");
+_Static_assert((int)TINFL_MAX_HUFF_SYMBOLS_0 ==
+                   (int)ISAAC_VITA_INFLATE_MEMO_LIT_MAX &&
+                   (int)TINFL_MAX_HUFF_SYMBOLS_1 ==
+                   (int)ISAAC_VITA_INFLATE_MEMO_DIST_MAX,
+               "inflate memo key bounds differ from tinfl");
+#else
+#define ISAAC_MINIZ_TABLE_MEMO 0
+#endif
+
 #define TINFL_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define TINFL_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define TINFL_CLEAR(value) memset(&(value), 0, sizeof(value))
@@ -278,6 +307,9 @@ int ISAAC_MINIZ_NATIVE_ENTRY(
     do {
         TINFL_GET_BITS(3, r->final, 3);
         r->type = r->final >> 1;
+#if ISAAC_MINIZ_TABLE_MEMO
+        isaac_vita_inflate_memo_note_block(r->type);
+#endif
         if (r->type == 0U) {
             TINFL_SKIP_BITS(5, num_bits & 7U);
             for (counter = 0U; counter < 4U; ++counter) {
@@ -385,6 +417,21 @@ int ISAAC_MINIZ_NATIVE_ENTRY(
                 uint32_t next_code[17];
                 uint32_t total_symbols[16];
 
+#if ISAAC_MINIZ_TABLE_MEMO
+                /* type == 1 here means tables[1] and tables[0] are about to
+                 * be built from final code_size/table_sizes (a fixed block
+                 * enters at 1; a dynamic block reaches 1 after tables[2] and
+                 * its code lengths).  A memo hit writes both look_up/tree
+                 * spans and leaves the loop at the value the build exits
+                 * with: 0 here, then --r->type == UINT32_MAX ends it. */
+                if (r->type == 1U &&
+                        isaac_vita_inflate_memo_lookup(
+                            (uint8_t *)r->tables, r->final >> 1,
+                            r->table_sizes)) {
+                    r->type = 0U;
+                    continue;
+                }
+#endif
                 TINFL_CLEAR(total_symbols);
                 TINFL_CLEAR(table->look_up);
                 TINFL_CLEAR(table->tree);
@@ -485,6 +532,13 @@ int ISAAC_MINIZ_NATIVE_ENTRY(
                            r->table_sizes[1]);
                 }
             }
+#if ISAAC_MINIZ_TABLE_MEMO
+            /* Only reached when the build completed (a failed code set
+             * leaves through state 35 and never resumes); the memo keeps
+             * what a preceding lookup miss asked for, nothing otherwise. */
+            isaac_vita_inflate_memo_store(
+                (const uint8_t *)r->tables, r->final >> 1, r->table_sizes);
+#endif
 
             for (;;) {
                 uint8_t *source;

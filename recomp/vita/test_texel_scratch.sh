@@ -67,6 +67,101 @@ if owners != ["host_vita_texel_scratch.c"]:
 print("Vita texel scratch 8 MiB CMake default/dependency/source scope: PASS")
 PY
 
+python3 - "$root/vita/CMakeLists.txt" "$root/runtime/entry_vita.c" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+options = re.findall(
+    r"option\(ISAAC_VITA_TEXEL_SCRATCH_32M\s+.*?\s+(ON|OFF)\)",
+    text,
+    re.DOTALL,
+)
+if options != ["OFF"]:
+    raise SystemExit("32 MiB texel font option must default exactly OFF")
+if not re.search(
+    r"if\(ISAAC_VITA_TEXEL_SCRATCH_32M AND NOT "
+    r"ISAAC_VITA_TEXEL_SCRATCH\).*?message\(FATAL_ERROR",
+    text,
+    re.DOTALL,
+):
+    raise SystemExit("32 MiB texel option lost its scratch dependency")
+if not re.search(
+    r"if\(ISAAC_VITA_TEXEL_SCRATCH_32M AND "
+    r"ISAAC_VITA_TEXEL_SCRATCH_8M\).*?message\(FATAL_ERROR",
+    text,
+    re.DOTALL,
+):
+    raise SystemExit("32 MiB and 8 MiB texel capacities lost their exclusion")
+lines = text.splitlines()
+markers = [
+    index
+    for index, line in enumerate(lines)
+    if re.fullmatch(r"\s*ISAAC_VITA_TEXEL_SCRATCH_32M=1\)", line)
+]
+if len(markers) != 1:
+    raise SystemExit(
+        f"expected one 32 MiB source definition, found {len(markers)}"
+    )
+marker = markers[0]
+starts = [
+    index
+    for index in range(marker, -1, -1)
+    if "set_property(SOURCE" in lines[index]
+]
+if not starts:
+    raise SystemExit("32 MiB definition is not source-scoped")
+block = "\n".join(lines[starts[0] : marker + 1])
+owners = re.findall(r'"\$\{ISAAC_RUNTIME\}/([^\"]+)"', block)
+if owners != ["entry_vita.c", "host_vita_texel_scratch.c"]:
+    raise SystemExit(
+        f"32 MiB texel definition escaped its owners: {owners}"
+    )
+# The imported heap boundary reads no capacity constant; the base
+# TEXEL_SCRATCH definition must not have regained entry_vita.c, so an OFF
+# build compiles entry_vita.c exactly as before the option existed.
+base_markers = [
+    index
+    for index, line in enumerate(lines)
+    if re.fullmatch(
+        r"\s*APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_TEXEL_SCRATCH=1\)",
+        line,
+    )
+]
+if len(base_markers) != 1:
+    raise SystemExit(
+        f"expected one TEXEL_SCRATCH source definition, found {len(base_markers)}"
+    )
+base_start = [
+    index
+    for index in range(base_markers[0], -1, -1)
+    if "set_property(SOURCE" in lines[index]
+][0]
+base_block = "\n".join(lines[base_start : base_markers[0] + 1])
+base_owners = re.findall(r'"\$\{ISAAC_RUNTIME\}/([^\"]+)"', base_block)
+if base_owners != ["host_vita_heap.c", "host_vita_texel_scratch.c"]:
+    raise SystemExit(
+        f"TEXEL_SCRATCH definition owners drifted: {base_owners}"
+    )
+entry = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+if "isaac_vita_texel_scratch_reserve(" not in entry:
+    raise SystemExit("entry_vita.c lost the early texel scratch reserve")
+if re.search(r"^#if defined\(ISAAC_VITA_TEXEL_SCRATCH\)\s*$", entry, re.M):
+    raise SystemExit(
+        "entry_vita.c must gate the texel reserve on TEXEL_SCRATCH_32M only"
+    )
+guards = re.findall(
+    r"^#if defined\(ISAAC_VITA_TEXEL_SCRATCH_32M\)\s*$", entry, re.M
+)
+if len(guards) != 2:
+    raise SystemExit(
+        f"expected two TEXEL_SCRATCH_32M guards in entry_vita.c, found {len(guards)}"
+    )
+print("Vita texel scratch 32 MiB CMake default/dependency/exclusion/source scope + entry guard: PASS")
+PY
+
 "$host_cc" $common -pthread -DISAAC_VITA_TEXEL_SCRATCH_ORACLE=1 \
     -I"$fake_include" \
     "$root/runtime/host_vita_texel_scratch.c" \
@@ -79,6 +174,12 @@ PY
     "$root/runtime/host_vita_texel_scratch_oracle.c" \
     -o "$work/texel-scratch-8m-host-oracle"
 "$work/texel-scratch-8m-host-oracle"
+"$host_cc" $common -pthread -DISAAC_VITA_TEXEL_SCRATCH_ORACLE=1 \
+    -DISAAC_VITA_TEXEL_SCRATCH_32M=1 -I"$fake_include" \
+    "$root/runtime/host_vita_texel_scratch.c" \
+    "$root/runtime/host_vita_texel_scratch_oracle.c" \
+    -o "$work/texel-scratch-32m-host-oracle"
+"$work/texel-scratch-32m-host-oracle"
 
 # Freeze the actual heap-import order and clean-failure semantics.  A failed
 # USER_RW reservation must continue through ordinary guest malloc; an exact
@@ -130,6 +231,26 @@ routing_common="-std=gnu11 -O2 -Wall -Wextra -Werror \
     -o "$work/texel-scratch-8m-routing-oracle"
 "$work/texel-scratch-8m-routing-oracle"
 
+# The 32 MiB font capacity admits the literal 16/32 MiB Chinese atlases at the
+# same imported heap boundary object; only the texel owner is recompiled.
+"$host_cc" $routing_common -DISAAC_VITA_TEXEL_SCRATCH_ORACLE=1 \
+    -DISAAC_VITA_TEXEL_SCRATCH_32M=1 \
+    -c "$root/runtime/host_vita_texel_scratch.c" \
+    -o "$work/texel-scratch-32m.routing-state.o"
+"$host_cc" $routing_common -DISAAC_VITA_TEXEL_SCRATCH_ORACLE=1 \
+    -DISAAC_VITA_TEXEL_SCRATCH_ROUTING_ORACLE=1 \
+    -DISAAC_VITA_TEXEL_SCRATCH_32M=1 \
+    -c "$root/runtime/host_vita_texel_scratch_oracle.c" \
+    -o "$work/texel-scratch-32m.routing-oracle.o"
+"$host_cc" \
+    "$work/host-vita-heap.texel-routing.o" \
+    "$work/guest.texel-routing.o" \
+    "$work/texel-scratch-32m.routing-state.o" \
+    "$work/texel-scratch-32m.routing-oracle.o" \
+    -Wl,--gc-sections \
+    -o "$work/texel-scratch-32m-routing-oracle"
+"$work/texel-scratch-32m-routing-oracle"
+
 if [ -n "${ISAAC_TEXEL_PE_PATH:-}" ] && \
    [ -n "${ISAAC_TEXEL_GENERATED_DIR:-}" ]; then
     python3 "$root/test_texel_scratch_census.py" \
@@ -175,6 +296,73 @@ if cmp -s "$work/texel-scratch.actual-header.o" \
           "$work/texel-scratch-8m.actual-header.o"; then
     echo "8 MiB texel selection did not change the ARM object" >&2
     exit 3
+fi
+
+"$cc" $arm -DISAAC_VITA_TEXEL_SCRATCH_32M=1 \
+    -c "$root/runtime/host_vita_texel_scratch.c" \
+    -o "$work/texel-scratch-32m.actual-header.o"
+"$cc" $arm -DISAAC_VITA_TEXEL_SCRATCH_32M=1 -I"$fake_include" \
+    -c "$root/runtime/host_vita_texel_scratch.c" \
+    -o "$work/texel-scratch-32m.fake-header.o"
+if ! cmp -s "$work/texel-scratch-32m.actual-header.o" \
+              "$work/texel-scratch-32m.fake-header.o"; then
+    echo "fake sysmem header changed the 32 MiB texel object" >&2
+    exit 3
+fi
+if cmp -s "$work/texel-scratch.actual-header.o" \
+          "$work/texel-scratch-32m.actual-header.o" || \
+   cmp -s "$work/texel-scratch-8m.actual-header.o" \
+          "$work/texel-scratch-32m.actual-header.o"; then
+    echo "32 MiB texel selection did not change the ARM object" >&2
+    exit 3
+fi
+# The early reserve entry exists only in the 32 MiB production object; the
+# default object stays the lazy pre-option build.
+"$nm" --defined-only "$work/texel-scratch-32m.actual-header.o" \
+    > "$work/32m-production.defined"
+"$nm" --defined-only "$work/texel-scratch.actual-header.o" \
+    > "$work/production.defined"
+if ! grep -Eq "[[:space:]]T[[:space:]]+isaac_vita_texel_scratch_reserve$" \
+        "$work/32m-production.defined"; then
+    cat "$work/32m-production.defined" >&2
+    echo "32 MiB production texel object misses the early reserve API" >&2
+    exit 9
+fi
+if grep -q "isaac_vita_texel_scratch_reserve" "$work/production.defined" || \
+   "$nm" "$work/texel-scratch.actual-header.o" | \
+        grep -q "isaac_vita_texel_scratch_reserve"; then
+    echo "default texel object gained the early reserve API (OFF identity)" >&2
+    exit 9
+fi
+
+"$cc" $arm -I"$fake_include" \
+    -DISAAC_VITA_TEXEL_SCRATCH_LINK_PROBE=1 \
+    -DISAAC_VITA_TEXEL_SCRATCH_32M=1 \
+    "$root/runtime/host_vita_texel_scratch.c" \
+    "$root/runtime/host_vita_texel_scratch_oracle.c" \
+    -Wl,--gc-sections -o "$work/texel-scratch-32m-softfp-link.elf"
+"$readelf" -h "$work/texel-scratch-32m-softfp-link.elf" > "$work/32m-header"
+"$readelf" -A "$work/texel-scratch-32m-softfp-link.elf" \
+    > "$work/32m-attributes"
+"$nm" -u "$work/texel-scratch-32m-softfp-link.elf" > "$work/32m-link.undefined"
+"$nm" -u "$work/texel-scratch-32m.actual-header.o" \
+    > "$work/32m-production.undefined"
+if ! grep -q "Version5 EABI, soft-float ABI" "$work/32m-header" || \
+   grep -q "Tag_ABI_VFP_args" "$work/32m-attributes"; then
+    echo "32 MiB texel scratch link is not ARM EABI5 softfp" >&2
+    exit 5
+fi
+if [ -s "$work/32m-link.undefined" ]; then
+    cat "$work/32m-link.undefined" >&2
+    echo "32 MiB fake-sysmem ARM texel link has unresolved symbols" >&2
+    exit 6
+fi
+"$nm" -u "$work/texel-scratch.actual-header.o" \
+    > "$work/production.undefined"
+if ! cmp -s "$work/32m-production.undefined" "$work/production.undefined"; then
+    diff "$work/production.undefined" "$work/32m-production.undefined" >&2 || :
+    echo "32 MiB production texel object changed its dependency set" >&2
+    exit 8
 fi
 
 "$cc" $arm -I"$fake_include" \
@@ -357,11 +545,15 @@ sha256sum \
     "$root/vita/test_texel_scratch.sh" \
     "$work/texel-scratch-host-oracle" \
     "$work/texel-scratch-8m-host-oracle" \
+    "$work/texel-scratch-32m-host-oracle" \
     "$work/texel-scratch-routing-oracle" \
     "$work/texel-scratch-8m-routing-oracle" \
+    "$work/texel-scratch-32m-routing-oracle" \
     "$work/guest.texel-routing.o" \
     "$work/texel-scratch.actual-header.o" \
     "$work/texel-scratch-8m.actual-header.o" \
+    "$work/texel-scratch-32m.actual-header.o" \
     "$work/texel-scratch-softfp-link.elf" \
-    "$work/texel-scratch-8m-softfp-link.elf"
-echo "Vita texel scratch default/8 MiB lifecycle/concurrency/canaries + fallback routing + memblock contract + ARM diff/EABI5 softfp/link: PASS (ARM ELF was not executed)"
+    "$work/texel-scratch-8m-softfp-link.elf" \
+    "$work/texel-scratch-32m-softfp-link.elf"
+echo "Vita texel scratch default/8 MiB/32 MiB lifecycle/concurrency/canaries/early reserve + fallback routing + memblock contract + ARM diff/EABI5 softfp/link: PASS (ARM ELF was not executed)"

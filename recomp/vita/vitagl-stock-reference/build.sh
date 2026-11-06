@@ -59,6 +59,11 @@ fbo_rt_reuse_header="$script_dir/isaac_fbo_rt_reuse.h"
 fbo_rt_reuse_source="$script_dir/isaac_fbo_rt_reuse.c"
 fbo_rt_reuse_lease_patch="$script_dir/0024-isaac-fbo-rt-bounded-lease.patch"
 fbo_rt_interlude_patch="$script_dir/0033-isaac-fbo-rt-interlude-reuse.patch"
+scene_guard_patch="$script_dir/0034-isaac-scene-guard.patch"
+rgb_subupload_patch="$script_dir/0035-isaac-rgb-subupload.patch"
+rgb_subupload_header="$script_dir/isaac_rgb_subupload.h"
+intensity_texture_patch="$script_dir/0037-isaac-intensity-texture.patch"
+intensity_texture_header="$script_dir/isaac_intensity_texture.h"
 coloroffset_link_proof_patch="$script_dir/0022-isaac-coloroffset-link-proof.patch"
 skip_zero_fragment_uniform_patch="$script_dir/0023-isaac-skip-zero-fragment-uniform.patch"
 coloroffset_metadata_once_patch="$script_dir/0026-isaac-coloroffset-metadata-once.patch"
@@ -82,6 +87,9 @@ native_resource_profile=${ISAAC_NATIVE_RESOURCE_PROFILE:-0}
 fbo_rt_reuse=${ISAAC_FBO_RT_REUSE:-0}
 fbo_rt_reuse_lease=${ISAAC_FBO_RT_REUSE_LEASE:-0}
 fbo_rt_interlude_reuse=${ISAAC_FBO_RT_INTERLUDE_REUSE:-0}
+scene_guard=${ISAAC_SCENE_GUARD:-0}
+rgb_subupload=${ISAAC_RGB_SUBUPLOAD:-0}
+intensity_texture=${ISAAC_INTENSITY_TEXTURE:-0}
 fbo_rt_scenes=${ISAAC_FBO_RT_SCENES:-0}
 # 0 = no 0008 patch, 1/2 = diagnostic TRIVIAL/NODISCARD, 3 = gated neutral
 # production specialization. Diagnostic modes intentionally change the picture.
@@ -126,6 +134,9 @@ for value in \
     "fbo_rt_reuse:$fbo_rt_reuse" \
     "fbo_rt_reuse_lease:$fbo_rt_reuse_lease" \
     "fbo_rt_interlude_reuse:$fbo_rt_interlude_reuse" \
+    "scene_guard:$scene_guard" \
+    "rgb_subupload:$rgb_subupload" \
+    "intensity_texture:$intensity_texture" \
     "fbo_rt_scenes:$fbo_rt_scenes" \
     "coloroffset_staging_proof:$coloroffset_staging_proof" \
     "coloroffset_single_final_bind:$coloroffset_single_final_bind" \
@@ -424,11 +435,16 @@ apply_source_patch()
     # 0015 adds declarations immediately after that signature. Keep both native
     # variants supported without changing 0015; all other patches retain the
     # normal context requirement, and the final source is still SHA-checked.
+    # 0034 is applied last and replaces single lines that every supported
+    # source shape shares (zero-context hunks anchored on unique lines).
     patch_context=
     if [ "$patch" = "$laser_light_halo_patch" ] ||
        [ "$patch" = "$laser_light_nearest_patch" ] ||
        [ "$patch" = "$laser_atlas_nearest_patch" ] ||
-       [ "$patch" = "$sdk_sparse_patch" ]; then
+       [ "$patch" = "$sdk_sparse_patch" ] ||
+       [ "$patch" = "$scene_guard_patch" ] ||
+       [ "$patch" = "$rgb_subupload_patch" ] ||
+       [ "$patch" = "$intensity_texture_patch" ]; then
         patch_context=--unidiff-zero
     fi
     # The stock tree declares text=auto.  Without this pin, an ambient Windows
@@ -504,6 +520,11 @@ fbo_rt_reuse_header_sha=$(sha256sum "$fbo_rt_reuse_header" | awk '{print $1}')
 fbo_rt_reuse_source_sha=$(sha256sum "$fbo_rt_reuse_source" | awk '{print $1}')
 fbo_rt_reuse_lease_patch_sha=$(sha256sum "$fbo_rt_reuse_lease_patch" | awk '{print $1}')
 fbo_rt_interlude_patch_sha=$(sha256sum "$fbo_rt_interlude_patch" | awk '{print $1}')
+scene_guard_patch_sha=$(sha256sum "$scene_guard_patch" | awk '{print $1}')
+rgb_subupload_patch_sha=$(sha256sum "$rgb_subupload_patch" | awk '{print $1}')
+rgb_subupload_header_sha=$(sha256sum "$rgb_subupload_header" | awk '{print $1}')
+intensity_texture_patch_sha=$(sha256sum "$intensity_texture_patch" | awk '{print $1}')
+intensity_texture_header_sha=$(sha256sum "$intensity_texture_header" | awk '{print $1}')
 laser_p8_reference_sha=$(sha256sum "$laser_p8_reference" | awk '{print $1}')
 script_sha=$(sha256sum "$script_dir/build.sh" | awk '{print $1}')
 build_flags="SOFTFP_ABI=1 NO_DEBUG=1 NO_SPLASHSCREEN=1 SINGLE_THREADED_GC=1"
@@ -615,11 +636,26 @@ fi
 if [ "$p8_safe_upload" = 1 ]; then
     build_flags="$build_flags HAVE_ISAAC_P8_SAFE_UPLOAD=1"
 fi
+if [ "$rgb_subupload" = 1 ]; then
+    build_flags="$build_flags HAVE_ISAAC_RGB_SUBUPLOAD=1"
+fi
+if [ "$intensity_texture" = 1 ]; then
+    build_flags="$build_flags HAVE_ISAAC_INTENSITY_TEXTURE=1"
+fi
 if [ "$fbo_valid_region" = 1 ]; then
     # 0009 also edits misc.c (glViewport) and tests.c (update_scissor_test);
     # the contract key keeps its name, the patch name records the scope.
     build_flags="$build_flags HAVE_ISAAC_FBO_VALID_REGION=1"
     gxm_source_patch_name="$gxm_source_patch_name+0009-isaac-fbo-valid-region"
+fi
+if [ "$scene_guard" = 1 ]; then
+    # 0034 also edits misc.c (glClear) and tests.c (update_scissor_test).
+    build_flags="$build_flags HAVE_ISAAC_SCENE_GUARD=1"
+    if [ "$gxm_source_patch_name" = none ]; then
+        gxm_source_patch_name=0034-isaac-scene-guard
+    else
+        gxm_source_patch_name="$gxm_source_patch_name+0034-isaac-scene-guard"
+    fi
 fi
 if [ "$laser_atlas_p8" = 1 ]; then
     build_flags="$build_flags HAVE_ISAAC_LASER_ATLAS_P8=1"
@@ -709,7 +745,13 @@ emit_recipe_inputs()
     "$laser_light_nearest_patch_sha" "$laser_light_nearest_policy_sha" \
     "$laser_atlas_nearest" "$laser_atlas_nearest_patch_sha" \
     "$laser_atlas_nearest_policy_sha" "$fbo_float_sync_patch_sha" "$fbo_scissor_resize_patch_sha" \
-    "$fbo_scissor_replay_patch_sha" "$fbo_scissor_replay_region_patch_sha"
+    "$fbo_scissor_replay_patch_sha" "$fbo_scissor_replay_region_patch_sha" \
+    "$scene_guard" "$scene_guard_patch_sha" \
+    "$rgb_subupload" "$rgb_subupload_patch_sha" "$rgb_subupload_header_sha"
+    if [ "$intensity_texture" = 1 ]; then
+        printf '%s\n' 'intensity-texture-v1=1' "$intensity_texture_patch_sha" \
+            "$intensity_texture_header_sha"
+    fi
     # ON changes the embedded cache key and must have a distinct native source
     # directory/marker too. Do not append anything to the legacy OFF recipe.
     if [ "$shader_cache_observer_compat" = 1 ]; then
@@ -943,7 +985,85 @@ if [ ! -f "$marker" ]; then
     if [ "$laser_halo_profile" = 1 ]; then
         apply_source_patch "$white_census_patch"
     fi
+    # Isaac scene guard (0034) last: it wraps lines every shape above shares
+    # (gxm.c scene_reset/scene_end, misc.c glClear, tests.c update_scissor_test).
+    if [ "$scene_guard" = 1 ]; then
+        apply_source_patch "$scene_guard_patch"
+    fi
+    if [ "$rgb_subupload" = 1 ]; then
+        apply_source_patch "$rgb_subupload_patch"
+        cp -- "$rgb_subupload_header" "$source_dir/source/isaac_rgb_subupload.h"
+    fi
+    if [ "$intensity_texture" = 1 ]; then
+        apply_source_patch "$intensity_texture_patch"
+        cp -- "$intensity_texture_header" "$source_dir/source/isaac_intensity_texture.h"
+    fi
     printf '%s\n' "$recipe" > "$marker"
+fi
+if [ "$intensity_texture" = 1 ]; then
+    verify_sha "$source_dir/source/isaac_intensity_texture.h" "$intensity_texture_header_sha"
+    for file in textures.c shared.h utils/gpu_utils.h; do
+        if ! grep -Fq HAVE_ISAAC_INTENSITY_TEXTURE "$source_dir/source/$file"; then
+            echo "intensity texture lifecycle hook missing: $file" >&2
+            exit 5
+        fi
+    done
+else
+    if grep -Fq HAVE_ISAAC_INTENSITY_TEXTURE "$source_dir/source/textures.c" \
+            "$source_dir/source/shared.h" "$source_dir/source/utils/gpu_utils.h"; then
+        echo "intensity texture storage escaped its opt-in source" >&2
+        exit 5
+    fi
+fi
+if [ "$rgb_subupload" = 1 ]; then
+    verify_sha "$source_dir/source/isaac_rgb_subupload.h" "$rgb_subupload_header_sha"
+    for evidence in 'vglIsaacRgbSubuploadSnapshot' 'isaac_rgb_subupload_full_replace(' 'isaac_rgb_subupload_rows('; do
+        if [ "$(grep -Fc "$evidence" "$source_dir/source/textures.c")" != 1 ]; then
+            echo "stock vitaGL RGB subupload patch is incomplete: $evidence" >&2
+            exit 5
+        fi
+    done
+else
+    if grep -Fq 'isaac_rgb_subupload' "$source_dir/source/textures.c"; then
+        echo "RGB subupload escaped its opt-in source" >&2
+        exit 5
+    fi
+fi
+if [ "$scene_guard" = 1 ]; then
+    for evidence in '#ifdef HAVE_ISAAC_SCENE_GUARD' 'static GLboolean isaac_scene_open = GL_FALSE;' \
+            'isaac_scene_guard_note_begin_scene(r);' 'isaac_scene_guard_note_rt(r);' \
+            'void vglIsaacSceneGuardSnapshot(uint32_t out[8]) {' 'uint32_t vglIsaacSceneGuardChanged(void) {' \
+            'void vglIsaacSceneGuardRecovery(uint32_t out[4]) {' 'isaac_scene_guard_note_end_scene(isaac_end_r);' \
+            'if (!isaac_scene_open && !isaac_scene_dangling) {'; do
+        if ! grep -Fq "$evidence" "$source_dir/source/gxm.c"; then
+            echo "stock vitaGL scene guard patch is incomplete: $evidence" >&2
+            exit 5
+        fi
+    done
+    if [ "$(grep -Fc 'isaac_scene_guard_note_begin_scene(r);' "$source_dir/source/gxm.c")" != 2 ]; then
+        echo "stock vitaGL scene guard patch is incomplete: both sceGxmBeginScene sites" >&2
+        exit 5
+    fi
+    for evidence in 'if (!isaacSceneGuardOpen()) {' 'if (!isaacSceneGuardReserveVertex(&vbuffer))' \
+            'if (!isaacSceneGuardReserveFragment(&fbuffer))'; do
+        if ! grep -Fq "$evidence" "$source_dir/source/misc.c"; then
+            echo "stock vitaGL scene guard patch is incomplete: misc.c $evidence" >&2
+            exit 5
+        fi
+    done
+    if [ "$(grep -Fc 'isaacSceneGuardReserveVertex(&vertex_buffer);' "$source_dir/source/tests.c")" != 2 ]; then
+        echo "stock vitaGL scene guard patch is incomplete: tests.c mask sites" >&2
+        exit 5
+    fi
+    if grep -Fq 'SceneGuard' "$source_dir/source/vitaGL.h" || grep -Fq 'SceneGuard' "$source_dir/source/shared.h"; then
+        echo "scene guard hook leaked into vitaGL.h/shared.h" >&2
+        exit 5
+    fi
+else
+    if grep -Eq 'HAVE_ISAAC_SCENE_GUARD|SceneGuard' "$source_dir/source/gxm.c" "$source_dir/source/misc.c" "$source_dir/source/tests.c"; then
+        echo "stock vitaGL source unexpectedly contains the scene guard" >&2
+        exit 5
+    fi
 fi
 if [ "$skip_zero_fragment_uniform" = 1 ]; then
     if [ "$(grep -Fc 'if (ISAAC_FRAGMENT_DEFAULT_UNIFORM_NEEDED(p)) {' "$source_dir/source/custom_shaders.c")" != 2 ]; then
@@ -1452,6 +1572,15 @@ fi
 if [ "$fbo_rt_interlude_reuse" = 1 ]; then
     extra_cflags="$extra_cflags -DHAVE_ISAAC_FBO_RT_INTERLUDE_REUSE=1"
 fi
+if [ "$scene_guard" = 1 ]; then
+    extra_cflags="$extra_cflags -DHAVE_ISAAC_SCENE_GUARD=1"
+fi
+if [ "$rgb_subupload" = 1 ]; then
+    extra_cflags="$extra_cflags -DHAVE_ISAAC_RGB_SUBUPLOAD=1"
+fi
+if [ "$intensity_texture" = 1 ]; then
+    extra_cflags="$extra_cflags -DHAVE_ISAAC_INTENSITY_TEXTURE=1"
+fi
 if [ "$fbo_rt_scenes" = 1 ]; then
     extra_cflags="$extra_cflags -DHAVE_ISAAC_FBO_RT_SCENES=1"
 fi
@@ -1499,6 +1628,7 @@ fi
 # another vitaGL profile. The stock flags, exact behavior switches and
 # independent proof-counter switch define the whole behavioral set.
 env -i PATH="$PATH" VITASDK="$VITASDK" SOURCE_DATE_EPOCH="$source_epoch" \
+    TMPDIR="${TMPDIR:-/tmp}" \
     make --directory="$source_dir" \
     --jobs="$jobs" \
     VGL_GIT_HASH="$source_short" \
@@ -1516,6 +1646,20 @@ if [ ! -s "$built_library" ] || [ ! -s "$built_header" ]; then
     exit 6
 fi
 nm_symbols=$("$VITASDK/bin/arm-vita-eabi-nm" -g "$built_library")
+for endpoint in isaacIntensityPrepare isaacIntensityRelease vglIsaacIntensitySnapshot; do
+    case "$intensity_texture:$nm_symbols" in
+    1:*"$endpoint"*) ;;
+    1:*) echo "intensity texture archive lacks $endpoint" >&2; exit 6 ;;
+    0:*"$endpoint"*) echo "intensity texture endpoint escaped OFF: $endpoint" >&2; exit 6 ;;
+    0:*) ;;
+    esac
+done
+case "$rgb_subupload:$nm_symbols" in
+1:*vglIsaacRgbSubuploadSnapshot*) ;;
+1:*) echo "RGB subupload archive lacks its snapshot endpoint" >&2; exit 6 ;;
+0:*vglIsaacRgbSubuploadSnapshot*) echo "RGB subupload endpoint escaped OFF" >&2; exit 6 ;;
+0:*) ;;
+esac
 case "$shader_cache:$nm_symbols" in
 1:*vglGetIsaacShaderCacheStats*) ;;
 1:*)
@@ -1528,6 +1672,20 @@ case "$shader_cache:$nm_symbols" in
     ;;
 0:*) ;;
 esac
+# The archive exports the scene guard snapshot and change edge iff the guard is on.
+if [ "$scene_guard" = 1 ]; then
+    for endpoint in vglIsaacSceneGuardSnapshot vglIsaacSceneGuardChanged; do
+        if ! printf '%s\n' "$nm_symbols" | grep -Fq "$endpoint"; then
+            echo "scene guard stock vitaGL archive lacks $endpoint" >&2
+            exit 6
+        fi
+    done
+else
+    if printf '%s\n' "$nm_symbols" | grep -Fq vglIsaacSceneGuard; then
+        echo "scene guard endpoints escaped their opt-in build" >&2
+        exit 6
+    fi
+fi
 if [ "$coloroffset_optimizations" = 1 ]; then
     for endpoint in vglIsaacMarkColorOffsetShader vglGetIsaacColorOffsetStats; do
         if ! printf '%s\n' "$nm_symbols" | grep -Fq "$endpoint"; then
@@ -1705,6 +1863,9 @@ printf '%s\n' "$recipe" > "$output_root/recipe.txt"
     printf 'fbo_scissor_replay_patch_sha256=%s\n' "$fbo_scissor_replay_patch_sha"
     printf 'fbo_scissor_replay_region_patch_sha256=%s\n' "$fbo_scissor_replay_region_patch_sha"
     printf 'flags=%s\n' "$build_flags"
+    printf 'intensity_texture=%s\n' "$intensity_texture"
+    printf 'intensity_texture_patch_sha256=%s\n' "$intensity_texture_patch_sha"
+    printf 'intensity_texture_header_sha256=%s\n' "$intensity_texture_header_sha"
     printf 'gpu_draw_optimizations=%s\n' "$gpu_draw_optimizations"
     printf 'gpu_draw_patch_sha256=%s\n' "$gpu_draw_patch_sha"
     printf 'gpu_draw_policy_sha256=%s\n' "$gpu_draw_policy_sha"
@@ -1763,6 +1924,11 @@ printf '%s\n' "$recipe" > "$output_root/recipe.txt"
     printf 'fbo_rt_reuse_lease_patch_sha256=%s\n' "$fbo_rt_reuse_lease_patch_sha"
     printf 'fbo_rt_interlude_reuse=%s\n' "$fbo_rt_interlude_reuse"
     printf 'fbo_rt_interlude_patch_sha256=%s\n' "$fbo_rt_interlude_patch_sha"
+    printf 'scene_guard=%s\n' "$scene_guard"
+    printf 'scene_guard_patch_sha256=%s\n' "$scene_guard_patch_sha"
+    printf 'rgb_subupload=%s\n' "$rgb_subupload"
+    printf 'rgb_subupload_patch_sha256=%s\n' "$rgb_subupload_patch_sha"
+    printf 'rgb_subupload_header_sha256=%s\n' "$rgb_subupload_header_sha"
     printf 'fbo_rt_reuse_lease_policy=%s\n' 'one-spare; one-extra-rotation; current-retirement-Collect-witness; Finish-is-not-EndScene'
     printf 'native_resource_patch_sha256=%s\n' "$native_resource_patch_sha"
     printf 'native_resource_api_sha256=%s\n' "$native_resource_api_sha"

@@ -153,10 +153,9 @@ _Static_assert(ROOM_SLAB_PAGE_CAP *
                    ISAAC_VITA_ROOM_ENTRY_SLAB_SLOTS_PER_PAGE ==
                    ROOM_SLAB_SLOT_CAP,
                "room-entry total slot bound drifted");
-_Static_assert(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES -
-                   ISAAC_VITA_ROOM_ENTRY_SLAB_RAW_MAX_BACKING_BYTES ==
-                   ISAAC_VITA_ROOM_ENTRY_SLAB_NOMINAL_RAW_REMAINDER,
-               "room-entry nominal request remainder drifted");
+_Static_assert(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES >
+                   ISAAC_VITA_ROOM_ENTRY_SLAB_RAW_MAX_BACKING_BYTES,
+               "overflow mspace must hold the whole raw slab backing");
 _Static_assert(ROOM_SLAB_PAGE_CAP <=
                    ROOM_SLAB_NONFULL_WORDS * 32U,
                "room-entry non-full page mask must cover every page");

@@ -1,0 +1,53 @@
+diff --git a/source/textures.c b/source/textures.c
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -947,1 +947,22 @@
++#ifdef HAVE_ISAAC_RGB_SUBUPLOAD
++#include "isaac_rgb_subupload.h"
++static uint32_t isaac_rgb_subupload_entries, isaac_rgb_subupload_rects;
++static uint32_t isaac_rgb_subupload_elisions;
++static uint64_t isaac_rgb_subupload_elided_bytes;
++static void isaac_rgb_subupload_count(uint32_t *value) {
++	if (*value != UINT32_MAX) ++*value;
++}
++/* Consumer-declared, like the other Isaac endpoints; not part of vitaGL.h. */
++void vglIsaacRgbSubuploadSnapshot(uint32_t out[6]) {
++	out[0] = isaac_rgb_subupload_entries;
++	out[1] = isaac_rgb_subupload_rects;
++	out[2] = isaac_rgb_subupload_elisions;
++	out[3] = (uint32_t)isaac_rgb_subupload_elided_bytes;
++	out[4] = (uint32_t)(isaac_rgb_subupload_elided_bytes >> 32);
++	out[5] = ISAAC_RGB_SUBUPLOAD_NEON;
++}
++#endif
+ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
++#ifdef HAVE_ISAAC_RGB_SUBUPLOAD
++	isaac_rgb_subupload_count(&isaac_rgb_subupload_entries);
++#endif
+@@ -1003,1 +1024,16 @@
++#ifdef HAVE_ISAAC_RGB_SUBUPLOAD
++		if (isaac_rgb_subupload_full_replace(
++				texture_data != NULL && tex->status == TEX_VALID && bpp == 4 &&
++				target == GL_TEXTURE_2D && format == GL_RGB && type == GL_UNSIGNED_BYTE &&
++				tex_format == SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR &&
++				sceGxmTextureGetType(&tex->gxm_tex) == SCE_GXM_TEXTURE_LINEAR,
++				level, xoffset, yoffset, width, height, orig_w, orig_h,
++				tex->mip_count, unpack_row_len, pixels)) {
++			isaac_rgb_subupload_count(&isaac_rgb_subupload_elisions);
++			if (isaac_rgb_subupload_elided_bytes > UINT64_MAX - size)
++				isaac_rgb_subupload_elided_bytes = UINT64_MAX;
++			else
++				isaac_rgb_subupload_elided_bytes += size;
++		} else
++#endif
+ 		vgl_fast_memcpy(texture_data, tex->data, size);
+@@ -1253,1 +1289,9 @@
++#ifdef HAVE_ISAAC_RGB_SUBUPLOAD
++		} else if (level == 0 && bpp == 4 && data_bpp == 3 &&
++				(uintptr_t)read_cb == (uintptr_t)read_rgb888 &&
++				(uintptr_t)write_cb == (uintptr_t)write_rgba8888 &&
++				isaac_rgb_subupload_rows(ptr, mip_stride, (const uint8_t *)pixels,
++					unpack_row_len, width, height)) {
++			isaac_rgb_subupload_count(&isaac_rgb_subupload_rects);
++#endif
+ 		} else { // Executing texture modification via callbacks

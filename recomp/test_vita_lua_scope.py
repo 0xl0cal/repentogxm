@@ -51,6 +51,7 @@ def build_and_run(fastpath: int, lua_source: Path | None,
         ["cl", "/nologo", "/std:c11", "/O2", "/W4", "/WX", "/MT", "/wd4310",
          f"/DISAAC_VITA_LUA_SCOPE_FASTPATH={fastpath}",
          "/DISAAC_VITA_LUA_NATIVE_GETCLASS=1",
+         "/DISAAC_VITA_LUA_CALL_ERROR_CATCH=1",
          f"/I{quote(source / 'src')}", f"/I{quote(RUNTIME)}", "/c"]
         + [quote(path) for path in bridge_sources]
     )

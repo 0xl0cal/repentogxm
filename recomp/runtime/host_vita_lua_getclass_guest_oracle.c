@@ -25,11 +25,32 @@
  * canBeConst byte with garbage upper bytes, the relative-index quirk
  * (index -2 checks one slot and returns another), an index beyond the top,
  * and the seam as the outermost owner while its own GC step runs a guest
- * __gc that re-enters the wrap (getExact, as the game's __gc chain does). */
+ * __gc that re-enters the wrap (getExact, as the game's __gc chain does).
+ *
+ * Lua-state exactness (the shared gate of the RENDER60 S3.2 Lua levers):
+ *   - every luaC_step is seen by this file's luaC_step (the test compiles
+ *     lgc.c with -DluaC_step=isaac_oracle_luaC_step_real), which records the
+ *     GC point: L->top, the live stack slots, debt, total bytes, collector
+ *     state, CallInfo depth, and whether the step moved the Lua stack;
+ *   - exact cases (no GC: debt forced negative): the translated body, the
+ *     API path and the wrap start from the same string cache, debt and
+ *     dead-slot residue and must leave the same string cache, debt, total
+ *     bytes and live stack;
+ *   - GC transcripts: the same script on fresh Lua states in a reset
+ *     deterministic arena (same addresses), once per variant, under forced
+ *     collector steps inside the seam, guest and Lua finalizers, a finalizer
+ *     that grows the Lua stack (moves it) and one that rehashes the registry
+ *     and a class table; the GC-point records, finalizer order and results
+ *     must agree, and with ISAAC_VITA_LUA_GETCLASS_DIRECT the API path and
+ *     the direct path must leave byte-identical arenas;
+ *   - ISAAC_VITA_LUA_GETCLASS_DIRECT: the node memo's hit, miss and stale
+ *     paths, including a hit on a key whose value was removed. */
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>      /* _msize: heap_poison_free */
 #include <string.h>
 
 #include <windows.h>
@@ -37,6 +58,9 @@
 #include "lua.h"
 #include "lauxlib.h"
 #include "lstate.h"      /* G(L)/luaE_setdebt: the GC-inside-the-seam stress */
+#include "lgc.h"         /* luaC_step (the GC-point hook), collector states */
+#include "lfunc.h"       /* UpVal: the heap digest */
+#include "ltable.h"      /* gkey/gval/gnext: the heap digest */
 
 #include "host_vita_lua.h"
 #include "host_vita_lua_getclass.h"
@@ -121,14 +145,463 @@ int guest_stack_owner_violation(CPU *__restrict c, uint32_t pc)
     return 0;
 }
 
-void *isaac_vita_guest_malloc(size_t size) { return malloc(size); }
+/* --- deterministic arena (GC transcripts) -------------------------------------
+ *
+ * The transcripts run one script on fresh Lua states, once per variant.  While
+ * s_arena_on, every allocation of the bridge's luaL_newstate allocator comes
+ * from this reservation, which is zeroed and given empty free lists before
+ * each run, so two runs that make the same allocation sequence get the same
+ * addresses and leave the same bytes.  16-byte size classes below 64 KiB and
+ * one first-fit list above; every reallocation that changes the size class
+ * moves the block (the most hostile choice for code that keeps stack or node
+ * pointers across an allocation). */
+#define ARENA_BYTES   (96U << 20)
+#define ARENA_HEADER  16U
+#define ARENA_CLASSES 4096U
+#define ARENA_LIVE    0xa110c8edU
+
+static uint8_t *s_arena;
+static int s_arena_on;
+static uint32_t s_arena_bump, s_arena_high, s_arena_live, s_arena_failed;
+static uint32_t s_arena_free[ARENA_CLASSES + 1U];   /* header offset + 1; 0 = empty */
+
+static uint32_t *arena_header(uint32_t at)
+{
+    return (uint32_t *)(void *)(s_arena + at);
+}
+
+static int arena_owns(const void *pointer)
+{
+    return s_arena != NULL && (const uint8_t *)pointer >= s_arena + ARENA_HEADER &&
+           (const uint8_t *)pointer < s_arena + ARENA_BYTES;
+}
+
+static uint32_t arena_class(uint32_t capacity)
+{
+    return capacity / 16U < ARENA_CLASSES ? capacity / 16U : ARENA_CLASSES;
+}
+
+static void *arena_alloc(size_t size)
+{
+    uint32_t capacity, cls, at;
+    if (size == 0U || size > ARENA_BYTES / 2U) {
+        ++s_arena_failed;
+        return NULL;
+    }
+    capacity = ((uint32_t)size + 15U) & ~15U;
+    cls = arena_class(capacity);
+    if (cls < ARENA_CLASSES && s_arena_free[cls] != 0U) {
+        at = s_arena_free[cls] - 1U;
+        s_arena_free[cls] = arena_header(at)[1];
+    } else {
+        uint32_t *link = &s_arena_free[ARENA_CLASSES];
+        at = UINT32_MAX;
+        if (cls == ARENA_CLASSES) {
+            while (*link != 0U) {
+                uint32_t candidate = *link - 1U;
+                if (arena_header(candidate)[0] >= capacity) {
+                    *link = arena_header(candidate)[1];
+                    at = candidate;
+                    break;
+                }
+                link = &arena_header(candidate)[1];
+            }
+        }
+        if (at == UINT32_MAX) {
+            if (ARENA_BYTES - s_arena_bump < ARENA_HEADER + capacity) {
+                ++s_arena_failed;
+                return NULL;
+            }
+            at = s_arena_bump;
+            s_arena_bump += ARENA_HEADER + capacity;
+            if (s_arena_bump > s_arena_high)
+                s_arena_high = s_arena_bump;
+            arena_header(at)[0] = capacity;
+        }
+    }
+    arena_header(at)[1] = ARENA_LIVE;
+    ++s_arena_live;
+    return s_arena + at + ARENA_HEADER;
+}
+
+/* Freed payloads are poisoned, so a read through a stale pointer (a memo
+ * node in a freed node array, a pre-reallocation StkId) returns 0xA5 bytes
+ * -- a tag no TValue has -- instead of the old, still-correct value and
+ * shows up as a wrong result, a heap mismatch or a fault, not only in a
+ * counter (with the memo validation removed, the unpoisoned
+ * arena kept every comparison equal).  Deterministic, so runs stay
+ * comparable. */
+#define ARENA_POISON 0xa5
+
+static void arena_free(void *pointer)
+{
+    uint32_t at = (uint32_t)((uint8_t *)pointer - s_arena) - ARENA_HEADER;
+    uint32_t cls = arena_class(arena_header(at)[0]);
+    if (arena_header(at)[1] != ARENA_LIVE) {
+        ++s_arena_failed;              /* double free / foreign pointer */
+        return;
+    }
+    memset(s_arena + at + ARENA_HEADER, ARENA_POISON, arena_header(at)[0]);
+    arena_header(at)[1] = s_arena_free[cls];
+    s_arena_free[cls] = at + 1U;
+    --s_arena_live;
+}
+
+static void *arena_realloc(void *pointer, size_t size)
+{
+    uint32_t at, capacity;
+    void *moved;
+    if (pointer == NULL)
+        return arena_alloc(size);
+    at = (uint32_t)((uint8_t *)pointer - s_arena) - ARENA_HEADER;
+    capacity = arena_header(at)[0];
+    if ((((uint32_t)size + 15U) & ~15U) == capacity)
+        return pointer;
+    moved = arena_alloc(size);
+    if (moved == NULL)
+        return NULL;
+    memcpy(moved, pointer, capacity < size ? capacity : size);
+    arena_free(pointer);
+    return moved;
+}
+
+static int arena_reset(void)
+{
+    if (s_arena == NULL) {
+        s_arena = (uint8_t *)VirtualAlloc(NULL, ARENA_BYTES, MEM_RESERVE | MEM_COMMIT,
+                                          PAGE_READWRITE);
+        if (s_arena == NULL)
+            return 0;
+    }
+    memset(s_arena, 0, s_arena_high);
+    memset(s_arena_free, 0, sizeof s_arena_free);
+    s_arena_bump = s_arena_high = s_arena_live = s_arena_failed = 0U;
+    return 1;
+}
+
+void *isaac_vita_guest_malloc(size_t size)
+{
+    return s_arena_on ? arena_alloc(size) : malloc(size);
+}
+
+/* Outside the arena (exact and memo cases) the C heap gets the same two
+ * properties: a freed block is poisoned (its size from the CRT's _msize; the
+ * oracle is MSVC-only, it already uses VirtualAlloc) and a reallocation always
+ * moves, so a stale pointer never reads the old bytes there either. */
+static void heap_poison_free(void *pointer)
+{
+    if (pointer != NULL)
+        memset(pointer, ARENA_POISON, _msize(pointer));
+    free(pointer);
+}
+
 void *isaac_vita_guest_realloc(void *pointer, size_t size, int *valid_owner)
 {
+    void *moved;
+    size_t old_size;
     if (valid_owner)
         *valid_owner = 1;
-    return realloc(pointer, size);
+    if (arena_owns(pointer) || (pointer == NULL && s_arena_on))
+        return arena_realloc(pointer, size);
+    if (pointer == NULL || size == 0U)
+        return realloc(pointer, size);
+    moved = malloc(size);
+    if (moved == NULL)
+        return NULL;
+    old_size = _msize(pointer);
+    memcpy(moved, pointer, old_size < size ? old_size : size);
+    heap_poison_free(pointer);
+    return moved;
 }
-int isaac_vita_guest_free(void *pointer) { free(pointer); return 1; }
+
+int isaac_vita_guest_free(void *pointer)
+{
+    if (arena_owns(pointer))
+        arena_free(pointer);
+    else
+        heap_poison_free(pointer);
+    return 1;
+}
+
+/* --- Lua-state snapshots ------------------------------------------------------ */
+
+#define FNV64_INIT  0xcbf29ce484222325ULL
+#define FNV64_PRIME 0x00000100000001b3ULL
+
+static uint64_t fnv_bytes(uint64_t h, const void *data, size_t size)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    while (size-- != 0U) {
+        h ^= *p++;
+        h *= FNV64_PRIME;
+    }
+    return h;
+}
+
+static uint64_t fnv_u32(uint64_t h, uint32_t value)
+{
+    return fnv_bytes(h, &value, sizeof value);
+}
+
+/* The bytes of a stack slot Lua writes: value_ and tt_, not the alignment
+ * padding after tt_. */
+#define SLOT_BYTES (offsetof(TValue, tt_) + sizeof(int))
+
+/* What a slot means: its tag and the value field the tag selects (a nil or
+ * boolean slot keeps stale bytes in the rest of value_). */
+static uint64_t fnv_slot_meaning(uint64_t h, const TValue *o)
+{
+    h = fnv_u32(h, (uint32_t)rttype(o));
+    if (iscollectable(o))
+        return fnv_u32(h, (uint32_t)(uintptr_t)gcvalue(o));
+    switch (ttype(o)) {
+    case LUA_TNUMINT: {
+        lua_Integer i = ivalue(o);
+        return fnv_bytes(h, &i, sizeof i);
+    }
+    case LUA_TNUMFLT: {
+        lua_Number n = fltvalue(o);
+        return fnv_bytes(h, &n, sizeof n);
+    }
+    case LUA_TBOOLEAN:
+        return fnv_u32(h, (uint32_t)bvalue(o));
+    case LUA_TLIGHTUSERDATA:
+        return fnv_u32(h, (uint32_t)(uintptr_t)pvalue(o));
+    case LUA_TLCF:
+        return fnv_u32(h, (uint32_t)(uintptr_t)fvalue(o));
+    default:
+        return h;
+    }
+}
+
+/* One collector step as luaC_step (below) sees it on entry. */
+typedef struct gc_record {
+    uint32_t seq;
+    uint32_t in_seam;
+    int32_t gcstate;
+    int32_t debt;
+    uint32_t total;
+    int32_t top;            /* L->top - L->stack */
+    int32_t stacksize;
+    int32_t ci_depth;
+    uint32_t moved;         /* the step reallocated the Lua stack */
+    uint64_t live;          /* meaning of [stack, top) */
+    uint64_t image;         /* meaning of the whole stack, dead slots included */
+} gc_record;
+
+#define GC_KEEP 2048U
+
+typedef struct gc_transcript {
+    uint32_t points, in_seam, moved, moved_in_seam;
+    uint64_t meaning;       /* every record except its image */
+    uint64_t image;         /* every record's image */
+    uint32_t kept;
+    gc_record first[GC_KEEP];
+} gc_transcript;
+
+/* One GC transcript run (run_transcript). */
+typedef struct transcript {
+    gc_transcript gc;
+    uint64_t fin;           /* finalizer order: (kind, object serial) */
+    uint32_t fin_calls;
+    uint64_t results;       /* every probe result */
+    uint32_t result_count, result_bad;
+    uint64_t heap;          /* heap_digest() before lua_close */
+    uint32_t heap_objects;
+    uint64_t arena;         /* arena bytes [0, high) before lua_close (informational) */
+    uint32_t arena_high, arena_live_after_close, arena_failed;
+    int32_t debt;
+    uint32_t total;
+    int32_t gcstate;
+    uint32_t handled, fallbacks;
+    uint32_t memo[8];       /* ISAAC_LGC_MEMO_COUNT deltas (direct path) */
+} transcript;
+
+/* What the Lua heap means, object by object: every collectable object on
+ * allgc / finobj / tobefnz / fixedgc and every short string in the string
+ * table (address, list link, tag, mark bits and the fields Lua reads), the
+ * global state's collector fields, string cache and tag-method names, and the
+ * thread's live stack.  Raw arena bytes are not a sound comparison: Lua copies
+ * C-stack temporaries into the heap whole (lapi.c lua_rawsetp's `TValue k`
+ * reaches a node key through luaH_set), so the half of value_ a light
+ * userdata does not use and the padding after tt_ carry whatever the C stack
+ * held there -- bytes no Lua operation reads.  Run in the deterministic arena,
+ * equal allocation sequences give equal addresses, so pointers are compared
+ * as values. */
+static uint64_t fnv_ptr(uint64_t h, const void *pointer)
+{
+    return fnv_u32(h, (uint32_t)(uintptr_t)pointer);
+}
+
+static uint64_t digest_object(uint64_t h, const GCObject *o)
+{
+    int i;
+    h = fnv_ptr(h, o);
+    h = fnv_ptr(h, o->next);
+    h = fnv_u32(h, o->tt);
+    h = fnv_u32(h, o->marked);
+    switch (o->tt) {
+    case LUA_TSHRSTR:
+    case LUA_TLNGSTR: {
+        const TString *ts = gco2ts(o);
+        size_t len = tsslen(ts);
+        h = fnv_u32(h, ts->extra);
+        h = fnv_u32(h, ts->hash);
+        h = fnv_u32(h, (uint32_t)len);
+        if (o->tt == LUA_TSHRSTR)
+            h = fnv_ptr(h, ts->u.hnext);
+        return fnv_bytes(h, getstr(ts), len);
+    }
+    case LUA_TTABLE: {
+        const Table *t = gco2t(o);
+        unsigned int k;
+        h = fnv_u32(h, t->flags);
+        h = fnv_u32(h, t->lsizenode);
+        h = fnv_u32(h, t->sizearray);
+        h = fnv_ptr(h, t->array);
+        h = fnv_ptr(h, t->node);
+        h = fnv_ptr(h, t->lastfree);
+        h = fnv_ptr(h, t->metatable);
+        h = fnv_ptr(h, t->gclist);
+        for (k = 0U; k < t->sizearray; ++k)
+            h = fnv_slot_meaning(h, &t->array[k]);
+        for (i = 0; i < sizenode(t); ++i) {
+            const Node *n = &t->node[i];
+            h = fnv_slot_meaning(h, gkey(n));
+            h = fnv_u32(h, (uint32_t)gnext(n));
+            h = fnv_slot_meaning(h, gval(n));
+        }
+        return h;
+    }
+    case LUA_TUSERDATA: {
+        const Udata *u = gco2u(o);
+        TValue user;
+        user.value_ = u->user_;
+        settt_(&user, u->ttuv_);
+        h = fnv_ptr(h, u->metatable);
+        h = fnv_u32(h, (uint32_t)u->len);
+        h = fnv_slot_meaning(h, &user);
+        /* newud's serial; the rest of every block is never written */
+        return u->len >= 4U ? fnv_bytes(h, getudatamem(u), 4U) : h;
+    }
+    case LUA_TLCL: {
+        const LClosure *cl = gco2lcl(o);
+        h = fnv_u32(h, cl->nupvalues);
+        h = fnv_ptr(h, cl->gclist);
+        h = fnv_ptr(h, cl->p);
+        for (i = 0; i < cl->nupvalues; ++i) {
+            const UpVal *uv = cl->upvals[i];
+            h = fnv_ptr(h, uv);
+            if (uv != NULL) {
+                h = fnv_ptr(h, uv->v);
+                h = fnv_u32(h, (uint32_t)uv->refcount);
+                h = fnv_slot_meaning(h, uv->v);
+            }
+        }
+        return h;
+    }
+    case LUA_TCCL: {
+        const CClosure *cl = gco2ccl(o);
+        h = fnv_u32(h, cl->nupvalues);
+        h = fnv_ptr(h, cl->gclist);
+        h = fnv_u32(h, (uint32_t)(uintptr_t)cl->f);
+        for (i = 0; i < cl->nupvalues; ++i)
+            h = fnv_slot_meaning(h, &cl->upvalue[i]);
+        return h;
+    }
+    case LUA_TPROTO: {
+        const Proto *p = gco2p(o);
+        h = fnv_u32(h, p->numparams);
+        h = fnv_u32(h, p->is_vararg);
+        h = fnv_u32(h, p->maxstacksize);
+        h = fnv_u32(h, (uint32_t)p->sizecode);
+        h = fnv_bytes(h, p->code, sizeof(Instruction) * (size_t)p->sizecode);
+        for (i = 0; i < p->sizek; ++i)
+            h = fnv_slot_meaning(h, &p->k[i]);
+        for (i = 0; i < p->sizep; ++i)
+            h = fnv_ptr(h, p->p[i]);
+        h = fnv_ptr(h, p->cache);
+        h = fnv_ptr(h, p->source);
+        return fnv_ptr(h, p->gclist);
+    }
+    default:
+        return h;
+    }
+}
+
+static uint64_t heap_digest(lua_State *L, uint32_t *objects)
+{
+    global_State *g = G(L);
+    GCObject *lists[4];
+    const TValue *slot;
+    uint64_t h = FNV64_INIT;
+    int i, j;
+    *objects = 0U;
+    lists[0] = g->allgc;
+    lists[1] = g->finobj;
+    lists[2] = g->tobefnz;
+    lists[3] = g->fixedgc;
+    for (i = 0; i < 4; ++i) {
+        const GCObject *o;
+        h = fnv_u32(h, 0xa11c0000U + (uint32_t)i);
+        for (o = lists[i]; o != NULL; o = o->next) {
+            h = digest_object(h, o);
+            ++*objects;
+        }
+    }
+    h = fnv_u32(h, (uint32_t)g->strt.size);
+    h = fnv_u32(h, (uint32_t)g->strt.nuse);
+    h = fnv_ptr(h, g->strt.hash);
+    for (i = 0; i < g->strt.size; ++i) {
+        const TString *ts;
+        for (ts = g->strt.hash[i]; ts != NULL; ts = ts->u.hnext) {
+            h = digest_object(h, obj2gco(ts));
+            ++*objects;
+        }
+    }
+    h = fnv_u32(h, (uint32_t)g->totalbytes);
+    h = fnv_u32(h, (uint32_t)g->GCdebt);
+    h = fnv_u32(h, (uint32_t)g->GCmemtrav);
+    h = fnv_u32(h, (uint32_t)g->GCestimate);
+    h = fnv_slot_meaning(h, &g->l_registry);
+    h = fnv_u32(h, g->seed);
+    h = fnv_u32(h, ((uint32_t)g->currentwhite << 24) | ((uint32_t)g->gcstate << 16) |
+                   ((uint32_t)g->gckind << 8) | g->gcrunning);
+    h = fnv_ptr(h, g->allgc);
+    h = fnv_ptr(h, g->sweepgc);
+    h = fnv_ptr(h, g->finobj);
+    h = fnv_ptr(h, g->gray);
+    h = fnv_ptr(h, g->grayagain);
+    h = fnv_ptr(h, g->weak);
+    h = fnv_ptr(h, g->ephemeron);
+    h = fnv_ptr(h, g->allweak);
+    h = fnv_ptr(h, g->tobefnz);
+    h = fnv_ptr(h, g->fixedgc);
+    h = fnv_ptr(h, g->twups);
+    h = fnv_u32(h, g->gcfinnum);
+    h = fnv_u32(h, (uint32_t)g->gcpause);
+    h = fnv_u32(h, (uint32_t)g->gcstepmul);
+    h = fnv_ptr(h, g->memerrmsg);
+    for (i = 0; i < TM_N; ++i)
+        h = fnv_ptr(h, g->tmname[i]);
+    for (i = 0; i < LUA_NUMTAGS; ++i)
+        h = fnv_ptr(h, g->mt[i]);
+    for (i = 0; i < STRCACHE_N; ++i)
+        for (j = 0; j < STRCACHE_M; ++j)
+            h = fnv_ptr(h, g->strcache[i][j]);
+    h = fnv_ptr(h, L->stack);
+    h = fnv_u32(h, (uint32_t)(L->top - L->stack));
+    h = fnv_u32(h, (uint32_t)L->stacksize);
+    h = fnv_u32(h, L->nci);
+    h = fnv_ptr(h, L->openupval);
+    for (slot = L->stack; slot < L->top; ++slot)
+        h = fnv_slot_meaning(h, slot);
+    return h;
+}
+
+static gc_transcript *s_gc_record;       /* recording GC points (NULL: count only) */
+static transcript *s_tr;                 /* recording finalizers and results */
+static uint32_t s_gc_points_in_seam, s_gc_moves_in_seam;
 
 int isaac_vita_startup_map_path(CPU *__restrict c, uint32_t guest_path,
                                 char *native_path, uint32_t capacity)
@@ -360,9 +833,14 @@ static void make_object(lua_State *L, int mt_ref, const char *name)
     lua_pop(L, 1);
 }
 
+static uint32_t s_ud_serial;
+
+/* newud(mt): a 200-byte userdata stamped with a creation serial (the
+ * transcripts record finalizer order by it). */
 static int native_newud(lua_State *L)
 {
-    lua_newuserdata(L, 200U);
+    uint32_t *block = (uint32_t *)lua_newuserdata(L, 200U);
+    *block = ++s_ud_serial;
     lua_pushvalue(L, 1);
     lua_setmetatable(L, -2);
     return 1;
@@ -373,6 +851,87 @@ static int native_newud(lua_State *L)
 static int native_gc_debt(lua_State *L)
 {
     luaE_setdebt(G(L), 1);
+    return 0;
+}
+
+/* --- transcript natives ------------------------------------------------------- */
+
+enum { FN_GETCLASS = 0, FN_GETEXACT = 1 };
+
+static int s_probe_fn, s_probe_variant;
+static uint32_t s_probe_key, s_probe_cbc;
+static int32_t s_probe_index;
+
+/* probe_set(k): the call the next probe(x) makes (list[k + 1] in the
+ * transcript script is the matching object). */
+static const struct { int fn; uint32_t key; uint32_t can_be_const; } s_probe_configs[] = {
+    { FN_GETCLASS, KEY_A, 0U },   /* objs.A: exact */
+    { FN_GETCLASS, KEY_A, 0U },   /* objs.B: one __parent hop */
+    { FN_GETCLASS, KEY_A, 0U },   /* objs.C: two hops */
+    { FN_GETCLASS, KEY_A, 1U },   /* objs.Ac: const object, class.__const */
+    { FN_GETCLASS, KEY_A, 1U },   /* objs.Bc: const + one hop */
+    { FN_GETEXACT, KEY_A, 0U },   /* objs.A: exact */
+    { FN_GETEXACT, KEY_A, 0U },   /* objs.Ac: the class's const variant */
+};
+
+static int native_probe_set(lua_State *L)
+{
+    lua_Integer k = luaL_checkinteger(L, 1);
+    if (k < 0 || k >= (lua_Integer)(sizeof s_probe_configs / sizeof s_probe_configs[0]))
+        return luaL_error(L, "probe_set: no configuration %d", (int)k);
+    s_probe_fn = s_probe_configs[k].fn;
+    s_probe_key = s_probe_configs[k].key;
+    s_probe_cbc = s_probe_configs[k].can_be_const;
+    s_probe_index = 1;
+    return 0;
+}
+
+/* mark(result, object): fold the probe result and check it is the object's block. */
+static int native_mark(lua_State *L)
+{
+    void *got = lua_touserdata(L, 1);
+    void *want = lua_touserdata(L, 2);
+    if (s_tr != NULL) {
+        s_tr->results = fnv_u32(s_tr->results, (uint32_t)(uintptr_t)got);
+        ++s_tr->result_count;
+        if (got != want || got == NULL)
+            ++s_tr->result_bad;
+    }
+    return 0;
+}
+
+static void note_finalizer(uint32_t kind, const void *block)
+{
+    if (s_tr == NULL)
+        return;
+    s_tr->fin = fnv_u32(s_tr->fin, kind);
+    s_tr->fin = fnv_u32(s_tr->fin, block ? *(const uint32_t *)block : 0U);
+    ++s_tr->fin_calls;
+}
+
+/* gcid(u): a Lua __gc function's record of the object it finalizes. */
+static int native_gcid(lua_State *L)
+{
+    note_finalizer(2U, lua_touserdata(L, 1));
+    return 0;
+}
+
+/* junk(): one new light-userdata key in the registry and one in class A's
+ * table (a __gc calls it, so both tables rehash inside collector steps the
+ * seam's own string pushes run). */
+#define JUNK_KEYS 0x71000000U
+static uint32_t s_junk;
+
+static int native_junk(lua_State *L)
+{
+    ++s_junk;
+    lua_pushboolean(L, 1);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, (const void *)(uintptr_t)(JUNK_KEYS + 4U * s_junk));
+    if (lua_rawgetp(L, LUA_REGISTRYINDEX, (const void *)(uintptr_t)KEY_A) == LUA_TTABLE) {
+        lua_pushboolean(L, 1);
+        lua_rawsetp(L, -2, (const void *)(uintptr_t)(JUNK_KEYS + 0x00400000U + 4U * s_junk));
+    }
+    lua_pop(L, 1);
     return 0;
 }
 
@@ -490,16 +1049,36 @@ void __real_sub_003f8c80(CPU *__restrict c)
     sub_003f8c80(c);
 }
 
-/* --- the four entry variants --------------------------------------------------- */
+/* --- the entry variants ----------------------------------------------------------- */
 
-enum { FN_GETCLASS = 0, FN_GETEXACT = 1 };
-enum { VARIANT_TRANSLATED = 0, VARIANT_WRAP = 1 };
+/* TRANSLATED: the generated body.  WRAP: the --wrap seam as built.  API: the
+ * seam's Lua C API path (isaac_vita_lua_get*_try, __real on a fallback) --
+ * what the wrap runs without ISAAC_VITA_LUA_GETCLASS_DIRECT, so with the knob
+ * it is the reference the direct path is compared against. */
+enum { VARIANT_TRANSLATED = 0, VARIANT_WRAP = 1, VARIANT_API = 2 };
+
+static void call_api(CPU *c, int fn)
+{
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    if (fn == FN_GETCLASS) {
+        if (!isaac_vita_lua_getclass_try(c))
+            __real_sub_003f8e30(c);
+    } else {
+        if (!isaac_vita_lua_getexact_try(c))
+            __real_sub_003f8c80(c);
+    }
+#else
+    if (fn == FN_GETCLASS) __wrap_sub_003f8e30(c); else __wrap_sub_003f8c80(c);
+#endif
+}
 
 static void call_variant(CPU *c, int fn, int variant)
 {
     snapshot_entry(c);
     s_in_seam = 1;
-    if (fn == FN_GETCLASS) {
+    if (variant == VARIANT_API) {
+        call_api(c, fn);
+    } else if (fn == FN_GETCLASS) {
         if (variant == VARIANT_WRAP) __wrap_sub_003f8e30(c); else sub_003f8e30(c);
     } else {
         if (variant == VARIANT_WRAP) __wrap_sub_003f8c80(c); else sub_003f8c80(c);
@@ -527,9 +1106,6 @@ static uint32_t push_call(CPU *c, int fn, uint32_t key, uint32_t can_be_const,
 
 /* --- guest closures ------------------------------------------------------------- */
 
-static int s_probe_fn, s_probe_variant;
-static uint32_t s_probe_key, s_probe_cbc;
-static int32_t s_probe_index;
 static uint32_t s_gc_calls, s_gc_in_seam;
 
 static void guest_probe(CPU *__restrict c)
@@ -552,6 +1128,8 @@ static void guest_gc(CPU *__restrict c)
     ++s_gc_calls;
     if (s_in_seam)
         ++s_gc_in_seam;
+    if (s_tr != NULL)
+        note_finalizer(1U, lua_touserdata((lua_State *)(uintptr_t)ld32(c->esp + 4U), 1));
     c->eax = 0U;
     (void)gpop(c);
 }
@@ -611,6 +1189,63 @@ static void guest_gc_exact(CPU *__restrict c)
     (void)gpop(c);
 }
 
+/* --- GC points --------------------------------------------------------------------- */
+
+/* recomp/test_vita_lua_getclass.py compiles lgc.c with
+ * -DluaC_step=isaac_oracle_luaC_step_real, so every other reference to
+ * luaC_step -- luaC_checkGC in lapi.c, in the bridge and in the seam's direct
+ * path -- lands here (the eboot wraps luaC_step the same way under
+ * ISAAC_VITA_LUA_COST_PROFILE).  The record is the collector's input at the
+ * GC point: the live stack, L->top, debt, total bytes, state. */
+void isaac_oracle_luaC_step_real(lua_State *L);
+
+void luaC_step(lua_State *L)
+{
+    gc_transcript *t = s_gc_record;
+    const TValue *before = L->stack;
+    gc_record r;
+    uint32_t moved;
+    memset(&r, 0, sizeof r);
+    if (t != NULL) {
+        const CallInfo *ci;
+        const TValue *o;
+        r.seq = t->points;
+        r.in_seam = (uint32_t)s_in_seam;
+        r.gcstate = G(L)->gcstate;
+        r.debt = (int32_t)G(L)->GCdebt;
+        r.total = (uint32_t)gettotalbytes(G(L));
+        r.top = (int32_t)(L->top - L->stack);
+        r.stacksize = L->stacksize;
+        for (ci = L->ci; ci != NULL; ci = ci->previous)
+            ++r.ci_depth;
+        r.live = FNV64_INIT;
+        for (o = L->stack; o < L->top; ++o)
+            r.live = fnv_slot_meaning(r.live, o);
+        /* dead slots too, by meaning: their raw bytes carry residue
+         * (ldo.c luaD_reallocstack sets only the tag of new slots) */
+        r.image = FNV64_INIT;
+        for (o = L->stack; o < L->stack + L->stacksize; ++o)
+            r.image = fnv_slot_meaning(r.image, o);
+    }
+    isaac_oracle_luaC_step_real(L);
+    moved = L->stack != before;
+    if (s_in_seam) {
+        ++s_gc_points_in_seam;
+        s_gc_moves_in_seam += moved;
+    }
+    if (t != NULL) {
+        r.moved = moved;
+        ++t->points;
+        t->in_seam += r.in_seam != 0U;
+        t->moved += moved;
+        t->moved_in_seam += moved && r.in_seam;
+        t->meaning = fnv_bytes(t->meaning, &r, offsetof(gc_record, image));
+        t->image = fnv_bytes(t->image, &r.image, sizeof r.image);
+        if (t->kept < GC_KEEP)
+            t->first[t->kept++] = r;
+    }
+}
+
 /* --- direct comparison ------------------------------------------------------------ */
 
 typedef struct outcome {
@@ -622,12 +1257,13 @@ typedef struct outcome {
     uint8_t above[ESP_HEADROOM + 16U];
 } outcome;
 
+static void collect_outcome(const CPU *c, outcome *out);
+
 static void run_direct(int fn, int variant, const char *object,
                        const char *object2, uint32_t key,
                        uint32_t can_be_const, int32_t index, outcome *out)
 {
     CPU *c = &s_cpu;
-    int i;
     lua_settop(s_L, 0);
     push_object(s_L, object);
     if (object2)
@@ -635,6 +1271,12 @@ static void run_direct(int fn, int variant, const char *object,
     reset_cpu(c);
     (void)push_call(c, fn, key, can_be_const, index);
     call_variant(c, fn, variant);
+    collect_outcome(c, out);
+}
+
+static void collect_outcome(const CPU *c, outcome *out)
+{
+    int i;
     memset(out, 0, sizeof *out);
     out->eax = c->eax; out->esp = c->esp; out->ecx = c->ecx; out->edx = c->edx;
     out->ebx = c->ebx; out->ebp = c->ebp; out->esi = c->esi; out->edi = c->edi;
@@ -852,6 +1494,19 @@ static int run_pcall_case(const pcall_case *k)
     CHECK(run_pcall_variant(k, VARIANT_TRANSLATED, translated, sizeof translated,
                             &ok_translated) == 0);
     CHECK(!ok_translated);
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    {
+        /* the API path (the wrap without the knob) raises the same error */
+        char api[512];
+        int ok_api;
+        CHECK(run_pcall_variant(k, VARIANT_API, api, sizeof api, &ok_api) == 0);
+        CHECK(!ok_api);
+        if (strcmp(translated, api) != 0)
+            printf("          api: \"%s\"\n", api);
+        CHECK(strcmp(translated, api) == 0);
+        CHECK(st->last_reason == k->reason);
+    }
+#endif
     fallbacks_before = st->fallbacks[k->fn];
     handled_before = st->handled[k->fn];
     real_before = s_real_calls;
@@ -1223,6 +1878,14 @@ static int setup_lua(void)
     lua_setglobal(s_L, "newud");
     lua_pushcfunction(s_L, native_gc_debt);
     lua_setglobal(s_L, "gc_debt");
+    lua_pushcfunction(s_L, native_probe_set);
+    lua_setglobal(s_L, "probe_set");
+    lua_pushcfunction(s_L, native_mark);
+    lua_setglobal(s_L, "mark");
+    lua_pushcfunction(s_L, native_gcid);
+    lua_setglobal(s_L, "gcid");
+    lua_pushcfunction(s_L, native_junk);
+    lua_setglobal(s_L, "junk");
     lua_newtable(s_L);
     lua_setglobal(s_L, "objs");
 
@@ -1285,6 +1948,450 @@ static int setup_lua(void)
     return 0;
 }
 
+/* --- Lua-state exactness ----------------------------------------------------------- */
+
+#if !defined(ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY)
+/* (VERIFY re-runs the translated body after a native hit, so its pushes and
+ * GC points happen twice; the state comparisons are for the shipped seams.) */
+
+#define DEAD_SLOTS 24
+
+typedef struct lua_image {
+    l_mem debt;
+    lu_mem total;
+    int gcstate;
+    ptrdiff_t top;
+    int stacksize;
+    const TValue *stack;
+    TString *strcache[STRCACHE_N][STRCACHE_M];
+    uint64_t live;          /* meaning of [stack, top) */
+    uint64_t dead;          /* value_+tt_ bytes of [top, top + DEAD_SLOTS) */
+} lua_image;
+
+static void image_take(lua_State *L, lua_image *im)
+{
+    const TValue *o;
+    memset(im, 0, sizeof *im);
+    im->debt = G(L)->GCdebt;
+    im->total = gettotalbytes(G(L));
+    im->gcstate = G(L)->gcstate;
+    im->top = L->top - L->stack;
+    im->stacksize = L->stacksize;
+    im->stack = L->stack;
+    memcpy(im->strcache, G(L)->strcache, sizeof im->strcache);
+    im->live = FNV64_INIT;
+    for (o = L->stack; o < L->top; ++o)
+        im->live = fnv_slot_meaning(im->live, o);
+    im->dead = FNV64_INIT;
+    for (o = L->top; o < L->top + DEAD_SLOTS; ++o)
+        im->dead = fnv_bytes(im->dead, o, SLOT_BYTES);
+}
+
+/* One direct case three times -- translated body, API path, wrap -- each from
+ * the same string cache, debt and dead-slot residue, the collector held off
+ * by a negative debt.  Round 1 first evicts the two guest .rdata strings from
+ * the string cache, so luaS_new takes its miss path (strcmp both entries,
+ * shift, luaS_newlstr) instead of its hit path. */
+static int run_exact_case(const direct_case *k, int round, uint32_t *dead_differs)
+{
+    static const int variants[3] = { VARIANT_TRANSLATED, VARIANT_API, VARIANT_WRAP };
+    lua_State *L = s_L;
+    global_State *g = G(L);
+    TString *cache[STRCACHE_N][STRCACHE_M];
+    TValue dead[DEAD_SLOTS];
+    lua_image image[3];
+    outcome result[3];
+    const l_mem debt0 = -(l_mem)(32 << 20);
+    lu_mem total0 = 0U;
+    int v;
+
+    for (v = 0; v < 3; ++v) {
+        CPU *c = &s_cpu;
+        lua_settop(L, 0);
+        push_object(L, k->object);
+        if (v == 0) {
+            int i;
+            if (round == 1) {
+                const char *strings[2];
+                strings[0] = (const char *)(uintptr_t)VA(ISAAC_LGC_STR_CONST_RVA);
+                strings[1] = (const char *)(uintptr_t)VA(ISAAC_LGC_STR_PARENT_RVA);
+                for (i = 0; i < 2; ++i) {
+                    /* lstring.c luaS_new's bucket; memerrmsg is luaS_init's empty entry */
+                    unsigned bucket = point2uint(strings[i]) % STRCACHE_N;
+                    int j;
+                    for (j = 0; j < STRCACHE_M; ++j)
+                        g->strcache[bucket][j] = g->memerrmsg;
+                }
+            }
+            memcpy(cache, g->strcache, sizeof cache);
+            CHECK(L->stack_last - L->top >= DEAD_SLOTS);
+            for (i = 0; i < DEAD_SLOTS; ++i) {
+                memset(&dead[i], 0x60 + i, sizeof dead[i]);
+                settt_(&dead[i], LUA_TNIL);
+            }
+            luaE_setdebt(g, debt0);
+            total0 = gettotalbytes(g);
+        } else {
+            memcpy(g->strcache, cache, sizeof cache);
+            luaE_setdebt(g, debt0);
+            CHECK(gettotalbytes(g) == total0);
+        }
+        memcpy(L->top, dead, sizeof dead);
+        reset_cpu(c);
+        (void)push_call(c, k->fn, k->key, k->can_be_const, k->index);
+        call_variant(c, k->fn, variants[v]);
+        CHECK(!c->fault && s_fault_calls == 0U);
+        collect_outcome(c, &result[v]);
+        image_take(L, &image[v]);
+    }
+    CHECK(same_outcome(&result[0], &result[1]));
+    CHECK(same_outcome(&result[1], &result[2]));
+    for (v = 1; v < 3; ++v) {
+        CHECK(image[v].debt == image[0].debt && image[v].total == image[0].total);
+        CHECK(image[v].gcstate == image[0].gcstate);
+        CHECK(image[v].top == image[0].top && image[v].stack == image[0].stack &&
+              image[v].stacksize == image[0].stacksize);
+        CHECK(memcmp(image[v].strcache, image[0].strcache, sizeof image[0].strcache) == 0);
+        CHECK(image[v].live == image[0].live);
+    }
+    /* the wrap leaves exactly the API path's dead slots */
+    CHECK(image[2].dead == image[1].dead);
+    if (image[1].dead != image[0].dead)
+        ++*dead_differs;
+    printf("  exact : %-36s round=%d alloc=%d strcache/debt/live same, dead slots %s\n",
+           k->name, round, (int)(image[0].total - total0),
+           image[1].dead == image[0].dead ? "same" : "differ from translated (API == wrap)");
+    lua_settop(L, 0);
+    return 0;
+}
+#endif /* !ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY */
+
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+#define KEY_TMP 0x98806878U
+
+/* One getClass(object, key) through `variant`; `want` (or NULL) is the
+ * expected memo counter delta, `got` receives it. */
+static int memo_call(const char *name, int variant, const char *object, uint32_t key,
+                     int stub, uint32_t reason, const uint32_t *want, uint32_t *got)
+{
+    CPU *c = &s_cpu;
+    const isaac_vita_lua_getclass_stats *st = isaac_vita_lua_getclass_stats_get();
+    uint32_t before[ISAAC_LGC_MEMO_COUNT], after[ISAAC_LGC_MEMO_COUNT];
+    unsigned i;
+    lua_settop(s_L, 0);
+    push_object(s_L, object);
+    reset_cpu(c);
+    (void)push_call(c, FN_GETCLASS, key, 0U, 1);
+    isaac_vita_lua_getclass_direct_memo(before);
+    if (stub)
+        s_real_mode = REAL_STUB;
+    call_variant(c, FN_GETCLASS, variant);
+    s_real_mode = REAL_GENERATED;
+    isaac_vita_lua_getclass_direct_memo(after);
+    CHECK(!c->fault && s_fault_calls == 0U && s_real_contract_failures == 0U);
+    CHECK(st->last_reason == reason);
+    if (reason == ISAAC_LGC_HANDLED)
+        CHECK(c->eax == (uint32_t)(uintptr_t)lua_touserdata(s_L, 1));
+    else
+        CHECK(c->eax == 0xdeadbeefU);              /* the recording stub ran */
+    for (i = 0U; i < ISAAC_LGC_MEMO_COUNT; ++i) {
+        got[i] = after[i] - before[i];
+        if (want != NULL && got[i] != want[i]) {
+            printf("  memo  : %s: counter %u moved by %u, expected %u\n", name ? name : "?",
+                   i, (unsigned)got[i], (unsigned)want[i]);
+            return 1;
+        }
+    }
+    if (name != NULL)
+        printf("  memo  : %-46s class %u/%u/%u identity %u/%u/%u reason=%u\n", name,
+               (unsigned)got[0], (unsigned)got[1], (unsigned)got[2], (unsigned)got[3],
+               (unsigned)got[4], (unsigned)got[5], (unsigned)reason);
+    lua_settop(s_L, 0);
+    return 0;
+}
+
+static int run_memo_cases(void)
+{
+    static const uint32_t cold[ISAAC_LGC_MEMO_COUNT] = { 0U, 1U, 0U, 0U, 1U, 0U };
+    static const uint32_t warm[ISAAC_LGC_MEMO_COUNT] = { 1U, 0U, 0U, 1U, 0U, 0U };
+    static const uint32_t new_key[ISAAC_LGC_MEMO_COUNT] = { 0U, 1U, 0U, 1U, 0U, 0U };
+    static const uint32_t class_hit[ISAAC_LGC_MEMO_COUNT] = { 1U, 0U, 0U, 0U, 0U, 0U };
+    static const uint32_t none[ISAAC_LGC_MEMO_COUNT] = { 0U, 0U, 0U, 0U, 0U, 0U };
+    uint32_t got[ISAAC_LGC_MEMO_COUNT], sum[ISAAC_LGC_MEMO_COUNT];
+    uint32_t i, j;
+
+    isaac_vita_lua_getclass_direct_memo_flush();
+    CHECK(memo_call("cold: both lookups miss", VARIANT_WRAP, "A", KEY_A, 0,
+                    ISAAC_LGC_HANDLED, cold, got) == 0);
+    CHECK(memo_call("warm: both lookups hit", VARIANT_WRAP, "A", KEY_A, 0,
+                    ISAAC_LGC_HANDLED, warm, got) == 0);
+    /* The registry grows one key at a time with a lookup after each insert:
+     * every rehash moves its node array (the new array is allocated while the
+     * old one is still live, so they cannot overlap) and the next lookup must
+     * find the memo node stale, then refill. */
+    memset(sum, 0, sizeof sum);
+    for (i = 0U; i < 600U; ++i) {
+        lua_pushboolean(s_L, 1);
+        lua_rawsetp(s_L, LUA_REGISTRYINDEX, (const void *)(uintptr_t)(JUNK_KEYS + 0x00800000U + 4U * i));
+        CHECK(memo_call(NULL, VARIANT_WRAP, "A", KEY_A, 0, ISAAC_LGC_HANDLED, NULL, got) == 0);
+        for (j = 0U; j < ISAAC_LGC_MEMO_COUNT; ++j)
+            sum[j] += got[j];
+    }
+    CHECK(sum[ISAAC_LGC_MEMO_CLASS_STALE] > 0U && sum[ISAAC_LGC_MEMO_CLASS_MISS] == 0U &&
+          sum[ISAAC_LGC_MEMO_CLASS_HIT] + sum[ISAAC_LGC_MEMO_CLASS_STALE] == 600U);
+    CHECK(sum[ISAAC_LGC_MEMO_IDENTITY_HIT] == 600U);
+    printf("  memo  : %-46s class %u/%u/%u identity %u/%u/%u\n",
+           "600 registry inserts, a lookup after each", (unsigned)sum[0], (unsigned)sum[1],
+           (unsigned)sum[2], (unsigned)sum[3], (unsigned)sum[4], (unsigned)sum[5]);
+    /* the same for the identity lookup: class A's table (objs.A's metatable) */
+    memset(sum, 0, sizeof sum);
+    for (i = 0U; i < 64U; ++i) {
+        CHECK(lua_rawgetp(s_L, LUA_REGISTRYINDEX, (const void *)(uintptr_t)KEY_A) == LUA_TTABLE);
+        lua_pushboolean(s_L, 1);
+        lua_rawsetp(s_L, -2, (const void *)(uintptr_t)(JUNK_KEYS + 0x00c00000U + 4U * i));
+        lua_pop(s_L, 1);
+        CHECK(memo_call(NULL, VARIANT_WRAP, "A", KEY_A, 0, ISAAC_LGC_HANDLED, NULL, got) == 0);
+        for (j = 0U; j < ISAAC_LGC_MEMO_COUNT; ++j)
+            sum[j] += got[j];
+    }
+    CHECK(sum[ISAAC_LGC_MEMO_IDENTITY_STALE] > 0U && sum[ISAAC_LGC_MEMO_IDENTITY_MISS] == 0U &&
+          sum[ISAAC_LGC_MEMO_IDENTITY_HIT] + sum[ISAAC_LGC_MEMO_IDENTITY_STALE] == 64U);
+    CHECK(sum[ISAAC_LGC_MEMO_CLASS_HIT] == 64U);
+    printf("  memo  : %-46s class %u/%u/%u identity %u/%u/%u\n",
+           "64 inserts into class A's table, a lookup after each", (unsigned)sum[0],
+           (unsigned)sum[1], (unsigned)sum[2], (unsigned)sum[3], (unsigned)sum[4],
+           (unsigned)sum[5]);
+    /* A removed value: lua_rawsetp(nil) keeps the key in its node (ltable.c
+     * luaH_set finds it), so the memo node is still valid and its value is
+     * nil -- exactly what luaH_get returns: CLASS fallback on both paths. */
+    CHECK(lua_rawgetp(s_L, LUA_REGISTRYINDEX, (const void *)(uintptr_t)KEY_A) == LUA_TTABLE);
+    lua_rawsetp(s_L, LUA_REGISTRYINDEX, (const void *)(uintptr_t)KEY_TMP);
+    CHECK(memo_call("registry[tmp] = class A: class miss", VARIANT_WRAP, "A", KEY_TMP, 0,
+                    ISAAC_LGC_HANDLED, new_key, got) == 0);
+    CHECK(memo_call("registry[tmp] warm", VARIANT_WRAP, "A", KEY_TMP, 0,
+                    ISAAC_LGC_HANDLED, warm, got) == 0);
+    lua_pushnil(s_L);
+    lua_rawsetp(s_L, LUA_REGISTRYINDEX, (const void *)(uintptr_t)KEY_TMP);
+    CHECK(memo_call("registry[tmp] = nil: memo hit reads nil", VARIANT_WRAP, "A", KEY_TMP, 1,
+                    ISAAC_LGC_REASON_CLASS, class_hit, got) == 0);
+    CHECK(memo_call("registry[tmp] = nil: API path agrees", VARIANT_API, "A", KEY_TMP, 1,
+                    ISAAC_LGC_REASON_CLASS, none, got) == 0);
+    return 0;
+}
+#endif /* ISAAC_VITA_LUA_GETCLASS_DIRECT */
+
+#if !defined(ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY)
+#define TRANSCRIPT_ITERATIONS 12000
+
+/* Collector steps forced inside the seam (gc_debt right before every probe);
+ * guest and Lua finalizers; a finalizer that recurses 150 Lua frames, so the
+ * Lua stack grows (moves) inside a collector step the seam's own string push
+ * runs, and later shrinks (moves) in an atomic phase; a finalizer that adds a
+ * key to the registry and to class A's table (rehash: memo nodes go stale). */
+static const char s_transcript_chunk[] =
+    "local mt = { __gc = gc_probe }\n"
+    "local deep\n"
+    "deep = function(n) if n == 0 then return 0 end return 1 + deep(n - 1) end\n"
+    "local mt_move = { __gc = function(u) gcid(u) deep(150) end }\n"
+    "local mt_rehash = { __gc = function(u) gcid(u) junk() end }\n"
+    "local list = { objs.A, objs.B, objs.C, objs.Ac, objs.Bc, objs.A, objs.Ac }\n"
+    "for i = 1, 12000 do\n"
+    "  newud(mt)\n"
+    "  if i % 3 == 0 then newud(mt_move) end\n"
+    "  if i % 4 == 0 then newud(mt_rehash) end\n"
+    "  local k = i % 7\n"
+    "  probe_set(k)\n"
+    "  gc_debt()\n"
+    "  local x = list[k + 1]\n"
+    "  mark(probe(x), x)\n"
+    "end\n"
+    "return true";
+
+static transcript s_transcripts[4];
+
+/* The script on a fresh state in the reset arena, every probe through
+ * `variant`.  Called from one place, so the C stack address lstate.c's
+ * makeseed mixes into the string-hash seed is the same in every run (the test
+ * compiles Lua with a constant luai_makeseed). */
+static int run_transcript(int variant, transcript *out)
+{
+    const isaac_vita_lua_getclass_stats *st = isaac_vita_lua_getclass_stats_get();
+    lua_State *saved_L = s_L;
+    uint32_t saved_word = s_state_word;
+    int saved_ref_G = s_ref_G;
+    uint32_t handled_before = st->handled[0] + st->handled[1];
+    uint32_t fallbacks_before = st->fallbacks[0] + st->fallbacks[1];
+    uint32_t close_arguments[1];
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    uint32_t memo_before[ISAAC_LGC_MEMO_COUNT], memo_after[ISAAC_LGC_MEMO_COUNT];
+    unsigned i;
+#endif
+
+    memset(out, 0, sizeof *out);
+    out->gc.meaning = out->gc.image = out->fin = out->results = FNV64_INIT;
+    CHECK(arena_reset());
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    isaac_vita_lua_getclass_direct_memo_flush();
+    isaac_vita_lua_getclass_direct_memo(memo_before);
+#endif
+    s_ud_serial = 0U;
+    s_junk = 0U;
+    s_arena_on = 1;
+    CHECK(setup_lua() == 0);
+    CHECK(arena_owns(s_L));
+    s_probe_variant = variant;
+    s_tr = out;
+    s_gc_record = &out->gc;
+    CHECK(run_chunk(&s_cpu, s_transcript_chunk, 1));
+    CHECK(lua_toboolean(s_L, -1));
+    lua_settop(s_L, 0);
+    s_gc_record = NULL;
+    s_tr = NULL;
+    out->debt = (int32_t)G(s_L)->GCdebt;
+    out->total = (uint32_t)gettotalbytes(G(s_L));
+    out->gcstate = G(s_L)->gcstate;
+    out->arena_high = s_arena_high;
+    out->heap = heap_digest(s_L, &out->heap_objects);
+    out->arena = fnv_bytes(FNV64_INIT, s_arena, s_arena_high);
+    close_arguments[0] = s_state_word;
+    reset_cpu(&s_cpu);
+    CHECK(invoke_import(&s_cpu, LUA_IMPORT_CLOSE, close_arguments, 1U));
+    s_arena_on = 0;
+    out->arena_live_after_close = s_arena_live;
+    out->arena_failed = s_arena_failed;
+    s_L = saved_L;
+    s_state_word = saved_word;
+    s_ref_G = saved_ref_G;
+    out->handled = st->handled[0] + st->handled[1] - handled_before;
+    out->fallbacks = st->fallbacks[0] + st->fallbacks[1] - fallbacks_before;
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    isaac_vita_lua_getclass_direct_memo(memo_after);
+    for (i = 0U; i < ISAAC_LGC_MEMO_COUNT; ++i)
+        out->memo[i] = memo_after[i] - memo_before[i];
+#endif
+    return 0;
+}
+
+static int same_meaning(const transcript *a, const transcript *b)
+{
+    return a->gc.points == b->gc.points && a->gc.in_seam == b->gc.in_seam &&
+           a->gc.moved == b->gc.moved && a->gc.moved_in_seam == b->gc.moved_in_seam &&
+           a->gc.meaning == b->gc.meaning && a->fin == b->fin &&
+           a->fin_calls == b->fin_calls && a->results == b->results &&
+           a->result_count == b->result_count && a->result_bad == b->result_bad &&
+           a->debt == b->debt && a->total == b->total && a->gcstate == b->gcstate;
+}
+
+/* + every GC point's whole stack by meaning (dead slots too), the heap digest and
+ * the arena high-water mark (the same allocation sequence) */
+static int same_state(const transcript *a, const transcript *b)
+{
+    return same_meaning(a, b) && a->gc.image == b->gc.image && a->heap == b->heap &&
+           a->heap_objects == b->heap_objects && a->arena_high == b->arena_high;
+}
+
+static void print_gc_record(const char *tag, const gc_record *r)
+{
+    printf("      %-10s seq=%u seam=%u state=%d debt=%d total=%u top=%d size=%d ci=%d "
+           "moved=%u live=%016llx image=%016llx\n", tag, (unsigned)r->seq,
+           (unsigned)r->in_seam, (int)r->gcstate, (int)r->debt, (unsigned)r->total,
+           (int)r->top, (int)r->stacksize, (int)r->ci_depth, (unsigned)r->moved,
+           (unsigned long long)r->live, (unsigned long long)r->image);
+}
+
+static void first_difference(const transcript *a, const char *an,
+                             const transcript *b, const char *bn)
+{
+    uint32_t i, n = a->gc.kept < b->gc.kept ? a->gc.kept : b->gc.kept;
+    for (i = 0U; i < n; ++i) {
+        if (memcmp(&a->gc.first[i], &b->gc.first[i], sizeof a->gc.first[i]) != 0) {
+            printf("    first GC point that differs: #%u\n", (unsigned)i);
+            print_gc_record(an, &a->gc.first[i]);
+            print_gc_record(bn, &b->gc.first[i]);
+            return;
+        }
+    }
+    printf("    the first %u GC points agree; points %u/%u fin %u/%u results %u/%u "
+           "debt %d/%d total %u/%u\n", (unsigned)n, (unsigned)a->gc.points,
+           (unsigned)b->gc.points, (unsigned)a->fin_calls, (unsigned)b->fin_calls,
+           (unsigned)a->result_count, (unsigned)b->result_count, (int)a->debt, (int)b->debt,
+           (unsigned)a->total, (unsigned)b->total);
+}
+
+static int run_transcripts(void)
+{
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    static const char *const names[4] = { "translated", "api", "direct", "api-again" };
+#else
+    static const char *const names[4] = { "translated", "wrap", "wrap-again", "wrap-third" };
+#endif
+    static const int order[4] = { VARIANT_TRANSLATED, VARIANT_API, VARIANT_WRAP, VARIANT_API };
+    const transcript *t = s_transcripts;
+    int i;
+
+    for (i = 0; i < 4; ++i) {
+        const transcript *r = &s_transcripts[i];
+        CHECK(run_transcript(order[i], &s_transcripts[i]) == 0);
+        printf("  trans : %-10s points=%u in_seam=%u moved=%u moved_in_seam=%u fin=%u "
+               "results=%u bad=%u handled=%u fallbacks=%u arena=%u KiB\n", names[i],
+               (unsigned)r->gc.points, (unsigned)r->gc.in_seam, (unsigned)r->gc.moved,
+               (unsigned)r->gc.moved_in_seam, (unsigned)r->fin_calls,
+               (unsigned)r->result_count, (unsigned)r->result_bad, (unsigned)r->handled,
+               (unsigned)r->fallbacks, (unsigned)(r->arena_high >> 10));
+        printf("          meaning=%016llx image=%016llx heap=%016llx (%u objects) fin=%016llx "
+               "results=%016llx arena bytes=%016llx\n", (unsigned long long)r->gc.meaning,
+               (unsigned long long)r->gc.image, (unsigned long long)r->heap,
+               (unsigned)r->heap_objects, (unsigned long long)r->fin,
+               (unsigned long long)r->results, (unsigned long long)r->arena);
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+        if (order[i] == VARIANT_WRAP)
+            printf("          memo class %u/%u/%u identity %u/%u/%u\n",
+                   (unsigned)r->memo[0], (unsigned)r->memo[1], (unsigned)r->memo[2],
+                   (unsigned)r->memo[3], (unsigned)r->memo[4], (unsigned)r->memo[5]);
+#endif
+        CHECK(r->result_count == TRANSCRIPT_ITERATIONS && r->result_bad == 0U);
+        CHECK(r->arena_live_after_close == 0U && r->arena_failed == 0U);
+        CHECK(r->gc.in_seam > 0U && r->fin_calls > 0U);
+        CHECK(s_fault_calls == 0U && s_real_contract_failures == 0U);
+    }
+    /* the harness itself is deterministic: the same path twice, same state */
+    if (!same_state(&t[1], &t[3]))
+        first_difference(&t[1], names[1], &t[3], names[3]);
+    CHECK(same_state(&t[1], &t[3]));
+    /* the shipped wrap and the API path: identical GC points (live stack,
+     * whole stack by meaning, debt, total, state), finalizer order, results, heap */
+    if (!same_state(&t[1], &t[2]))
+        first_difference(&t[1], names[1], &t[2], names[2]);
+    CHECK(same_state(&t[1], &t[2]));
+    /* the translated body: same GC points by meaning, finalizers, results */
+    if (!same_meaning(&t[0], &t[1]))
+        first_difference(&t[0], names[0], &t[1], names[1]);
+    CHECK(same_meaning(&t[0], &t[1]));
+    /* ... and the same heap: every live object and the live stack by meaning
+     * (dead slots are not compared: the translated body rotates where the API
+     * path copies, see the exact cases) */
+    CHECK(t[0].heap == t[1].heap && t[0].heap_objects == t[1].heap_objects);
+    CHECK(t[2].gc.moved_in_seam > 0U && t[2].handled == TRANSCRIPT_ITERATIONS &&
+          t[2].fallbacks == 0U);
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    for (i = 0; i < ISAAC_LGC_MEMO_COUNT; ++i)
+        CHECK(t[2].memo[i] > 0U);
+    printf("  trans : direct == api: every GC point (live stack, whole stack incl. dead slots, debt, total, "
+           "state), finalizer order, results and the heap digest identical; arena bytes %s\n",
+           t[1].arena == t[2].arena ? "same" : "differ (C-stack residue in copied temporaries)");
+#else
+    printf("  trans : wrap == wrap: every GC point, finalizer order, results and the heap digest "
+           "identical (harness deterministic); arena bytes %s\n",
+           t[1].arena == t[3].arena ? "same" : "differ (C-stack residue in copied temporaries)");
+#endif
+    printf("  trans : translated == %s by meaning (GC points, finalizers, results, debt); "
+           "whole stack %s, heap digest %s\n", names[1],
+           t[0].gc.image == t[1].gc.image ? "same" : "differ (dead slots)",
+           "same");
+    return 0;
+}
+#endif /* !ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY */
+
 int main(void)
 {
     const isaac_vita_lua_getclass_stats *st;
@@ -1319,6 +2426,38 @@ int main(void)
     CHECK(run_upvalue_case() == 0);
     CHECK(run_nested_gc_exact_case() == 0);
     CHECK(run_gc_error_case() == 0);
+#if !defined(ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY)
+    {
+        uint32_t dead_differs = 0U, cases = 0U;
+        int round;
+        for (round = 0; round < 2; ++round) {
+            for (i = 0U; i < sizeof s_direct_cases / sizeof s_direct_cases[0]; ++i, ++cases)
+                CHECK(run_exact_case(&s_direct_cases[i], round, &dead_differs) == 0);
+        }
+        printf("  exact : %u cases x 3 paths: string cache, debt, total bytes, collector state, "
+               "live stack identical; dead slots API == wrap in all, translated differs in %u\n",
+               (unsigned)cases, (unsigned)dead_differs);
+    }
+#endif
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    CHECK(run_memo_cases() == 0);
+#endif
+#if !defined(ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY)
+    CHECK(run_transcripts() == 0);
+#endif
+    printf("gc points: inside a getClass/getExact call=%u, of which moved the Lua stack=%u\n",
+           (unsigned)s_gc_points_in_seam, (unsigned)s_gc_moves_in_seam);
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    {
+        uint32_t memo[ISAAC_LGC_MEMO_COUNT];
+        isaac_vita_lua_getclass_direct_memo(memo);
+        printf("memo coverage: class hit/miss/stale=%u/%u/%u identity hit/miss/stale=%u/%u/%u\n",
+               (unsigned)memo[0], (unsigned)memo[1], (unsigned)memo[2], (unsigned)memo[3],
+               (unsigned)memo[4], (unsigned)memo[5]);
+        for (i = 0U; i < ISAAC_LGC_MEMO_COUNT; ++i)
+            CHECK(memo[i] > 0U);
+    }
+#endif
 
     handled = st->handled[0] + st->handled[1];
 #if defined(ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY)

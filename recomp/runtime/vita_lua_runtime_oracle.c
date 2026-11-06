@@ -11,6 +11,12 @@
 #include "lauxlib.h"
 #include "host_vita_lua.h"
 #include "host_vita_startup.h"
+#if defined(ISAAC_VITA_LUA_LOADFILE_RETRY)
+/* lfo_fault_*: the fake sceIo kernel under lauxlib.c's FILE calls
+ * (test_vita_lua_runtime.py variant "loadfile-retry"). */
+#include "host_vita_lua_loadfile.h"
+#include "vita_lua_loadfile_fault.h"
+#endif
 
 enum {
     GUEST_ALLOCATOR = 0x003fca80U,
@@ -1013,6 +1019,171 @@ static int gc_make_garbage(CPU *c, uint32_t state)
            c->eax == LUA_OK;
 }
 
+#if defined(ISAAC_VITA_LUA_LOADFILE_RETRY)
+/* ISAAC_VITA_LUA_LOADFILE_RETRY, bridge oracle: one transient read fault
+ * through vita_lua_loadfilex_import, the production caller of
+ * __wrap_luaL_loadfilex.  The recovered import must leave what the clean
+ * import leaves (one function with the same lua_dump bytes, the same rebased
+ * package.path), and vita_lua_rebase_script_package_path must run once per
+ * import, not once per attempt: _G.package is moved behind an __index that
+ * counts lookups of "package" (the rebase's lua_getglobal is the only one on
+ * this path).  Everything that allocates goes through the imports, so the
+ * guest allocator runs under a bound CPU. */
+static uint64_t s_lf_clock;
+static char s_lf_chunk_name[] = "=loadfile-retry";
+static char s_lf_guest_global[] = "LF_GUEST";
+static char s_lf_setup[] =
+    "local P = package\n"
+    "local saved, n = P.path, 0\n"
+    "lf_reset = function() P.path = LF_GUEST end\n"
+    "lf_lookups = function() return n end\n"
+    "lf_path = function() return P.path end\n"
+    "lf_restore = function()\n"
+    "  setmetatable(_G, nil)\n"
+    "  package = P\n"
+    "  P.path = saved\n"
+    "  lf_reset, lf_lookups, lf_path, lf_restore, LF_GUEST =\n"
+    "    nil, nil, nil, nil, nil\n"
+    "end\n"
+    "package = nil\n"
+    "setmetatable(_G, { __index = function(_, k)\n"
+    "  if k == 'package' then n = n + 1 return P end\n"
+    "end })\n";
+static char s_lf_reset[] = "lf_reset()";
+static char s_lf_lookups[] = "return lf_lookups()";
+static char s_lf_path[] = "return lf_path()";
+static char s_lf_restore[] = "lf_restore()";
+
+uint64_t isaac_vita_lua_loadfile_oracle_now_us(void)
+{
+    s_lf_clock += 3U;
+    return s_lf_clock;
+}
+
+void isaac_vita_lua_loadfile_oracle_sleep_us(uint32_t us)
+{
+    s_lf_clock += us;
+}
+
+int isaac_vita_lua_loadfile_oracle_thread_id(void)
+{
+    return 0x40010003;
+}
+
+static int lf_dump_writer(lua_State *L, const void *p, size_t size, void *ud)
+{
+    uint32_t *hash = (uint32_t *)ud;
+    const unsigned char *bytes = (const unsigned char *)p;
+    size_t index;
+
+    (void)L;
+    for (index = 0U; index < size; ++index) {
+        *hash ^= bytes[index];
+        *hash *= 16777619U;
+    }
+    return 0;
+}
+
+static int lf_run(CPU *c, uint32_t state, char *code, uint32_t results)
+{
+    uint32_t load_arguments[] = {
+        state, pointer32(code), (uint32_t)strlen(code),
+        pointer32(s_lf_chunk_name), 0U
+    };
+    uint32_t pcall_arguments[] = { state, 0U, results, 0U, 0U, 0U };
+
+    return invoke_import(c, LUA_IMPORT_LOADBUFFERX, load_arguments, 5U) &&
+           c->eax == LUA_OK &&
+           invoke_import(c, LUA_IMPORT_PCALLK, pcall_arguments, 6U) &&
+           c->eax == LUA_OK;
+}
+
+static int lf_settop(CPU *c, uint32_t state, int top)
+{
+    uint32_t arguments[] = { state, (uint32_t)top };
+
+    return invoke_import(c, LUA_IMPORT_SETTOP, arguments, 2U);
+}
+
+/* One import of s_guest_mod_path with package.path reset to its guest form
+ * first; *hash = lua_dump of the loaded function, path = the rebased
+ * package.path, *lookups = the "package" lookups so far. */
+static int lf_bridge_import(CPU *c, uint32_t state, lua_State *L,
+                            uint32_t *hash, char *path, size_t path_size,
+                            int64_t *lookups)
+{
+    uint32_t load_arguments[] = { state, pointer32(s_guest_mod_path), 0U };
+    unsigned map_calls = s_path_map_calls;
+    int top = lua_gettop(L);
+    const char *rebased;
+    size_t length;
+
+    if (!lf_run(c, state, s_lf_reset, 0U) ||
+        !invoke_import(c, LUA_IMPORT_LOADFILEX, load_arguments, 3U) ||
+        c->eax != LUA_OK || lua_gettop(L) != top + 1 ||
+        lua_type(L, -1) != LUA_TFUNCTION ||
+        s_path_map_calls != map_calls + 1U)
+        return 0;
+    *hash = 2166136261U;
+    lua_dump(L, lf_dump_writer, hash, 0);
+    if (!lf_settop(c, state, top) || !lf_run(c, state, s_lf_path, 1U))
+        return 0;
+    rebased = lua_tostring(L, -1);
+    length = rebased ? strlen(rebased) : 0U;
+    if (!rebased || length >= path_size ||
+        strcmp(rebased, s_guest_package_path) == 0)
+        return 0;
+    memcpy(path, rebased, length + 1U);
+    if (!lf_settop(c, state, top) || !lf_run(c, state, s_lf_lookups, 1U))
+        return 0;
+    *lookups = import_checkinteger(c, state, -1);
+    return lf_settop(c, state, top);
+}
+
+static int check_loadfile_retry(CPU *c, uint32_t state, lua_State *L)
+{
+    char clean_path[ISAAC_VITA_STARTUP_PATH_MAX + 80U];
+    char fault_path[ISAAC_VITA_STARTUP_PATH_MAX + 80U];
+    uint32_t push_arguments[] = { state, pointer32(s_guest_package_path) };
+    uint32_t global_arguments[] = { state, pointer32(s_lf_guest_global) };
+    uint32_t clean_hash = 0U;
+    uint32_t fault_hash = 0U;
+    int64_t clean_lookups = -1;
+    int64_t fault_lookups = -1;
+    unsigned fired;
+    unsigned opens;
+    int top = lua_gettop(L);
+    int ok;
+
+    s_path_mode = ORACLE_PATH_SCRIPT;
+    lfo_fault_clear();
+    if (!invoke_import(c, LUA_IMPORT_PUSHSTRING, push_arguments, 2U) ||
+        !invoke_import(c, LUA_IMPORT_SETGLOBAL, global_arguments, 2U) ||
+        !lf_run(c, state, s_lf_setup, 0U))
+        return 0;
+    ok = lf_bridge_import(c, state, L, &clean_hash, clean_path,
+                          sizeof clean_path, &clean_lookups);
+    fired = lfo_fault_fired();
+    opens = lfo_kernel_opens();
+    lfo_fault_add("main.lua", LFO_READ_AT, 1, EIO, 1U, 1);
+    ok = ok &&
+         lf_bridge_import(c, state, L, &fault_hash, fault_path,
+                          sizeof fault_path, &fault_lookups) &&
+         lfo_fault_fired() == fired + 1U && lfo_kernel_opens() == opens + 2U;
+    fired = lfo_fault_fired() - fired;
+    opens = lfo_kernel_opens() - opens;
+    lfo_fault_clear();
+    ok = ok && clean_lookups == 1 && fault_lookups == 2 &&
+         fault_hash == clean_hash && strcmp(fault_path, clean_path) == 0;
+    isaac_vita_lua_loadfile_report("bridge-loadfile-retry");
+    printf("[loadfile-retry] bridge import: %s rebase_lookups=%d,%d "
+           "dump=%08x/%08x opens=%u fired=%u\n", ok ? "PASS" : "FAIL",
+           (int)clean_lookups, (int)fault_lookups, (unsigned)clean_hash,
+           (unsigned)fault_hash, opens, fired);
+    return lf_run(c, state, s_lf_restore, 0U) && lua_gettop(L) == top && ok;
+}
+#endif
+
 /* lua_gc policy (host_vita_lua_gc.c).  Knobs ON: a GCCOLLECT whose return
  * word is the Level-init family's 0x3b5870 becomes one bounded step and
  * logs the clamp line; any other site collects fully and logs nothing; 120
@@ -1640,6 +1811,12 @@ int main(int argc, char **argv)
     if (!check_loadfile_boundary(&cpu, state, native_state))
         return fail(&cpu, native_state,
                     "luaL_loadfilex path/fallback/error ABI mismatch");
+#if defined(ISAAC_VITA_LUA_LOADFILE_RETRY)
+    if (!check_loadfile_retry(&cpu, state, native_state))
+        return fail(&cpu, native_state,
+                    "ISAAC_VITA_LUA_LOADFILE_RETRY bridge import did not "
+                    "recover a transient read fault exactly once");
+#endif
     if (!check_gc_policy(&cpu, state))
         return fail(&cpu, native_state,
                     "lua_gc GCCOLLECT clamp / GC profile policy mismatch");

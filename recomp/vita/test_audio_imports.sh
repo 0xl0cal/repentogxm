@@ -22,6 +22,7 @@ strings="$VITASDK/bin/arm-vita-eabi-strings"
 host_cc=${HOST_CC:-cc}
 a005_site_status=SKIP
 stream_contract_status=SKIP
+shield_site_status=SKIP
 
 if [ -n "${ISAAC_AUDIO_TEST_PE:-}" ]; then
     "${ISAAC_AUDIO_TEST_PYTHON:-python3}" \
@@ -31,7 +32,23 @@ if [ -n "${ISAAC_AUDIO_TEST_PE:-}" ]; then
         "$root/test_audio_stream_starvation_contract.py" \
         --pe "$ISAAC_AUDIO_TEST_PE"
     stream_contract_status=PASS
+    "${ISAAC_AUDIO_TEST_PYTHON:-python3}" \
+        "$root/test_audio_shield_sites.py" --pe "$ISAAC_AUDIO_TEST_PE"
+    shield_site_status=PASS
 fi
+
+# ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN: the abort-stop tail that leaves the
+# OpenAL owner to the process exit (host oracle + Vita entry/adapter edges).
+ISAAC_AUDIO_ABORT_TEST_ROOT="$root" \
+ISAAC_AUDIO_ABORT_TEST_OUT="$work/abort-teardown" \
+    bash "$root/vita/test_audio_abort_teardown.sh"
+
+# ISAAC_VITA_AUDIO_STARVATION_SHIELD / ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT:
+# the IsPlaying decision table and the slot reset --wrap receipt (host
+# oracles + knob-only Vita objects).
+ISAAC_AUDIO_SHIELD_TEST_ROOT="$root" \
+ISAAC_AUDIO_SHIELD_TEST_OUT="$work/starvation-shield" \
+    bash "$root/vita/test_audio_starvation_shield.sh"
 
 common_flags="-std=gnu11 -O2 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=softfp -mthumb -fno-strict-aliasing -ffunction-sections -fdata-sections -Wall -Wextra -Werror"
 production_flags="$common_flags -DGUEST_STACK_REQUIRED=1"
@@ -560,8 +577,12 @@ sha256sum \
     "$root/runtime/vita_audio_link_probe.c" \
     "$root/runtime/vita_audio_test_openal.h" \
     "$root/runtime/vita_audio_import_oracle.c" \
+    "$root/runtime/vita_audio_abort_teardown_oracle.c" \
+    "$root/vita/test_audio_abort_teardown.sh" \
+    "$root/vita/test_audio_starvation_shield.sh" \
     "$root/test_audio_a005_sites.py" \
     "$root/test_audio_stream_starvation_contract.py" \
+    "$root/test_audio_shield_sites.py" \
     "$root/vita/audio_oracle_include/guest_coverage_generated.h" \
     "$root/vita/CMakeLists.txt" \
     "$root/vita/test_audio_imports.sh" \
@@ -576,4 +597,4 @@ sha256sum \
     "$work/vita-audio-integration.o" \
     "$work/vita-audio-import-link.elf" \
     "$work/vita-audio-library-link.elf"
-echo "Vita OpenAL softfp integration: PASS (24/24 imports; A005 frozen sites=$a005_site_status; OGG starvation contract=$stream_contract_status; bounded attribution/folding; executed indexed/manager pool-order + immediate manager-failure + retry-safe final telemetry oracle; duplicate/direct/partial owner oracle; manual duplicate no-op; terminal KAGE/audio ON/OFF edges; explicit SceLibKernel+openal+pthread+SceAudio+SceAudioIn)"
+echo "Vita OpenAL softfp integration: PASS (24/24 imports; A005 frozen sites=$a005_site_status; OGG starvation contract=$stream_contract_status; starvation shield sites=$shield_site_status; bounded attribution/folding; executed indexed/manager pool-order + immediate manager-failure + retry-safe final telemetry oracle; duplicate/direct/partial owner oracle; manual duplicate no-op; terminal KAGE/audio ON/OFF edges; explicit SceLibKernel+openal+pthread+SceAudio+SceAudioIn)"

@@ -12,14 +12,21 @@
  * the opt-in guest cache, dispatch table, GL redundancy cache, vitaGL draw
  * policy, fixed-step scheduler, import-kinds census and heap receipt append
  * bounded records in deterministic
- * t,c,a,gt,gx,x,xd,g,d,i,o,y,v,q,f,fa,fp,e,k,kp,b,h,p,l,m,n,s,r,w,ik,ih,mem,ha,rl order
+ * t,c,a,tl,gt,gx,x,xd,g,d,i,o,y,v,q,f,fa,fp,e,k,kp,b,h,p,l,m,n,s,r,w,ik,ih,mem,ha,rl order
  * (kage_vita_phase_profile.h). */
 #include "kage_vita_phase_profile.h"
 #include "kage_vita_deep_profile.h"
 #include "kage_vita_fullspeed_scheduler.h"
 #include "kage_vita_guest_sampler.h"
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+# include "kage_vita_gpu_frame_profile.h"
+#endif
 #include "guest.h"
 #include "gl_vita_backend.h"
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+# include "gl_record_backend.h"
+# include "kage_vita_backend.h"
+#endif
 #if defined(ISAAC_VITA_FRAME_SPIKE_PROFILE)
 # include "kage_vita_frame_spike_profile.h"
 static KageVitaFrameSpikeWindow s_spikes;
@@ -40,6 +47,45 @@ static uint32_t s_spike_bad_start, s_spike_clamp_start;
 /* ph120.kq: the Image::PushQuad host replay's per-window verdict counters
  * (host_vita_kage_quad_fastpath.c owns the take-and-zero). */
 # include "host_vita_kage_quad_fastpath.h"
+#endif
+#if defined(ISAAC_VITA_UNIFORM_SET_RECEIPT)
+/* ph120.us: the KAGE Shader uniform-path census
+ * (host_vita_uniform_set_receipt.c owns the take-and-zero). */
+# include "host_vita_uniform_set_receipt.h"
+#endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+/* ph120.gf: the G FUEL seed seams' verdicts
+ * (host_vita_gfuel_seed_native.c owns the take-and-zero). */
+# include "host_vita_gfuel_seed_native.h"
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+/* ph120.cr: the camera ring replay's verdicts
+ * (host_vita_camera_ring_native.c owns the take-and-zero). */
+# include "host_vita_camera_ring_native.h"
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+/* ph120.ut / ph120.uz: inclusive timers over Game::Update's subtrees
+ * (host_vita_update_probe.c owns the take-and-zero). */
+# include "host_vita_update_probe.h"
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+/* ph120.hc/hf/hm: guest heap import routes and stage spans
+ * (host_vita_heap.c owns the take-and-zero). */
+# include "host_vita_heap_stage.h"
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE) && \
+    !defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+# error ph120.hg/hv (ISAAC_VITA_HEAP_FREE_COST_PROFILE) extend the heap stage profile
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+/* ph120.rn: the render chain replay's verdicts
+ * (host_vita_render_chain_native.c owns the take-and-zero). */
+# include "host_vita_render_chain_native.h"
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+/* ph120.hn: the HasCollectible replay's verdicts
+ * (host_vita_hascoll_native.c owns the take-and-zero). */
+# include "host_vita_hascoll_native.h"
 #endif
 #if defined(ISAAC_VITA_HEAP_CENSUS)
 /* ph120.mem: the heap-lock half comes from host_vita_heap.c in one lock
@@ -245,7 +291,7 @@ static void kage_vita_profile_report_halo(const char *bid, uint32_t window, uint
     defined(ISAAC_VITA_IO_WINDOW_PROFILE) || defined(ISAAC_VITA_STATIC_SFX_PROFILE) || \
     defined(ISAAC_VITA_PNG_WINDOW_PROFILE) || defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) || \
     defined(ISAAC_VITA_ANM2_WINDOW_PROFILE) || defined(ISAAC_VITA_PNG_TEXEL_INIT_ELISION) || \
-    defined(ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE)
+    defined(ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE) || defined(ISAAC_VITA_ARCHIVE_READ_TRAIL)
 # include "kage_vita_room_profile.h"
 # define KVPP_ROOM_DISCARD() kage_vita_room_profile_discard()
 # define KVPP_ROOM_REPORT(b, w, l) kage_vita_room_profile_report(b, w, l)
@@ -430,6 +476,9 @@ static uint32_t s_import_calls_delta[GUEST_PHASE_PROFILE_IMPORT_ID_SLOTS];
 # define KAGE_VITA_PROFILE_SNAPSHOT_IMPORTS() ((void)0)
 #endif
 static uint32_t s_window_time_get_time;
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+static IsaacVitaClearLatchCounters s_window_clear_latch;
+#endif
 #if defined(ISAAC_VITA_GUEST_LOOKUP_CACHE)
 static uint32_t s_window_lookup_cache_hits;
 static uint32_t s_window_lookup_cache_misses;
@@ -741,6 +790,9 @@ static void kage_vita_profile_reset_window(void)
 
 void kage_vita_phase_profile_reset(void)
 {
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    isaac_gl_record_worker_quiesce();
+#endif
 #if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
     {
         int saved_errno = errno;
@@ -1324,6 +1376,36 @@ static void kage_vita_profile_log_locations(
         time_get_time_calls);
 }
 
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+/* ph120.tl: the KAGE Clear expiry-loop clock latch in the timeGetTime
+ * handler (host_vita_post_com.c), window deltas taken at the same instants
+ * as ph120.a tgt.  site(n,h,f,s) = calls from the two loop sites / eligible
+ * calls (ON: answered from the latch; OBSERVE: would be) / key misses that
+ * read and re-arm / site calls from another CPU (tripwire, must be 0);
+ * obs(t,x,d,w) = OBSERVE-only fresh-versus-latch differences (0 in ON) /
+ * expiries decided by the returned value / OBSERVE-only decision flips (0
+ * in ON; d == 0 over a run means ON would have run the same trajectory) /
+ * element stamps newer than the latch (tripwire, must be 0); clk = clock
+ * reads by the handler at every site (OBSERVE: clk == tgt; ON: clk ==
+ * tgt - h). */
+static void kage_vita_profile_log_clear_latch(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaClearLatchCounters *now,
+    const IsaacVitaClearLatchCounters *start)
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.tl bid=%.32s win=%u loops=%u mode=%u "
+        "site(n,h,f,s)=%u,%u,%u,%u obs(t,x,d,w)=%u,%u,%u,%u clk=%u\n",
+        build_id, window, last_outer_loop,
+        (unsigned)ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE,
+        now->site_calls - start->site_calls, now->hits - start->hits,
+        now->fresh - start->fresh, now->foreign_cpu - start->foreign_cpu,
+        now->ticks - start->ticks, now->expiries - start->expiries,
+        now->flips - start->flips, now->stamp_ahead - start->stamp_ahead,
+        now->clock_reads - start->clock_reads);
+}
+#endif
+
 #if defined(ISAAC_VITA_FULLSPEED_SCHEDULER)
 /* ph120.w: the previous window's synchronous emission block on the game
  * thread -- the loop-head deltas, percentile sort, every ph120 record and the
@@ -1339,6 +1421,68 @@ static void kage_vita_profile_log_emission(
         "[kage-vita] ph120.w bid=%.32s win=%u loops=%u emit(us,max)=%u,%u\n",
         build_id, window, last_outer_loop, emit_us, emit_max_us);
 }
+
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+/* ph120.fd / ph120.fs: the S5 floor-debt receipt
+ * (KageVitaFullspeedFloorDebtSnapshot, kage_vita_fullspeed_scheduler.h),
+ * taken and zeroed once per window, printed only by FLOOR_DEBT=OBSERVE|ON
+ * builds, right after ph120.w.
+ *   fd: p = Game::Update paces with a live floor; late(c,us,max) = paces
+ *       that started after their floor by less than one Game tick with no
+ *       grid-rule event (stale drop, clock reset, failed head wait) since,
+ *       their summed and largest lateness; kept = summed min(late, cap, grid
+ *       room) (kept by ON; OBSERVE: the same rule on stock's trajectory);
+ *       over(c,us) = late paces kept below their lateness (cap or grid
+ *       clamp), summed late - kept; clamp(c,us) = those the grid clamp kept
+ *       below min(late, cap), summed min(late, cap) - kept (kept + clamp =
+ *       sum min(late, cap));
+ *       stale(c,g,us) = stale-cut paces, those < one tick late (grid rule),
+ *       their summed lateness; gf(n,pos,max,min,last) = signed us from the
+ *       next Game floor to the next full head's 60-Hz grid deadline, sampled
+ *       after every pace (pos = samples above 0; the header says when > 0).
+ *   fs: h = late paces by lateness <1 (inside the floor's own microsecond),
+ *       <250, <1000, <2000, <5000, <16667, <33334 us (sums to late c);
+ *       slack(b,l,us) = interpolated frames predicted to end inside
+ *       (floor, floor + admit slack], and (ON) the late paces that followed
+ *       an admitted one, with their summed lateness; floor = the next Game
+ *       floor at this report, us, hex like ph120.s at= (0: none).
+ * Window identity: each Game floor is one period after the previous floor
+ * plus the lateness that pace dropped, so between two reports the floor
+ * stamp advances p * 33,333 1/3 us + late us + stale us under OBSERVE, and
+ * over us + stale us in place of late us under ON, to 1 us of rounding per
+ * pace (bench_run.py fres).  The report's at= is read before the loop
+ * head's wait, so at-deltas carry the boundary tick's work.
+ * Two records so each stays below the 384-byte logger ceiling at all-ones
+ * (fd 362 bytes, fs 239; pinned by the cadence30 phase oracle). */
+static void kage_vita_profile_log_floor_debt(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const KageVitaFullspeedFloorDebtSnapshot *value)
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.fd bid=%.32s win=%u loops=%u p=%u "
+        "late(c,us,max)=%u,%u,%u kept=%u over(c,us)=%u,%u "
+        "clamp(c,us)=%u,%u "
+        "stale(c,g,us)=%u,%u,%u gf(n,pos,max,min,last)=%u,%u,%d,%d,%d\n",
+        build_id, window, last_outer_loop, value->paces,
+        value->late, value->late_us, value->late_max_us,
+        value->kept_us, value->over, value->over_us,
+        value->clamp, value->clamp_us,
+        value->stale, value->stale_grid, value->stale_us,
+        value->gf_n, value->gf_pos,
+        (int)value->gf_max_us, (int)value->gf_min_us,
+        (int)value->gf_last_us);
+    KVPP_PRINTF(
+        "[kage-vita] ph120.fs bid=%.32s win=%u loops=%u "
+        "h=%u,%u,%u,%u,%u,%u,%u slack(b,l,us)=%u,%u,%u floor=%08x%08x\n",
+        build_id, window, last_outer_loop,
+        value->late_hist[0], value->late_hist[1], value->late_hist[2],
+        value->late_hist[3], value->late_hist[4], value->late_hist[5],
+        value->late_hist[6],
+        value->slack_band, value->slack_late, value->slack_late_us,
+        (unsigned)(uint32_t)(value->floor_us >> 32),
+        (unsigned)(uint32_t)value->floor_us);
+}
+#endif
 
 static void kage_vita_profile_log_scheduler(
     const char *build_id, uint32_t window, uint32_t last_outer_loop,
@@ -2338,6 +2482,452 @@ static void kage_vita_profile_log_kage_quad(
         k->declined[8]);
 }
 #endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+/* ph120.gf: the HasCollectible G FUEL seams for the window
+ * (ISAAC_VITA_GFUEL_SEED_NATIVE; take-and-zero at the window boundary,
+ * discarded once at the first loop head).  q(n,h) = __wrap_sub_0039cb10
+ * entries / answered natively; m(n,h) = the same for __wrap_sub_0039cb80;
+ * w = native answers whose seed set was not empty (the inline sub_000206b0
+ * loop ran); p = native answers that found SEED_G_FUEL; d(s,n,w,b) =
+ * declines into the translated body by reason: guest stack, null link,
+ * walk bound, G FUEL byte above 7; l(k,t,o) = entries into the translated
+ * sub_000206b0 when k=1 (profiling seams linked): from the translated
+ * sub_0039cb10 (return word 0x39cb3c) / from other units.
+ * Then, filled by the profiling seams (zero without them):
+ * ph120.gu h(n,i,g) = HasCollectible entries from other units / with
+ *   ignoreModifiers / with a negative id; us(q,m,o,h,z) = n/us/over of the
+ *   1-in-64 timed spans: the two G FUEL wrappers, the translated
+ *   sub_000206b0 under other callers, HasCollectible inclusive (only the
+ *   entries not inside another HasCollectible, h - x), and the empty clock
+ *   bracket.  Per call: us / (n - over) - z's mean.
+ * ph120.gl / ph120.gh n= x= top=ret:entries,... = the o entries / the
+ *   HasCollectible entries by the return word of their call site: distinct
+ *   words, untabled entries, top ten (always ten pairs, 0:0 = unused).
+ * ph120.gn x = h(n) entries inside another HasCollectible; b = HasCollectible
+ *   bodies, however entered; t(n,h,p) = GetTrinketMultiplier entries from
+ *   other units / from HasCollectible / outside any HasCollectible; us(t) =
+ *   n/us/over of the last ones' 1-in-64 spans.
+ * ph120.gb = the b bodies by HasCollectible's own return word, as gl/gh. */
+_Static_assert(ISAAC_VITA_GFUEL_DECLINE_REASONS == 4,
+               "ph120.gf prints four decline reasons");
+_Static_assert(ISAAC_VITA_GFUEL_TIMERS == 6 &&
+               ISAAC_VITA_GFUEL_TIMER_GTM == 5,
+               "ph120.gu prints the first five timers, ph120.gn the sixth");
+_Static_assert(ISAAC_VITA_GFUEL_TOP_SITES == 10, "top ten call sites");
+static void kage_vita_profile_log_gfuel_sites(
+    const char *tag, const char *build_id, uint32_t window,
+    uint32_t last_outer_loop, const IsaacVitaGfuelSites *s)
+{
+    const IsaacVitaGfuelSite *t = s->top;
+
+    /* always ten pairs; unused ones print as 0:0 */
+    KVPP_PRINTF(
+        "[kage-vita] ph120.%s bid=%.32s win=%u loops=%u n=%u x=%u "
+        "top=%x:%u,%x:%u,%x:%u,%x:%u,%x:%u,%x:%u,%x:%u,%x:%u,%x:%u,%x:%u\n",
+        tag, build_id, window, last_outer_loop, s->distinct, s->overflow,
+        t[0].ret, t[0].n, t[1].ret, t[1].n, t[2].ret, t[2].n, t[3].ret,
+        t[3].n, t[4].ret, t[4].n, t[5].ret, t[5].n, t[6].ret, t[6].n,
+        t[7].ret, t[7].n, t[8].ret, t[8].n, t[9].ret, t[9].n);
+}
+static void kage_vita_profile_log_gfuel(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaGfuelSeedCounters *g)
+{
+    const IsaacVitaGfuelTimer *t = g->timer;
+
+    KVPP_PRINTF(
+        "[kage-vita] ph120.gf bid=%.32s win=%u loops=%u q(n,h)=%u,%u "
+        "m(n,h)=%u,%u w=%u p=%u d(s,n,w,b)=%u,%u,%u,%u l(k,t,o)=%u,%u,%u\n",
+        build_id, window, last_outer_loop, g->query_calls, g->query_handled,
+        g->mode_calls, g->mode_handled, g->walked, g->present,
+        g->declined[0], g->declined[1], g->declined[2], g->declined[3],
+        g->lookup_linked, g->lookup_translated, g->lookup_other);
+    KVPP_PRINTF(
+        "[kage-vita] ph120.gu bid=%.32s win=%u loops=%u h(n,i,g)=%u,%u,%u "
+        "us(q,m,o,h,z)=%u/%u/%u,%u/%u/%u,%u/%u/%u,%u/%u/%u,%u/%u/%u\n",
+        build_id, window, last_outer_loop, g->has_calls, g->has_ignore,
+        g->has_negative, t[0].n, t[0].us, t[0].over, t[1].n, t[1].us,
+        t[1].over, t[2].n, t[2].us, t[2].over, t[3].n, t[3].us, t[3].over,
+        t[4].n, t[4].us, t[4].over);
+    kage_vita_profile_log_gfuel_sites("gl", build_id, window, last_outer_loop,
+                                      &g->lookup_sites);
+    kage_vita_profile_log_gfuel_sites("gh", build_id, window, last_outer_loop,
+                                      &g->has_sites);
+    KVPP_PRINTF(
+        "[kage-vita] ph120.gn bid=%.32s win=%u loops=%u x=%u b=%u "
+        "t(n,h,p)=%u,%u,%u us(t)=%u/%u/%u\n",
+        build_id, window, last_outer_loop, g->has_nested, g->has_bodies,
+        g->gtm_calls, g->gtm_from_has, g->gtm_top, t[5].n, t[5].us, t[5].over);
+    kage_vita_profile_log_gfuel_sites("gb", build_id, window, last_outer_loop,
+                                      &g->body_sites);
+}
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+/* GL render thread (ISAAC_VITA_GL_THREAD_WORKER).  vitaGL, the shim counters
+ * and the vitaGL "take" statistics belong to the render thread.  At the first
+ * loop head and at every window flush the take below runs a closure ON the
+ * render thread after everything recorded so far, so when it returns the
+ * render thread is idle and every vitaGL read of this window flush (scene,
+ * RT-interlude, GPU-draw stats) sees the work the window recorded.  One
+ * blocking wait per window; ph120.rt counts it in c(n,us).
+ * ph120.rt: wall/busy = render-thread window wall and busy microseconds;
+ * f(n,o) = present closures, beyond the 256-sample cap; fr(50,95,max) =
+ * render busy microseconds per present (nearest rank); sw = vglSwapBuffers
+ * microseconds; hw = ring high-water bytes; r = records; game-thread blocked
+ * waits: s(n,w,us) = S calls, of which blocked, blocked microseconds;
+ * h(n,us) = present waited for the previous one (frame held; frames are
+ * never dropped by construction); c(n,us) = closures/drains; rf = ring-full
+ * sleeps. */
+static void kage_vita_profile_log_render_thread(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacGlRecordWorkerWindow *w)
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.rt bid=%.32s win=%u loops=%u wall=%u busy=%u "
+        "f(n,o)=%u,%u fr(50,95,max)=%u,%u,%u sw=%u hw=%u r=%u "
+        "s(n,w,us)=%u,%u,%u h(n,us)=%u,%u c(n,us)=%u,%u rf=%u\n",
+        build_id, window, last_outer_loop, w->wall_us, w->busy_us,
+        w->frames, w->frame_overflow, w->frame_p50_us, w->frame_p95_us,
+        w->frame_max_us, w->swap_us, w->ring_high_water, w->records,
+        w->syncs, w->sync_waits, w->sync_wait_us, w->held, w->held_us,
+        w->call_waits, w->call_wait_us, w->ring_full_waits);
+}
+/* ph120.rw (same window, after rt): wk = producer semaphore signals; sl(n,t)
+ * = render-thread sleeps, timeouts that found unkicked work; mb(n,s,us) =
+ * memory admission checks, of which 1/64 timed, their µs; ap(s,us) = 1/64
+ * timed ring appends, their µs; cb = bytes copied into the ring; mq =
+ * admission syscalls actually made (cache misses); ck = the clock pair's
+ * own cost on the ap samples (true append us = ap.us - ck); rs =
+ * interpolated renders declined because the render thread was behind. */
+static void kage_vita_profile_log_render_wake(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacGlRecordWorkerWindow *w)
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.rw bid=%.32s win=%u loops=%u wk=%u sl(n,t)=%u,%u "
+        "mb(n,s,us)=%u,%u,%u ap(s,us)=%u,%u cb=%u mq=%u ck=%u rs=%u\n",
+        build_id, window, last_outer_loop, w->wakes, w->consumer_sleeps,
+        w->consumer_timeouts, w->mb_calls, w->mb_samples, w->mb_us,
+        w->ap_samples, w->ap_us, w->copied_bytes, w->mb_queries,
+        w->clock_us, w->render_skips);
+}
+static IsaacGlRecordWorkerWindow s_render_thread_window;
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+#  include <stdio.h>
+/* ph120.ro + ph120.rop (ISAAC_VITA_GL_RECORD_OPCODE_CENSUS, after rw): the
+ * recorder's per-opcode census of the same window (gl_record_backend.h).
+ * ro: ops = opcode slots with any non-zero field, lines = the rop records
+ * that follow; k = 1/k sampling of the random replay timing and of the
+ * game-thread appends; x = exact replay timings per opcode and window;
+ * ck16 = 16 back-to-back render-thread clock intervals (us); f = the field
+ * order of every slot.  rop: part = 0..lines-1, op = slot:fields;... with
+ * three slots per record, so all-ones fields stay within 512 bytes. */
+#  define KVPP_CENSUS_SLOTS_PER_LINE 3u
+static int kage_vita_profile_census_active(const IsaacGlRecordOpcodeStats *o)
+{
+    return (o->n | o->b | o->e | o->eus | o->rs | o->rus | o->ps | o->pst |
+            o->pus | o->sy | o->sw | o->swus) != 0u;
+}
+static void kage_vita_profile_log_opcode_census(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacGlRecordOpcodeCensus *c)
+{
+    char text[KVPP_CENSUS_SLOTS_PER_LINE *
+              sizeof ";78:4294967295,4294967295,4294967295,4294967295,"
+                     "4294967295,4294967295,4294967295,4294967295,"
+                     "4294967295,4294967295,4294967295,4294967295"];
+    uint32_t slot, active = 0u, part = 0u, in_line = 0u;
+    size_t used = 0u;
+
+    for (slot = 0u; slot < ISAAC_GL_RECORD_CENSUS_OPS; ++slot)
+        if (kage_vita_profile_census_active(&c->op[slot])) ++active;
+    KVPP_PRINTF(
+        "[kage-vita] ph120.ro bid=%.32s win=%u loops=%u ops=%u lines=%u "
+        "k=64 x=%u ck16=%u f=n,b,e,eus,rs,rus,ps,pst,pus,sy,sw,swus\n",
+        build_id, window, last_outer_loop, active,
+        (active + KVPP_CENSUS_SLOTS_PER_LINE - 1u) / KVPP_CENSUS_SLOTS_PER_LINE,
+        ISAAC_GL_RECORD_CENSUS_EXACT, c->ck16_us);
+    for (slot = 0u; slot < ISAAC_GL_RECORD_CENSUS_OPS; ++slot) {
+        const IsaacGlRecordOpcodeStats *o = &c->op[slot];
+        int wrote;
+        if (!kage_vita_profile_census_active(o)) continue;
+        /* The buffer holds three all-ones slots: no truncation. */
+        wrote = snprintf(text + used, sizeof text - used,
+            "%s%u:%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u", in_line ? ";" : "",
+            (unsigned)slot, (unsigned)o->n, (unsigned)o->b, (unsigned)o->e,
+            (unsigned)o->eus, (unsigned)o->rs, (unsigned)o->rus,
+            (unsigned)o->ps, (unsigned)o->pst, (unsigned)o->pus,
+            (unsigned)o->sy, (unsigned)o->sw, (unsigned)o->swus);
+        if (wrote > 0) used += (size_t)wrote;
+        if (used >= sizeof text) used = sizeof text - 1u;
+        if (++in_line == KVPP_CENSUS_SLOTS_PER_LINE) {
+            KVPP_PRINTF("[kage-vita] ph120.rop bid=%.32s win=%u part=%u op=%s\n",
+                build_id, window, part, text);
+            ++part;
+            in_line = 0u;
+            used = 0u;
+        }
+    }
+    if (in_line)
+        KVPP_PRINTF("[kage-vita] ph120.rop bid=%.32s win=%u part=%u op=%s\n",
+            build_id, window, part, text);
+}
+# endif
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+/* ph120.cr: the camera ring replay for the window
+ * (ISAAC_VITA_CAMERA_RING_NATIVE; take-and-zero at the window boundary,
+ * discarded once at the first loop head).  n = sub_0049df90 entries; h =
+ * replayed natively; st = loop steps of the replayed calls; d(f,o,r,k,l,x)
+ * = declines into the translated body by reason: guest stack frame, null/
+ * wrapping/overlapping pointer, ring arithmetic (cap, start), n * frac
+ * outside int32, InverseLerp logger state, NaN input. */
+_Static_assert(ISAAC_VITA_CAMERA_RING_DECLINE_REASONS == 6,
+               "ph120.cr prints six decline reasons");
+static void kage_vita_profile_log_camera_ring(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaCameraRingCounters *r)
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.cr bid=%.32s win=%u loops=%u n=%u h=%u st=%u "
+        "d(f,o,r,k,l,x)=%u,%u,%u,%u,%u,%u\n",
+        build_id, window, last_outer_loop, r->calls, r->handled, r->steps,
+        r->declined[0], r->declined[1], r->declined[2], r->declined[3],
+        r->declined[4], r->declined[5]);
+}
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+/* ph120.ut i= then four rva:n/t/us/in/mx = the probe's seams from index i:
+ * entries, timed spans, their inclusive sum in us, probe spans completed
+ * inside them, the longest span.  ph120.uz z(n,us) = empty clock brackets.
+ * Per call: (us - in * z) / t. */
+_Static_assert(ISAAC_VITA_UPDATE_PROBE_PER_LINE == 4, "ph120.ut prints four");
+static void kage_vita_profile_log_update_probe(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaUpdateProbe *p)
+{
+    unsigned i;
+
+    KVPP_PRINTF("[kage-vita] ph120.uz bid=%.32s win=%u loops=%u k=%u z(n,us)=%u,%u\n",
+                build_id, window, last_outer_loop,
+                (unsigned)ISAAC_VITA_UPDATE_PROBES, p->z_n, p->z_us);
+    for (i = 0; i < ISAAC_VITA_UPDATE_PROBES; i += 4U) {
+        IsaacVitaUpdateProbeRow r[4];
+        unsigned j;
+
+        memset(r, 0, sizeof r);
+        for (j = 0; j < 4U && i + j < ISAAC_VITA_UPDATE_PROBES; ++j)
+            r[j] = p->row[i + j];
+        KVPP_PRINTF(
+            "[kage-vita] ph120.ut bid=%.32s win=%u loops=%u i=%u "
+            "%x:%u/%u/%u/%u/%u,%x:%u/%u/%u/%u/%u,%x:%u/%u/%u/%u/%u,"
+            "%x:%u/%u/%u/%u/%u\n",
+            build_id, window, last_outer_loop, i,
+            r[0].rva, r[0].n, r[0].t, r[0].us, r[0].in, r[0].mx,
+            r[1].rva, r[1].n, r[1].t, r[1].us, r[1].in, r[1].mx,
+            r[2].rva, r[2].n, r[2].t, r[2].us, r[2].in, r[2].mx,
+            r[3].rva, r[3].n, r[3].t, r[3].us, r[3].in, r[3].mx);
+    }
+    /* ph120.uc p= t= us= h,a,f,c,s=: import calls made inside the timed
+     * spans of a composition probe (heap, _access, file, lock, string). */
+    for (i = 0; i < ISAAC_VITA_UPDATE_PROBE_COMPOSED; ++i) {
+        const IsaacVitaUpdateProbeComposed *o = &p->composed[i];
+
+        KVPP_PRINTF(
+            "[kage-vita] ph120.uc bid=%.32s win=%u loops=%u p=%x t=%u us=%u "
+            "h,a,f,c,s=%u,%u,%u,%u,%u\n",
+            build_id, window, last_outer_loop, o->rva, o->t, o->us,
+            o->calls[0], o->calls[1], o->calls[2], o->calls[3], o->calls[4]);
+    }
+    /* ph120.uk p= d= x= top=key:n/us x8: a keyed probe's entries by key
+     * (distinct keys, entries that found no slot), top eight by us. */
+    for (i = 0; i < ISAAC_VITA_UPDATE_PROBE_KEYED; ++i) {
+        const IsaacVitaUpdateProbeKeyed *k = &p->keyed[i];
+        const IsaacVitaUpdateProbeKey *t = k->top;
+
+        KVPP_PRINTF(
+            "[kage-vita] ph120.uk bid=%.32s win=%u loops=%u p=%x d=%u x=%u "
+            "top=%x:%u/%u,%x:%u/%u,%x:%u/%u,%x:%u/%u,%x:%u/%u,%x:%u/%u,"
+            "%x:%u/%u,%x:%u/%u\n",
+            build_id, window, last_outer_loop, k->rva, k->distinct,
+            k->overflow, t[0].key, t[0].n, t[0].us, t[1].key, t[1].n,
+            t[1].us, t[2].key, t[2].n, t[2].us, t[3].key, t[3].n, t[3].us,
+            t[4].key, t[4].n, t[4].us, t[5].key, t[5].n, t[5].us, t[6].key,
+            t[6].n, t[6].us, t[7].key, t[7].n, t[7].us);
+    }
+}
+_Static_assert(ISAAC_VITA_UPDATE_PROBE_TOP_KEYS == 8, "ph120.uk prints eight");
+_Static_assert(ISAAC_VITA_UPDATE_PROBE_GROUPS == 5, "ph120.uc prints five groups");
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+/* ph120.hc: guest heap import calls for the window.  f(n,0,o,a,t,s,k,p) =
+ * free imports / NULL / served by OGG emergency, ANM2 scratch, texel scratch,
+ * room slab / slab route skipped by the immutable-range reject / generic
+ * frees of overflow-pool blocks; m(n,a,t,s,p,0) = malloc imports / ANM2,
+ * texel, slab / overflow pool after native OOM / NULL; c, r = calloc and
+ * realloc imports.
+ * ph120.hf / ph120.hm: 1-in-64 spans n/us/over of the free stages
+ * a(all) p(terminal+OGG+ANM2+texel) s(slab route) o(Vorbis observer) l(lock)
+ * g(ledger lookup/lease/remove) n(newlib free) t(unlock+telemetry) and the
+ * malloc stages a p(pre-routes) l(lock) r(ready+reserve) n(newlib malloc)
+ * g(ledger insert) t(unlock+telemetry) z(empty clock bracket).
+ * Per call: us / (n - over) - z.us / z.n. */
+_Static_assert(ISAAC_VITA_HEAP_COUNTS == 16, "ph120.hc prints 16 counts");
+_Static_assert(ISAAC_VITA_HEAP_STAGE_TIMERS == 16, "hf+hm print 16 timers");
+#define KVPP_HEAP_SPAN "%u/%u/%u"
+#define KVPP_HEAP_T(i) t[i].n, t[i].us, t[i].over
+static void kage_vita_profile_log_heap_stage(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaHeapStageCounters *h)
+{
+    const uint32_t *k = h->count;
+    const IsaacVitaHeapStageTimer *t = h->timer;
+
+    KVPP_PRINTF(
+        "[kage-vita] ph120.hc bid=%.32s win=%u loops=%u "
+        "f(n,0,o,a,t,s,k,p)=%u,%u,%u,%u,%u,%u,%u,%u "
+        "m(n,a,t,s,p,0)=%u,%u,%u,%u,%u,%u c=%u r=%u\n",
+        build_id, window, last_outer_loop, k[0], k[1], k[2], k[3], k[4],
+        k[5], k[6], k[7], k[8], k[9], k[10], k[11], k[12], k[13], k[14],
+        k[15]);
+    KVPP_PRINTF(
+        "[kage-vita] ph120.hf bid=%.32s win=%u loops=%u us(a,p,s,o,l,g,n,t)="
+        KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN ","
+        KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN ","
+        KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN "\n",
+        build_id, window, last_outer_loop, KVPP_HEAP_T(0), KVPP_HEAP_T(1),
+        KVPP_HEAP_T(2), KVPP_HEAP_T(3), KVPP_HEAP_T(4), KVPP_HEAP_T(5),
+        KVPP_HEAP_T(6), KVPP_HEAP_T(7));
+    KVPP_PRINTF(
+        "[kage-vita] ph120.hm bid=%.32s win=%u loops=%u us(a,p,l,r,n,g,t,z)="
+        KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN ","
+        KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN ","
+        KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN "\n",
+        build_id, window, last_outer_loop, KVPP_HEAP_T(8), KVPP_HEAP_T(9),
+        KVPP_HEAP_T(10), KVPP_HEAP_T(11), KVPP_HEAP_T(12), KVPP_HEAP_T(13),
+        KVPP_HEAP_T(14), KVPP_HEAP_T(15));
+}
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+/* ph120.hg (ISAAC_VITA_HEAP_FREE_COST_PROFILE): the free ledger span g split
+ * into 1-in-64 sub-spans k (lookup) e (lease scan + overflow check) r (remove)
+ * taken on calls whose a/g spans are not timed (per call: us / (n - over) -
+ * z from ph120.hm); lk(n,p,m) = generic frees that found their entry, find
+ * probes, max probes; rm(n,s,v,m) = removes, preflight entries scanned,
+ * entries shifted back, max scan; ls = lease checks that had to scan;
+ * led(l,c) = ledger entries / capacity at the window end.
+ * ph120.hv: pf(s,m) = frees the free prefilter kept off / handed to the
+ * OGG/ANM2/texel routes; nv(n,k,m,0,1,2,3) = Vorbis free observer calls,
+ * sum and max of live-mask bits, calls with 0/1/2/3+ live bits. */
+_Static_assert(ISAAC_VITA_HEAP_COST_TIMERS == 3, "ph120.hg prints 3 timers");
+_Static_assert(ISAAC_VITA_HEAP_NV_CENSUS == 7, "ph120.hv prints 7 nv");
+static void kage_vita_profile_log_heap_free_cost(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaHeapFreeCost *h)
+{
+    const IsaacVitaHeapStageTimer *t = h->timer;
+
+    KVPP_PRINTF(
+        "[kage-vita] ph120.hg bid=%.32s win=%u loops=%u us(k,e,r)="
+        KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN "," KVPP_HEAP_SPAN
+        " lk(n,p,m)=%u,%u,%u rm(n,s,v,m)=%u,%u,%u,%u ls=%u led(l,c)=%u,%u\n",
+        build_id, window, last_outer_loop, KVPP_HEAP_T(0), KVPP_HEAP_T(1),
+        KVPP_HEAP_T(2), h->lookups, h->lookup_probes, h->lookup_probe_max,
+        h->removes, h->remove_scan, h->remove_moves, h->remove_scan_max,
+        h->lease_scans, h->ledger_live, h->ledger_capacity);
+    KVPP_PRINTF(
+        "[kage-vita] ph120.hv bid=%.32s win=%u loops=%u pf(s,m)=%u,%u "
+        "nv(n,k,m,0,1,2,3)=%u,%u,%u,%u,%u,%u,%u\n",
+        build_id, window, last_outer_loop, h->prefilter_skip,
+        h->prefilter_maybe, h->nv[0], h->nv[1], h->nv[2], h->nv[3],
+        h->nv[4], h->nv[5], h->nv[6]);
+}
+#endif
+#undef KVPP_HEAP_SPAN
+#undef KVPP_HEAP_T
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+/* ph120.rn: the render chain replay for the window
+ * (ISAAC_VITA_RENDER_CHAIN_NATIVE; take-and-zero at the window boundary,
+ * discarded once at the first loop head).  f/fd = sub_0025af60 entries /
+ * declined to the translated body (short stack); gn/gc = size getters
+ * answered from a pinned leaf / entered through guest_call; rl =
+ * DecrementReference calls; r/ri/rd = sub_0055f610 entries / with
+ * sub_0055f630 inlined / declined. */
+static void kage_vita_profile_log_render_chain(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaRenderChainCounters *r)
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.rn bid=%.32s win=%u loops=%u f=%u fd=%u gn=%u "
+        "gc=%u rl=%u r=%u ri=%u rd=%u\n",
+        build_id, window, last_outer_loop, r->fill_calls, r->fill_declined,
+        r->getters_native, r->getters_called, r->releases, r->render_calls,
+        r->render_inlined, r->render_declined);
+}
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+/* ph120.hn: the HasCollectible replay for the window
+ * (ISAAC_VITA_HASCOLLECTIBLE_NATIVE; take-and-zero at the window boundary,
+ * discarded once at the first loop head).  n = entries (the --wrap seam, or
+ * the G FUEL profiling wrapper in profiling builds); h = answered natively;
+ * b = native bodies (h plus their HasCollectible(0xbf) calls); y = handled
+ * entries that returned al = 1; d(s,c,i,g,t,n,w,x) = declines into the
+ * translated body by reason: guest stack, co-op baby, id
+ * (negative/0x147/0x148/0x139/9/0x3b), G FUEL byte above 7 or its walk,
+ * the twin HasCollectible call, null link, map walk or effect list over the
+ * bound, item-predicate jump target outside the frozen pair. */
+_Static_assert(ISAAC_VITA_HASCOLL_DECLINE_REASONS == 8,
+               "ph120.hn prints eight decline reasons");
+static void kage_vita_profile_log_hascoll(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaHasCollCounters *h)
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.hn bid=%.32s win=%u loops=%u n=%u h=%u b=%u y=%u "
+        "d(s,c,i,g,t,n,w,x)=%u,%u,%u,%u,%u,%u,%u,%u\n",
+        build_id, window, last_outer_loop, h->calls, h->handled, h->bodies,
+        h->yes, h->declined[0], h->declined[1], h->declined[2],
+        h->declined[3], h->declined[4], h->declined[5], h->declined[6],
+        h->declined[7]);
+}
+#endif
+#if defined(ISAAC_VITA_UNIFORM_SET_RECEIPT)
+
+/* ph120.us: the KAGE Shader uniform path for the window
+ * (ISAAC_VITA_UNIFORM_SET_RECEIPT; take-and-zero at the window boundary,
+ * discarded once at the first loop head).  b(n,a,r,rn,it,im) = Shader::Bind
+ * entries / Shader::ApplyUniforms entries / largest uniform-record count
+ * seen on a Shader ([this+0x10..0x14) stride 0x18) / entries whose record
+ * count was non-zero / sum of the index-list lengths the bodies loop over
+ * (= per-record SetUniform calls made) / largest such list;
+ * s(n,i,t,x0,x1,o) = Shader::SetUniform entries / Shader::SetUniformInt
+ * entries / name literal "Transform" / "Texture0" / "Texture1" / any other
+ * name pointer; c(n,v,f) = Shader::Collapse (sub_005679e0) entries / values
+ * held by the Shader's records at entry / non-sampler values the body is
+ * about to free (the "free" half of a malloc/free churn); bad = entries
+ * whose stack window or this/list/records pointer was not readable
+ * (counted, body still runs).  r=0, it=0, s(n)=0 and c(f)=0 all
+ * session is the proof that the uniform loop is dead in this PE: SetUniform
+ * (slot 8) is reached only from that loop, while the fixed per-Bind calls
+ * are SetUniformInt (slot 7) for "Texture0" and, with a second bound target,
+ * "Texture1" (s(i)=x0+x1, 1-2 per Bind) and the Transform matrix through
+ * sub_00565240's direct GL slot calls (not counted here). */
+static void kage_vita_profile_log_uniform_set(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const IsaacVitaUniformSetCounters *u)
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.us bid=%.32s win=%u loops=%u "
+        "b(n,a,r,rn,it,im)=%u,%u,%u,%u,%u,%u "
+        "s(n,i,t,x0,x1,o)=%u,%u,%u,%u,%u,%u c(n,v,f)=%u,%u,%u bad=%u\n",
+        build_id, window, last_outer_loop,
+        u->binds, u->applies, u->records_max, u->records_nonempty,
+        u->iterations, u->iterations_max,
+        u->sets, u->set_ints, u->name_transform, u->name_texture0,
+        u->name_texture1, u->name_other,
+        u->collapses, u->collapse_values, u->frees, u->bad);
+}
+#endif
 
 #if defined(ISAAC_VITA_HEAP_CENSUS)
 /* ph120.mem: the per-window guest-heap receipt (ISAAC_VITA_HEAP_CENSUS).
@@ -2444,8 +3034,15 @@ static void kage_vita_profile_heap_collect(kage_vita_heap_record *record)
     kage_vita_phase_profile_oracle_vgl_ram(&record->vgl_free,
                                            &record->vgl_total);
 # else
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    /* The render thread's published copy (also safe on the badalloc/exit
+     * report, which must not wait for the render thread). */
+    record->vgl_free = kage_vita_backend_vgl_mem(KAGE_VITA_VGL_SNAPSHOT_RAM_FREE);
+    record->vgl_total = kage_vita_backend_vgl_mem(KAGE_VITA_VGL_SNAPSHOT_RAM_TOTAL);
+#else
     record->vgl_free = (uint32_t)vglMemFree(VGL_MEM_RAM);
     record->vgl_total = (uint32_t)vglMemTotal(VGL_MEM_RAM);
+#endif
 # endif
     record->slot_live = census.ogg_slot_live;
 }
@@ -2515,6 +3112,35 @@ static void kage_vita_profile_log_image_retain(
         now.budget_bytes, now.headroom_bytes, now.vf_ram, now.vf_vram,
         now.armed);
     s_image_retain_prev = now;
+#if defined(ISAAC_VITA_IMAGE_RETAIN_GHOST)
+    {
+        /* ph120.irg (cumulative): eligible frees, first frees, re-offers =
+         * re-decodes with their KiB, ghost-table drops, then re-decode
+         * count / KiB by stack distance <= 4,8,16,24,32,48,64,96,>96 MiB.
+         * ph120.irm (this window): samples, minimum vitaGL free RAM, VRAM,
+         * PHYCONT, their sum, kernel free USER_RW, sampler us sum/max.
+         * Worst case about 390 bytes. */
+        isaac_irg_stats g;
+        isaac_irg_mem m;
+
+        isaac_vita_image_retain_ghost_take(&g, &m);
+        KVPP_PRINTF(
+            "[kage-vita] ph120.irg bid=%.32s win=%u loops=%u "
+            "off=%u cold=%u rel=%u/%uk drop=%u "
+            "n=%u,%u,%u,%u,%u,%u,%u,%u,%u kb=%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+            build_id, window, last_outer_loop,
+            g.offers, g.cold, g.reloads, g.reload_kb, g.dropped,
+            g.n[0], g.n[1], g.n[2], g.n[3], g.n[4], g.n[5], g.n[6], g.n[7],
+            g.n[8], g.kb[0], g.kb[1], g.kb[2], g.kb[3], g.kb[4], g.kb[5],
+            g.kb[6], g.kb[7], g.kb[8]);
+        KVPP_PRINTF(
+            "[kage-vita] ph120.irm bid=%.32s win=%u loops=%u n=%u "
+            "min(r,v,p,s,u)=%u,%u,%u,%u,%u us(sum,max)=%u,%u\n",
+            build_id, window, last_outer_loop, m.n,
+            m.min_ram, m.min_vram, m.min_phy, m.min_sum, m.min_user,
+            m.us_sum, m.us_max);
+    }
+#endif
 }
 #endif
 
@@ -2570,7 +3196,7 @@ static void kage_vita_profile_report(
     (void)report_at_us;
 #endif
     /* Every enabled record is one call with one newline, emitted in
-     * t,c,a,gt,gw,gd,gu,gx,x,xd,g,d,i,o,y,v,q,f,fa,fp,e,k,b,h,p,l,m,n,s,r,w,ik,ih,mem,ha,rl order
+     * t,c,a,tl,gt,gw,gd,gu,gx,x,xd,g,d,i,o,y,v,q,f,fa,fp,e,k,b,h,p,l,m,n,s,r,w,ik,ih,mem,ha,rl order
      * (kage_vita_phase_profile.h; gw (ISAAC_VITA_GL_WRAPPER_TIME) directly
      * after gt, then gx: gt and gx come from the same scene take).
      * Prefix/payload splitting is forbidden because the Vita logger
@@ -2594,6 +3220,12 @@ static void kage_vita_profile_report(
         ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
         s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
         last_outer_loop);
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+    KAGE_VITA_GPU_FRAME_PROFILE_REPORT(
+        ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+        s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+        last_outer_loop);
+#endif
     kage_vita_profile_log_counts(
         ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
         s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
@@ -2604,6 +3236,13 @@ static void kage_vita_profile_report(
         s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
         last_outer_loop, gl,
         g_isaac_vita_post_com_time_get_time_calls - s_window_time_get_time);
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    kage_vita_profile_log_clear_latch(
+        ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+        s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+        last_outer_loop, &g_isaac_vita_clear_latch_counters,
+        &s_window_clear_latch);
+#endif
 #if defined(ISAAC_VITA_GL_TIME_PROFILE)
     kage_vita_profile_log_gl_time(
         ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
@@ -2788,6 +3427,17 @@ static void kage_vita_profile_report(
             ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
             s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
             last_outer_loop, s_last_emit_us, s_max_emit_us);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+        {
+            KageVitaFullspeedFloorDebtSnapshot floor_debt;
+
+            kage_vita_fullspeed_scheduler_floor_debt_take(&floor_debt);
+            kage_vita_profile_log_floor_debt(
+                ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+                s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+                last_outer_loop, &floor_debt);
+        }
+#endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
         pace_wait_calls = scheduler.pace_wait_calls -
             s_window_scheduler.pace_wait_calls;
@@ -2826,6 +3476,115 @@ static void kage_vita_profile_report(
             s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
             last_outer_loop, &kage_quad);
     }
+#endif
+#if defined(ISAAC_VITA_UNIFORM_SET_RECEIPT)
+    /* us follows kq (or takes its place) without moving any earlier
+     * record; the take-and-zero is the window boundary. */
+    {
+        IsaacVitaUniformSetCounters uniform_set;
+
+        isaac_vita_uniform_set_receipt_take(&uniform_set);
+        kage_vita_profile_log_uniform_set(
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop, &uniform_set);
+    }
+#endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    /* gf, then cr, follow us without moving any earlier record; the
+     * take-and-zero is the window boundary. */
+    {
+        IsaacVitaGfuelSeedCounters gfuel;
+
+        isaac_vita_gfuel_seed_take(&gfuel);
+        kage_vita_profile_log_gfuel(
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop, &gfuel);
+    }
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+    {
+        IsaacVitaCameraRingCounters camera_ring;
+
+        isaac_vita_camera_ring_take(&camera_ring);
+        kage_vita_profile_log_camera_ring(
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop, &camera_ring);
+    }
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+    {
+        static IsaacVitaUpdateProbe update_probe;
+
+        isaac_vita_update_probe_take(&update_probe);
+        kage_vita_profile_log_update_probe(
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop, &update_probe);
+    }
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    {
+        IsaacVitaHeapStageCounters heap_stage;
+
+        isaac_vita_heap_stage_take(&heap_stage);
+        kage_vita_profile_log_heap_stage(
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop, &heap_stage);
+    }
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    {
+        IsaacVitaHeapFreeCost heap_free_cost;
+
+        isaac_vita_heap_free_cost_take(&heap_free_cost);
+        kage_vita_profile_log_heap_free_cost(
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop, &heap_free_cost);
+    }
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    {
+        IsaacVitaRenderChainCounters render_chain;
+
+        isaac_vita_render_chain_take(&render_chain);
+        kage_vita_profile_log_render_chain(
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop, &render_chain);
+    }
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    /* hn follows rn without moving any earlier record. */
+    {
+        IsaacVitaHasCollCounters hascoll;
+
+        isaac_vita_hascoll_native_take(&hascoll);
+        kage_vita_profile_log_hascoll(
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop, &hascoll);
+    }
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    kage_vita_profile_log_render_thread(
+        ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+        s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+        last_outer_loop, &s_render_thread_window);
+    kage_vita_profile_log_render_wake(
+        ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+        s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+        last_outer_loop, &s_render_thread_window);
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+    kage_vita_profile_log_opcode_census(
+        ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+        s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+        last_outer_loop, isaac_gl_record_opcode_census());
+# endif
 #endif
 #if defined(ISAAC_VITA_LASER_HALO_PROFILE) && ISAAC_VITA_LASER_HALO_PROFILE
     /* One counter snapshot at the outer window boundary, never at the
@@ -2923,6 +3682,16 @@ void kage_vita_phase_profile_oracle_emit_max_records(void)
         &guest, &gl, UINT32_MAX);
     kage_vita_profile_log_locations(
         max_build_id, UINT32_MAX, UINT32_MAX, &gl, UINT32_MAX);
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    {
+        IsaacVitaClearLatchCounters all_ones, zero;
+
+        memset(&all_ones, 0xff, sizeof all_ones);
+        memset(&zero, 0, sizeof zero);
+        kage_vita_profile_log_clear_latch(
+            max_build_id, UINT32_MAX, UINT32_MAX, &all_ones, &zero);
+    }
+#endif
 #if defined(ISAAC_VITA_GL_TIME_PROFILE)
     {
         IsaacVitaGlTimeProfile gl_time;
@@ -3066,6 +3835,19 @@ void kage_vita_phase_profile_oracle_emit_max_records(void)
         &scheduler, &scheduler_prior);
     kage_vita_profile_log_emission(
         max_build_id, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX);
+#if defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    {
+        KageVitaFullspeedFloorDebtSnapshot floor_debt;
+
+        /* All-ones counters; the signed gf fields at their longest. */
+        memset(&floor_debt, 0xff, sizeof floor_debt);
+        floor_debt.gf_max_us = INT32_MIN;
+        floor_debt.gf_min_us = INT32_MIN;
+        floor_debt.gf_last_us = INT32_MIN;
+        kage_vita_profile_log_floor_debt(
+            max_build_id, UINT32_MAX, UINT32_MAX, &floor_debt);
+    }
+#endif
 #endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
     {
@@ -3096,6 +3878,98 @@ void kage_vita_phase_profile_oracle_emit_max_records(void)
         kage_vita_profile_log_kage_quad(
             max_build_id, UINT32_MAX, UINT32_MAX, &kage_quad);
     }
+#endif
+#if defined(ISAAC_VITA_UNIFORM_SET_RECEIPT)
+    {
+        IsaacVitaUniformSetCounters uniform_set;
+
+        memset(&uniform_set, 0xff, sizeof uniform_set);
+        kage_vita_profile_log_uniform_set(
+            max_build_id, UINT32_MAX, UINT32_MAX, &uniform_set);
+    }
+#endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    {
+        IsaacVitaGfuelSeedCounters gfuel;
+
+        memset(&gfuel, 0xff, sizeof gfuel);
+        kage_vita_profile_log_gfuel(
+            max_build_id, UINT32_MAX, UINT32_MAX, &gfuel);
+    }
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+    {
+        IsaacVitaCameraRingCounters camera_ring;
+
+        memset(&camera_ring, 0xff, sizeof camera_ring);
+        kage_vita_profile_log_camera_ring(
+            max_build_id, UINT32_MAX, UINT32_MAX, &camera_ring);
+    }
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+    {
+        static IsaacVitaUpdateProbe update_probe;
+
+        memset(&update_probe, 0xff, sizeof update_probe);
+        kage_vita_profile_log_update_probe(
+            max_build_id, UINT32_MAX, UINT32_MAX, &update_probe);
+    }
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    {
+        IsaacVitaHeapStageCounters heap_stage;
+
+        memset(&heap_stage, 0xff, sizeof heap_stage);
+        kage_vita_profile_log_heap_stage(
+            max_build_id, UINT32_MAX, UINT32_MAX, &heap_stage);
+    }
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    {
+        IsaacVitaHeapFreeCost heap_free_cost;
+
+        memset(&heap_free_cost, 0xff, sizeof heap_free_cost);
+        kage_vita_profile_log_heap_free_cost(
+            max_build_id, UINT32_MAX, UINT32_MAX, &heap_free_cost);
+    }
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    {
+        IsaacVitaRenderChainCounters render_chain;
+
+        memset(&render_chain, 0xff, sizeof render_chain);
+        kage_vita_profile_log_render_chain(
+            max_build_id, UINT32_MAX, UINT32_MAX, &render_chain);
+    }
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    {
+        IsaacVitaHasCollCounters hascoll;
+
+        memset(&hascoll, 0xff, sizeof hascoll);
+        kage_vita_profile_log_hascoll(
+            max_build_id, UINT32_MAX, UINT32_MAX, &hascoll);
+    }
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    {
+        IsaacGlRecordWorkerWindow render_thread;
+
+        memset(&render_thread, 0xff, sizeof render_thread);
+        kage_vita_profile_log_render_thread(
+            max_build_id, UINT32_MAX, UINT32_MAX, &render_thread);
+        kage_vita_profile_log_render_wake(
+            max_build_id, UINT32_MAX, UINT32_MAX, &render_thread);
+    }
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+    {
+        static IsaacGlRecordOpcodeCensus census;
+
+        memset(&census, 0xff, sizeof census);
+        kage_vita_profile_log_opcode_census(
+            max_build_id, UINT32_MAX, UINT32_MAX, &census);
+    }
+# endif
 #endif
 #if defined(ISAAC_VITA_LASER_HALO_PROFILE) && ISAAC_VITA_LASER_HALO_PROFILE
     {
@@ -3147,6 +4021,12 @@ void kage_vita_phase_profile_note_loop_head(uint32_t outer_loop_count)
 {
     uint64_t now = kage_vita_profile_now();
     int reported = 0;
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    if (!s_running)
+        isaac_gl_record_worker_take(NULL);
+    else if ((s_completed_loops + 1u) % KAGE_VITA_PHASE_PROFILE_WINDOW == 0u)
+        isaac_gl_record_worker_take(&s_render_thread_window);
+#endif
 
     if (!s_running) {
 #if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
@@ -3179,6 +4059,31 @@ void kage_vita_phase_profile_note_loop_head(uint32_t outer_loop_count)
          * first window, like the gt buckets below. */
         isaac_vita_kage_quad_fastpath_take(NULL);
 #endif
+#if defined(ISAAC_VITA_UNIFORM_SET_RECEIPT)
+        /* Same for the loading/menu Shader binds before the first window. */
+        isaac_vita_uniform_set_receipt_take(NULL);
+#endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+        isaac_vita_gfuel_seed_take(NULL);
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+        isaac_vita_camera_ring_take(NULL);
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+        isaac_vita_update_probe_take(NULL);
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+        isaac_vita_heap_stage_take(NULL);
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+        isaac_vita_heap_free_cost_take(NULL);
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+        isaac_vita_render_chain_take(NULL);
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+        isaac_vita_hascoll_native_take(NULL);
+#endif
 #if defined(ISAAC_VITA_GL_TIME_PROFILE)
         {
             /* Discard whatever accumulated before the first window (loading
@@ -3210,6 +4115,9 @@ void kage_vita_phase_profile_note_loop_head(uint32_t outer_loop_count)
         s_window_attrib_pending = gl_vita_backend_attrib_pending();
 #endif
         s_window_time_get_time = g_isaac_vita_post_com_time_get_time_calls;
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+        s_window_clear_latch = g_isaac_vita_clear_latch_counters;
+#endif
 #if defined(ISAAC_VITA_VITAGL_GPU_DRAW_OPTIMIZATIONS)
         vglGetIsaacGpuDrawStats(&s_window_vitagl);
 #endif
@@ -3565,6 +4473,9 @@ void kage_vita_phase_profile_note_loop_head(uint32_t outer_loop_count)
         s_window_attrib_pending = gl_vita_backend_attrib_pending();
 #endif
         s_window_time_get_time = g_isaac_vita_post_com_time_get_time_calls;
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+        s_window_clear_latch = g_isaac_vita_clear_latch_counters;
+#endif
 #if defined(ISAAC_VITA_VITAGL_GPU_DRAW_OPTIMIZATIONS)
         s_window_vitagl = vitagl_current;
 #endif
@@ -3647,6 +4558,9 @@ void kage_vita_phase_profile_note_render_entry(void)
 #endif
 
     KAGE_VITA_GUEST_SAMPLER_PHASE(KAGE_VITA_GUEST_SAMPLER_RND);
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+    KAGE_VITA_GPU_FRAME_PROFILE_RENDER(1u);
+#endif
     if (!s_running)
         return;
     now = kage_vita_profile_now();
@@ -3660,6 +4574,9 @@ void kage_vita_phase_profile_note_render_return(void)
     kage_vita_deep_phase_set(KVD_PHASE_OTHER);
 #endif
     KAGE_VITA_GUEST_SAMPLER_PHASE(KAGE_VITA_GUEST_SAMPLER_OTH);
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+    KAGE_VITA_GPU_FRAME_PROFILE_RENDER(0u);
+#endif
 #if defined(ISAAC_VITA_PHASE_PROFILE_OTHER)
     if (s_running) {
         uint64_t now = kage_vita_profile_now();
@@ -3732,6 +4649,9 @@ void kage_vita_phase_profile_note_present_return(void)
          * epoch. Do not turn either discontinuity into a giant unsigned gap. */
         s_have_present_return = valid;
     }
+#if defined(ISAAC_VITA_IMAGE_RETAIN_GHOST)
+    isaac_vita_image_retain_ghost_sample();
+#endif
 }
 
 void kage_vita_phase_profile_note_limiter_entry(void)
@@ -3964,7 +4884,13 @@ void kage_vita_phase_profile_laser_begin(
     active->token = token;
     active->cost_class = cost_class;
 #if defined(ISAAC_VITA_VITAGL_GPU_DRAW_OPTIMIZATIONS)
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    /* The laser's GL work is recorded here and runs later on the render
+     * thread: no per-laser vitaGL delta exists (reads 0). */
+    memset(&active->vitagl, 0, sizeof active->vitagl);
+#else
     vglGetIsaacGpuDrawStats(&active->vitagl);
+#endif
 #endif
     /* The clock follows the statistics snapshot so its cost is not charged to
      * the translated laser owner. */
@@ -4010,7 +4936,11 @@ void kage_vita_phase_profile_laser_end(uint32_t token, uint32_t shadow)
     active = &s_laser_active[shadow][depth - 1u];
     ended_at = kage_vita_profile_now();
 #if defined(ISAAC_VITA_VITAGL_GPU_DRAW_OPTIMIZATIONS)
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    memset(&vitagl, 0, sizeof vitagl);
+#else
     vglGetIsaacGpuDrawStats(&vitagl);
+#endif
 #endif
     s_laser_active_depth[shadow] = depth - 1u;
     if (active->cost_class >= KAGE_VITA_LASER_COST_CLASS_COUNT) {

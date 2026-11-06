@@ -25,6 +25,8 @@
 #define SCE_ENOENT ((int32_t)UINT32_C(0x80010002))
 #define SCE_EIO    ((int32_t)UINT32_C(0x80010005))
 #define SCE_ENODEV ((int32_t)UINT32_C(0x80010013))
+/* SCE_ERROR_ERRNO_EBADF, as in Adrenaline cef/include/psperror.h. */
+#define SCE_EBADF  ((int32_t)UINT32_C(0x80010009))
 
 static const unsigned char s_bytes[] = "abcdefghij";
 /* Same ten-byte length as s_bytes; the word at offset 4 is a valid
@@ -162,6 +164,14 @@ int isaac_vita_archive_cache_close(isaac_vita_archive_cache_file *file)
     errno = EBADF;
     return EOF;
 }
+
+#if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
+void isaac_vita_archive_fd_repair_counts(uint32_t *repaired, uint32_t *leaked)
+{
+    *repaired = 0U;
+    *leaked = 0U;
+}
+#endif
 
 /* The newlib-lane recovery seam is never taken by a raw token; count it. */
 FILE *isaac_vita_archive_cache_reopen_native(const char *native_path,
@@ -1095,6 +1105,74 @@ static int test_recover_publish_bounds(void)
     CHECK(!entry->recover.path[0] && !entry->recover.mode[0]);
     return 0;
 }
+
+/* EBADF from sceIoPread is recovered like ENODEV.  A cursor beyond the
+ * guest long (INT32_MAX here) cannot be restored exactly: that failure is
+ * left alone and counted unknown_pos. */
+static int test_recover_raw_ebadf_and_unknown_position(void)
+{
+    uint32_t fopen_arguments[2] = {
+        1U, (uint32_t)(uintptr_t)s_guest_mode_rb
+    };
+    uint32_t fread_arguments[4] = {
+        (uint32_t)(uintptr_t)s_guest_output, 1U, 2U, 0U
+    };
+    uint32_t one_argument[1];
+    vita_crt_file_token *entry = &s_file_tokens[0];
+    CPU cpu;
+    uint32_t esp;
+    uint32_t token;
+    int32_t descriptor;
+
+    reset_oracle();
+    esp = prepare_cdecl(&cpu, fopen_arguments, 2U);
+    vita_crt_fopen(&cpu);
+    token = cpu.eax;
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && entry->raw_archive.live &&
+          token == (uint32_t)(uintptr_t)entry);
+    descriptor = entry->raw_archive.descriptor;
+    fread_arguments[3] = token;
+
+    CHECK(vita_crt_raw_archive_fseek(entry, 3L, SEEK_SET) == 0);
+    s_fail_pread_call = s_pread_calls + 1U;
+    s_fail_pread_result = SCE_EBADF;
+    g_isaac_vita_crt_errno = EINVAL;
+    esp = prepare_cdecl(&cpu, fread_arguments, 4U);
+    vita_crt_fread(&cpu);
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && cpu.eax == 2U &&
+          memcmp(s_guest_output, "de", 2U) == 0 &&
+          entry->raw_archive.position == 5 && !entry->raw_archive.error &&
+          entry->raw_archive.descriptor != descriptor &&
+          entry->token == token && s_open_calls == 2U &&
+          s_close_calls == 1U && g_isaac_vita_crt_errno == EINVAL);
+    CHECK(s_descriptor_recover.ebadf == 1U &&
+          s_descriptor_recover.enodev == 0U &&
+          s_descriptor_recover.recovered == 1U &&
+          s_descriptor_recover.unknown_pos == 0U);
+    descriptor = entry->raw_archive.descriptor;
+
+    CHECK(vita_crt_raw_archive_fseek(entry, (long)INT32_MAX + 1L,
+                                     SEEK_SET) == 0);
+    s_fail_pread_call = s_pread_calls + 1U;
+    esp = prepare_cdecl(&cpu, fread_arguments, 4U);
+    vita_crt_fread(&cpu);
+    CHECK(!cpu.fault && cpu.esp == esp + 4U && cpu.eax == 0U &&
+          entry->raw_archive.error &&
+          entry->raw_archive.descriptor == descriptor &&
+          s_open_calls == 2U && s_close_calls == 1U &&
+          g_isaac_vita_crt_errno == EBADF && s_file_lock == 0U);
+    CHECK(s_descriptor_recover.ebadf == 2U &&
+          s_descriptor_recover.recovered == 1U &&
+          s_descriptor_recover.unknown_pos == 1U &&
+          s_descriptor_recover.reopen_fail == 0U);
+
+    one_argument[0] = token;
+    esp = prepare_cdecl(&cpu, one_argument, 1U);
+    vita_crt_fclose(&cpu);
+    CHECK(!cpu.fault && cpu.esp == esp + 4U &&
+          !vita_crt_dynamic_file_is_live(entry));
+    return 0;
+}
 #endif
 
 int main(void)
@@ -1110,6 +1188,7 @@ int main(void)
     CHECK(test_descriptor_enodev_on_header_read() == 0);
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     CHECK(test_recover_publish_bounds() == 0);
+    CHECK(test_recover_raw_ebadf_and_unknown_position() == 0);
     puts("Vita CRT raw packed-archive ENOMEM fallback host oracle "
          "(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER): PASS");
 #else

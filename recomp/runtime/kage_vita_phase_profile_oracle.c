@@ -594,7 +594,10 @@ static vglIsaacColorOffsetFsProbeStats s_fs_probe_stats = {
 #else
 # define ORACLE_FS_PROBE_RECORDS 0U
 #endif
-#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER)
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+/* s, r, w, then the S5 floor-debt receipt fd, fs */
+# define ORACLE_SCHEDULER_RECORDS 5U
+#elif defined(ISAAC_VITA_FULLSPEED_SCHEDULER)
 # define ORACLE_SCHEDULER_RECORDS 3U
 #else
 # define ORACLE_SCHEDULER_RECORDS 0U
@@ -624,9 +627,24 @@ static vglIsaacColorOffsetFsProbeStats s_fs_probe_stats = {
 #else
 # define ORACLE_LASER_RECORDS 0U
 #endif
+/* ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE (OBSERVE 1 / ON 2): ph120.tl
+ * directly after ph120.a, window deltas of the handler's cumulative counters
+ * taken at the same instants as tgt.  host_vita_post_com.c owns the counters
+ * in production; this stand-in advances them in add_gl_counts on the same
+ * base + k scheme (k = 100..108 in field order). */
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+# include "host_vita_post_com.h"
+# define ORACLE_CLEAR_LATCH_RECORDS 1U
+/* All-ones fields: 11 ten-digit numbers behind the 32-byte build id. */
+# define ORACLE_MAX_CLEAR_LATCH_LENGTH 227u
+IsaacVitaClearLatchCounters g_isaac_vita_clear_latch_counters;
+#else
+# define ORACLE_CLEAR_LATCH_RECORDS 0U
+#endif
 /* ph120.a (location queries + timeGetTime) is unconditional under
- * ISAAC_VITA_PHASE_PROFILE and follows ph120.c. */
-#define ORACLE_LOCATION_RECORDS 1U
+ * ISAAC_VITA_PHASE_PROFILE and follows ph120.c; ph120.tl rides with it, so
+ * every later record index moves with ORACLE_LOCATION_RECORDS. */
+#define ORACLE_LOCATION_RECORDS (1U + ORACLE_CLEAR_LATCH_RECORDS)
 /* ISAAC_VITA_KAGE_QUAD_FASTPATH: ph120.kq follows ph120.mem.  Stand-in for
  * the replay TU's take (host_vita_kage_quad_fastpath.c is not linked here):
  * distinct synthetic fields per take, NULL discards, counts pinned. */
@@ -662,6 +680,339 @@ void isaac_vita_kage_quad_fastpath_take(IsaacVitaKageQuadCounters *out)
 }
 #else
 # define ORACLE_KAGE_QUAD_RECORDS 0U
+#endif
+/* ISAAC_VITA_GFUEL_SEED_NATIVE / ISAAC_VITA_CAMERA_RING_NATIVE: ph120.gf and
+ * ph120.cr follow ph120.kq (ph120.us has no oracle leg).  Stand-ins for the
+ * replay TUs' takes, as for kq. */
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+# include "host_vita_gfuel_seed_native.h"
+# define ORACLE_GFUEL_RECORDS 6U
+/* All-ones fields behind the 32-byte build id: gf 15 ten-digit numbers;
+ * gu 3 + 15; gl/gh 2 + ten "ffffffff:4294967295" sites. */
+# define ORACLE_MAX_GFUEL_LENGTH 271u
+# define ORACLE_MAX_GFUEL_US_LENGTH 311u
+# define ORACLE_MAX_GFUEL_SITES_LENGTH 320u
+# define ORACLE_MAX_GFUEL_NEST_LENGTH 197u
+static uint32_t s_gfuel_takes, s_gfuel_discards;
+void isaac_vita_gfuel_seed_take(IsaacVitaGfuelSeedCounters *out)
+{
+    ++s_gfuel_takes;
+    if (out) {
+        uint32_t base = 100u * s_gfuel_takes, i;
+        memset(out, 0, sizeof *out);
+        out->query_calls = base + 1u;
+        out->query_handled = base + 2u;
+        out->mode_calls = base + 3u;
+        out->mode_handled = base + 4u;
+        out->walked = base + 5u;
+        out->present = base + 6u;
+        for (i = 0u; i < ISAAC_VITA_GFUEL_DECLINE_REASONS; ++i)
+            out->declined[i] = base + 10u + i;
+        out->lookup_linked = 1u;
+        out->lookup_translated = base + 20u;
+        out->lookup_other = base + 21u;
+        out->has_calls = base + 30u;
+        out->has_ignore = base + 31u;
+        out->has_negative = base + 32u;
+        for (i = 0u; i < ISAAC_VITA_GFUEL_TIMERS; ++i) {
+            out->timer[i].n = base + 40u + 3u * i;
+            out->timer[i].us = base + 41u + 3u * i;
+            out->timer[i].over = base + 42u + 3u * i;
+        }
+        /* two tabled sites; the other eight print as 0:0 */
+        out->lookup_sites.distinct = base + 60u;
+        out->lookup_sites.overflow = base + 61u;
+        out->lookup_sites.top[0].ret = 0x00abc000u + base;
+        out->lookup_sites.top[0].n = base + 63u;
+        out->lookup_sites.top[1].ret = 0x00abc008u + base;
+        out->lookup_sites.top[1].n = base + 62u;
+        out->has_sites.distinct = base + 70u;
+        out->has_sites.overflow = base + 71u;
+        out->has_nested = base + 33u;
+        out->has_bodies = base + 34u;
+        out->gtm_calls = base + 35u;
+        out->gtm_from_has = base + 36u;
+        out->gtm_top = base + 37u;
+        out->body_sites.distinct = base + 80u;
+        out->body_sites.overflow = base + 81u;
+        out->body_sites.top[0].ret = 0x00def000u + base;
+        out->body_sites.top[0].n = base + 82u;
+    } else {
+        ++s_gfuel_discards;
+    }
+}
+#else
+# define ORACLE_GFUEL_RECORDS 0U
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+# include "host_vita_camera_ring_native.h"
+# define ORACLE_CAMERA_RING_RECORDS 1U
+/* All-ones fields: 11 ten-digit numbers behind the 32-byte build id. */
+# define ORACLE_MAX_CAMERA_RING_LENGTH 211u
+static uint32_t s_camera_ring_takes, s_camera_ring_discards;
+void isaac_vita_camera_ring_take(IsaacVitaCameraRingCounters *out)
+{
+    ++s_camera_ring_takes;
+    if (out) {
+        uint32_t base = 100u * s_camera_ring_takes, i;
+        memset(out, 0, sizeof *out);
+        out->calls = base + 1u;
+        out->handled = base + 2u;
+        out->steps = base + 3u;
+        for (i = 0u; i < ISAAC_VITA_CAMERA_RING_DECLINE_REASONS; ++i)
+            out->declined[i] = base + 10u + i;
+    } else {
+        ++s_camera_ring_discards;
+    }
+}
+#else
+# define ORACLE_CAMERA_RING_RECORDS 0U
+#endif
+/* ISAAC_VITA_UPDATE_PROBE: ph120.uz then ph120.ut per four probes. */
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+# include "host_vita_update_probe.h"
+# define ORACLE_UPDATE_PROBE_LINES \
+    ((ISAAC_VITA_UPDATE_PROBES + 3U) / 4U)
+# define ORACLE_UPDATE_PROBE_RECORDS \
+    (1U + ORACLE_UPDATE_PROBE_LINES + ISAAC_VITA_UPDATE_PROBE_COMPOSED + \
+     ISAAC_VITA_UPDATE_PROBE_KEYED)
+static uint32_t s_update_probe_takes, s_update_probe_discards;
+void isaac_vita_update_probe_take(IsaacVitaUpdateProbe *out)
+{
+    ++s_update_probe_takes;
+    if (out) {
+        uint32_t base = 1000u * s_update_probe_takes, i;
+        memset(out, 0, sizeof *out);
+        for (i = 0u; i < ISAAC_VITA_UPDATE_PROBES; ++i) {
+            out->row[i].rva = 0x100u + i;
+            out->row[i].n = base + i;
+            out->row[i].t = i;
+            out->row[i].us = 7u * i;
+            out->row[i].in = 1u;
+            out->row[i].mx = 2u;
+        }
+        out->z_n = base + 1u;
+        out->z_us = base + 2u;
+        for (i = 0u; i < ISAAC_VITA_UPDATE_PROBE_COMPOSED; ++i) {
+            uint32_t k;
+            out->composed[i].rva = 0x60u + i;
+            out->composed[i].t = i;
+            out->composed[i].us = 2u * i;
+            for (k = 0u; k < ISAAC_VITA_UPDATE_PROBE_GROUPS; ++k)
+                out->composed[i].calls[k] = base + k;
+        }
+        for (i = 0u; i < ISAAC_VITA_UPDATE_PROBE_KEYED; ++i) {
+            out->keyed[i].rva = 0x40u + i;
+            out->keyed[i].distinct = 3u;
+            out->keyed[i].overflow = i;
+            out->keyed[i].top[0].key = 0xa0u + i;
+            out->keyed[i].top[0].n = base;
+            out->keyed[i].top[0].us = 9u;
+        }
+    } else {
+        ++s_update_probe_discards;
+    }
+}
+#else
+# define ORACLE_UPDATE_PROBE_RECORDS 0U
+#endif
+/* ISAAC_VITA_HEAP_STAGE_PROFILE: ph120.hc/hf/hm follow ph120.cr.  Stand-in
+ * for host_vita_heap.c's take. */
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+# include "host_vita_heap_stage.h"
+# define ORACLE_HEAP_STAGE_RECORDS 3U
+/* All-ones: hc 18 ten-digit numbers; hf/hm 2 + eight n/us/over triples. */
+# define ORACLE_MAX_HEAP_COUNTS_LENGTH 304u
+# define ORACLE_MAX_HEAP_SPANS_LENGTH 374u
+static uint32_t s_heap_stage_takes, s_heap_stage_discards;
+void isaac_vita_heap_stage_take(IsaacVitaHeapStageCounters *out)
+{
+    ++s_heap_stage_takes;
+    if (out) {
+        uint32_t base = 100u * s_heap_stage_takes, i;
+        for (i = 0u; i < ISAAC_VITA_HEAP_COUNTS; ++i)
+            out->count[i] = base + i;
+        for (i = 0u; i < ISAAC_VITA_HEAP_STAGE_TIMERS; ++i) {
+            out->timer[i].n = base + 40u + 3u * i;
+            out->timer[i].us = base + 41u + 3u * i;
+            out->timer[i].over = base + 42u + 3u * i;
+        }
+    } else {
+        ++s_heap_stage_discards;
+    }
+}
+#else
+# define ORACLE_HEAP_STAGE_RECORDS 0U
+#endif
+/* ISAAC_VITA_HEAP_FREE_COST_PROFILE: ph120.hg/hv follow ph120.hm.  Stand-in
+ * for host_vita_heap.c's take. */
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+# define ORACLE_HEAP_FREE_COST_RECORDS 2U
+/* All-ones: hg 2 + three n/us/over triples + 10 counts; hv 2 + 9 counts. */
+# define ORACLE_MAX_HEAP_COST_LENGTH 343u
+# define ORACLE_MAX_HEAP_VORBIS_LENGTH 215u
+static uint32_t s_heap_free_cost_takes, s_heap_free_cost_discards;
+void isaac_vita_heap_free_cost_take(IsaacVitaHeapFreeCost *out)
+{
+    ++s_heap_free_cost_takes;
+    if (out) {
+        uint32_t base = 100u * s_heap_free_cost_takes, i;
+        for (i = 0u; i < ISAAC_VITA_HEAP_COST_TIMERS; ++i) {
+            out->timer[i].n = base + 50u + 3u * i;
+            out->timer[i].us = base + 51u + 3u * i;
+            out->timer[i].over = base + 52u + 3u * i;
+        }
+        out->lookups = base + 60u;
+        out->lookup_probes = base + 61u;
+        out->lookup_probe_max = base + 62u;
+        out->removes = base + 63u;
+        out->remove_scan = base + 64u;
+        out->remove_moves = base + 65u;
+        out->remove_scan_max = base + 66u;
+        out->lease_scans = base + 67u;
+        out->ledger_live = base + 68u;
+        out->ledger_capacity = base + 69u;
+        out->prefilter_skip = base + 70u;
+        out->prefilter_maybe = base + 71u;
+        for (i = 0u; i < ISAAC_VITA_HEAP_NV_CENSUS; ++i)
+            out->nv[i] = base + 72u + i;
+    } else {
+        ++s_heap_free_cost_discards;
+    }
+}
+#else
+# define ORACLE_HEAP_FREE_COST_RECORDS 0U
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+# include "host_vita_render_chain_native.h"
+# define ORACLE_RENDER_CHAIN_RECORDS 1U
+/* All-ones fields: 10 ten-digit numbers behind the 32-byte build id. */
+# define ORACLE_MAX_RENDER_CHAIN_LENGTH 200u
+static uint32_t s_render_chain_takes, s_render_chain_discards;
+void isaac_vita_render_chain_take(IsaacVitaRenderChainCounters *out)
+{
+    ++s_render_chain_takes;
+    if (out) {
+        uint32_t base = 100u * s_render_chain_takes;
+        out->fill_calls = base + 1u;
+        out->fill_declined = base + 2u;
+        out->getters_native = base + 3u;
+        out->getters_called = base + 4u;
+        out->releases = base + 5u;
+        out->render_calls = base + 6u;
+        out->render_inlined = base + 7u;
+        out->render_declined = base + 8u;
+    } else {
+        ++s_render_chain_discards;
+    }
+}
+#else
+# define ORACLE_RENDER_CHAIN_RECORDS 0U
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+# include "host_vita_hascoll_native.h"
+# define ORACLE_HASCOLL_RECORDS 1U
+/* All-ones fields: 12 ten-digit numbers behind the 32-byte build id. */
+# define ORACLE_MAX_HASCOLL_LENGTH 249u
+static uint32_t s_hascoll_takes, s_hascoll_discards;
+void isaac_vita_hascoll_native_take(IsaacVitaHasCollCounters *out)
+{
+    ++s_hascoll_takes;
+    if (out) {
+        uint32_t base = 100u * s_hascoll_takes, r;
+        out->calls = base + 1u;
+        out->handled = base + 2u;
+        out->bodies = base + 3u;
+        out->yes = base + 4u;
+        for (r = 0; r < ISAAC_VITA_HASCOLL_DECLINE_REASONS; ++r)
+            out->declined[r] = base + 5u + r;
+    } else {
+        ++s_hascoll_discards;
+    }
+}
+#else
+# define ORACLE_HASCOLL_RECORDS 0U
+#endif
+/* ISAAC_VITA_GL_THREAD_WORKER: ph120.rt follows ph120.cr.  Stand-in for the
+ * recorder's render-thread take (fields base+1.. in declaration order) and
+ * quiesce (reset). */
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+# include "gl_record_backend.h"
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+/* ISAAC_VITA_GL_RECORD_OPCODE_CENSUS: ph120.ro + ph120.rop after rw.  The
+ * stand-in census has seven active slots (0 and 78 included: an out-of-range
+ * opcode and the closures print, never drop), slot 3 stays zero (omitted):
+ * ro + three rop records (3, 3, 1 slots).  The max flush prints all 79
+ * slots: ro + 27 rop records (RENDER60 S4, ISAAC_VITA_GL_RECORD_ATTRIB_BATCH:
+ * 81 slots with opcodes 79/80, still 27 records of three; RENDER60 W-pkt,
+ * ISAAC_VITA_KAGE_BIND_PACKET: 82 slots with opcode 81, ro + 28 records,
+ * the last holding slot 81). */
+#  define ORACLE_CENSUS_RECORDS 4U
+#  if defined(ISAAC_VITA_KAGE_BIND_PACKET)
+#   define ORACLE_MAX_CENSUS_PARTS 28u
+#   define ORACLE_MAX_CENSUS_OPS "ops=82 lines=28 "
+#  elif defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+#   define ORACLE_MAX_CENSUS_PARTS 27u
+#   define ORACLE_MAX_CENSUS_OPS "ops=81 lines=27 "
+#  else
+#   define ORACLE_MAX_CENSUS_PARTS 27u
+#   define ORACLE_MAX_CENSUS_OPS "ops=79 lines=27 "
+#  endif
+#  define ORACLE_MAX_EXTRA_RECORDS (1U + ORACLE_MAX_CENSUS_PARTS - ORACLE_CENSUS_RECORDS)
+/* ro all-ones: five ten-digit numbers behind the 32-byte build id. */
+#  define ORACLE_MAX_CENSUS_LENGTH 173u
+/* rop: three all-ones slots of twelve ten-digit fields; inside the 512-byte
+ * allowance ph120.s uses (ISAAC_VITA_LOG_ASYNC_LINE_MAX is 1024). */
+#  define ORACLE_MAX_CENSUS_PART_LENGTH 490u
+static IsaacGlRecordOpcodeCensus s_census;
+_Static_assert(sizeof(IsaacGlRecordOpcodeStats) == 12u * sizeof(uint32_t),
+               "twelve census fields per slot");
+const IsaacGlRecordOpcodeCensus *isaac_gl_record_opcode_census(void)
+{
+    return &s_census;
+}
+# else
+#  define ORACLE_CENSUS_RECORDS 0U
+# endif
+# define ORACLE_RENDER_THREAD_RECORDS (2U + ORACLE_CENSUS_RECORDS) /* rt, rw (, ro, rop) */
+/* All-ones fields: 20 ten-digit numbers behind the 32-byte build id. */
+# define ORACLE_MAX_RENDER_THREAD_LENGTH 356u
+/* ph120.rw all-ones: 14 ten-digit numbers. */
+# define ORACLE_MAX_RENDER_WAKE_LENGTH 265u
+static uint32_t s_render_thread_takes, s_render_thread_discards;
+static uint32_t s_render_thread_quiesces;
+void isaac_gl_record_worker_take(IsaacGlRecordWorkerWindow *out)
+{
+    ++s_render_thread_takes;
+    if (out) {
+        uint32_t words[sizeof *out / sizeof(uint32_t)], i;
+        for (i = 0u; i < sizeof words / sizeof words[0]; ++i)
+            words[i] = 100u * s_render_thread_takes + 1u + i;
+        memcpy(out, words, sizeof *out);
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+        {
+            /* slot k: fields 100*take + 12k + 1.. in declaration order */
+            static const uint32_t slots[7] = {0u, 1u, 2u, 9u, 41u, 72u, 78u};
+            uint32_t k, f, v[12];
+            memset(&s_census, 0, sizeof s_census);
+            s_census.ck16_us = 100u * s_render_thread_takes + 99u;
+            for (k = 0u; k < 7u; ++k) {
+                for (f = 0u; f < 12u; ++f)
+                    v[f] = 100u * s_render_thread_takes + 12u * k + f + 1u;
+                memcpy(&s_census.op[slots[k]], v, sizeof v);
+            }
+        }
+# endif
+    } else {
+        ++s_render_thread_discards;   /* the census copy is left alone */
+    }
+}
+void isaac_gl_record_worker_quiesce(void)
+{
+    ++s_render_thread_quiesces;
+}
+#else
+# define ORACLE_RENDER_THREAD_RECORDS 0U
 #endif
 /* ISAAC_VITA_HEAP_CENSUS: ph120.mem is the last record of every window. */
 #if defined(ISAAC_VITA_HEAP_CENSUS)
@@ -706,6 +1057,11 @@ uint32_t vglGetIsaacLaserHaloStats(vglIsaacLaserHaloStats *out, uint32_t words)
       ORACLE_LASER_RECORDS + \
       ORACLE_SCHEDULER_RECORDS + ORACLE_IMPORT_KINDS_RECORDS + \
       ORACLE_HEAP_CENSUS_RECORDS + ORACLE_KAGE_QUAD_RECORDS + \
+      ORACLE_GFUEL_RECORDS + ORACLE_CAMERA_RING_RECORDS + \
+      ORACLE_UPDATE_PROBE_RECORDS + \
+      ORACLE_HEAP_STAGE_RECORDS + ORACLE_HEAP_FREE_COST_RECORDS + \
+      ORACLE_RENDER_CHAIN_RECORDS + ORACLE_HASCOLL_RECORDS + \
+      ORACLE_RENDER_THREAD_RECORDS + \
       ORACLE_HALO_RECORDS + ORACLE_ROOM_LOG_RECORDS)
 IsaacVitaGlPhaseProfileCounters g_isaac_vita_gl_phase_profile_counters;
 /* host_vita_post_com.c owns this in production; the oracle links without it. */
@@ -713,7 +1069,8 @@ uint32_t g_isaac_vita_post_com_time_get_time_calls;
 
 static uint64_t s_now;
 static uint32_t s_clock_reads;
-static char s_logs[8192];
+/* 32 KiB: the probe-heap-decomp leg prints ~38 records per window. */
+static char s_logs[32768];
 static size_t s_log_length;
 static unsigned s_log_calls;
 
@@ -764,6 +1121,17 @@ static void add_gl_counts(uint32_t base)
     g_isaac_vita_post_com_time_get_time_calls += base + 45u;
     g_isaac_vita_gl_phase_profile_counters.location_cache_mismatch +=
         base + 46u;
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    g_isaac_vita_clear_latch_counters.site_calls += base + 100u;
+    g_isaac_vita_clear_latch_counters.hits += base + 101u;
+    g_isaac_vita_clear_latch_counters.fresh += base + 102u;
+    g_isaac_vita_clear_latch_counters.foreign_cpu += base + 103u;
+    g_isaac_vita_clear_latch_counters.ticks += base + 104u;
+    g_isaac_vita_clear_latch_counters.expiries += base + 105u;
+    g_isaac_vita_clear_latch_counters.flips += base + 106u;
+    g_isaac_vita_clear_latch_counters.stamp_ahead += base + 107u;
+    g_isaac_vita_clear_latch_counters.clock_reads += base + 108u;
+#endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION) || \
     defined(ISAAC_VITA_FBO_RASTER_SCALE)
     /* ph120.e clear(x,r,p[,a,d]) raster(t,v,s): the printed fields, in
@@ -1451,6 +1819,10 @@ int main(int argc, char **argv)
     const char *timing;
     const char *counts;
     const char *location;
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    const char *clear_latch;
+    size_t max_clear_latch_length;
+#endif
 #if defined(ISAAC_VITA_GL_TIME_PROFILE)
     const char *gl_time;
     const char *gl_scene;
@@ -1533,6 +1905,12 @@ int main(int argc, char **argv)
     const char *scheduler_pointer;
     const char *emission;
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    const char *floor_debt;
+    const char *floor_slack;
+    size_t max_floor_debt_length;
+    size_t max_floor_slack_length;
+#endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
     const char *import_kinds;
     const char *import_hot;
@@ -1544,6 +1922,38 @@ int main(int argc, char **argv)
 #if defined(ISAAC_VITA_KAGE_QUAD_FASTPATH)
     const char *kage_quad_record;
     size_t max_kage_quad_length;
+#endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    size_t max_gfuel_length, max_gfuel_us_length;
+    size_t max_gfuel_lookup_length, max_gfuel_has_length;
+    size_t max_gfuel_nest_length, max_gfuel_body_length;
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+    size_t max_camera_ring_length;
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+    size_t max_update_probe_z_length, max_update_probe_t_length;
+    size_t max_update_probe_k_length, max_update_probe_c_length;
+    uint32_t update_probe_line;
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    size_t max_heap_counts_length, max_heap_free_length, max_heap_malloc_length;
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    size_t max_heap_cost_length, max_heap_vorbis_length;
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    size_t max_render_chain_length;
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    size_t max_hascoll_length;
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    size_t max_render_thread_length, max_render_wake_length;
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+    size_t max_census_length, max_census_part_length = 0u;
+    unsigned census_part;
+# endif
 #endif
     size_t max_timing_length;
     size_t max_counts_length;
@@ -1752,6 +2162,9 @@ int main(int argc, char **argv)
     counts = log_line(1u);
     next_line = 2u;
     location = log_line(next_line++);
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    clear_latch = log_line(next_line++);
+#endif
 #if defined(ISAAC_VITA_GL_TIME_PROFILE)
     gl_time = log_line(next_line++);
 # if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE) && ISAAC_VITA_GL_TIME_SDK_SPARSE
@@ -1827,6 +2240,10 @@ int main(int argc, char **argv)
     scheduler_pointer = log_line(next_line++);
     emission = log_line(next_line++);
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    floor_debt = log_line(next_line++);
+    floor_slack = log_line(next_line++);
+#endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
     import_kinds = log_line(next_line++);
     import_hot = log_line(next_line++);
@@ -1851,6 +2268,132 @@ int main(int argc, char **argv)
                  "h=202 c(x,k,g,s)=203,204,205,206 p(b,t,f,r,d)=207,208,209,"
                  "210,211 d(f,oa,ob,on,c,a,s,g,t)=220,221,222,223,224,225,"
                  "226,227,228\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    /* One discard at the first loop head, one take per window flush. */
+    CHECK(s_gfuel_takes == 2u && s_gfuel_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gf bid=phase:oracle win=1 loops=120 q(n,h)=201,202 "
+                 "m(n,h)=203,204 w=205 p=206 d(s,n,w,b)=210,211,212,213 "
+                 "l(k,t,o)=1,220,221\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gu bid=phase:oracle win=1 loops=120 h(n,i,g)=230,231,232 "
+                 "us(q,m,o,h,z)=240/241/242,243/244/245,246/247/248,249/250/251,"
+                 "252/253/254\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gl bid=phase:oracle win=1 loops=120 n=260 x=261 "
+                 "top=abc0c8:263,abc0d0:262,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gh bid=phase:oracle win=1 loops=120 n=270 x=271 "
+                 "top=0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gn bid=phase:oracle win=1 loops=120 x=233 b=234 "
+                 "t(n,h,p)=235,236,237 us(t)=255/256/257\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gb bid=phase:oracle win=1 loops=120 n=280 x=281 "
+                 "top=def0c8:282,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+    CHECK(s_camera_ring_takes == 2u && s_camera_ring_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.cr bid=phase:oracle win=1 loops=120 n=201 h=202 "
+                 "st=203 d(f,o,r,k,l,x)=210,211,212,213,214,215\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+    CHECK(s_update_probe_takes == 2u && s_update_probe_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.uz bid=phase:oracle win=1 loops=120 k=62 "
+                 "z(n,us)=2001,2002\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.ut bid=phase:oracle win=1 loops=120 i=0 "
+                 "100:2000/0/0/1/2,101:2001/1/7/1/2,102:2002/2/14/1/2,"
+                 "103:2003/3/21/1/2\n") != NULL);
+    for (update_probe_line = 1u; update_probe_line < ORACLE_UPDATE_PROBE_LINES;
+         ++update_probe_line)
+        CHECK(strstr(log_line(next_line++), "ph120.ut bid=phase:oracle win=1 ") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.uc bid=phase:oracle win=1 loops=120 p=60 t=0 us=0 "
+                 "h,a,f,c,s=2000,2001,2002,2003,2004\n") != NULL);
+    for (update_probe_line = 1u; update_probe_line < ISAAC_VITA_UPDATE_PROBE_COMPOSED;
+         ++update_probe_line)
+        CHECK(strstr(log_line(next_line++), "ph120.uc bid=phase:oracle win=1 ") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.uk bid=phase:oracle win=1 loops=120 p=40 d=3 x=0 "
+                 "top=a0:2000/9,0:0/0,0:0/0,0:0/0,0:0/0,0:0/0,0:0/0,0:0/0\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.uk bid=phase:oracle win=1 loops=120 p=41 d=3 x=1 "
+                 "top=a1:2000/9,") != NULL);
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    CHECK(s_heap_stage_takes == 2u && s_heap_stage_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hc bid=phase:oracle win=1 loops=120 "
+                 "f(n,0,o,a,t,s,k,p)=200,201,202,203,204,205,206,207 "
+                 "m(n,a,t,s,p,0)=208,209,210,211,212,213 c=214 r=215\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hf bid=phase:oracle win=1 loops=120 us(a,p,s,o,l,g,n,t)="
+                 "240/241/242,243/244/245,246/247/248,249/250/251,252/253/254,"
+                 "255/256/257,258/259/260,261/262/263\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hm bid=phase:oracle win=1 loops=120 us(a,p,l,r,n,g,t,z)="
+                 "264/265/266,267/268/269,270/271/272,273/274/275,276/277/278,"
+                 "279/280/281,282/283/284,285/286/287\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    CHECK(s_heap_free_cost_takes == 2u && s_heap_free_cost_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hg bid=phase:oracle win=1 loops=120 us(k,e,r)="
+                 "250/251/252,253/254/255,256/257/258 lk(n,p,m)=260,261,262 "
+                 "rm(n,s,v,m)=263,264,265,266 ls=267 led(l,c)=268,269\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hv bid=phase:oracle win=1 loops=120 pf(s,m)=270,271 "
+                 "nv(n,k,m,0,1,2,3)=272,273,274,275,276,277,278\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    CHECK(s_render_chain_takes == 2u && s_render_chain_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rn bid=phase:oracle win=1 loops=120 f=201 fd=202 "
+                 "gn=203 gc=204 rl=205 r=206 ri=207 rd=208\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    CHECK(s_hascoll_takes == 2u && s_hascoll_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hn bid=phase:oracle win=1 loops=120 n=201 h=202 b=203 "
+                 "y=204 d(s,c,i,g,t,n,w,x)=205,206,207,208,209,210,211,212\n")
+          != NULL);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    /* One discard at the first loop head, one take per window flush; the
+     * resets quiesced the render thread before clearing shim counters. */
+    CHECK(s_render_thread_takes == 2u && s_render_thread_discards == 1u &&
+          s_render_thread_quiesces != 0u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rt bid=phase:oracle win=1 loops=120 wall=201 busy=202 "
+                 "f(n,o)=203,204 fr(50,95,max)=205,206,207 sw=208 hw=209 "
+                 "r=210 s(n,w,us)=211,212,213 h(n,us)=214,215 "
+                 "c(n,us)=216,217 rf=218\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rw bid=phase:oracle win=1 loops=120 wk=219 "
+                 "sl(n,t)=220,221 mb(n,s,us)=222,223,224 ap(s,us)=225,226 "
+                 "cb=227 mq=228 ck=229 rs=230\n") != NULL);
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.ro bid=phase:oracle win=1 loops=120 ops=7 lines=3 "
+                 "k=64 x=32 ck16=299 f=n,b,e,eus,rs,rus,ps,pst,pus,sy,sw,swus\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rop bid=phase:oracle win=1 part=0 op="
+                 "0:201,202,203,204,205,206,207,208,209,210,211,212"
+                 ";1:213,214,215,216,217,218,219,220,221,222,223,224"
+                 ";2:225,226,227,228,229,230,231,232,233,234,235,236\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rop bid=phase:oracle win=1 part=1 op="
+                 "9:237,238,239,240,241,242,243,244,245,246,247,248"
+                 ";41:249,250,251,252,253,254,255,256,257,258,259,260"
+                 ";72:261,262,263,264,265,266,267,268,269,270,271,272\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rop bid=phase:oracle win=1 part=2 op="
+                 "78:273,274,275,276,277,278,279,280,281,282,283,284\n") != NULL);
+# endif
 #endif
     CHECK(timing != NULL && counts != NULL && location != NULL);
 #if defined(ISAAC_VITA_LASER_HALO_PROFILE) && ISAAC_VITA_LASER_HALO_PROFILE
@@ -1898,6 +2441,21 @@ int main(int argc, char **argv)
     CHECK(strstr(location,
                  "ph120.a bid=phase:oracle win=1 loops=120 "
                  "loc(a,u,h,m)=5160,5280,5400,5640 tgt=5520\n") != NULL);
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    /* ph120.tl: 120 add_gl_counts(1) calls, field k advances by 1 + k for
+     * k = 100..108, so every field is 120 * (101 + i) in field order. */
+    CHECK(clear_latch != NULL);
+    {
+        char expected_clear_latch[256];
+
+        snprintf(expected_clear_latch, sizeof expected_clear_latch,
+                 "ph120.tl bid=phase:oracle win=1 loops=120 mode=%u "
+                 "site(n,h,f,s)=12120,12240,12360,12480 "
+                 "obs(t,x,d,w)=12600,12720,12840,12960 clk=13080\n",
+                 (unsigned)ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE);
+        CHECK(strstr(clear_latch, expected_clear_latch) != NULL);
+    }
+#endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION) || \
     defined(ISAAC_VITA_FBO_RASTER_SCALE)
     /* ph120.e sits right after the vitaGL records: window deltas of the
@@ -2184,6 +2742,20 @@ int main(int argc, char **argv)
                  "frame(last:s,b,e)=00000000,0,0 "
                  "frame(fail:s,b,e)=00000000,0,0\n") != NULL);
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    /* No Game::Update reaches the scheduler here: an all-zero receipt. */
+    CHECK(floor_debt != NULL && floor_slack != NULL);
+    CHECK(strstr(floor_debt,
+                 "ph120.fd bid=phase:oracle win=1 loops=120 p=0 "
+                 "late(c,us,max)=0,0,0 kept=0 over(c,us)=0,0 "
+                 "clamp(c,us)=0,0 "
+                 "stale(c,g,us)=0,0,0 gf(n,pos,max,min,last)=0,0,0,0,0\n")
+          != NULL);
+    CHECK(strstr(floor_slack,
+                 "ph120.fs bid=phase:oracle win=1 loops=120 "
+                 "h=0,0,0,0,0,0,0 slack(b,l,us)=0,0,0 "
+                 "floor=0000000000000000\n") != NULL);
+#endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
     CHECK(import_kinds != NULL && import_hot != NULL);
 # if defined(ISAAC_VITA_GUEST_DISPATCH_TABLE)
@@ -2229,6 +2801,9 @@ int main(int argc, char **argv)
     counts = log_line(ORACLE_RECORDS_PER_WINDOW + 1U);
     next_line = ORACLE_RECORDS_PER_WINDOW + 2u;
     location = log_line(next_line++);
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    clear_latch = log_line(next_line++);
+#endif
     CHECK(location != NULL);
 #if defined(ISAAC_VITA_GL_TIME_PROFILE)
     /* Nothing accumulated in the second window: all-zero buckets, third
@@ -2378,6 +2953,10 @@ int main(int argc, char **argv)
     scheduler_pointer = log_line(next_line++);
     emission = log_line(next_line++);
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    floor_debt = log_line(next_line++);
+    floor_slack = log_line(next_line++);
+#endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
     import_kinds = log_line(next_line++);
     import_hot = log_line(next_line++);
@@ -2399,6 +2978,128 @@ int main(int argc, char **argv)
                  "h=302 c(x,k,g,s)=303,304,305,306 p(b,t,f,r,d)=307,308,309,"
                  "310,311 d(f,oa,ob,on,c,a,s,g,t)=320,321,322,323,324,325,"
                  "326,327,328\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    CHECK(s_gfuel_takes == 3u && s_gfuel_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gf bid=phase:oracle win=2 loops=240 q(n,h)=301,302 "
+                 "m(n,h)=303,304 w=305 p=306 d(s,n,w,b)=310,311,312,313 "
+                 "l(k,t,o)=1,320,321\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gu bid=phase:oracle win=2 loops=240 h(n,i,g)=330,331,332 "
+                 "us(q,m,o,h,z)=340/341/342,343/344/345,346/347/348,349/350/351,"
+                 "352/353/354\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gl bid=phase:oracle win=2 loops=240 n=360 x=361 "
+                 "top=abc12c:363,abc134:362,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gh bid=phase:oracle win=2 loops=240 n=370 x=371 "
+                 "top=0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gn bid=phase:oracle win=2 loops=240 x=333 b=334 "
+                 "t(n,h,p)=335,336,337 us(t)=355/356/357\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.gb bid=phase:oracle win=2 loops=240 n=380 x=381 "
+                 "top=def12c:382,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0,0:0\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+    CHECK(s_camera_ring_takes == 3u && s_camera_ring_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.cr bid=phase:oracle win=2 loops=240 n=301 h=302 "
+                 "st=303 d(f,o,r,k,l,x)=310,311,312,313,314,315\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+    CHECK(s_update_probe_takes == 3u && s_update_probe_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.uz bid=phase:oracle win=2 loops=240 k=62 "
+                 "z(n,us)=3001,3002\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.ut bid=phase:oracle win=2 loops=240 i=0 "
+                 "100:3000/0/0/1/2,101:3001/1/7/1/2,102:3002/2/14/1/2,"
+                 "103:3003/3/21/1/2\n") != NULL);
+    for (update_probe_line = 1u; update_probe_line < ORACLE_UPDATE_PROBE_LINES;
+         ++update_probe_line)
+        CHECK(strstr(log_line(next_line++), "ph120.ut bid=phase:oracle win=2 ") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.uc bid=phase:oracle win=2 loops=240 p=60 t=0 us=0 "
+                 "h,a,f,c,s=3000,3001,3002,3003,3004\n") != NULL);
+    for (update_probe_line = 1u; update_probe_line < ISAAC_VITA_UPDATE_PROBE_COMPOSED;
+         ++update_probe_line)
+        CHECK(strstr(log_line(next_line++), "ph120.uc bid=phase:oracle win=2 ") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.uk bid=phase:oracle win=2 loops=240 p=40 d=3 x=0 "
+                 "top=a0:3000/9,0:0/0,0:0/0,0:0/0,0:0/0,0:0/0,0:0/0,0:0/0\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.uk bid=phase:oracle win=2 loops=240 p=41 d=3 x=1 "
+                 "top=a1:3000/9,") != NULL);
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    CHECK(s_heap_stage_takes == 3u && s_heap_stage_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hc bid=phase:oracle win=2 loops=240 "
+                 "f(n,0,o,a,t,s,k,p)=300,301,302,303,304,305,306,307 "
+                 "m(n,a,t,s,p,0)=308,309,310,311,312,313 c=314 r=315\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hf bid=phase:oracle win=2 loops=240 us(a,p,s,o,l,g,n,t)="
+                 "340/341/342,343/344/345,346/347/348,349/350/351,352/353/354,"
+                 "355/356/357,358/359/360,361/362/363\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hm bid=phase:oracle win=2 loops=240 us(a,p,l,r,n,g,t,z)="
+                 "364/365/366,367/368/369,370/371/372,373/374/375,376/377/378,"
+                 "379/380/381,382/383/384,385/386/387\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    CHECK(s_heap_free_cost_takes == 3u && s_heap_free_cost_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hg bid=phase:oracle win=2 loops=240 us(k,e,r)="
+                 "350/351/352,353/354/355,356/357/358 lk(n,p,m)=360,361,362 "
+                 "rm(n,s,v,m)=363,364,365,366 ls=367 led(l,c)=368,369\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hv bid=phase:oracle win=2 loops=240 pf(s,m)=370,371 "
+                 "nv(n,k,m,0,1,2,3)=372,373,374,375,376,377,378\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    CHECK(s_render_chain_takes == 3u && s_render_chain_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rn bid=phase:oracle win=2 loops=240 f=301 fd=302 "
+                 "gn=303 gc=304 rl=305 r=306 ri=307 rd=308\n") != NULL);
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    CHECK(s_hascoll_takes == 3u && s_hascoll_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.hn bid=phase:oracle win=2 loops=240 n=301 h=302 b=303 "
+                 "y=304 d(s,c,i,g,t,n,w,x)=305,306,307,308,309,310,311,312\n")
+          != NULL);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    CHECK(s_render_thread_takes == 3u && s_render_thread_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rt bid=phase:oracle win=2 loops=240 wall=301 busy=302 "
+                 "f(n,o)=303,304 fr(50,95,max)=305,306,307 sw=308 hw=309 "
+                 "r=310 s(n,w,us)=311,312,313 h(n,us)=314,315 "
+                 "c(n,us)=316,317 rf=318\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rw bid=phase:oracle win=2 loops=240 wk=319 "
+                 "sl(n,t)=320,321 mb(n,s,us)=322,323,324 ap(s,us)=325,326 "
+                 "cb=327 mq=328 ck=329 rs=330\n") != NULL);
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.ro bid=phase:oracle win=2 loops=240 ops=7 lines=3 "
+                 "k=64 x=32 ck16=399 f=n,b,e,eus,rs,rus,ps,pst,pus,sy,sw,swus\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rop bid=phase:oracle win=2 part=0 op="
+                 "0:301,302,303,304,305,306,307,308,309,310,311,312"
+                 ";1:313,314,315,316,317,318,319,320,321,322,323,324"
+                 ";2:325,326,327,328,329,330,331,332,333,334,335,336\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rop bid=phase:oracle win=2 part=1 op="
+                 "9:337,338,339,340,341,342,343,344,345,346,347,348"
+                 ";41:349,350,351,352,353,354,355,356,357,358,359,360"
+                 ";72:361,362,363,364,365,366,367,368,369,370,371,372\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.rop bid=phase:oracle win=2 part=2 op="
+                 "78:373,374,375,376,377,378,379,380,381,382,383,384\n") != NULL);
+# endif
 #endif
     CHECK(timing != NULL && counts != NULL);
 #if defined(ISAAC_VITA_LASER_HALO_PROFILE) && ISAAC_VITA_LASER_HALO_PROFILE
@@ -2458,6 +3159,20 @@ int main(int argc, char **argv)
     CHECK(strstr(location,
                  "ph120.a bid=phase:oracle win=2 loops=240 "
                  "loc(a,u,h,m)=5280,5400,5520,5760 tgt=5640\n") != NULL);
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    /* Second window: add_gl_counts(2), so 120 * (102 + i). */
+    CHECK(clear_latch != NULL);
+    {
+        char expected_clear_latch[256];
+
+        snprintf(expected_clear_latch, sizeof expected_clear_latch,
+                 "ph120.tl bid=phase:oracle win=2 loops=240 mode=%u "
+                 "site(n,h,f,s)=12240,12360,12480,12600 "
+                 "obs(t,x,d,w)=12720,12840,12960,13080 clk=13200\n",
+                 (unsigned)ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE);
+        CHECK(strstr(clear_latch, expected_clear_latch) != NULL);
+    }
+#endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION) || \
     defined(ISAAC_VITA_FBO_RASTER_SCALE)
     CHECK(fbo_policy != NULL);
@@ -2640,6 +3355,13 @@ int main(int argc, char **argv)
                  "frame(last:s,b,e)=00000000,0,0 "
                  "frame(fail:s,b,e)=00000000,0,0\n") != NULL);
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    CHECK(floor_debt != NULL && floor_slack != NULL);
+    CHECK(strstr(floor_debt,
+                 "ph120.fd bid=phase:oracle win=2 loops=240 p=0 ") != NULL);
+    CHECK(strstr(floor_slack,
+                 "ph120.fs bid=phase:oracle win=2 loops=240 h=") != NULL);
+#endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
     /* The second window carried the injected residuals: the gate must print
      * them and clear ok while the per-kind split itself stays exact. */
@@ -2750,11 +3472,18 @@ int main(int argc, char **argv)
     kage_vita_phase_profile_oracle_emit_max_records();
     /* The max flush omits ph120.e (bounded by construction, see
      * ORACLE_FBO_POLICY_RECORDS). */
+#if !defined(ORACLE_MAX_EXTRA_RECORDS)
+# define ORACLE_MAX_EXTRA_RECORDS 0U
+#endif
     CHECK(s_log_calls ==
-          ORACLE_RECORDS_PER_WINDOW - ORACLE_FBO_POLICY_RECORDS);
+          ORACLE_RECORDS_PER_WINDOW - ORACLE_FBO_POLICY_RECORDS +
+          ORACLE_MAX_EXTRA_RECORDS);
     max_timing_length = log_line_length(log_line(0u));
     max_counts_length = log_line_length(log_line(1u));
     max_location_length = log_line_length(log_line(2u));
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    max_clear_latch_length = log_line_length(log_line(3u));
+#endif
 #if defined(ISAAC_VITA_GL_TIME_PROFILE)
     max_gl_time_length = log_line_length(
         log_line(2u + ORACLE_LOCATION_RECORDS));
@@ -2844,6 +3573,14 @@ int main(int argc, char **argv)
     max_scheduler_pointer_length = log_line_length(log_line(next_line++));
     max_emission_length = log_line_length(log_line(next_line++));
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    CHECK(log_line(next_line) != NULL &&
+          strstr(log_line(next_line), "ph120.fd ") != NULL);
+    max_floor_debt_length = log_line_length(log_line(next_line++));
+    CHECK(log_line(next_line) != NULL &&
+          strstr(log_line(next_line), "ph120.fs ") != NULL);
+    max_floor_slack_length = log_line_length(log_line(next_line++));
+#endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
     max_import_kinds_length = log_line_length(log_line(next_line++));
     max_import_hot_length = log_line_length(log_line(next_line++));
@@ -2854,6 +3591,82 @@ int main(int argc, char **argv)
 #if defined(ISAAC_VITA_KAGE_QUAD_FASTPATH)
     max_kage_quad_length = log_line_length(log_line(next_line++));
 #endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    max_gfuel_length = log_line_length(log_line(next_line++));
+    max_gfuel_us_length = log_line_length(log_line(next_line++));
+    max_gfuel_lookup_length = log_line_length(log_line(next_line++));
+    max_gfuel_has_length = log_line_length(log_line(next_line++));
+    max_gfuel_nest_length = log_line_length(log_line(next_line++));
+    max_gfuel_body_length = log_line_length(log_line(next_line++));
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+    max_camera_ring_length = log_line_length(log_line(next_line++));
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+    max_update_probe_z_length = log_line_length(log_line(next_line++));
+    max_update_probe_t_length = 0u;
+    for (update_probe_line = 0u; update_probe_line < ORACLE_UPDATE_PROBE_LINES;
+         ++update_probe_line) {
+        size_t n = log_line_length(log_line(next_line++));
+        if (n > max_update_probe_t_length)
+            max_update_probe_t_length = n;
+    }
+    max_update_probe_c_length = 0u;
+    for (update_probe_line = 0u; update_probe_line < ISAAC_VITA_UPDATE_PROBE_COMPOSED;
+         ++update_probe_line) {
+        size_t n = log_line_length(log_line(next_line++));
+        if (n > max_update_probe_c_length)
+            max_update_probe_c_length = n;
+    }
+    max_update_probe_k_length = 0u;
+    for (update_probe_line = 0u; update_probe_line < ISAAC_VITA_UPDATE_PROBE_KEYED;
+         ++update_probe_line) {
+        size_t n = log_line_length(log_line(next_line++));
+        if (n > max_update_probe_k_length)
+            max_update_probe_k_length = n;
+    }
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    max_heap_counts_length = log_line_length(log_line(next_line++));
+    max_heap_free_length = log_line_length(log_line(next_line++));
+    max_heap_malloc_length = log_line_length(log_line(next_line++));
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    max_heap_cost_length = log_line_length(log_line(next_line++));
+    max_heap_vorbis_length = log_line_length(log_line(next_line++));
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    max_render_chain_length = log_line_length(log_line(next_line++));
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    max_hascoll_length = log_line_length(log_line(next_line++));
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    max_render_thread_length = log_line_length(log_line(next_line++));
+    max_render_wake_length = log_line_length(log_line(next_line++));
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+    CHECK(strstr(log_line(next_line), "ph120.ro bid=12345678901234567890123456789012 "
+                 "win=4294967295 loops=4294967295 " ORACLE_MAX_CENSUS_OPS) != NULL);
+    max_census_length = log_line_length(log_line(next_line++));
+    for (census_part = 0u; census_part < ORACLE_MAX_CENSUS_PARTS; ++census_part) {
+        const char *part = log_line(next_line++);
+        size_t length = log_line_length(part);
+        CHECK(part != NULL && strncmp(part, "[kage-vita] ph120.rop bid=", 26u) == 0);
+        if (length > max_census_part_length) max_census_part_length = length;
+    }
+#  if defined(ISAAC_VITA_KAGE_BIND_PACKET)
+    CHECK(strstr(log_line(next_line - 2u), " part=26 op=78:4294967295,") != NULL &&
+          strstr(log_line(next_line - 2u), ";80:4294967295,") != NULL);
+    CHECK(strstr(log_line(next_line - 1u), " part=27 op=81:4294967295,") != NULL &&
+          strchr(log_line(next_line - 1u), ';') == NULL);
+#  else
+    CHECK(strstr(log_line(next_line - 1u), " part=26 op=78:4294967295,") != NULL);
+#   if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    CHECK(strstr(log_line(next_line - 1u), ";80:4294967295,") != NULL);
+#   endif
+#  endif
+# endif
+#endif
 #if defined(ISAAC_VITA_PHASE_PROFILE_OTHER)
     /* oth= adds 37 bytes at ten digits each; ph120.s already uses the
      * 512-byte allowance (503). */
@@ -2863,6 +3676,10 @@ int main(int argc, char **argv)
 #endif
     CHECK(max_counts_length == 375u && max_counts_length < 384u);
     CHECK(max_location_length == 161u && max_location_length < 384u);
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    CHECK(max_clear_latch_length == ORACLE_MAX_CLEAR_LATCH_LENGTH &&
+          max_clear_latch_length < 384u);
+#endif
 #if defined(ISAAC_VITA_GL_TIME_PROFILE)
 # if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE) && ISAAC_VITA_GL_TIME_SDK_SPARSE
     CHECK(max_gl_time_length > 0u && max_gl_time_length <= 512u);
@@ -2969,6 +3786,12 @@ int main(int argc, char **argv)
           max_scheduler_pointer_length < 384u);
     CHECK(max_emission_length == 124u && max_emission_length < 384u);
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    /* all-ones counters, every signed gf field at INT32_MIN, the floor
+     * stamp at ffffffffffffffff */
+    CHECK(max_floor_debt_length == 362u && max_floor_debt_length < 384u);
+    CHECK(max_floor_slack_length == 239u && max_floor_slack_length < 384u);
+#endif
 #if defined(ISAAC_VITA_PROFILE_IMPORT_KINDS)
     CHECK(max_import_kinds_length == 332u && max_import_kinds_length < 384u);
     CHECK(max_import_hot_length == 305u && max_import_hot_length < 384u);
@@ -2981,6 +3804,61 @@ int main(int argc, char **argv)
     CHECK(max_kage_quad_length == ORACLE_MAX_KAGE_QUAD_LENGTH &&
           max_kage_quad_length < 384u);
 #endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    CHECK(max_gfuel_length == ORACLE_MAX_GFUEL_LENGTH &&
+          max_gfuel_length < 384u);
+    CHECK(max_gfuel_us_length == ORACLE_MAX_GFUEL_US_LENGTH &&
+          max_gfuel_us_length < 384u);
+    CHECK(max_gfuel_lookup_length == ORACLE_MAX_GFUEL_SITES_LENGTH &&
+          max_gfuel_has_length == ORACLE_MAX_GFUEL_SITES_LENGTH &&
+          max_gfuel_lookup_length < 384u);
+    CHECK(max_gfuel_nest_length == ORACLE_MAX_GFUEL_NEST_LENGTH &&
+          max_gfuel_body_length == ORACLE_MAX_GFUEL_SITES_LENGTH &&
+          max_gfuel_nest_length < 384u);
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+    CHECK(max_camera_ring_length == ORACLE_MAX_CAMERA_RING_LENGTH &&
+          max_camera_ring_length < 384u);
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+    /* All-ones counters; ut = 24 ten-digit numbers, four rva words, i=44. */
+    CHECK(max_update_probe_z_length == 125u &&
+          max_update_probe_t_length == 351u &&
+          max_update_probe_t_length < 384u &&
+          max_update_probe_k_length == 379u &&
+          max_update_probe_c_length == 193u);
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    CHECK(max_heap_counts_length == ORACLE_MAX_HEAP_COUNTS_LENGTH &&
+          max_heap_free_length == ORACLE_MAX_HEAP_SPANS_LENGTH &&
+          max_heap_malloc_length == ORACLE_MAX_HEAP_SPANS_LENGTH &&
+          max_heap_free_length < 384u);
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    CHECK(max_heap_cost_length == ORACLE_MAX_HEAP_COST_LENGTH &&
+          max_heap_vorbis_length == ORACLE_MAX_HEAP_VORBIS_LENGTH &&
+          max_heap_cost_length < 384u);
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    CHECK(max_render_chain_length == ORACLE_MAX_RENDER_CHAIN_LENGTH &&
+          max_render_chain_length < 384u);
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    CHECK(max_hascoll_length == ORACLE_MAX_HASCOLL_LENGTH &&
+          max_hascoll_length < 384u);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    CHECK(max_render_thread_length == ORACLE_MAX_RENDER_THREAD_LENGTH &&
+          max_render_thread_length < 384u);
+    CHECK(max_render_wake_length == ORACLE_MAX_RENDER_WAKE_LENGTH &&
+          max_render_wake_length < 384u);
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+    CHECK(max_census_length == ORACLE_MAX_CENSUS_LENGTH &&
+          max_census_length < 384u);
+    CHECK(max_census_part_length == ORACLE_MAX_CENSUS_PART_LENGTH &&
+          max_census_part_length <= 512u);
+# endif
+#endif
 #if defined(ISAAC_VITA_LASER_HALO_PROFILE) && ISAAC_VITA_LASER_HALO_PROFILE
     CHECK(log_line_length(log_line(next_line)) == 341u && log_line_length(log_line(next_line)) <= 512u);
     CHECK(strstr(log_line(next_line), "white_on=1 ordinary(p,w)=4294967295,4294967295") != NULL);
@@ -2991,10 +3869,13 @@ int main(int argc, char **argv)
     CHECK(log_line_length(log_line(next_line++)) <= 512u);
 #endif
     CHECK(next_line ==
-          ORACLE_RECORDS_PER_WINDOW - ORACLE_FBO_POLICY_RECORDS);
-    CHECK(log_line(ORACLE_RECORDS_PER_WINDOW - ORACLE_FBO_POLICY_RECORDS)
+          ORACLE_RECORDS_PER_WINDOW - ORACLE_FBO_POLICY_RECORDS +
+          ORACLE_MAX_EXTRA_RECORDS);
+    CHECK(log_line(ORACLE_RECORDS_PER_WINDOW - ORACLE_FBO_POLICY_RECORDS +
+                   ORACLE_MAX_EXTRA_RECORDS)
               != NULL &&
-          *log_line(ORACLE_RECORDS_PER_WINDOW - ORACLE_FBO_POLICY_RECORDS)
+          *log_line(ORACLE_RECORDS_PER_WINDOW - ORACLE_FBO_POLICY_RECORDS +
+                    ORACLE_MAX_EXTRA_RECORDS)
               == '\0');
 
 #if defined(ISAAC_VITA_ROOM_LOG_MARKERS) && ISAAC_VITA_ROOM_LOG_MARKERS
@@ -3111,6 +3992,10 @@ int main(int argc, char **argv)
 #else
     printf("/-/-");
 #endif
+#if defined(ISAAC_VITA_FULLSPEED_SCHEDULER) && defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT
+    /* Suffix only under the floor-debt define (same rule as fa/fp). */
+    printf("; fd/fs=%zu/%zu", max_floor_debt_length, max_floor_slack_length);
+#endif
 #if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
     printf("; x=%zu/xd=%zu", max_texture_churn_length,
            max_texture_delete_length);
@@ -3142,9 +4027,46 @@ int main(int argc, char **argv)
      * string in test_kage_vita_phase_profile.py stays frozen. */
     printf("; mem=%zu", max_heap_length);
 #endif
+#if defined(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    /* Suffix only under the latch define (same rule as mem above). */
+    printf("; tl=%zu", max_clear_latch_length);
+#endif
 #if defined(ISAAC_VITA_KAGE_QUAD_FASTPATH)
     /* Suffix only under the fast-path define (same rule as mem above). */
     printf("; kq=%zu", max_kage_quad_length);
+#endif
+#if defined(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    printf("; gf=%zu; gu=%zu; gl=%zu; gh=%zu; gn=%zu; gb=%zu",
+           max_gfuel_length, max_gfuel_us_length, max_gfuel_lookup_length,
+           max_gfuel_has_length, max_gfuel_nest_length, max_gfuel_body_length);
+#endif
+#if defined(ISAAC_VITA_CAMERA_RING_NATIVE)
+    printf("; cr=%zu", max_camera_ring_length);
+#endif
+#if defined(ISAAC_VITA_UPDATE_PROBE)
+    printf("; uz=%zu; ut=%zu; uc=%zu; uk=%zu", max_update_probe_z_length,
+           max_update_probe_t_length, max_update_probe_c_length,
+           max_update_probe_k_length);
+#endif
+#if defined(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    printf("; hc=%zu; hf=%zu; hm=%zu", max_heap_counts_length,
+           max_heap_free_length, max_heap_malloc_length);
+#endif
+#if defined(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    printf("; hg=%zu; hv=%zu", max_heap_cost_length, max_heap_vorbis_length);
+#endif
+#if defined(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    printf("; rn=%zu", max_render_chain_length);
+#endif
+#if defined(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    printf("; hn=%zu", max_hascoll_length);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    printf("; rt=%zu; rw=%zu", max_render_thread_length, max_render_wake_length);
+# if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+    /* Suffix only under the census define (frozen PASS strings elsewhere). */
+    printf("; ro=%zu; rop=%zu", max_census_length, max_census_part_length);
+# endif
 #endif
 #if defined(ISAAC_VITA_GL_TIME_SDK_SPARSE) && ISAAC_VITA_GL_TIME_SDK_SPARSE
     printf("; sdk32=%zu/%zu/%zu/%zu", max_gl_time_length,

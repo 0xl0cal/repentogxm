@@ -5,6 +5,9 @@
  * session inactive.  A later Initialize reuses the real context instead of
  * trying to manufacture or recreate a GLFW object. */
 #include "kage_vita_backend.h"
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+#include "gl_record_backend.h"
+#endif
 #include "kage_vita_deep_profile.h"
 
 #include <stdint.h>
@@ -54,8 +57,17 @@ void isaac_vita_log(const char *format, ...);
 #if defined(ISAAC_VITA_SCREENSHOT_PROBE)
 # include "kage_vita_screenshot_probe.h"
 #endif
+#if defined(ISAAC_VITA_TROPHIES)
+# include "host_vita_trophies.h"
+#endif
 #if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
 void kage_vita_first_frame_note_present_return(uint32_t present_count);
+#endif
+#if defined(ISAAC_VITA_DEBUG_OVERLAY)
+# include "host_vita_debug_overlay.h"
+#endif
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+# include "kage_vita_gpu_frame_profile.h"
 #endif
 
 #define KAGE_VITA_LOGICAL_WIDTH   960u
@@ -138,6 +150,54 @@ static uint8_t s_stock_fbo_rt_scenes = 1u;
 #else
 # define KAGE_VITA_STOCK_FBO_RT_SCENES_BANNER ""
 # define KAGE_VITA_STOCK_FBO_RT_SCENES_ARG
+#endif
+/* ISAAC_VITA_VITAGL_SCENE_GUARD: the counters of 0034-isaac-scene-guard.patch.
+ * Stock vitaGL ignores setup_render_target and sceGxmBeginScene failures in
+ * scene_reset (sceGxmCreateRenderTarget refuses under driver-memory pressure,
+ * seen at Ultra Greed's death); glClear then wrote its clear uniforms through
+ * an uninitialised default-uniform-buffer pointer (Vita C2-12828-1, data
+ * abort at dfar 0x10e).  The patch fails those writes and draws closed and
+ * counts them; this owner logs a startup receipt and, after a swap on which
+ * the counters changed, their snapshot: the first eight changes, then every
+ * 256th.  The hooks are declared here, not in vitaGL.h (the 0004 shader
+ * cache hashes that header).  A failed sceGxmEndScene leaves the scene open
+ * inside GXM (2026-09-27: every later BeginScene returned WITHIN_SCENE and
+ * the display froze); the guard keeps retrying the end like stock vitaGL, and
+ * the recovery words say whether a scene is still dangling, how many ends
+ * were retried and recovered, and the last EndScene error itself. */
+#if defined(ISAAC_VITA_VITAGL_SCENE_GUARD)
+void vglIsaacSceneGuardSnapshot(uint32_t out[8]);
+void vglIsaacSceneGuardRecovery(uint32_t out[4]);
+uint32_t vglIsaacSceneGuardChanged(void);
+void isaac_vita_log(const char *format, ...);
+static uint32_t s_scene_guard_seen;
+static uint32_t s_scene_guard_changes;
+
+static void kage_vita_scene_guard_receipt(void)
+{
+    uint32_t events = vglIsaacSceneGuardChanged();
+    uint32_t counters[8];
+    uint32_t recovery[4];
+
+    if (events == s_scene_guard_seen)
+        return;
+    s_scene_guard_seen = events;
+    s_scene_guard_changes++;
+    if (s_scene_guard_changes > 8u && (s_scene_guard_changes % 256u) != 0u)
+        return;
+    vglIsaacSceneGuardSnapshot(counters);
+    vglIsaacSceneGuardRecovery(recovery);
+    isaac_vita_log(
+        "KAGE VITA SCENE GUARD: rt_fail=%u begin_fail=%u end_fail=%u "
+        "reserve_fail=%u skipped(clear,draw)=%u,%u last_err=0x%08x "
+        "skipped_end=%u dangling=%u end_retry=%u recovered=%u "
+        "end_err=0x%08x changes=%u",
+        (unsigned)counters[0], (unsigned)counters[1], (unsigned)counters[2],
+        (unsigned)counters[3], (unsigned)counters[4], (unsigned)counters[5],
+        (unsigned)counters[7], (unsigned)counters[6],
+        (unsigned)recovery[0], (unsigned)recovery[1], (unsigned)recovery[2],
+        (unsigned)recovery[3], (unsigned)s_scene_guard_changes);
+}
 #endif
 /* ISAAC_VITA_STOCK_FBO_VALID_REGION=1 (observe) | 2 (on): the mode hook of
  * 0009-isaac-fbo-valid-region.patch.  The game's offscreen attachments are
@@ -392,12 +452,25 @@ static int kage_vita_display_surfaces_ready(
 }
 #endif
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+/* Render thread: every vitaGL call runs there.  The
+ * game thread keeps session/loading ownership, counters and the heartbeat. */
+#include <psp2/kernel/threadmgr.h>
+#include "gl_owner_check.h"
+static int s_defer_session, s_owed_activate, s_owed_loading;
+static uint32_t s_present_position;
+static void kvb_noop_closure(void *unused) { (void)unused; }
+#endif
+
 static void kage_vita_backend_start_loading_epoch(void)
 {
     /* A new counter epoch precedes both readers.  Start the independent
      * watchdog before loading_start's first vglSwapBuffers: if that call never
      * returns, pre-loop reports retain fread=0 and loading_swaps=0.  Watchdog
      * creation remains diagnostic-only. */
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    if (s_defer_session) { s_owed_loading = 1; return; } /* game thread */
+#endif
     isaac_vita_reset_archive_fread_epoch();
     KAGE_VITA_STALL_START();
     kage_vita_loading_start();
@@ -407,6 +480,9 @@ static void kage_vita_backend_activate_session(void)
 {
     /* This is the common physical-Vita boundary used by manual_kage_vita.c.
      * The legacy kage_pc_backend_initialize wrapper is not on that route. */
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    if (s_defer_session) { s_owed_activate = 1; return; } /* game thread */
+#endif
     KAGE_VITA_FULLSPEED_RESET();
     KAGE_VITA_STABLE30_RESET();
 #if defined(ISAAC_VITA_SIM_CADENCE_RECEIPT)
@@ -424,7 +500,21 @@ void __wrap_invoke_splashscreen(void)
     sceClibPrintf("[kage-vita] vitaGL splash suppressed\n");
 }
 
+#if defined(ISAAC_VITA_TROPHIES)
+/* Pumps one trophy setup-dialog frame: vglSwapBuffers(GL_TRUE) runs
+ * sceCommonDialogUpdate on the back buffer, so the trophy unit never
+ * includes vitaGL. */
+static void kage_vita_trophy_present(void)
+{
+    vglSwapBuffers(GL_TRUE);
+}
+#endif
+
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+static int kage_vita_backend_initialize_impl(uint32_t width, uint32_t height)
+#else
 int kage_vita_backend_initialize(uint32_t width, uint32_t height)
+#endif
 {
 #if !defined(ISAAC_VITA_VITAGL_STOCK_REFERENCE)
     IsaacVitaGlDisplaySurfaceStatus display_status;
@@ -496,6 +586,11 @@ int kage_vita_backend_initialize(uint32_t width, uint32_t height)
     vglSetupDisplayRenderTarget(
         (uint8_t)KAGE_VITA_RENDER_TARGET_SCENES);
 #endif
+#if defined(ISAAC_VITA_VITAGL_SCENE_GUARD)
+    /* Startup receipt of the 0034 guard, once per process like the requests
+     * below (the warm re-initialize after Shutdown returned above). */
+    isaac_vita_log("KAGE VITA SCENE GUARD: on");
+#endif
 #if defined(ISAAC_VITA_STOCK_FBO_RT_SCENES)
     /* Offscreen (FBO) render targets: N scene slots instead of vitaGL's one,
      * so the three offscreen passes of a frame on the manager FBO no longer
@@ -561,6 +656,18 @@ int kage_vita_backend_initialize(uint32_t width, uint32_t height)
         kage_vita_set_error("vitaGL initialized without a GL_VERSION string");
         return 0;
     }
+#if defined(ISAAC_VITA_TROPHIES)
+    /* Trophy Stage B (recomp/vita/TROPHIES.md): opens the sets with queued
+     * trophies one at a time and then the gameplay pair, one bounded setup
+     * dialog per context (at most two live; device run 2026-10-09); no
+     * dialog is ever shown later.  Only here does this thread own GXM with
+     * no scene open, the
+     * loading overlay callback not yet installed (kage_vita_loading.c
+     * overwrites the whole framebuffer), vsync at vitaGL's default and the
+     * scheduler, watchdog and present counters not started; the warm path
+     * above returned earlier.  A no-op when Stage A disabled trophies. */
+    isaac_vita_trophies_setup(kage_vita_trophy_present);
+#endif
 
     /* KAGE retains its measured 960x540 logical coordinate system.  The
      * optional scaled display raster (720x408 or 480x272) scales only the
@@ -649,9 +756,142 @@ int kage_vita_backend_initialize(uint32_t width, uint32_t height)
     return 1;
 }
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+typedef struct KvbInit { uint32_t width, height; int result; } KvbInit;
+#if defined(ISAAC_GL_RECORD_ADMISSION_RECEIPT)
+/* GL_RECORD_ADMISSION_CACHE_STANDALONE only: the boot receipt names the free
+ * wrap the recorder's admission cache relies on. */
+# include <psp2/kernel/sysmem.h>
+/* Weak: resolves to 0 if no free wrap is linked (the receipt then says MISSING). */
+int __wrap_sceKernelFreeMemBlock(SceUID uid) __attribute__((weak));
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_VGL_MEM_SNAPSHOT)
+/* vitaGL's allocator is single-threaded, so the game-thread readers of its
+ * free space (image retain headroom and ghost, heap census) read this copy.
+ * The render thread publishes it after init and after every swap: at most
+ * one frame old, inside the FRAME_PURGE_FREQ frames by which vitaGL already
+ * defers texture frees. */
+/* Same ABI slot as KAGE_VITA_VGL_MEM_PHYCONT (copied from the IO_PROFILE block
+ * above, which this knob does not depend on). */
+#define KVB_VGL_MEM_PHYCONT ((vglMemType)(VGL_MEM_RAM + 1))
+static volatile uint32_t s_vgl_mem[KAGE_VITA_VGL_SNAPSHOT_WORDS];
+static void kvb_publish_vgl_mem(void)
+{
+    __atomic_store_n(&s_vgl_mem[KAGE_VITA_VGL_SNAPSHOT_RAM_FREE],
+                     (uint32_t)vglMemFree(VGL_MEM_RAM), __ATOMIC_RELAXED);
+    __atomic_store_n(&s_vgl_mem[KAGE_VITA_VGL_SNAPSHOT_VRAM_FREE],
+                     (uint32_t)vglMemFree(VGL_MEM_VRAM), __ATOMIC_RELAXED);
+    __atomic_store_n(&s_vgl_mem[KAGE_VITA_VGL_SNAPSHOT_PHYCONT_FREE],
+                     (uint32_t)vglMemFree(KVB_VGL_MEM_PHYCONT), __ATOMIC_RELAXED);
+    __atomic_store_n(&s_vgl_mem[KAGE_VITA_VGL_SNAPSHOT_RAM_TOTAL],
+                     (uint32_t)vglMemTotal(VGL_MEM_RAM), __ATOMIC_RELAXED);
+}
+uint32_t kage_vita_backend_vgl_mem(unsigned index)
+{
+    return index < KAGE_VITA_VGL_SNAPSHOT_WORDS
+        ? __atomic_load_n(&s_vgl_mem[index], __ATOMIC_RELAXED) : 0u;
+}
+#else
+# define kvb_publish_vgl_mem() ((void)0)
+#endif
+
+static void kvb_initialize_closure(void *context)
+{
+    KvbInit *init = (KvbInit *)context;
+    init->result = kage_vita_backend_initialize_impl(init->width, init->height);
+    if (init->result)
+        kvb_publish_vgl_mem();
+}
+
+/* Start the render thread once, narrow the game thread to USER_0 and log the
+ * RESOLVED ids/masks/mode (not the intent). */
+static int kvb_worker_ensure(void)
+{
+    int self, before, after, rc, render, render_mask;
+    if (isaac_gl_record_worker_active())
+        return 1;
+    self = sceKernelGetThreadId();
+    before = sceKernelGetThreadCpuAffinityMask(self);
+    rc = sceKernelChangeThreadCpuAffinityMask(self, SCE_KERNEL_CPU_MASK_USER_0);
+    after = sceKernelGetThreadCpuAffinityMask(self);
+    if (!isaac_gl_record_worker_start(NULL)) {
+        isaac_vita_log("KAGE VITA GL RENDER THREAD: start FAILED");
+        return 0;
+    }
+    isaac_gl_record_worker_call(kvb_noop_closure, NULL); /* thread id is set */
+    render = isaac_gl_record_worker_thread_id();
+    render_mask = sceKernelGetThreadCpuAffinityMask(render);
+    isaac_vita_log(
+        "KAGE VITA GL RENDER THREAD: mode=%s game_tid=0x%08x "
+        "game_mask_before=0x%08x game_mask_after=0x%08x game_mask_rc=0x%08x "
+        "render_tid=0x%08x render_mask=0x%08x render_free_stack=%d",
+        ISAAC_GL_RECORD_WORKER_MODE_NAME, (unsigned)self, (unsigned)before,
+        (unsigned)after, (unsigned)rc, (unsigned)render, (unsigned)render_mask,
+        sceKernelGetThreadStackFreeSize(render));
+#if defined(ISAAC_GL_RECORD_ADMISSION_RECEIPT)
+    {
+        /* --wrap redirects this TU's reference too: equal iff the wrap is
+         * linked.  volatile copies keep GCC from folding the comparison of
+         * two symbol addresses. */
+        volatile uintptr_t called = (uintptr_t)&sceKernelFreeMemBlock;
+        volatile uintptr_t wrap = (uintptr_t)&__wrap_sceKernelFreeMemBlock;
+        int linked = wrap != 0u && called == wrap;
+# if defined(ISAAC_GL_RECORD_ADMISSION_CACHE_VERIFY)
+        uint32_t st[4];
+        int st_ok = isaac_gl_record_admission_selftest(st);   /* game thread = producer */
+        isaac_vita_log("KAGE VITA GL RECORD ADMISSION: cache=on owner=%s wrap=%s verify=1 "
+                       "selftest(cached,bumped,stale,after)=%u,%u,%u,%u ok=%d",
+                       ISAAC_GL_RECORD_ADMISSION_RECEIPT, linked ? "linked" : "MISSING",
+                       (unsigned)st[0], (unsigned)st[1], (unsigned)st[2], (unsigned)st[3], st_ok);
+# else
+        isaac_vita_log("KAGE VITA GL RECORD ADMISSION: cache=on owner=%s wrap=%s verify=0",
+                       ISAAC_GL_RECORD_ADMISSION_RECEIPT, linked ? "linked" : "MISSING");
+# endif
+    }
+#endif
+    return 1;
+}
+
+int kage_vita_backend_initialize(uint32_t width, uint32_t height)
+{
+    KvbInit init;
+    if (!kvb_worker_ensure()) {
+        kage_vita_set_error("GL render thread could not start");
+        return 0;
+    }
+    init.width = width;
+    init.height = height;
+    init.result = 0;
+    s_defer_session = 1;
+    s_owed_activate = s_owed_loading = 0;
+    isaac_gl_record_worker_call(kvb_initialize_closure, &init);
+    s_defer_session = 0;
+    /* Same order as the impl: activate, then the loading epoch. */
+    if (s_owed_activate) kage_vita_backend_activate_session();
+    if (s_owed_loading) kage_vita_backend_start_loading_epoch();
+    return init.result;
+}
+#endif
+
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+static void kvb_attrib_sync_closure(void *unused)
+{
+    (void)unused;
+    gl_vita_backend_attrib_sync();
+}
+#endif
+
 void kage_vita_backend_deactivate(void)
 {
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    isaac_gl_record_drain();
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    isaac_gl_record_worker_wait(s_present_position);
+    isaac_gl_record_worker_call(kvb_attrib_sync_closure, NULL);
+#else
     gl_vita_backend_attrib_sync();
+#endif
     /* Join the diagnostic reader before any process-owned guest/backend state
      * can be released.  Stop is idempotent across ordinary and final teardown. */
     KAGE_VITA_STALL_STOP();
@@ -661,6 +901,52 @@ void kage_vita_backend_deactivate(void)
     KAGE_VITA_STABLE30_DEACTIVATE();
     kage_vita_input_deactivate();
 }
+
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+/* Fullspeed scheduler, interpolated (non-full) phase only: while the previous
+ * present closure has not run, rendering this frame would make Present wait
+ * for the render thread and delay the next Game::Update.  Decline it (one
+ * frame stays in flight, the update cadence is untouched).  Never waits. */
+int kage_vita_backend_render_admit(void)
+{
+    if (!isaac_gl_record_worker_behind(s_present_position))
+        return 1;
+    isaac_gl_record_worker_note_render_skip();
+    return 0;
+}
+#endif
+
+static void kvb_present_closure(void *unused)
+{
+    uint64_t swap_started_at;
+    (void)unused;
+    gl_vita_backend_attrib_sync();
+#if defined(ISAAC_VITA_VITAGL_SHADER_CACHE)
+    gl_vita_backend_shader_cache_report();
+#endif
+#if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    gl_vita_backend_fbo_present();
+#endif
+#if defined(ISAAC_VITA_GL_FILL_CENSUS)
+    gl_vita_backend_fill_census_present();
+#endif
+#if defined(ISAAC_VITA_DEBUG_OVERLAY)
+    isaac_vita_debug_overlay_present_render(); /* the display callback */
+#endif
+    swap_started_at = sceKernelGetProcessTimeWide();
+    vglSwapBuffers(GL_FALSE);
+    isaac_gl_record_worker_frame_end(
+        (uint32_t)(sceKernelGetProcessTimeWide() - swap_started_at));
+    kvb_publish_vgl_mem();
+#if defined(ISAAC_VITA_VITAGL_SCENE_GUARD)
+    kage_vita_scene_guard_receipt();
+#endif
+#if defined(ISAAC_VITA_GL_OWNER_CHECK) && ISAAC_VITA_GL_OWNER_CHECK
+    isaac_gl_owner_report();
+#endif
+}
+#endif
 
 int kage_vita_backend_present(void)
 {
@@ -673,6 +959,13 @@ int kage_vita_backend_present(void)
         kage_vita_set_error("Vita KAGE Present requested before initialize");
         return 0;
     }
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD && \
+    !(defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER)
+    /* Worker: no drain.  The present closure is ordered behind every record
+     * of the frame; draining here would make the game thread wait for the
+     * whole replay and leave only the swap overlapping. */
+    isaac_gl_record_drain();
+#endif
 #if defined(ISAAC_VITA_GL_WRAPPER_TIME)
     /* ph120.gw p bucket: this whole method (attribute sync, loading finish,
      * shader-cache/fill-census bookkeeping, the swap, the heartbeat) on the
@@ -680,6 +973,41 @@ int kage_vita_backend_present(void)
     uint64_t wrapper_started_at = sceKernelGetProcessTimeWide();
 #endif
     KAGE_VITA_STALL_NOTE_PRESENT_ENTER(s_present_count);
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    /* Loading finish keeps its lock/owner on this thread; its own vitaGL
+     * calls are closures.  Then one frame in flight: wait for the previous
+     * present's closure before queueing this one. */
+    kage_vita_loading_finish();
+    KAGE_VITA_PHASE_PROFILE_PRESENT_ENTER();
+#if defined(ISAAC_VITA_DEBUG_OVERLAY)
+    ISAAC_VITA_DEBUG_OVERLAY_PRESENT_ENTER();
+#endif
+    /* GPU frame profile: game-side bracket around the post (its header: with
+     * the worker busy/rbusy/gf stay exact, lag/q/swp describe this post). */
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+    KAGE_VITA_GPU_FRAME_PROFILE_PRESENT_ENTER();
+#endif
+    isaac_gl_record_worker_wait(s_present_position);
+    s_present_position = isaac_gl_record_worker_post(kvb_present_closure, NULL);
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+    KAGE_VITA_GPU_FRAME_PROFILE_PRESENT_RETURN();
+#endif
+    KAGE_VITA_PHASE_PROFILE_PRESENT_RETURN();
+#if defined(ISAAC_VITA_DEBUG_OVERLAY)
+    ISAAC_VITA_DEBUG_OVERLAY_PRESENT_RETURN();
+#endif
+#if defined(ISAAC_GL_RECORD_ADMISSION_CACHE_VERIFY)
+    /* Measurement builds: cumulative since the boot self-test, one line per
+     * 1024 presents; the gate reads the last one (misses <= 4 x wraps + 1). */
+    if ((s_present_count & 1023u) == 1023u) {
+        uint32_t vs[3];
+        isaac_gl_record_admission_verify_stats(vs);
+        isaac_vita_log("KAGE VITA GL RECORD ADMISSION VERIFY: presents=%u wraps=%u misses=%u hits=%u",
+                       (unsigned)(s_present_count + 1u), (unsigned)vs[0], (unsigned)vs[1],
+                       (unsigned)vs[2]);
+    }
+#endif
+#else
     gl_vita_backend_attrib_sync();
     /* Belt-and-suspenders fallback.  The generated loop-head hook normally
      * drains the CPU loading overlay before Update/Render starts; Present is
@@ -700,6 +1028,13 @@ int kage_vita_backend_present(void)
     gl_vita_backend_fill_census_present();
 #endif
     KAGE_VITA_PHASE_PROFILE_PRESENT_ENTER();
+#if defined(ISAAC_VITA_DEBUG_OVERLAY)
+    /* Debug overlay: swap bracket + display callback (one branch when off). */
+    ISAAC_VITA_DEBUG_OVERLAY_PRESENT_ENTER();
+#endif
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+    KAGE_VITA_GPU_FRAME_PROFILE_PRESENT_ENTER();
+#endif
 #if defined(ISAAC_VITA_GL_TIME_PROFILE) && \
     (!defined(ISAAC_VITA_GL_TIME_SDK_SPARSE) || !ISAAC_VITA_GL_TIME_SDK_SPARSE)
     {
@@ -716,7 +1051,17 @@ int kage_vita_backend_present(void)
 #else
     vglSwapBuffers(GL_FALSE);
 #endif
+#if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
+    KAGE_VITA_GPU_FRAME_PROFILE_PRESENT_RETURN();
+#endif
     KAGE_VITA_PHASE_PROFILE_PRESENT_RETURN();
+#if defined(ISAAC_VITA_DEBUG_OVERLAY)
+    ISAAC_VITA_DEBUG_OVERLAY_PRESENT_RETURN();
+#endif
+#if defined(ISAAC_VITA_VITAGL_SCENE_GUARD)
+    kage_vita_scene_guard_receipt();
+#endif
+#endif /* render thread */
 #if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
     gl_vita_backend_first_frame_queue_end();
 #endif
@@ -786,6 +1131,14 @@ int kage_vita_backend_present(void)
     return 1;
 }
 
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+static void kvb_vsync_closure(void *unused)
+{
+    (void)unused;
+    vglWaitVblankStart(GL_FALSE);
+}
+#endif
+
 int kage_vita_backend_set_vsync(int enabled)
 {
     int requested;
@@ -795,10 +1148,17 @@ int kage_vita_backend_set_vsync(int enabled)
         return 0;
     }
     requested = enabled != 0;
+#if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
+    isaac_gl_record_drain();
+#endif
     /* The frozen guest's own monotonic 1/60 limiter is the only pacing
      * authority on Vita.  Enabling vitaGL swap wait also makes the guest skip
      * that limiter, coupling simulation speed directly to emulator Presents. */
+#if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    isaac_gl_record_worker_call(kvb_vsync_closure, NULL);
+#else
     vglWaitVblankStart(GL_FALSE);
+#endif
     s_vsync_enabled = 0;
     s_vsync_change_count++;
     ISAAC_VITA_LOG_PRINTF(

@@ -66,6 +66,7 @@ VT_LOADER_RVA = {"PNG": 0x5A0C50, "PCX": 0x5A0630, "PIC": 0x5A0630}
 CTRL_VT_RVA = 0x608360
 CTRL_VT_SLOTS = {4: 0x7B70, 8: 0x7B50, 0xC: 0x7AF0}   # TryAddRef, AddRef, Release
 ORACLE_PASS = "IMAGE RETAIN ORACLE PASS: checks=644 scenarios=66 records=1024"
+ORACLE_PASS_PHYCONT = "IMAGE RETAIN ORACLE PASS: checks=657 scenarios=69 records=1024"
 # The game's Mutex class: vtable (+0xc Enter sub_00562e00, +0x10 Leave
 # sub_00562ec0), {vt, u8 init @+4, CRITICAL_SECTION* @+8}, held byte at
 # CS+0x18.  Enter = EnterCriticalSection; while (held) Sleep(1000); held = 1.
@@ -442,21 +443,59 @@ def default_cc() -> list[str]:
 
 
 def run_oracle(cc: list[str], work: Path) -> None:
-    for required in (0, 1):
-        for opt in ("-O2", "-O0"):
-            exe = work / f"ir-oracle-s{required}{opt}{'.exe' if os.name == 'nt' else ''}"
-            command = [*cc, "-std=c11", opt, "-Wall", "-Wextra", "-Werror",
-                       "-DISAAC_VITA_IMAGE_RETAIN=1",
-                       "-DISAAC_VITA_IMAGE_RETAIN_ORACLE=1",
-                       "-DGUEST_IMAGE_BASE=0x98000000U",
-                       f"-DGUEST_STACK_REQUIRED={required}",
-                       "-I", str(RUNTIME), str(MODULE), str(ORACLE), "-o", str(exe)]
-            if os.name != "nt":
-                command.append("-no-pie")
-            run(command)
-            out = run([str(exe)]).strip()
-            require(out == ORACLE_PASS, f"oracle (stack={required} {opt}) said: {out}")
-            print(f"host oracle stack_required={required} {opt}: {out}")
+    # The PHYCONT leg reruns every scenario (PHYCONT free is 0 in them) plus
+    # the one that only passes when the headroom really adds PHYCONT.
+    for phy, expect in ((0, ORACLE_PASS), (1, ORACLE_PASS_PHYCONT)):
+        for required in (0, 1):
+            for opt in ("-O2", "-O0"):
+                exe = work / f"ir-oracle-p{phy}s{required}{opt}{'.exe' if os.name == 'nt' else ''}"
+                command = [*cc, "-std=c11", opt, "-Wall", "-Wextra", "-Werror",
+                           "-DISAAC_VITA_IMAGE_RETAIN=1",
+                           "-DISAAC_VITA_IMAGE_RETAIN_ORACLE=1",
+                           "-DGUEST_IMAGE_BASE=0x98000000U",
+                           f"-DGUEST_STACK_REQUIRED={required}",
+                           *(["-DISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT=1"] if phy else []),
+                           "-I", str(RUNTIME), str(MODULE), str(ORACLE), "-o", str(exe)]
+                if os.name != "nt":
+                    command.append("-no-pie")
+                run(command)
+                out = run([str(exe)]).strip()
+                require(out == expect, f"oracle (phycont={phy} stack={required} {opt}) said: {out}")
+                print(f"host oracle phycont={phy} stack_required={required} {opt}: {out}")
+
+
+# Production free-memory readers: the module (not the oracle build) picks
+# them by ISAAC_VITA_GL_THREAD_WORKER x ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT.
+# The PHYCONT reader once existed only in the direct-vitaGL branch, so a
+# worker + PHYCONT build did not compile; a syntax pass over all four
+# flavours against stand-in vitaGL/psp2 declarations keeps that closed.
+STUB_HEADERS = {
+    "vitaGL.h": "#pragma once\n#include <stddef.h>\n"
+                "typedef enum { VGL_MEM_VRAM, VGL_MEM_RAM, VGL_MEM_SLOW, "
+                "VGL_MEM_BUDGET, VGL_MEM_ALL } vglMemType;\n"
+                "size_t vglMemFree(vglMemType type);\n"
+                "size_t vglMemTotal(vglMemType type);\n",
+    "psp2/kernel/processmgr.h": "#pragma once\n#include <stdint.h>\n"
+                                "uint64_t sceKernelGetProcessTimeWide(void);\n",
+    "psp2/kernel/sysmem.h": "#pragma once\n",
+}
+
+
+def run_flavours(cc: list[str], work: Path) -> None:
+    stubs = work / "stub-include"
+    for name, text in STUB_HEADERS.items():
+        path = stubs / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline="\n")
+    for worker in (0, 1):
+        for phy in (0, 1):
+            run([*cc, "-std=c11", "-fsyntax-only", "-Wall", "-Wextra", "-Werror",
+                 *RETAIN_DEFS, "-DGUEST_IMAGE_BASE=0x98000000U",
+                 *(["-DISAAC_VITA_GL_THREAD_WORKER=1"] if worker else []),
+                 *(["-DISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT=1"] if phy else []),
+                 "-I", str(RUNTIME), "-I", str(stubs), str(MODULE)])
+            print(f"production flavour gl_thread_worker={worker} phycont={phy}: "
+                  f"compiles (-Werror): PASS")
 
 
 # -------------------------------------------------------------------- ARM ---
@@ -517,6 +556,7 @@ def main() -> int:
         if not args.skip_oracle:
             cc = shlex.split(args.cc) if args.cc else default_cc()
             run_oracle(cc, work)
+            run_flavours(cc, work)
         if args.arm_cc:
             arm_cross(args.arm_cc, work)
         else:

@@ -5,11 +5,17 @@
 #include <stdint.h>
 
 /* Keep the request's low bit at 4 KiB.  Vita3K's USER_RW allocator retains
- * one additional low-bit quantum, so this exact 0x007d5000-byte request has
- * a measured retained span of 0x007d6000 bytes. */
-#define ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES          0x007d5000U
-#define ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES 0x007d6000U
+ * one additional low-bit quantum, so a request of N bytes with low bit 0x1000
+ * has a retained span of N + 0x1000 (measured 0x007d5000 -> 0x007d6000).
+ * The size is the CMake STRING knob ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES;
+ * the default is compiled in here and CMake emits no definition for it. */
 #define ISAAC_VITA_HEAP_OVERFLOW_MSPACE_PAGE_BYTES     0x00001000U
+#ifndef ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES
+#define ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES          0x007d5000U
+#endif
+#define ISAAC_VITA_HEAP_OVERFLOW_MSPACE_RETAINED_BYTES \
+    (ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES + \
+     ISAAC_VITA_HEAP_OVERFLOW_MSPACE_PAGE_BYTES)
 #define ISAAC_VITA_HEAP_OVERFLOW_MSPACE_ALIGNMENT      8U
 #define ISAAC_VITA_HEAP_OVERFLOW_INTERNAL_PAGE_BYTES   0x00010000U
 #define ISAAC_VITA_HEAP_OVERFLOW_MSPACE_INVALID_UID    ((int32_t)-1)
@@ -69,6 +75,9 @@ int isaac_vita_heap_overflow_mspace_init(
 /* Domain classification only: interior and stale addresses still classify as
  * inside this pool.  It is not an ownership predicate. */
 int isaac_vita_heap_overflow_mspace_contains(const void *pointer);
+/* A zero logical malloc request uses one physical byte when this pool has
+ * capacity. The outer router still records requested_size == 0, while the
+ * returned pointer is a distinct live allocation requiring ordinary free. */
 void *isaac_vita_heap_overflow_mspace_malloc(size_t size);
 void *isaac_vita_heap_overflow_mspace_calloc(size_t count, size_t size);
 /* Native sub-allocators may retain bounded backing from this same mspace.

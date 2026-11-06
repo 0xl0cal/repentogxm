@@ -10,7 +10,9 @@
 #    overload report position, over-long printf written synchronously with
 #    exact bytes, mixed-size two-producer fill).
 # 2. Checks the CMake scope: the option exists, exactly the eight owners see
-#    the macro, abort() is wrapped, the raw allocator gate knows the source.
+#    the macro, the ring-size macro reaches both the ring owner and the
+#    banner TU (platform.c prints ring_kb= from it), abort() is wrapped, the
+#    raw allocator gate knows the source.
 # 3. With VITASDK set: cross-compiles the module for the Vita under the
 #    eboot's flags and checks the __wrap_abort/__real_abort contract and that
 #    no libc allocator is referenced.
@@ -38,7 +40,12 @@ fi
     "$root/runtime/host_vita_log_async.c" \
     "$root/runtime/host_vita_log_async_oracle.c" \
     -o "$work/log-async-host-oracle-8k"
-"$work/log-async-host-oracle-8k"
+# The ring owner reports the size it was built with (the knob value, not the
+# header default); the 8 KiB build must say so.
+oracle_8k=$("$work/log-async-host-oracle-8k")
+printf '%s\n' "$oracle_8k"
+printf '%s\n' "$oracle_8k" | grep -q 'oracle: PASS checks=[0-9]* ring_kb=8 ' \
+    || { echo "8 KiB oracle did not report ring_kb=8 (ring size does not follow ISAAC_VITA_LOG_ASYNC_RING_KB)" >&2; exit 1; }
 
 # The same oracle checks actual native batch append/recovery, exact bytes,
 # record boundaries and no-lock fallback, with both supported ring sizes.
@@ -64,7 +71,7 @@ test "$(printf '%s\n' "$batch_block" | grep -c '"${ISAAC_RUNTIME}/')" -eq 1
 block=$(awk '/^  if\(ISAAC_VITA_LOG_ASYNC\)$/,/^  endif\(\)$/' "$cmake")
 for owner in entry_vita.c host_vita_log_async.c kage_vita_phase_profile.c \
              kage_vita_guest_sampler.c kage_vita_backend.c kage_vita_input.c \
-             kage_vita_generated_hooks.c; do
+             kage_vita_generated_hooks.c kage_vita_gpu_frame_profile.c; do
     printf '%s\n' "$block" | grep -q "\${ISAAC_RUNTIME}/$owner\"" \
         || { echo "log-async CMake scope lost $owner" >&2; exit 1; }
 done
@@ -72,6 +79,21 @@ printf '%s\n' "$block" | grep -q '^      platform.c$' \
     || { echo "log-async CMake scope lost platform.c" >&2; exit 1; }
 printf '%s\n' "$block" | grep -q -- '-Wl,--wrap=abort' \
     || { echo "log-async CMake scope lost --wrap=abort" >&2; exit 1; }
+# The ring-size macro must reach the ring owner and the banner TU together:
+# platform.c prints ring_kb= from ISAAC_VITA_LOG_ASYNC_RING_KB, and without
+# the definition it reports the header default (256) whatever the build set.
+ring_scope=$(printf '%s\n' "$block" \
+    | grep -B4 'ISAAC_VITA_LOG_ASYNC_RING_KB=${ISAAC_VITA_LOG_ASYNC_RING_KB})$')
+test "$(printf '%s\n' "$ring_scope" | grep -c '^    set_property(SOURCE$')" -eq 1 \
+    && printf '%s\n' "$ring_scope" | head -1 | grep -q '^    set_property(SOURCE$' \
+    || { echo "log-async ring size definition is not one set_property of exactly two owners" >&2; exit 1; }
+printf '%s\n' "$ring_scope" | grep -q '^      platform.c$' \
+    || { echo "log-async ring size macro does not reach platform.c (banner ring_kb= prints the header default)" >&2; exit 1; }
+printf '%s\n' "$ring_scope" | grep -q '"${ISAAC_RUNTIME}/host_vita_log_async.c"' \
+    || { echo "log-async ring size macro does not reach host_vita_log_async.c" >&2; exit 1; }
+grep -q 'ring_kb=%u' "$root/vita/platform.c" \
+    && grep -q '(unsigned)ISAAC_VITA_LOG_ASYNC_RING_KB,' "$root/vita/platform.c" \
+    || { echo "platform.c banner lost ring_kb= from ISAAC_VITA_LOG_ASYNC_RING_KB" >&2; exit 1; }
 if printf '%s\n' "$block" | grep -q 'ISAAC_GENERATED\|gl_vita_backend\|guest\.c'; then
     echo "log-async CMake scope leaked into generated units or guest.c" >&2
     exit 1
@@ -89,7 +111,7 @@ test "$(grep -c '^    KVPP_PRINTF($' "$profile")" -ge 26 \
 test "$(grep -c 'sceClibPrintf(' "$profile")" -eq 1 \
     || { echo "phase profiler still calls sceClibPrintf outside the macro (only the oracle declaration may remain)" >&2; exit 1; }
 for owner in kage_vita_guest_sampler.c kage_vita_backend.c kage_vita_input.c \
-             kage_vita_generated_hooks.c; do
+             kage_vita_generated_hooks.c kage_vita_gpu_frame_profile.c; do
     grep -q 'ISAAC_VITA_LOG_PRINTF(' "$root/runtime/$owner" \
         || { echo "$owner lost its ISAAC_VITA_LOG_PRINTF route" >&2; exit 1; }
 done

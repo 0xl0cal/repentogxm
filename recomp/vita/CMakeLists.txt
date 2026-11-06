@@ -66,6 +66,8 @@ set(ISAAC_VITA_LOADING_SELECTION_MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/kage_vita_loading_selection.cmake")
 set(ISAAC_VITA_STOCK_REFERENCE_SELECTION_MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/kage_vita_stock_reference_selection.cmake")
+set(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES_MODULE
+    "${CMAKE_CURRENT_SOURCE_DIR}/heap_overflow_mspace_bytes.cmake")
 set(ISAAC_GUEST_BASE "0x98000000" CACHE STRING
     "Fixed Vita address of the relocated PE image")
 set(ISAAC_VITA_HEAP_MB 81 CACHE STRING
@@ -123,6 +125,40 @@ if(ISAAC_VITA_AUDIO_REFILL_RECEIPT AND
   message(FATAL_ERROR
     "ISAAC_VITA_AUDIO_REFILL_RECEIPT requires the translated KAGE runtime and ISAAC_VITA_AUDIO=ON")
 endif()
+option(ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN
+       "On an abort stop (guest fault, bad_alloc, unsupported import) leave the OpenAL context/device to the process exit instead of joining the OpenAL pthreads from the entry tail; the Exit game path keeps the full teardown (requires ISAAC_VITA_AUDIO=ON)" OFF)
+if(ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE OR
+    NOT ISAAC_VITA_AUDIO))
+  message(FATAL_ERROR
+    "ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN requires the translated KAGE runtime and ISAAC_VITA_AUDIO=ON")
+endif()
+option(ISAAC_VITA_AUDIO_STARVATION_SHIELD
+       "Answer StreamSource::IsPlaying (the PE's one AL_SOURCE_STATE query, return marker 0x5be808) with AL_PLAYING for a live music stream whose OpenAL source merely ran dry during a load stall (StreamSourceOgg still in Sound::Manager's active list, not at eof, refilled from the stream site before, not stopped by the guest), restarting the source when PCM was queued after it stopped, so the MusicManager keeps the slot instead of logging 'music stopped playing' and dropping the track for good (GitHub issue 5).  Requires ISAAC_VITA_AUDIO=ON and the stream refill layer (ISAAC_VITA_AUDIO_WORKER or ISAAC_VITA_AUDIO_REFILL_RECEIPT); OFF keeps every object byte-identical" OFF)
+option(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT
+       "Diagnostic: log 'KAGE VITA AUDIO MUSIC DROP: slot=... src=... state=... eof=... last_refill_ms=...' with the OpenAL state of the stream the MusicManager is about to drop (GNU ld --wrap=sub_0056e9a0 over the translated slot reset, no corpus change), first 16 drops then every 16th, plus a final summary.  Requires ISAAC_VITA_AUDIO=ON and the stream refill layer (ISAAC_VITA_AUDIO_WORKER or ISAAC_VITA_AUDIO_REFILL_RECEIPT); OFF keeps every object byte-identical" OFF)
+if(ISAAC_VITA_AUDIO_STARVATION_SHIELD AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE OR
+    NOT ISAAC_VITA_AUDIO))
+  message(FATAL_ERROR
+    "ISAAC_VITA_AUDIO_STARVATION_SHIELD requires the translated KAGE runtime and ISAAC_VITA_AUDIO=ON")
+endif()
+if(ISAAC_VITA_AUDIO_STARVATION_SHIELD AND
+   NOT (ISAAC_VITA_AUDIO_WORKER OR ISAAC_VITA_AUDIO_REFILL_RECEIPT))
+  message(FATAL_ERROR
+    "ISAAC_VITA_AUDIO_STARVATION_SHIELD requires the stream refill layer: ISAAC_VITA_AUDIO_WORKER=ON or ISAAC_VITA_AUDIO_REFILL_RECEIPT=ON")
+endif()
+if(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE OR
+    NOT ISAAC_VITA_AUDIO))
+  message(FATAL_ERROR
+    "ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT requires the translated KAGE runtime and ISAAC_VITA_AUDIO=ON")
+endif()
+if(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT AND
+   NOT (ISAAC_VITA_AUDIO_WORKER OR ISAAC_VITA_AUDIO_REFILL_RECEIPT))
+  message(FATAL_ERROR
+    "ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT requires the stream refill layer: ISAAC_VITA_AUDIO_WORKER=ON or ISAAC_VITA_AUDIO_REFILL_RECEIPT=ON")
+endif()
 # No leading zero: the value is pasted as a C literal and 020000 would be octal.
 if(NOT ISAAC_VITA_AUDIO_REFILL_SPACING_US MATCHES "^(0|[1-9][0-9]*)$" OR
    ISAAC_VITA_AUDIO_REFILL_SPACING_US GREATER 200000)
@@ -158,6 +194,18 @@ if(ISAAC_VITA_NATIVE_VORBIS_ASYNC AND
    (NOT ISAAC_VITA_NATIVE_VORBIS OR NOT ISAAC_VITA_NATIVE_VORBIS_WORKER))
   message(FATAL_ERROR
     "ISAAC_VITA_NATIVE_VORBIS_ASYNC requires ISAAC_VITA_NATIVE_VORBIS=ON and ISAAC_VITA_NATIVE_VORBIS_WORKER=ON")
+endif()
+option(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH
+       "Guest free observer tests a dense copy of each mirror's alloc range before touching the multi-KiB mirror slot; same retire decisions" OFF)
+if(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH AND NOT ISAAC_VITA_NATIVE_VORBIS)
+  message(FATAL_ERROR "ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH requires ISAAC_VITA_NATIVE_VORBIS=ON")
+endif()
+option(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK
+       "Guest free observer scans only the mirror slots whose live bit is set (set at bind before active, cleared after every active=0) instead of all 20; same slots retired in the same order" OFF)
+if(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK AND
+   NOT ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH)
+  message(FATAL_ERROR
+    "ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK requires ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=ON (and so ISAAC_VITA_NATIVE_VORBIS=ON)")
 endif()
 if(ISAAC_VITA_NATIVE_VORBIS_ASYNC AND ISAAC_VITA_NATIVE_VORBIS_VERIFY)
   message(FATAL_ERROR
@@ -292,6 +340,20 @@ if(NOT ISAAC_VITA_IMAGE_RETAIN_HEADROOM_MB MATCHES "^[0-9]+$" OR
   message(FATAL_ERROR
     "ISAAC_VITA_IMAGE_RETAIN_HEADROOM_MB must be an integer in 0..512: ${ISAAC_VITA_IMAGE_RETAIN_HEADROOM_MB}")
 endif()
+option(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT
+       "Count vitaGL's free PHYCONT pool in the IMAGE_RETAIN headroom (RAM+VRAM+PHYCONT).  vitaGL allocates textures VRAM -> RAM -> PHYCONT, and in English PHYCONT holds ~22-26 MiB free while RAM+VRAM holds 1-13, so a RAM+VRAM rule can never retain there (measured on the device); in Chinese PHYCONT is full and the rule still retains nothing.  Pair with BUDGET_MB=12, HEADROOM_MB=16" OFF)
+if(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT AND NOT ISAAC_VITA_IMAGE_RETAIN)
+  message(FATAL_ERROR
+    "ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT requires ISAAC_VITA_IMAGE_RETAIN=ON")
+endif()
+option(ISAAC_VITA_IMAGE_RETAIN_GHOST
+       "Profiling: with IMAGE_RETAIN armed at BUDGET_MB=0 (frees exactly like OFF), log ph120.irg (sheet re-decodes by LRU stack distance = hit curve for every retention budget) and ph120.irm (per-window minimum vitaGL free RAM/VRAM/PHYCONT and kernel free USER_RW, sampled every present)" OFF)
+if(ISAAC_VITA_IMAGE_RETAIN_GHOST AND
+   (NOT ISAAC_VITA_IMAGE_RETAIN OR NOT ISAAC_VITA_IMAGE_RETAIN_BUDGET_MB EQUAL 0
+    OR NOT ISAAC_VITA_PHASE_PROFILE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_IMAGE_RETAIN_GHOST requires IMAGE_RETAIN=ON, IMAGE_RETAIN_BUDGET_MB=0 and PHASE_PROFILE=ON")
+endif()
 option(ISAAC_VITA_LUA
        "Enable the experimental pinned Lua 5.3.3 runtime bridge" OFF)
 set(ISAAC_LUA53_SOURCE_DIR "" CACHE PATH
@@ -325,6 +387,54 @@ set(ISAAC_VITA_LUA_ARENA_MB 0 CACHE STRING
     "Serve the LuaEngine state from a private USER_RW mspace of this many MiB, reserved before vitaGL init (0 keeps the guest heap)")
 if(ISAAC_VITA_LUA_RECEIPT AND NOT ISAAC_VITA_LUA)
   message(FATAL_ERROR "ISAAC_VITA_LUA_RECEIPT requires ISAAC_VITA_LUA=ON")
+endif()
+option(ISAAC_VITA_LUA_CALL_ERROR_CATCH
+       "At the 50 LuaBridge lua_pcallk sites that would throw LuaException, log the Lua error and return one nil (PC catches and logs per callback)" OFF)
+if(ISAAC_VITA_LUA_CALL_ERROR_CATCH AND NOT ISAAC_VITA_LUA)
+  message(FATAL_ERROR "ISAAC_VITA_LUA_CALL_ERROR_CATCH requires ISAAC_VITA_LUA=ON")
+endif()
+# Device bench run D4A4Pc (2026-10-26): one luaL_loadfilex read of
+# EID's descriptions/ab+/cs_cz.lua failed ("cannot read <path>: Success";
+# lauxlib reads errno after fclose, which newlib's _close_r zeroes) and EID
+# was absent for the whole run.  The retry is a link-time wrap of the
+# pristine call; the probe and the injection are for test eboots only and
+# never go into a release or timing recipe.
+option(ISAAC_VITA_LUA_LOADFILE_RETRY
+       "GNU ld --wrap=luaL_loadfilex: retry a lauxlib 'cannot read' LUA_ERRFILE up to ISAAC_VITA_LUA_LOADFILE_RETRY_MAX times (2/16/128 ms, per-boot budget 16 retries and 1 s) and a transient 'cannot open' once; KAGE VITA LUA LOADFILE STATS/RETRY receipts.  OFF adds no source, define or link option" OFF)
+set(ISAAC_VITA_LUA_LOADFILE_RETRY_MAX "3" CACHE STRING
+    "ISAAC_VITA_LUA_LOADFILE_RETRY: retries after a read error, 0..3 (0 = observe only: count and log, no retry)")
+option(ISAAC_VITA_LUA_LOADFILE_IO_PROBE
+       "Test eboots only, needs ISAAC_VITA_LUA_LOADFILE_RETRY: thread-armed --wrap of sceIoOpen/sceIoRead/sceIoClose recording the raw SCE return codes of the files luaL_loadfilex opens (sce=/close= in the RETRY receipt)" OFF)
+set(ISAAC_VITA_LUA_LOADFILE_IO_INJECT "" CACHE STRING
+    "Test eboots only, needs ISAAC_VITA_LUA_LOADFILE_IO_PROBE: <path-suffix>@<n>; on attempt 1 of a load whose sceIoOpen path ends with the suffix, its n-th sceIoRead returns __vita_make_sce_errno(EIO) instead of reading")
+if(ISAAC_VITA_LUA_LOADFILE_RETRY AND NOT ISAAC_VITA_LUA)
+  message(FATAL_ERROR "ISAAC_VITA_LUA_LOADFILE_RETRY requires ISAAC_VITA_LUA=ON")
+endif()
+# Pasted as a C literal: one digit.
+if(NOT ISAAC_VITA_LUA_LOADFILE_RETRY_MAX MATCHES "^[0-3]$")
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_LOADFILE_RETRY_MAX must be one of 0, 1, 2, 3 (got '${ISAAC_VITA_LUA_LOADFILE_RETRY_MAX}')")
+endif()
+if(ISAAC_VITA_LUA_LOADFILE_IO_PROBE AND NOT ISAAC_VITA_LUA_LOADFILE_RETRY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_LOADFILE_IO_PROBE requires ISAAC_VITA_LUA_LOADFILE_RETRY=ON")
+endif()
+if(NOT ISAAC_VITA_LUA_LOADFILE_IO_INJECT STREQUAL "")
+  if(NOT ISAAC_VITA_LUA_LOADFILE_IO_INJECT MATCHES "^[^@\"\\\\]+@[1-9][0-9]*$")
+    message(FATAL_ERROR
+      "ISAAC_VITA_LUA_LOADFILE_IO_INJECT must be <path-suffix>@<n> (no @, quote or backslash in the suffix, n >= 1; got '${ISAAC_VITA_LUA_LOADFILE_IO_INJECT}')")
+  endif()
+  if(NOT ISAAC_VITA_LUA_LOADFILE_IO_PROBE)
+    message(FATAL_ERROR
+      "ISAAC_VITA_LUA_LOADFILE_IO_INJECT requires ISAAC_VITA_LUA_LOADFILE_IO_PROBE=ON")
+  endif()
+endif()
+# ISAAC_VITA_IO_PROFILE and ISAAC_VITA_IO_WINDOW_PROFILE (options further
+# down; a -D or -C value is already in the cache here) wrap sceIoRead too.
+if(ISAAC_VITA_LUA_LOADFILE_IO_PROBE AND
+   (ISAAC_VITA_IO_PROFILE OR ISAAC_VITA_IO_WINDOW_PROFILE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_LOADFILE_IO_PROBE and ISAAC_VITA_IO_PROFILE/ISAAC_VITA_IO_WINDOW_PROFILE have exclusive sceIoRead wrappers")
 endif()
 if(NOT ISAAC_VITA_LUA_ARENA_MB MATCHES "^[0-9]+$" OR
    ISAAC_VITA_LUA_ARENA_MB GREATER 96)
@@ -374,6 +484,78 @@ endif()
 if(ISAAC_VITA_LUA_GC_PROFILE AND NOT ISAAC_VITA_LUA)
   message(FATAL_ERROR "ISAAC_VITA_LUA_GC_PROFILE requires ISAAC_VITA_LUA=ON")
 endif()
+option(ISAAC_VITA_LUA_CORE_ARM
+       "Compile the pristine Lua 5.3.3 archive (VM, GC, API) in ARM instead of Thumb-2 mode; same C, codegen only.  The bridge logs the mode it observes at state creation ([isaac-lua] core isa=)" OFF)
+if(ISAAC_VITA_LUA_CORE_ARM AND NOT ISAAC_VITA_LUA)
+  message(FATAL_ERROR "ISAAC_VITA_LUA_CORE_ARM requires ISAAC_VITA_LUA=ON")
+endif()
+option(ISAAC_VITA_LUA_COST_PROFILE
+       "Profiling: per ~2 s window log the time of top-level lua_pcallk imports, the translated LuaBridge callbacks they reach (top 8 targets), automatic GC steps (--wrap=luaC_step) and Lua allocator calls (--wrap=luaM_realloc_); two bounded [isaac-lua] cost lines" OFF)
+if(ISAAC_VITA_LUA_COST_PROFILE AND NOT ISAAC_VITA_LUA)
+  message(FATAL_ERROR "ISAAC_VITA_LUA_COST_PROFILE requires ISAAC_VITA_LUA=ON")
+endif()
+# Lua 5.3.3 runs a whole collection cycle's __gc finalizers inside one paced
+# step (lgc.c:841-850 doubles gcfinnum without bound; lgc.c:45 charges a
+# finalizer 5 work units): with EID ~1,400-1,700 LuaBridge callbacks, 13-18 ms
+# in one LuaEngine::Update step every 3-4 s.  ON compiles isaac_lua53 from a
+# derived lgc.c (recomp/vita/lua53_gc_finalizer_pace.py: exactly two lines,
+# line count preserved) in which one runafewfinalizers call runs at most MAX
+# finalizers and each costs COST work units, so a K KB step runs at most
+# ~K*1024/COST + 2*MAX of them.  Which objects are finalized, their order,
+# error propagation, luaC_fullgc and lua_close are unchanged; only when a
+# pending finalizer runs moves later (the Lua 5.4 policy, rescaled).
+# ISAAC_VITA_LUA_GC_SWEEP_COST (same derived file, third line lgc.c:39)
+# charges SWEEP work units per swept object instead of the pristine 5, so a
+# K KB step sweeps ~K*1024/SWEEP objects: the console frees/flips one object
+# in ~0.3-0.6 us, and pristine 5 lets one 128 KB step sweep ~26,000 of them
+# (the 11-15 ms GC steps without finalizers in the device GC profile).  The
+# default 5 leaves lgc.c:39 pristine.  OFF compiles the pristine 33-source
+# closure byte-identically; the sub-knobs refuse a non-default value then.
+option(ISAAC_VITA_LUA_GC_FINALIZER_PACE
+       "Pace Lua __gc finalizers: compile isaac_lua53 from a derived lgc.c (two lines) that runs at most ISAAC_VITA_LUA_GC_FINALIZER_MAX finalizers per runafewfinalizers call and charges each ISAAC_VITA_LUA_GC_FINALIZER_COST work units; OFF keeps the pristine Lua closure byte-identical" OFF)
+set(ISAAC_VITA_LUA_GC_FINALIZER_MAX 8 CACHE STRING
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE: most finalizers one runafewfinalizers call runs (1..4096; pristine doubles without bound)")
+set(ISAAC_VITA_LUA_GC_FINALIZER_COST 512 CACHE STRING
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE: GC work units charged per finalizer (1..65536; pristine 5; 1 unit ~ 1 byte marked, ~9 ns on the console)")
+set(ISAAC_VITA_LUA_GC_SWEEP_COST 5 CACHE STRING
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE: GC work units charged per swept object (1..400; 5 = pristine, line untouched)")
+if(ISAAC_VITA_LUA_GC_FINALIZER_PACE AND NOT ISAAC_VITA_LUA)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE requires ISAAC_VITA_LUA=ON")
+endif()
+if(NOT ISAAC_VITA_LUA_GC_FINALIZER_PACE AND
+   (NOT ISAAC_VITA_LUA_GC_FINALIZER_MAX STREQUAL "8" OR
+    NOT ISAAC_VITA_LUA_GC_FINALIZER_COST STREQUAL "512" OR
+    NOT ISAAC_VITA_LUA_GC_SWEEP_COST STREQUAL "5"))
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_FINALIZER_MAX/_COST and ISAAC_VITA_LUA_GC_SWEEP_COST "
+    "take effect only with ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON (got MAX="
+    "${ISAAC_VITA_LUA_GC_FINALIZER_MAX} COST=${ISAAC_VITA_LUA_GC_FINALIZER_COST} "
+    "SWEEP_COST=${ISAAC_VITA_LUA_GC_SWEEP_COST} with PACE OFF)")
+endif()
+if(NOT ISAAC_VITA_LUA_GC_FINALIZER_MAX MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_LUA_GC_FINALIZER_MAX LESS 1 OR
+   ISAAC_VITA_LUA_GC_FINALIZER_MAX GREATER 4096)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_FINALIZER_MAX must be an integer in 1..4096: "
+    "${ISAAC_VITA_LUA_GC_FINALIZER_MAX}")
+endif()
+if(NOT ISAAC_VITA_LUA_GC_FINALIZER_COST MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_LUA_GC_FINALIZER_COST LESS 1 OR
+   ISAAC_VITA_LUA_GC_FINALIZER_COST GREATER 65536)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_FINALIZER_COST must be an integer in 1..65536: "
+    "${ISAAC_VITA_LUA_GC_FINALIZER_COST}")
+endif()
+# lgc.c:42 GCSWEEPMAX = (GCSTEPSIZE / SWEEP) / 4 must stay >= 1: above 400 a
+# sweep singlestep does nothing, charges nothing, and luaC_step spins.
+if(NOT ISAAC_VITA_LUA_GC_SWEEP_COST MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_LUA_GC_SWEEP_COST LESS 1 OR
+   ISAAC_VITA_LUA_GC_SWEEP_COST GREATER 400)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_SWEEP_COST must be an integer in 1..400: "
+    "${ISAAC_VITA_LUA_GC_SWEEP_COST}")
+endif()
 if(NOT ISAAC_VITA_LUA_GCCOLLECT_STEP_KB MATCHES "^[0-9]+$" OR
    ISAAC_VITA_LUA_GCCOLLECT_STEP_KB GREATER 10000)
   message(FATAL_ERROR
@@ -393,6 +575,88 @@ if(ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY AND NOT ISAAC_VITA_LUA_NATIVE_GETCLASS)
   message(FATAL_ERROR
     "ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY requires ISAAC_VITA_LUA_NATIVE_GETCLASS=ON")
 endif()
+option(ISAAC_VITA_LUA_BINDING_REPLAY
+       "Serve 54 LuaBridge binding thunks natively (51 template-A scalar getters, CppBindClass GetData 0x446d90, bool(int,int) 0x433870, the __propget/__parent walk 0x3f90b0): one GNU ld --wrap per body; host_vita_lua_binding_replay.c compiles the bodies' own corpus text (host_vita_lua_binding_mirror.h, generated from the PE and corpus at configure time) with each Lua import crossing emulated in place behind pinned IAT slots, typed/generic endpoints and a stack window; any pin, owner or frame miss runs the translated body.  The elided crossings leave the ph120 import census (counted in the replay stats).  Requires ISAAC_VITA_LUA_NATIVE_GETCLASS, TRANSLATED_CPU with GPR_LOCAL + FLAGS_LOCAL, GUEST_STACK_GUARD=OFF and STALL_PROBE=OFF; OFF keeps every object byte-identical" OFF)
+option(ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY
+       "Proof build: after the replayed const scalar getters re-run the translated body on the rewound state and log any eax/esp/top/type/value/live-userdata mismatch, shipping the translated result" OFF)
+set(ISAAC_VITA_LUA_BINDING_REPLAY_FAMILIES "scalar;getdata;boolii;index2" CACHE STRING
+    "ISAAC_VITA_LUA_BINDING_REPLAY: the replayed families, a non-empty subset of scalar;getdata;boolii;index2 (scalar = the 51 template-A rows, getdata = 0x446d90, boolii = 0x433870, index2 = 0x3f90b0); a family left out keeps its translated bodies and no --wrap")
+if((ISAAC_VITA_LUA_BINDING_REPLAY OR ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY) AND
+   NOT ISAAC_VITA_LUA_NATIVE_GETCLASS)
+  # The replays call getClass through the seam's __wrap_ and enter the bridge
+  # owner the seam exports (host_vita_lua_getclass.c); the TU has the same
+  # #error.
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_BINDING_REPLAY requires ISAAC_VITA_LUA_NATIVE_GETCLASS=ON")
+endif()
+if(ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY AND NOT ISAAC_VITA_LUA_BINDING_REPLAY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY requires ISAAC_VITA_LUA_BINDING_REPLAY=ON")
+endif()
+set(ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK 0)
+if(ISAAC_VITA_LUA_BINDING_REPLAY)
+  set(ISAAC_LBR_FAMILY_SEEN)
+  foreach(ISAAC_LBR_FAMILY IN LISTS ISAAC_VITA_LUA_BINDING_REPLAY_FAMILIES)
+    if(ISAAC_LBR_FAMILY STREQUAL "scalar")
+      set(ISAAC_LBR_FAMILY_BIT 1)
+    elseif(ISAAC_LBR_FAMILY STREQUAL "getdata")
+      set(ISAAC_LBR_FAMILY_BIT 2)
+    elseif(ISAAC_LBR_FAMILY STREQUAL "boolii")
+      set(ISAAC_LBR_FAMILY_BIT 4)
+    elseif(ISAAC_LBR_FAMILY STREQUAL "index2")
+      set(ISAAC_LBR_FAMILY_BIT 8)
+    else()
+      message(FATAL_ERROR
+        "ISAAC_VITA_LUA_BINDING_REPLAY_FAMILIES: unknown family '${ISAAC_LBR_FAMILY}' "
+        "(expected a subset of scalar;getdata;boolii;index2)")
+    endif()
+    if(ISAAC_LBR_FAMILY IN_LIST ISAAC_LBR_FAMILY_SEEN)
+      message(FATAL_ERROR
+        "ISAAC_VITA_LUA_BINDING_REPLAY_FAMILIES: '${ISAAC_LBR_FAMILY}' listed twice")
+    endif()
+    list(APPEND ISAAC_LBR_FAMILY_SEEN "${ISAAC_LBR_FAMILY}")
+    math(EXPR ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK
+         "${ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK} | ${ISAAC_LBR_FAMILY_BIT}")
+  endforeach()
+  if(ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK EQUAL 0)
+    message(FATAL_ERROR
+      "ISAAC_VITA_LUA_BINDING_REPLAY_FAMILIES is empty: name at least one of "
+      "scalar;getdata;boolii;index2, or turn ISAAC_VITA_LUA_BINDING_REPLAY OFF")
+  endif()
+endif()
+# Lua 5.3.3 turns every integer it converts to a string (`..`, tostring,
+# lua_tolstring, lua_pushfstring %d/%I, error positions) into text with
+# snprintf(buff, 50, "%lld") inside luaO_tostring (lobject.c:376,
+# luaconf.h:513-514/591); with EID that is ~53 conversions per rendered frame
+# (measured on the device).  ON compiles isaac_lua53 from a derived lobject.c
+# (recomp/vita/lua53_integer2str.py: two lines in place, one function
+# appended, every pristine line keeps its number) whose digit loop writes
+# the same bytes and returns the same length (recomp/test_vita_lua_integer2str.py).
+# io.write and string.format keep the C library.  With
+# ISAAC_VITA_LUA_COST_PROFILE also ON, a boot self-test compares and times
+# both on the console's newlib ([isaac-lua] i2s selftest).  OFF compiles the
+# pristine 33-source closure byte-identically.
+option(ISAAC_VITA_LUA_INTEGER2STR
+       "Format Lua integers in luaO_tostring with a digit loop instead of snprintf(\"%lld\"): compile isaac_lua53 from a derived lobject.c (byte-identical text and length); with ISAAC_VITA_LUA_COST_PROFILE a boot self-test logs both costs.  OFF keeps the pristine Lua closure byte-identical" OFF)
+if(ISAAC_VITA_LUA_INTEGER2STR AND NOT ISAAC_VITA_LUA)
+  message(FATAL_ERROR "ISAAC_VITA_LUA_INTEGER2STR requires ISAAC_VITA_LUA=ON")
+endif()
+# The native getClass/getExact seam replays the translated bodies with ~14
+# Lua C API calls per call (2.5-3.8 us per getClass on the console, ~4,900
+# calls/s with EID).  ON makes the two wraps run the same replay with each
+# API call replaced by its pristine lapi.c body (inlined) and the two
+# light-userdata lookups served from a validated node memo; string interning,
+# the string cache, GC points and debt, stack slots and L->top stay those of
+# the API path (host_vita_lua_getclass.h, "Direct path";
+# recomp/test_vita_lua_getclass.py direct variants).  The S8 binding replays
+# call the same wrap, so they take the direct path too.  OFF compiles
+# host_vita_lua_getclass.c without the direct code.
+option(ISAAC_VITA_LUA_GETCLASS_DIRECT
+       "Native getClass/getExact seam without Lua C API calls: inlined pristine lapi.c bodies and a validated node memo for the registry/identity lookups (same strings, GC points, stack slots).  Requires ISAAC_VITA_LUA_NATIVE_GETCLASS; OFF keeps every object byte-identical" OFF)
+if(ISAAC_VITA_LUA_GETCLASS_DIRECT AND NOT ISAAC_VITA_LUA_NATIVE_GETCLASS)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GETCLASS_DIRECT requires ISAAC_VITA_LUA_NATIVE_GETCLASS=ON")
+endif()
 option(ISAAC_VITA_OPENAL_POOL
        "Route direct OpenAL C allocations through a dedicated USER_RW mspace" ON)
 option(ISAAC_VITA_IO_PROFILE
@@ -407,6 +671,18 @@ if(ISAAC_VITA_ARCHIVE_VALIDATION_RECEIPT AND
    NOT ISAAC_VITA_ARCHIVE_VALIDATION_SKIP)
   message(FATAL_ERROR
     "ISAAC_VITA_ARCHIVE_VALIDATION_RECEIPT requires ISAAC_VITA_ARCHIVE_VALIDATION_SKIP=ON")
+endif()
+option(ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR
+       "Trust a packed archive rewritten by tools/isaac_vita_halve_sfx.py when its .receipt sidecar matches the file (skips the per-entry mount validation the rewritten entries would otherwise pay on every boot)" OFF)
+if(ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR AND
+   NOT ISAAC_VITA_ARCHIVE_VALIDATION_RECEIPT)
+  message(FATAL_ERROR
+    "ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR requires ISAAC_VITA_ARCHIVE_VALIDATION_RECEIPT=ON")
+endif()
+if(ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR requires the translated KAGE target")
 endif()
 option(ISAAC_VITA_FIOS_CACHE
        "Use a bounded fail-open FIOS2 RAM cache for the Isaac data root" OFF)
@@ -423,6 +699,25 @@ endif()
 if(ISAAC_VITA_ASYNC_SAVE_WRITE AND ISAAC_VITA_SCAFFOLD_ONLY)
   message(FATAL_ERROR
     "ISAAC_VITA_ASYNC_SAVE_WRITE requires the real Vita runtime")
+endif()
+# Mom's Heart death (2026-09-10, nt2p): 45.5 ms and 28.6 ms of log.txt
+# writes on the game thread in two consecutive 2 s windows, one synchronous
+# sceIoWrite of 15-25 ms per logger record, because the frozen logger flushes
+# after every record and the CRT hands the flush to a 1 KiB-buffered newlib
+# FILE.
+option(ISAAC_VITA_GAME_LOG_ASYNC
+       "Hold the guest's Documents/.../log.txt FILE as a host byte ring drained by one append worker; INFO flushes return without storage I/O, WARN/ERROR/ASSERT flushes drain then append synchronously" OFF)
+set(ISAAC_VITA_GAME_LOG_ASYNC_RING_KB 64 CACHE STRING
+    "ISAAC_VITA_GAME_LOG_ASYNC: host ring for unappended log.txt bytes in KiB (32..1024; the guest logger record is at most 10240 bytes)")
+set(ISAAC_VITA_GAME_LOG_ASYNC_DURABLE_SEVERITY 1 CACHE STRING
+    "ISAAC_VITA_GAME_LOG_ASYNC: lowest guest logger severity (0 INFO, 1 WARN, 2 ERROR, 3 ASSERT; 4 = none) whose fflush appends synchronously before control returns")
+if(ISAAC_VITA_GAME_LOG_ASYNC AND NOT ISAAC_VITA_ARCHIVE_FILE_CACHE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_GAME_LOG_ASYNC requires ISAAC_VITA_ARCHIVE_FILE_CACHE=ON")
+endif()
+if(ISAAC_VITA_GAME_LOG_ASYNC AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_GAME_LOG_ASYNC requires the real Vita runtime")
 endif()
 option(ISAAC_VITA_CRT_SEEK_SHADOW
        "Elide read-only SEEK_END/ftell pairs on newlib FILE tokens with a cached fstat size" OFF)
@@ -441,10 +736,85 @@ if(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER AND NOT ISAAC_VITA_ARCHIVE_FILE_CACHE)
   message(FATAL_ERROR
     "ISAAC_VITA_CRT_DESCRIPTOR_RECOVER requires ISAAC_VITA_ARCHIVE_FILE_CACHE=ON")
 endif()
+option(ISAAC_VITA_CRT_FREAD_COMPLETE
+       "Complete a short fread on a packed-archive FILE token in place when the stream reports neither EOF nor an error (the ArchivedFile block reader ignores the count); KAGE VITA CRT FREAD SHORT receipts and a FREAD COMPLETE counter line" OFF)
+if(ISAAC_VITA_CRT_FREAD_COMPLETE AND NOT ISAAC_VITA_ARCHIVE_FILE_CACHE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_CRT_FREAD_COMPLETE requires ISAAC_VITA_ARCHIVE_FILE_CACHE=ON")
+endif()
+option(ISAAC_VITA_OGG_READAHEAD
+       "Native Vorbis music streams: GNU ld --wrap of newlib _read_r/_lseek_r/_close_r answers the 16 KiB FILE refills of the descriptors the native Vorbis top-ups read from chunks a CPU-2 worker has already read with sceIoPread on its own descriptor; same return values, bytes and errno as the real calls (KAGE VITA OGG READAHEAD receipt lines).  Requires ISAAC_VITA_NATIVE_VORBIS, ISAAC_VITA_ARCHIVE_FILE_CACHE and ISAAC_VITA_CRT_DESCRIPTOR_RECOVER.  OFF adds no source, define or link option; host_vita_crt.c and host_vita_native_vorbis.c objects equal the base after --strip-debug (only debug line numbers move)" OFF)
+set(ISAAC_VITA_OGG_READAHEAD_CHUNKS "4" CACHE STRING
+    "ISAAC_VITA_OGG_READAHEAD: 16 KiB chunks read ahead per stream, 2..16 (4 = 64 KiB, one USER_RW memblock per stream, at most 4 streams)")
+set(ISAAC_VITA_OGG_READAHEAD_WAIT_US "20000" CACHE STRING
+    "ISAAC_VITA_OGG_READAHEAD: longest game-thread wait for a chunk the worker is still reading before it reads the descriptor itself, microseconds, 0..200000")
+set(ISAAC_VITA_OGG_READAHEAD_PRIORITY "168" CACHE STRING
+    "ISAAC_VITA_OGG_READAHEAD: worker thread priority on CPU 2, 64..191 (the native Vorbis decoder runs at 170)")
+if(ISAAC_VITA_OGG_READAHEAD AND
+   (NOT ISAAC_VITA_NATIVE_VORBIS OR NOT ISAAC_VITA_ARCHIVE_FILE_CACHE OR
+    NOT ISAAC_VITA_CRT_DESCRIPTOR_RECOVER))
+  message(FATAL_ERROR
+    "ISAAC_VITA_OGG_READAHEAD requires ISAAC_VITA_NATIVE_VORBIS=ON, ISAAC_VITA_ARCHIVE_FILE_CACHE=ON and ISAAC_VITA_CRT_DESCRIPTOR_RECOVER=ON")
+endif()
+# Pasted as C literals: whole numbers, no leading zero.
+if(NOT ISAAC_VITA_OGG_READAHEAD_CHUNKS MATCHES "^[1-9][0-9]*$" OR
+   ISAAC_VITA_OGG_READAHEAD_CHUNKS LESS 2 OR
+   ISAAC_VITA_OGG_READAHEAD_CHUNKS GREATER 16)
+  message(FATAL_ERROR
+    "ISAAC_VITA_OGG_READAHEAD_CHUNKS must be a whole number in 2..16 (no leading zero)")
+endif()
+if(NOT ISAAC_VITA_OGG_READAHEAD_WAIT_US MATCHES "^(0|[1-9][0-9]*)$" OR
+   ISAAC_VITA_OGG_READAHEAD_WAIT_US GREATER 200000)
+  message(FATAL_ERROR
+    "ISAAC_VITA_OGG_READAHEAD_WAIT_US must be a whole number of microseconds in 0..200000 (no leading zero)")
+endif()
+if(NOT ISAAC_VITA_OGG_READAHEAD_PRIORITY MATCHES "^[1-9][0-9]*$" OR
+   ISAAC_VITA_OGG_READAHEAD_PRIORITY LESS 64 OR
+   ISAAC_VITA_OGG_READAHEAD_PRIORITY GREATER 191)
+  message(FATAL_ERROR
+    "ISAAC_VITA_OGG_READAHEAD_PRIORITY must be a thread priority in 64..191")
+endif()
+option(ISAAC_VITA_ACCESS_NEGATIVE_CACHE
+       "Answer _access probes below a mods/ directory known absent without a stat (exact: forgotten on any write-mode fopen or CreateDirectoryA that may reach mods/, and on a descriptor recovery); KAGE VITA ACCESS CACHE counter line" OFF)
+if(ISAAC_VITA_ACCESS_NEGATIVE_CACHE AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_ACCESS_NEGATIVE_CACHE requires the real Vita runtime")
+endif()
+option(ISAAC_VITA_LAUNCH_ARGS_FILE
+       "Bench/profile: append the whitespace-separated guest options of ux0:/data/isaacr001/launch-args.txt (e.g. --set-stage=1 --set-stage-type=4, which start a run without the menus) to the guest argv; absent file = unchanged argv; ISAAC VITA LAUNCH ARGS receipt with the resolved command line" OFF)
+if(ISAAC_VITA_LAUNCH_ARGS_FILE AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LAUNCH_ARGS_FILE requires the real Vita runtime")
+endif()
+option(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE
+       "Diagnostic: retain every fread/fseek/ftell/fclose on every packed-archive FILE token (any key, with the block-reader site and its caller) in a 1024-event arcdiag ring dumped at ArchivedFile fatals; short reads on every archive are written immediately" OFF)
+if(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE AND NOT ISAAC_VITA_ARCHIVE_FILE_CACHE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_ARCHIVE_DIAG_VERBOSE requires ISAAC_VITA_ARCHIVE_FILE_CACHE=ON")
+endif()
+option(ISAAC_VITA_ARCHIVE_READ_TRAIL
+       "Diagnostic: record one run per packed-archive seek (basename, offset, bytes, freads, process time) and print them per phase window as ph120.rts/ph120.rt for read-ahead and layout planning" OFF)
+set(ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP 64 CACHE STRING
+    "ISAAC_VITA_ARCHIVE_READ_TRAIL: recorded runs per 120-loop window (8..1024); runs beyond it are counted in drop=, never blocked on")
+if(NOT ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP LESS 8 OR
+   ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP GREATER 1024)
+  message(FATAL_ERROR
+    "ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP must be an integer in 8..1024: "
+    "${ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP}")
+endif()
+if(ISAAC_VITA_ARCHIVE_READ_TRAIL AND NOT ISAAC_VITA_ARCHIVE_FILE_CACHE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_ARCHIVE_READ_TRAIL requires ISAAC_VITA_ARCHIVE_FILE_CACHE=ON")
+endif()
 option(ISAAC_VITA_VANILLA_KAGE_BUNDLE
        "Enable frozen Godhead and KAGE RenderBatch correctness fixes" OFF)
 option(ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE
        "Use the common caustics/shockwave/filter settings from PCSB00676" OFF)
+option(ISAAC_VITA_EFFECTS_PROFILE_WATER
+       "Keep the Repentance water surface inside ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE" OFF)
+option(ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER
+       "Keep EnableColorModifier (floor colour tint) inside ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE" OFF)
 option(ISAAC_VITA_RENDERFRAME_FASTPATH
        "Borrow synchronized RenderFrame images without SmartPointer churn" OFF)
 option(ISAAC_VITA_FXRAY_ALPHA_MASK
@@ -473,12 +843,72 @@ option(ISAAC_VITA_PNG_CRC32_FASTPATH
        "Run the frozen bulk PNG zlib CRC-32 leaf through native code" OFF)
 option(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH
        "Run the frozen miniz v1.15 archive coroutine through guarded native code" OFF)
+option(ISAAC_VITA_INFLATE_TABLE_MEMO
+       "Keep the native archive inflater's built Huffman tables across blocks: the fixed tables are copied after the first fixed block, dynamic tables are memoised by their exact code-length header (requires ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH)" OFF)
+set(ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS 16 CACHE STRING
+    "Dynamic-table slots of ISAAC_VITA_INFLATE_TABLE_MEMO (1..256, about 6.75 KiB of .bss each; the fixed tables are kept separately)")
+if(NOT ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS LESS 1 OR
+   ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS GREATER 256)
+  message(FATAL_ERROR
+    "ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS must be an integer in 1..256: "
+    "${ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS}")
+endif()
 option(ISAAC_VITA_WAV_BUFFERED_REWIND
        "Reuse the first decoded archive block at the frozen WAV metadata rewind" OFF)
 option(ISAAC_VITA_ARCHIVE_XOR_FASTPATH
        "Word-XOR frozen mode-2 archive blocks, retaining the translated PRNG" OFF)
 option(ISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH
        "Run the frozen PRNG refresh natively only inside leased archive XOR" OFF)
+set(ISAAC_VITA_THEORA_PRECACHE_FRAMES 0 CACHE STRING
+    "Cap theoraplayer's per-clip RGBA frame queue (TheoraFrameQueue::setSize, sub_005a4c60) at this many frames; the 816x480 ending videos ask for 8-16 frames of 1.5 MiB each and exhaust the guest heap mid-run; 0 = untouched (no wrapper object, no link option)")
+if(NOT ISAAC_VITA_THEORA_PRECACHE_FRAMES MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_THEORA_PRECACHE_FRAMES GREATER 64)
+  message(FATAL_ERROR
+    "ISAAC_VITA_THEORA_PRECACHE_FRAMES must be an integer in 0..64: "
+    "${ISAAC_VITA_THEORA_PRECACHE_FRAMES}")
+endif()
+set(ISAAC_VITA_THEORA_WORKER_PUMP 0 CACHE STRING
+    "Run theoraplayer's decoder worker cooperatively on the main thread (the Vita build has no CreateThread and skips the worker, so video clips never decode): one slice per game frame from the game's TheoraVideoManager::update seam sub_00598d60, decoding at most this many frames per slice; 0 = untouched (no wrapper object, no link option)")
+option(ISAAC_VITA_THEORA_WORKER_PUMP_WATCHDOG
+       "Diagnostic: with ISAAC_VITA_THEORA_WORKER_PUMP > 0, start a reader thread that logs the pump, clip and guest-stack state when no slice completes for five seconds (release: OFF)" OFF)
+if(NOT ISAAC_VITA_THEORA_WORKER_PUMP MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_THEORA_WORKER_PUMP GREATER 8)
+  message(FATAL_ERROR
+    "ISAAC_VITA_THEORA_WORKER_PUMP must be an integer in 0..8: "
+    "${ISAAC_VITA_THEORA_WORKER_PUMP}")
+endif()
+option(ISAAC_VITA_NATIVE_THEORA
+       "Decode theoraplayer's video with the VitaSDK libtheoradec compiled natively instead of the translated libtheora 1.2.0alpha: thirteen th_* --wrap seams on the cross-unit calls from TheoraVideoClip_Theora (the shared th_info/ogg_packet/th_ycbcr_buffer layouts are identical on ARM32) plus a timed pass-through on TheoraVideoFrame::decode; OFF keeps every object byte-identical" OFF)
+option(ISAAC_VITA_NATIVE_THEORA_RGB
+       "With ISAAC_VITA_NATIVE_THEORA: convert theoraplayer's decoded frames YUV->RGB natively (one --wrap seam on libyuv's I420ToRGB24Matrix, libyuv's C reference math in NEON with the coefficients read from the caller's table, 0/-1 answers as the original); OFF keeps every object byte-identical" OFF)
+option(ISAAC_VITA_THEORA_CADENCE_PROFILE
+        "Diagnostic only: bounded ordered service/decode/render/fetch attribution; requires native Theora, worker pump and fullspeed scheduler" OFF)
+option(ISAAC_VITA_THEORA_RENDER_PRIORITY
+       "Keep late cinematic Render opportunities after a single-clip service with no current/previous Game update; preserves interpolation/lock admission and the 30-Hz Game floor" OFF)
+set(ISAAC_VITA_THEORADEC_SOURCE "vitasdk" CACHE STRING
+    "With ISAAC_VITA_NATIVE_THEORA: the libtheoradec.a behind the seams. vitasdk = the sysroot's arm-vita-eabi/lib/libtheoradec.a (libtheora 1.1.1, C only) with the sysroot header; master = ISAAC_VITA_THEORADEC_PREFIX/lib/libtheoradec.a with that prefix's headers (libtheora 1.2.0 with the ARM/NEON assembly, built from the release sources with the same softfp VitaSDK toolchain). Either way only the objcopy copy with the allocator imports renamed is linked; OFF ignores this")
+set_property(CACHE ISAAC_VITA_THEORADEC_SOURCE PROPERTY STRINGS vitasdk master)
+set(ISAAC_VITA_THEORADEC_PREFIX "" CACHE PATH
+    "Install prefix of the replacement libtheoradec (the master archive source): lib/libtheoradec.a and include/theora/*.h; required with ISAAC_VITA_THEORADEC_SOURCE=master, no default (libtheora 1.2.0 installed there by the softfp VitaSDK toolchain)")
+option(ISAAC_VITA_NATIVE_THEORA_PLANE_DIGEST
+       "Diagnostic, with ISAAC_VITA_NATIVE_THEORA: after every successful th_decode_packetin the seam reads the decoded planes back (th_decode_ycbcr_out, a pointer flip) and logs a CRC32 per plane over width x height bytes (KAGE VITA NATIVE THEORA DIGEST: receipts; recomp/vita/theora_plane_digest.c prints the same lines on the host from the same file, recomp/vita/theora_plane_digest_compare.py diffs them), so a replacement archive is proven bit-exact packet by packet; roughly 7-11 ms per 960x544 frame (byte-serial CRC), so frame timings taken with it ON are not representative; OFF keeps every object byte-identical" OFF)
+# The reference recompilation of Repentance+ found a per-layer
+# SetShaderUniform("ChampionColor") with a strcmp table scan and a
+# malloc/memcpy/free per value change.  In the frozen 1.7.9b PE the champion
+# tint is a vertex attribute (ChampionColorIn in the coloroffset_champion
+# attribute table 0x7aa558; the per-layer draw (LAYER_DRAW in
+# recomp/test_uniform_set_sites.py) only swaps the current-shader pointer)
+# and the KAGE Shader uniform-record vector that
+# Shader::Bind (sub_005671d0) loops over is never appended to.  The receipt
+# wraps Bind/ApplyUniforms/SetUniform/SetUniformInt/Collapse and counts
+# entries, the record count, the loop iterations, the name literals and the
+# values Collapse is about to free per ph120 window (ph120.us with
+# PHASE_PROFILE) plus a cumulative file-log line, so the device can confirm
+# the loop runs zero iterations and nothing is freed.  No fast path exists
+# because there is nothing to bypass (recomp/test_uniform_set_sites.py).
+option(ISAAC_VITA_UNIFORM_SET_RECEIPT
+       "Count KAGE Shader::Bind/ApplyUniforms/SetUniform/SetUniformInt/Collapse entries, uniform-record counts, loop iterations, name literals and pending value frees (ph120.us + KAGE VITA UNIFORM SET log line); diagnostic, --wrap of five translated roots" OFF)
 option(ISAAC_VITA_SAVE_CHECKSUM_FASTPATH
        "Feed the frozen save checksum through exact guarded native code" OFF)
 option(ISAAC_VITA_SAVE_READER_FASTPATH
@@ -499,6 +929,84 @@ option(ISAAC_VITA_FLOOR_THUNK_FASTPATH
        "Execute the authenticated 438-caller floor IAT thunk inline at its root (needs a corpus generated with GUEST_FLOOR_THUNK_FASTPATH=1)" OFF)
 option(ISAAC_VITA_SHADER_ATTRIB_FASTPATH
        "Replay the two authenticated Shader::EnableAttribs/DisableAttribs bodies into the typed GL wrappers on the host (needs GL_SHIM_FASTDISPATCH)" OFF)
+option(ISAAC_VITA_SHADER_SAMPLER_FASTPATH
+       "Replay frozen Shader::SetUniformInt native GL calls without dynamic adapter/translated stack glue; no value/location cache" OFF)
+# RENDER60 W-pkt (bind packet stage 1): --wrap seam over frozen KAGE
+# Shader::Bind (sub_005671d0) that replays, for the empty uniform-record list
+# the game binds, glUseProgram, both Shader::SetUniformInt calls,
+# Image::IsEmpty and RenderManager::Transform natively and publishes their
+# GL calls as ONE typed-recorder record (opcode 81) instead of 6..14 guest_call
+# crossings, adapters and ring records.  The render thread replays the same
+# calls, arguments, name/matrix bytes, order and return RVAs.
+option(ISAAC_VITA_KAGE_BIND_PACKET
+       "Replay frozen KAGE Shader::Bind (UseProgram, SetUniformInt x2, IsEmpty, Transform) natively into one GL recorder packet; exact translated fallback (needs GL_THREAD_WORKER + SHADER_ATTRIB_FASTPATH)" OFF)
+option(ISAAC_VITA_GL_THREAD_RECORD
+       "Stage-1 inline typed GL recorder (no second thread; unported draw snapshots use synchronous fallback)" OFF)
+if(ISAAC_VITA_GL_THREAD_RECORD AND
+   (NOT ISAAC_VITA_KAGE OR ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE))
+  message(FATAL_ERROR "GL_THREAD_RECORD requires KAGE and is incompatible with SHADER_ATTRIB_DIRECT_STATE")
+endif()
+option(ISAAC_VITA_GL_THREAD_WORKER
+       "GL render thread on USER_1 owning vitaGL; game thread records (needs GL_THREAD_RECORD + stock vitaGL)" OFF)
+option(ISAAC_VITA_GL_THREAD_WORKER_PROOF
+       "Ownership-proof mode: the game thread waits after every published record (no overlap)" OFF)
+if(ISAAC_VITA_GL_THREAD_WORKER AND
+   (NOT ISAAC_VITA_GL_THREAD_RECORD OR NOT ISAAC_VITA_VITAGL_STOCK_REFERENCE))
+  message(FATAL_ERROR "GL_THREAD_WORKER requires GL_THREAD_RECORD and VITAGL_STOCK_REFERENCE")
+endif()
+if(ISAAC_VITA_GL_THREAD_WORKER_PROOF AND NOT ISAAC_VITA_GL_THREAD_WORKER)
+  message(FATAL_ERROR "GL_THREAD_WORKER_PROOF requires GL_THREAD_WORKER")
+endif()
+option(ISAAC_VITA_GL_OWNER_CHECK
+       "Log (bounded, never drop) any vitaGL entry called off the GL render thread (--wrap trampolines; needs GL_THREAD_WORKER)" OFF)
+option(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+       "With the GL render thread: the fullspeed scheduler declines an interpolated Render while the previous present is still on the render thread (Present never waits; Game::Update cadence kept)" OFF)
+if(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION AND
+   (NOT ISAAC_VITA_GL_THREAD_WORKER OR NOT ISAAC_VITA_FULLSPEED_SCHEDULER))
+  message(FATAL_ERROR "GL_THREAD_RENDER_ADMISSION requires GL_THREAD_WORKER and FULLSPEED_SCHEDULER")
+endif()
+if(ISAAC_VITA_GL_OWNER_CHECK AND NOT ISAAC_VITA_GL_THREAD_WORKER)
+  message(FATAL_ERROR "GL_OWNER_CHECK requires GL_THREAD_WORKER")
+endif()
+option(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_STANDALONE
+       "Recorder memory-admission cache without the debug overlay: the recorder links its own sceKernelFreeMemBlock wrap when the overlay does not (needs GL_THREAD_WORKER)" OFF)
+option(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_VERIFY
+       "Measurement only: every admission-cache hit is re-queried (mismatch = fault) and a boot self-test frees one cached page (needs ..._STANDALONE and PHASE_PROFILE)" OFF)
+if(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_STANDALONE AND NOT ISAAC_VITA_GL_THREAD_WORKER)
+  message(FATAL_ERROR "GL_RECORD_ADMISSION_CACHE_STANDALONE requires GL_THREAD_WORKER")
+endif()
+# Sites that call vitaGL or read its state from the game thread and are not
+# routed through the render thread yet are refused.
+# PHASE_PROFILE reads vitaGL only after a render-thread take at the window
+# boundary (ph120.rt).  IMAGE_RETAIN (headroom, ghost, reports) and HEAP_CENSUS
+# read vitaGL's free space from the render thread's per-swap copy
+# (ISAAC_VITA_GL_THREAD_VGL_MEM_SNAPSHOT).
+if(ISAAC_VITA_GL_THREAD_WORKER)
+  foreach(ISAAC_GL_WORKER_CONFLICT IN ITEMS
+      ISAAC_VITA_FIRST_FRAME_PROBE ISAAC_VITA_RAW_GXM_PROBE ISAAC_VITA_SCREENSHOT_PROBE
+      ISAAC_VITA_GL_TIME_PROFILE ISAAC_VITA_GL_WRAPPER_TIME
+      ISAAC_VITA_DEEP_PROFILE ISAAC_VITA_IO_PROFILE
+      ISAAC_VITA_CONTINUE_PROFILE ISAAC_VITA_EXIT_MENU_PROFILE ISAAC_VITA_STALL_PROBE
+      ISAAC_VITA_STABLE_30_PRESENTATION ISAAC_VITA_GL_FILL_CENSUS
+      ISAAC_VITA_GL_TEXTURE_UPLOAD_LOG ISAAC_VITA_THEORA_CADENCE_PROFILE)
+    if(${ISAAC_GL_WORKER_CONFLICT})
+      message(FATAL_ERROR "GL_THREAD_WORKER: ${ISAAC_GL_WORKER_CONFLICT} is not routed through the render thread")
+    endif()
+  endforeach()
+endif()
+if(ISAAC_VITA_SHADER_SAMPLER_FASTPATH AND
+   (NOT ISAAC_VITA_KAGE OR NOT ISAAC_VITA_GL_SHIM_FASTDISPATCH OR
+    NOT ISAAC_VITA_SHADER_ATTRIB_FASTPATH OR ISAAC_VITA_UNIFORM_SET_RECEIPT OR
+    ISAAC_VITA_GUEST_SAMPLER OR ISAAC_VITA_STALL_PROBE))
+  message(FATAL_ERROR "SHADER_SAMPLER_FASTPATH requires KAGE + GL_SHIM_FASTDISPATCH + SHADER_ATTRIB_FASTPATH; UNIFORM_SET_RECEIPT/GUEST_SAMPLER/STALL_PROBE must be OFF")
+endif()
+if(ISAAC_VITA_KAGE_BIND_PACKET AND
+   (NOT ISAAC_VITA_KAGE OR NOT ISAAC_VITA_GL_SHIM_FASTDISPATCH OR
+    NOT ISAAC_VITA_SHADER_ATTRIB_FASTPATH OR NOT ISAAC_VITA_GL_THREAD_RECORD OR
+    NOT ISAAC_VITA_GL_THREAD_WORKER OR ISAAC_VITA_UNIFORM_SET_RECEIPT OR
+    ISAAC_VITA_STALL_PROBE))
+  message(FATAL_ERROR "KAGE_BIND_PACKET requires KAGE + GL_SHIM_FASTDISPATCH + SHADER_ATTRIB_FASTPATH + GL_THREAD_RECORD + GL_THREAD_WORKER; UNIFORM_SET_RECEIPT (also wraps sub_005671d0) and STALL_PROBE must be OFF")
+endif()
 # The replays call glGetAttribLocation once per attribute on both Enable and
 # Disable (~1000 typed-wrapper crossings per present in heavy rooms, ~1 us
 # each through the shim location cache).  The memo remembers the wrapper's
@@ -512,6 +1020,20 @@ option(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO
        "Memoize the per-attribute glGetAttribLocation answers inside the Shader::EnableAttribs/DisableAttribs replays (needs SHADER_ATTRIB_FASTPATH)" OFF)
 option(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY
        "Device A/B: every replay memo hit still performs the wrapper lookup and counts disagreements into ph120.a loc(...,m)" OFF)
+# RENDER60 S2b: the memo's entry count.  16 is the direct-mapped table the
+# memo was proven with (legacy fold ((self >> 4) ^ (self >> 9)) & 15) and
+# adds no compile definition, so the replay object stays byte for byte the
+# 16-entry one.  32/64/128 index by (self >> 2) & (entries - 1)
+# (host_vita_shader_attrib_fastpath.h, end): the static census of the frozen
+# PE (23 Shader objects) puts ColorOffset, water_v2, colormod and the KAGE
+# textured built-in in one 16-entry slot, the legacy fold still pairs
+# ColorOffset with that built-in at 64, and (self >> 2) leaves no static
+# pair at 64 (test_vita_shader_attrib_fastpath.py).  1236 bytes of BSS per
+# entry: 16 = 19.8 KB, 64 = 79.1 KB.  Anything but 16 requires the memo.
+set(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES 16 CACHE STRING
+    "Shader attrib location memo entries: 16 (legacy fold, default), 32, 64 or 128 (index by address >> 2; needs SHADER_ATTRIB_LOCATION_MEMO)")
+set_property(CACHE ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES
+             PROPERTY STRINGS 16 32 64 128)
 # The replays still cross into the typed backend once per attribute
 # (glEnableVertexAttribArray + glVertexAttribPointer on Enable,
 # glDisableVertexAttribArray on Disable; ~1000 table-indirect wrapper calls
@@ -523,6 +1045,22 @@ option(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY
 # that is not the Vita backend's own sends the replay down its per-call loop.
 option(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE
        "Hand the Shader::EnableAttribs/DisableAttribs replay's attribute set to the typed backend in one native call (needs SHADER_ATTRIB_FASTPATH; rejects GL_WRAPPER_TIME and STALL_PROBE)" OFF)
+# RENDER60 S4.  Behind the GL recorder (recipes A and B) every handled
+# Enable replay still publishes one toggle and one pointer record per
+# attribute (Disable: one toggle) after the S2 memo removed the lookups.
+# ESTIMATED for the P2 fight rooms: 19.6-20.1 records per draw that a
+# batch can fold, ~1650-2150 per present ((2a-1) + (a-1) per draw with
+# a = 7.196-7.363 attributes per draw and 84.6-106.7 draws per present,
+# MEASURED as P2 window medians of the three A2 device runs of 2026-10-25;
+# memo hit rate ASSUMED 1).  On a memo hit, while the
+# installed table is the recorder's own, the batch publishes ONE record per
+# replay (opcodes 79/80 after REC_WORKER_CALL) after applying the producer
+# shadow notes the per-call records would; the render thread unpacks it
+# into the same wrapper calls, same arguments, same order.  A miss, a
+# decline or a foreign table keeps the per-call records.  Checks with the
+# RENDER60 S4 option checks below.
+option(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH
+       "One GL-recorder record per handled Shader::EnableAttribs/DisableAttribs replay on a location-memo hit (needs GL_THREAD_RECORD + GL_THREAD_WORKER + SHADER_ATTRIB_FASTPATH + SHADER_ATTRIB_LOCATION_MEMO; rejects MEMO_VERIFY and DIRECT_STATE)" OFF)
 # Image::PushQuad (sub_0055f990) is the quad builder every sprite, tile and
 # text glyph goes through (~2000 calls per present in heavy rooms: 491
 # translated instructions, two ring reserves, an attribute size lookup and
@@ -536,6 +1074,36 @@ option(ISAAC_VITA_KAGE_QUAD_FASTPATH
        "Replay the authenticated Image::PushQuad body (cull, pixel snap, index/vertex emission, depth cursor, dirty vector) natively at its root (needs TRANSLATED_CPU and FLOOR_THUNK_FASTPATH)" OFF)
 option(ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE
        "Device A/B: run the Image::PushQuad replay's decline checks and count the verdicts into ph120.kq while the translated body still runs (needs KAGE_QUAD_FASTPATH)" OFF)
+option(ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE
+       "Image::PushQuad replay: run the unbatched blend/batch select (sub_005607a0) and the batch lookup's hit path (sub_005603f0) natively; misses, pair-vector growth, SetBlend and the getters keep the translated/registered code (needs KAGE_QUAD_FASTPATH, not OBSERVE)" OFF)
+option(ISAAC_VITA_GFUEL_SEED_NATIVE
+       "Serve HasCollectible's two SEED_G_FUEL queries (sub_0039cb10, sub_0039cb80 with the sub_000206b0 set walk) natively through link-time --wrap seams; G FUEL bytes above 7, null links and short stacks keep the translated bodies.  OFF keeps every object byte-identical" OFF)
+option(ISAAC_VITA_HASCOLLECTIBLE_NATIVE
+       "Answer Entity_Player::HasCollectible (sub_0033af30) natively through a link-time --wrap seam: the body, its HasCollectible(0xbf) call and the callees of its common paths (G FUEL mode/query with the sub_000206b0 set walk, effect list, item tags, the collectible map lookup, byte vector, item predicate, slots); co-op babies, ids 0x147/0x148/0x139/9/0x3b and negative ids, G FUEL bytes above 7, the twin call, nulls, long walks and short stacks keep the translated body (needs TRANSLATED_CPU_FLAGS_LOCAL).  OFF keeps every object byte-identical" OFF)
+option(ISAAC_VITA_CAMERA_RING_NATIVE
+       "Replay Camera::UpdateUltrasmooth's ring average (sub_0049df90: weighted mean of a Vector2 history ring, an int64 division per step on ARM) natively at its gen_all root seam; overlapping arguments, a non-positive capacity, NaN inputs and InverseLerp logger states keep the translated body (needs TRANSLATED_CPU_FLAGS_LOCAL)" OFF)
+option(ISAAC_VITA_UPDATE_PROBE
+       "Profiling: --wrap timers (entries, inclusive 1-in-64 spans) on 62 translated Game::Update subtrees, keyed tables for the Lua callback invoker and Entity_Effect::Init, printed as ph120.ut/uz/uk (needs PHASE_PROFILE)" OFF)
+# First-use SFX loads: with the native audio manager every sound
+# is loaded on its first Play, inside a gameplay frame (P2b: 1.51 s of WAV
+# loading in play windows, thunder ~570 ms in one).  This moves the measured
+# common set into Level::Init, i.e. into the floor-load freeze.
+option(ISAAC_VITA_SFX_FLOOR_PRELOAD
+       "After Level::Init (GNU ld --wrap=sub_00311e60) replay SFXManager::Play's own lazy-load branch (SoundEffect::Load 0x488070 with return word 0x488e91, then the loaded-count increment) for 13 sounds that were first-play loads in at least half of 48 device sessions, plus the five Downpour sounds (thunder, water flow, drips, wet steps, leech) on m_Stage 1-2 / m_StageType 4; already loaded, out-of-range and sample-less ids, the eager-load policy, audio off, a terminal heap, guest heap headroom below RESERVE_MB + the sound and an OpenAL pool with less than 2 MiB + the sound free keep the first-Play load.  Needs TRANSLATED_CPU, KAGE and AUDIO; excludes UPDATE_PROBE (same symbol).  OFF keeps every object byte-identical" OFF)
+set(ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB 8 CACHE STRING
+    "MiB of guest heap headroom (81 MiB newlib contract - mallinfo uordblks, the ph120.mem hr) the floor preload leaves free: a sound is loaded only while headroom >= this + its stock WAV bytes, so the preload never takes the heap to where the first-Play load would not have found it (session P minimum hr 0.46 MiB, run start ~19 MiB)")
+if(NOT ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB GREATER 64)
+  message(FATAL_ERROR
+    "ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB must be an integer in 0..64: ${ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB}")
+endif()
+# With the floor preload, the seeded bench fights still first-play eight to
+# nine sounds (P3 spawn 203-224 ms of WAV loading, death_burst_large 42-57 ms
+# inside one update), none of them in the floor list.
+option(ISAAC_VITA_SFX_FIGHT_PRELOAD
+       "Extend ISAAC_VITA_SFX_FLOOR_PRELOAD with a third list of 22 sounds (2.6 MiB stock WAV) that were first-play loads in the seeded bench fights or on hand-played Downpour floors, loaded after the floor lists by the same replay; the whole list is skipped (and logged) when guest heap headroom is below RESERVE_MB + its bytes or the OpenAL pool below 2 MiB + its bytes, and every per-sound skip of the floor lists still applies.  Needs SFX_FLOOR_PRELOAD.  OFF keeps every object byte-identical" OFF)
+option(ISAAC_VITA_RENDER_CHAIN_NATIVE
+       "Replay two sprite render-chain links natively through link-time --wrap seams: the vertex attribute filler sub_0025af60 (its eight size-getter calls answered from the nine pinned ImageBase leaves) and Image::Render sub_0055f610 with its [vtable+8] UV copy sub_0055f630 inlined; any other target keeps guest_call, a short guest stack keeps the translated bodies (needs TRANSLATED_CPU_FLAGS_LOCAL)" OFF)
 option(ISAAC_VITA_POOP_FX_SINGLE_CLOUD
        "Visual performance mode: render one of the three PoopFx clouds" OFF)
 option(ISAAC_VITA_STALL_PROBE
@@ -556,13 +1124,95 @@ set(ISAAC_VITA_LOG_ASYNC_RING_KB 256 CACHE STRING
     "ISAAC_VITA_LOG_ASYNC ring capacity in KiB; a full ring drops and counts the line ([kage-vita] log-async dropped=N)")
 option(ISAAC_VITA_LOG_ASYNC_FILE_BATCH
        "Append already queued adjacent native FILE records together (at most 8 records/4096 bytes); preserve one debug call per record" OFF)
+option(ISAAC_VITA_LOG_ASYNC_PRINTF_FILE
+       "Diagnostic: persist bounded async printf/profile records through the existing FILE+debug sink, independent of Cat-A-Log routing" OFF)
 option(ISAAC_VITA_PHASE_PROFILE
        "Aggregate loop timings plus dispatch/GL counts every 120 loops" OFF)
+# Declared with the GL thread knobs above; checked here, after the
+# PHASE_PROFILE option it depends on.
+if(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_VERIFY AND
+   (NOT ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_STANDALONE OR NOT ISAAC_VITA_PHASE_PROFILE))
+  message(FATAL_ERROR "GL_RECORD_ADMISSION_CACHE_VERIFY requires GL_RECORD_ADMISSION_CACHE_STANDALONE and PHASE_PROFILE")
+endif()
+option(ISAAC_VITA_GL_RECORD_OPCODE_CENSUS
+       "Measurement only: per-opcode GL recorder census each phase-profile window (ph120.ro/ph120.rop: records, payload bytes, render-thread replay us, 1/64-sampled game-thread us, S waits; needs PHASE_PROFILE and GL_THREAD_WORKER)" OFF)
+if(ISAAC_VITA_GL_RECORD_OPCODE_CENSUS AND
+   (NOT ISAAC_VITA_PHASE_PROFILE OR NOT ISAAC_VITA_GL_THREAD_WORKER))
+  message(FATAL_ERROR "GL_RECORD_OPCODE_CENSUS requires PHASE_PROFILE and GL_THREAD_WORKER")
+endif()
 option(ISAAC_VITA_ROOM_LOG_MARKERS
        "Timestamp authenticated Room logger formatting events; bounded owner queue drained with phase reports, not room completion or unique grid IDs" OFF)
 if(ISAAC_VITA_ROOM_LOG_MARKERS AND NOT ISAAC_VITA_PHASE_PROFILE)
   message(FATAL_ERROR "ISAAC_VITA_ROOM_LOG_MARKERS requires PHASE_PROFILE=ON")
 endif()
+if(ISAAC_VITA_ARCHIVE_READ_TRAIL AND NOT ISAAC_VITA_PHASE_PROFILE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_ARCHIVE_READ_TRAIL requires ISAAC_VITA_PHASE_PROFILE=ON")
+endif()
+# RENDER60 S6: the guest timeGetTime import handler (vita_post_com_timeGetTime
+# in host_vita_post_com.c).  No corpus change, no --wrap, no new TU.
+# * TIMEGETTIME_RECIPROCAL (leg 2): the handler's (uint32_t)(t / 1000) on the
+#   64-bit microsecond process time is a __aeabi_uldivmod call on the
+#   Cortex-A9; ON computes the same integer with four 32x32 multiplies
+#   (M = 0x20C49BA5E353F7CF, proof in host_vita_tgt_reciprocal.h, exhaustive
+#   and randomized host test in recomp/test_vita_clear_expiry_latch.py) and
+#   prints one KAGE VITA TGT RECIPROCAL self-test line at the first call
+#   (any mismatch on the device falls back to the division).  Bit-identical.
+# * CLEAR_EXPIRY_CLOCK_LATCH (leg 1): the KAGE Clear expiry loops
+#   (sub_00564f50, sub_00561f40) call timeGetTime once per pending-release
+#   element.  ON answers each keep iteration from the clock read that started
+#   its keep run.  That is timing-legal, not identical: an expiry that falls
+#   inside a run whose clock ticks is taken by the next Clear (heap only), so
+#   ON ships only with the owner's sign-off.  OBSERVE returns every fresh
+#   read (OFF behaviour) and counts what ON would do as ph120.tl.
+# OFF keeps every object byte-identical.
+option(ISAAC_VITA_TIMEGETTIME_RECIPROCAL
+       "timeGetTime import handler: exact multiply-high u64/1000 instead of the __aeabi_uldivmod division (identical results for every u64; KAGE VITA TGT RECIPROCAL self-test line at the first call).  OFF keeps every object byte-identical" OFF)
+set(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH OFF CACHE STRING
+    "timeGetTime import handler in the KAGE Clear expiry loops (sub_00564f50, sub_00561f40): OFF = one clock read per call, OBSERVE = OFF behaviour plus ph120.tl counts of what ON would do (needs PHASE_PROFILE), ON = keep iterations reuse their keep run's first clock read (timing-legal, not identical; owner sign-off)")
+string(TOUPPER "${ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH}"
+       ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_UPPER)
+if(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_UPPER STREQUAL "ON")
+  set(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE 2)
+  set(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_NAME ON)
+elseif(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_UPPER STREQUAL "OBSERVE")
+  set(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE 1)
+  set(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_NAME OBSERVE)
+elseif(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_UPPER MATCHES
+       "^(OFF|NO|FALSE|N|IGNORE|NOTFOUND|.*-NOTFOUND)?$")
+  # OFF, empty or another CMake false constant; 0/1/2 and other text are
+  # rejected, as for ISAAC_VITA_STOCK_FBO_VALID_REGION.
+  set(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE 0)
+  set(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_NAME OFF)
+else()
+  message(FATAL_ERROR
+    "ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH must be OFF, OBSERVE or ON "
+    "(got '${ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH}')")
+endif()
+if(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE EQUAL 1 AND
+   NOT ISAAC_VITA_PHASE_PROFILE)
+  # OBSERVE changes nothing the guest sees; its counters are its only output.
+  message(FATAL_ERROR
+    "ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH=OBSERVE requires "
+    "ISAAC_VITA_PHASE_PROFILE=ON (ph120.tl is its only output)")
+endif()
+if((ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE OR
+    ISAAC_VITA_TIMEGETTIME_RECIPROCAL) AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH and "
+    "ISAAC_VITA_TIMEGETTIME_RECIPROCAL require the real Vita runtime "
+    "(host_vita_post_com.c)")
+endif()
+if(ISAAC_VITA_TIMEGETTIME_RECIPROCAL)
+  set(ISAAC_VITA_TIMEGETTIME_RECIPROCAL_NAME ON)
+else()
+  set(ISAAC_VITA_TIMEGETTIME_RECIPROCAL_NAME OFF)
+endif()
+message(STATUS
+  "ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH=${ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_NAME} "
+  "(mode ${ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE})")
+message(STATUS
+  "ISAAC_VITA_TIMEGETTIME_RECIPROCAL=${ISAAC_VITA_TIMEGETTIME_RECIPROCAL_NAME}")
 option(ISAAC_VITA_GL_TIME_PROFILE
        "Split Game::Render wall time into native GL call buckets and GXM scene waits (ph120.gt)" OFF)
 option(ISAAC_VITA_GL_TIME_SDK_SPARSE
@@ -591,6 +1241,25 @@ option(ISAAC_VITA_CRT_FILE_LOOKUP_HINT
        "Reuse a fully validated last dynamic FILE slot under the existing lock" OFF)
 option(ISAAC_VITA_GUEST_SAMPLER
        "Sample the guest return-address chain from a second core every 1 ms and print per-phase hot translated functions (ph120.hot)" OFF)
+option(ISAAC_VITA_GUEST_SAMPLER_CHAIN
+       "With ISAAC_VITA_GUEST_SAMPLER: walk the whole live call chain of render-phase samples and print inclusive per-function counts (ph120.hoti/hci)" OFF)
+if(ISAAC_VITA_GUEST_SAMPLER_CHAIN AND NOT ISAAC_VITA_GUEST_SAMPLER)
+  message(FATAL_ERROR "ISAAC_VITA_GUEST_SAMPLER_CHAIN requires ISAAC_VITA_GUEST_SAMPLER=ON")
+endif()
+option(ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL
+       "Profile-only, with ISAAC_VITA_GUEST_SAMPLER: name swp-phase samples 'present' (the inline KAGE present has no guest marker; a stack scan names a stale word)" OFF)
+if(ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL AND NOT ISAAC_VITA_GUEST_SAMPLER)
+  message(FATAL_ERROR "ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL requires ISAAC_VITA_GUEST_SAMPLER=ON")
+endif()
+option(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL
+       "Profile-only, with ISAAC_VITA_GUEST_SAMPLER_CHAIN: carry the render chain walk across the Lua callback boundary (0xfff15333) and print the render watch list's every count (ph120.hotw), mod-callback invoker roots (ph120.hotl), rootless samples by outermost frame (ph120.hotu) and boundary links (ph120.hcl); only the sampler and Lua bridge objects change (the bridge publishes the live boundary addresses)" OFF)
+if(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL AND NOT ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+  message(FATAL_ERROR "ISAAC_VITA_GUEST_SAMPLER_RESIDUAL requires ISAAC_VITA_GUEST_SAMPLER_CHAIN=ON")
+endif()
+option(ISAAC_VITA_GPU_FRAME_PROFILE
+       "Profile only: poll vitaGL's per-scene fragment notification from CPU 2 and print GPU busy/lag/display-queue per window (ph120.gpu)" OFF)
+set(ISAAC_VITA_GPU_FRAME_PROFILE_PERIOD_US "500" CACHE STRING
+    "ISAAC_VITA_GPU_FRAME_PROFILE poll period in us")
 # The import-kinds census reads the one per-import array guest.c keeps for
 # the phase profiler (guest.h g_guest_phase_profile_import_calls, also the
 # dispatch table's ph120.i source).  Without ISAAC_VITA_DISPATCH_TABLE that
@@ -610,12 +1279,16 @@ option(ISAAC_VITA_PROFILE_IMPORT_KINDS
        ${ISAAC_VITA_PROFILE_IMPORT_KINDS_DEFAULT})
 option(ISAAC_VITA_PROFILE_FUNCTION_ENTRIES
        "Count translated body entries (direct+tail+indirect) as ph120.ik ent= (recompiles every generated unit; needs ISAAC_VITA_PHASE_PROFILE)" OFF)
+option(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS
+       "Profile-only: count translated body entries of the render watch list (kage_vita_render_watch.h) per sampler phase as ph120.fe; ids come from the compiled corpus's guest_coverage.json at configure time (recompiles every generated unit; needs ISAAC_VITA_GUEST_SAMPLER)" OFF)
 option(ISAAC_VITA_SIM_CADENCE_RECEIPT
        "Log real Game::Update cadence beside the 120-present heartbeat" OFF)
 option(ISAAC_VITA_WORLD_SEAM_DIAG
        "Bounded Room/Lua/late-overlay GL-state receipt for Utero II" OFF)
 option(ISAAC_VITA_TEXTURE_CHURN_PROFILE
        "Attribute texture-name scans, lifetimes and upload paths per phase window" OFF)
+option(ISAAC_VITA_GL_TEXTURE_UPLOAD_LOG
+       "Log every glTexImage2D of at least 1 MiB: extent, formats, vitaGL pool free before/after, glGetError, duration (diagnostic)" OFF)
 option(ISAAC_VITA_GL_FILL_CENSUS
        "Per-window projected fill census of guest draws as ph120.fa/ph120.fp (kilo-pixels per program/blend class, pass ordinal and attachment; shim-side Position/Transform/viewport shadows, no GL query; needs ISAAC_VITA_PHASE_PROFILE)" OFF)
 option(ISAAC_VITA_GL_FILL_CENSUS_DUMP
@@ -712,6 +1385,14 @@ if(ISAAC_VITA_KAGE_REFCOUNT_SEAM_VERIFY AND NOT ISAAC_VITA_KAGE_REFCOUNT_SEAM)
   message(FATAL_ERROR
     "ISAAC_VITA_KAGE_REFCOUNT_SEAM_VERIFY requires ISAAC_VITA_KAGE_REFCOUNT_SEAM=ON")
 endif()
+if(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS AND
+   ISAAC_VITA_KAGE_REFCOUNT_SEAM_VERIFY)
+  # VERIFY runs the translated reference and then restores the corpus-wide
+  # entry counter, not the census rows: the watched lock wrappers
+  # sub_00562e00/sub_00562ec0 (RC_COVERAGE_LOCK/UNLOCK) would count twice.
+  message(FATAL_ERROR
+    "ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS excludes ISAAC_VITA_KAGE_REFCOUNT_SEAM_VERIFY")
+endif()
 if(ISAAC_VITA_FLOOR_THUNK_FASTPATH AND ISAAC_VITA_SCAFFOLD_ONLY)
   message(FATAL_ERROR
     "ISAAC_VITA_FLOOR_THUNK_FASTPATH requires generated guest runtime")
@@ -756,6 +1437,52 @@ if(ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE AND NOT ISAAC_VITA_KAGE_QUAD_FASTPATH)
   message(FATAL_ERROR
     "ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE requires ISAAC_VITA_KAGE_QUAD_FASTPATH")
 endif()
+if(ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE AND NOT ISAAC_VITA_KAGE_QUAD_FASTPATH)
+  message(FATAL_ERROR
+    "ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE requires ISAAC_VITA_KAGE_QUAD_FASTPATH")
+endif()
+if(ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE AND ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE replays the select; ISAAC_VITA_KAGE_QUAD_FASTPATH_OBSERVE never replays")
+endif()
+if(ISAAC_VITA_GFUEL_SEED_NATIVE AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_GFUEL_SEED_NATIVE requires generated guest runtime")
+endif()
+if(ISAAC_VITA_GFUEL_SEED_NATIVE AND NOT ISAAC_VITA_TRANSLATED_CPU)
+  message(FATAL_ERROR
+    "ISAAC_VITA_GFUEL_SEED_NATIVE requires ISAAC_VITA_TRANSLATED_CPU")
+endif()
+if(ISAAC_VITA_UPDATE_PROBE AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_TRANSLATED_CPU OR
+    NOT ISAAC_VITA_PHASE_PROFILE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_UPDATE_PROBE needs the generated runtime, TRANSLATED_CPU and PHASE_PROFILE")
+endif()
+# KAGE and AUDIO together link host_vita_audio.c and host_vita_openal_pool.c
+# (ISAAC_VITA_AUDIO_ACTIVE), whose pool snapshot the preload reads.
+if(ISAAC_VITA_SFX_FLOOR_PRELOAD AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_TRANSLATED_CPU OR
+    NOT ISAAC_VITA_KAGE OR NOT ISAAC_VITA_AUDIO))
+  message(FATAL_ERROR
+    "ISAAC_VITA_SFX_FLOOR_PRELOAD needs the generated runtime, TRANSLATED_CPU, KAGE and AUDIO")
+endif()
+if(ISAAC_VITA_SFX_FLOOR_PRELOAD AND ISAAC_VITA_UPDATE_PROBE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_SFX_FLOOR_PRELOAD and ISAAC_VITA_UPDATE_PROBE both --wrap sub_00311e60 (Level::Init); build them separately")
+endif()
+if(ISAAC_VITA_SFX_FIGHT_PRELOAD AND NOT ISAAC_VITA_SFX_FLOOR_PRELOAD)
+  message(FATAL_ERROR
+    "ISAAC_VITA_SFX_FIGHT_PRELOAD extends ISAAC_VITA_SFX_FLOOR_PRELOAD (its list is walked by the floor preload's Level::Init seam); turn that on too")
+endif()
+if(ISAAC_VITA_CAMERA_RING_NATIVE AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_CAMERA_RING_NATIVE requires generated guest runtime")
+endif()
+if(ISAAC_VITA_CAMERA_RING_NATIVE AND NOT ISAAC_VITA_TRANSLATED_CPU)
+  message(FATAL_ERROR
+    "ISAAC_VITA_CAMERA_RING_NATIVE requires ISAAC_VITA_TRANSLATED_CPU")
+endif()
 if(ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE AND ISAAC_VITA_STALL_PROBE)
   message(FATAL_ERROR
     "ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE makes no per-wrapper crossings for the ISAAC_VITA_STALL_PROBE breadcrumbs: STALL_PROBE must be OFF")
@@ -792,6 +1519,79 @@ if(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE AND
   message(FATAL_ERROR
     "ISAAC_VITA_FULLSPEED_HEAD_ADVANCE requires FULLSPEED_SCHEDULER=ON and FULLSPEED_SERVICE_RESERVE=ON")
 endif()
+option(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT
+       "Experimental: admit interpolated frames on the Render body plus the recurring part of the Present wait; can trade exact 30 UPS for FPS" OFF)
+if(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT AND
+   NOT ISAAC_VITA_FULLSPEED_SCHEDULER)
+  message(FATAL_ERROR
+    "ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT requires ISAAC_VITA_FULLSPEED_SCHEDULER=ON")
+endif()
+# S5 floor debt (ISAAC_VITA_FULLSPEED_FLOOR_DEBT): the 30-UPS
+# floor keeps up to CAP us of a late Game::Update start as debt, so the
+# next floor is max(old floor, now - CAP, this full head's 60-Hz deadline) +
+# 33.333 ms instead of now + 33.333 ms; lateness of one Game tick or more,
+# and any pace after a stale wrapper drop, head clock reset or failed head
+# wait, keeps nothing (stale cut).  CAP and SLACK are validated in every
+# mode, so a bad value is FATAL even with FLOOR_DEBT=OFF.  This changes
+# the Game::Update start contract (starts >= 33.333 - CAP ms apart, up to 31
+# in a sliding second; long-run UPS still <= 30), so ON needs the owner's
+# sign-off and is in no recipe.  OBSERVE keeps every decision stock and
+# prints ph120.fd/ph120.fs.  ADMIT_SLACK_US > 0 (ON only acts on it) lets an
+# interpolated frame predicted to end up to that much after the floor run;
+# without the debt that overrun would be lost UPS, hence the FATAL below.
+set(ISAAC_VITA_FULLSPEED_FLOOR_DEBT OFF CACHE STRING
+    "Fullspeed 30-UPS floor debt: OFF = stock floor, OBSERVE = stock floor + ph120.fd/fs receipt, ON = keep up to FLOOR_DEBT_CAP_US of a late Game::Update start (changes the start-spacing contract; owner sign-off)")
+set(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US 8000 CACHE STRING
+    "Largest Game::Update start lateness kept as floor debt, 1..16666 us (used with FLOOR_DEBT=OBSERVE|ON; validated in every mode)")
+set(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US 0 CACHE STRING
+    "Admit an interpolated frame predicted to end up to this many us after the Game floor; 0 = stock test; needs FLOOR_DEBT=OBSERVE|ON and < FLOOR_DEBT_CAP_US (acts only with ON)")
+string(TOUPPER "${ISAAC_VITA_FULLSPEED_FLOOR_DEBT}"
+       ISAAC_VITA_FULLSPEED_FLOOR_DEBT_UPPER)
+if(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_UPPER STREQUAL "ON")
+  set(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE 2)
+elseif(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_UPPER STREQUAL "OBSERVE")
+  set(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE 1)
+elseif(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_UPPER MATCHES
+       "^(OFF|NO|FALSE|N|IGNORE|NOTFOUND|.*-NOTFOUND)?$")
+  # As STOCK_FBO_VALID_REGION: 0/1/2 and other text are rejected.
+  set(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE 0)
+else()
+  message(FATAL_ERROR
+    "ISAAC_VITA_FULLSPEED_FLOOR_DEBT must be OFF, OBSERVE or ON "
+    "(got '${ISAAC_VITA_FULLSPEED_FLOOR_DEBT}')")
+endif()
+if(NOT ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US MATCHES "^[1-9][0-9]*$" OR
+   ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US GREATER 16666)
+  message(FATAL_ERROR
+    "ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US must be an integer 1..16666 "
+    "(below one 60-Hz wrapper tick; got '${ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US}')")
+endif()
+if(NOT ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US MATCHES "^(0|[1-9][0-9]*)$")
+  message(FATAL_ERROR
+    "ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US must be a non-negative integer "
+    "(got '${ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US}')")
+endif()
+if(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE AND
+   NOT ISAAC_VITA_FULLSPEED_SCHEDULER)
+  message(FATAL_ERROR
+    "ISAAC_VITA_FULLSPEED_FLOOR_DEBT requires ISAAC_VITA_FULLSPEED_SCHEDULER=ON")
+endif()
+if(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE AND
+   ISAAC_VITA_FULLSPEED_HEAD_ADVANCE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_FULLSPEED_FLOOR_DEBT and ISAAC_VITA_FULLSPEED_HEAD_ADVANCE are exclusive (their floor/grid interaction is not proven)")
+endif()
+if(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US GREATER 0 AND
+   NOT ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US requires ISAAC_VITA_FULLSPEED_FLOOR_DEBT=OBSERVE or ON: an admitted overrun without the debt is lost UPS")
+endif()
+if(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US GREATER 0 AND
+   NOT ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US LESS
+       ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US)
+  message(FATAL_ERROR
+    "ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US must be below ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US")
+endif()
 option(ISAAC_VITA_STABLE_30_PRESENTATION
        "Present only completed 30-Hz game phases and suppress interpolation" OFF)
 if(ISAAC_VITA_STABLE_30_PRESENTATION AND NOT ISAAC_VITA_KAGE)
@@ -806,12 +1606,48 @@ if(ISAAC_VITA_STABLE_30_PRESENTATION AND ISAAC_VITA_FULLSPEED_SCHEDULER)
   message(FATAL_ERROR
     "stable 30-Hz presentation and the fullspeed scheduler are exclusive")
 endif()
+option(ISAAC_VITA_RUNTIME_SETTINGS
+       "Read ux0:/data/isaacr001/port.ini once at boot (fps_lock duty on the fullspeed scheduler; remap keys parsed and reported) and log the ISAAC VITA SETTINGS receipt" OFF)
+if(ISAAC_VITA_RUNTIME_SETTINGS AND NOT ISAAC_VITA_KAGE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_RUNTIME_SETTINGS requires ISAAC_VITA_KAGE=ON")
+endif()
+if(ISAAC_VITA_RUNTIME_SETTINGS AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_RUNTIME_SETTINGS requires generated guest code")
+endif()
+if(ISAAC_VITA_RUNTIME_SETTINGS AND ISAAC_VITA_IO_PROFILE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_RUNTIME_SETTINGS opens port.ini before the io-profile wrappers are initialised: ISAAC_VITA_IO_PROFILE must be OFF")
+endif()
+option(ISAAC_VITA_RENDER_SCALE_DEFAULT
+       "Write the port.ini render_scale setting (default 1 = 480x270 world; 2 = the game's stock 960x540) into options.ini MaxRenderScale at every boot and log the ISAAC VITA RENDER SCALE receipt" OFF)
+if(ISAAC_VITA_RENDER_SCALE_DEFAULT AND NOT ISAAC_VITA_RUNTIME_SETTINGS)
+  message(FATAL_ERROR
+    "ISAAC_VITA_RENDER_SCALE_DEFAULT requires ISAAC_VITA_RUNTIME_SETTINGS=ON (the value comes from port.ini)")
+endif()
+option(ISAAC_VITA_DEBUG_OVERLAY
+       "Debug builds only: on-screen overlay selected by port.ini debug_overlay=off|compact|full (FPS, frame ms, per-core load, RAM per consumer from a --wrap memblock/thread ledger); the release recipe pins it OFF" OFF)
+if(ISAAC_VITA_DEBUG_OVERLAY AND NOT ISAAC_VITA_KAGE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_DEBUG_OVERLAY requires ISAAC_VITA_KAGE=ON (it draws from vitaGL's display callback)")
+endif()
+if(ISAAC_VITA_DEBUG_OVERLAY AND NOT ISAAC_VITA_RUNTIME_SETTINGS)
+  message(FATAL_ERROR
+    "ISAAC_VITA_DEBUG_OVERLAY requires ISAAC_VITA_RUNTIME_SETTINGS=ON (the mode comes from port.ini)")
+endif()
+if(ISAAC_VITA_DEBUG_OVERLAY AND ISAAC_VITA_CONTINUE_OVERLAY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_DEBUG_OVERLAY and ISAAC_VITA_CONTINUE_OVERLAY both own vitaGL's single display callback: pick one")
+endif()
 if(ISAAC_VITA_FXRAY_ALPHA_MASK AND NOT ISAAC_VITA_KAGE)
   message(FATAL_ERROR
     "ISAAC_VITA_FXRAY_ALPHA_MASK requires the translated KAGE runtime")
 endif()
 option(ISAAC_VITA_GUEST_LOOKUP_CACHE
        "Cache exact guest lookups, confirmed dispatches and the dense IAT" OFF)
+option(ISAAC_VITA_CXX_THROW_DIAG
+       "Before the stop on an unresolved C++ throw import, log the thrown type, what() and a LuaException message" OFF)
 option(ISAAC_VITA_SYNC_IMPORT_FASTPATH
        "Route validated Enter/LeaveCriticalSection IDs directly to sync" OFF)
 option(ISAAC_VITA_DISPATCH_TABLE
@@ -846,7 +1682,7 @@ option(ISAAC_VITA_GL_TYPED_STATE_CACHE
        "Suppress exact-valid duplicate typed GL state requests" OFF)
 option(ISAAC_VITA_GL_ATTRIB_ENABLE_COALESCE
        "EXPERIMENTAL: coalesce known-valid attribute enable changes before native consumers" OFF)
-# GL shim dispatch trims (wf/opt-glshim, research-gl-shim-path findings 1/3):
+# GL shim dispatch trims (measured GL shim path costs):
 # probe the 0x7e typed-GL family before the dispatch cache and IAT search,
 # replace the 73-entry linear token scan and 73-case switch with the generated
 # direct-mapped token index, and replace the two CAS loops + four dmb per GL
@@ -863,7 +1699,57 @@ option(ISAAC_VITA_GL_LOCATION_CACHE
        "Memoize glGetAttribLocation/glGetUniformLocation in the GL shim (needs GL_SHIM_FASTDISPATCH; enable after a VERIFY device run)" OFF)
 option(ISAAC_VITA_GL_LOCATION_CACHE_VERIFY
        "Device A/B: shadow every location-cache hit with a native query and count mismatches into ph120.a loc(...,m)" OFF)
-# GL shim per-crossing cost (wf/opt-gltok).  TABLE_TOKENS registers the 73
+# ---- RENDER60 S2 option checks (test_vita_shader_attrib_fastpath.py runs
+# this block verbatim under cmake -P; keep it self-contained) ----
+if(NOT ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES MATCHES "^(16|32|64|128)$")
+  message(FATAL_ERROR
+    "ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES must be 16, 32, 64 or 128: "
+    "'${ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES}'")
+endif()
+if(NOT ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES STREQUAL "16" AND
+   NOT ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO)
+  message(FATAL_ERROR
+    "ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES=${ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES} "
+    "requires ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO")
+endif()
+# Both VERIFY variants count into the one ph120.a loc(...,m) counter: the
+# memo from the game thread (inside the replay), the shim location cache
+# from the GL render thread (inside the typed wrapper) once the recorder
+# worker runs.  A plain counter with two writers loses increments, and a
+# nonzero m could not be attributed to either cache.  One per build.
+if(ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY AND
+   ISAAC_VITA_GL_LOCATION_CACHE_VERIFY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY and "
+    "ISAAC_VITA_GL_LOCATION_CACHE_VERIFY both count ph120.a loc(...,m), from "
+    "two threads; enable one per build")
+endif()
+# ---- end of the RENDER60 S2 option checks ----
+# ---- RENDER60 S4 option checks (test_vita_shader_attrib_fastpath.py runs
+# this block verbatim under cmake -P; keep it self-contained).  GL_WRAPPER_TIME
+# and STALL_PROBE are already refused under GL_THREAD_WORKER. ----
+if(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH AND
+   (NOT ISAAC_VITA_GL_THREAD_RECORD OR NOT ISAAC_VITA_GL_THREAD_WORKER OR
+    NOT ISAAC_VITA_SHADER_ATTRIB_FASTPATH OR
+    NOT ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO))
+  message(FATAL_ERROR
+    "ISAAC_VITA_GL_RECORD_ATTRIB_BATCH requires ISAAC_VITA_GL_THREAD_RECORD, "
+    "ISAAC_VITA_GL_THREAD_WORKER, ISAAC_VITA_SHADER_ATTRIB_FASTPATH and "
+    "ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO")
+endif()
+# VERIFY looks every name up on a hit (the batch would reorder those
+# lookups); DIRECT_STATE bypasses the recorder (already FATAL through
+# GL_THREAD_RECORD, repeated for the message).
+if(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH AND
+   (ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY OR
+    ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_GL_RECORD_ATTRIB_BATCH batches memo hits behind the recorder: "
+    "ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_VERIFY and "
+    "ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE must be OFF")
+endif()
+# ---- end of the RENDER60 S4 option checks ----
+# GL shim per-crossing cost.  TABLE_TOKENS registers the 73
 # typed-GL tokens in the boot-built dispatch table (gl_bridge.c trampolines
 # count the dynamic call and run the owned adapter), so a GL call is
 # probe -> trampoline -> owner check -> adapter instead of probe miss ->
@@ -937,6 +1823,17 @@ if(ISAAC_VITA_DISPLAY_RASTER_SCALED AND NOT ISAAC_VITA_DISPLAY_RASTER_720)
       "Legacy alias: render the default framebuffer at 720x408 while retaining 960x540 guest coordinates"
       FORCE)
 endif()
+# GitHub issue #5 item 5.8b: the 960x540 image is centred in the 960x544 panel
+# only at KAGE init; the guest's own default-framebuffer glViewport(0, 0, ...)
+# then anchors it to the bottom (rows 0-3 black, content in rows 4-543).
+option(ISAAC_VITA_DISPLAY_CENTER_Y
+       "Add the native raster's 2 centring rows to the guest's default-framebuffer viewport Y (content in panel rows 2-541, issue #5 5.8b)" OFF)
+if(ISAAC_VITA_DISPLAY_CENTER_Y AND ISAAC_VITA_DISPLAY_RASTER_SCALED)
+  message(FATAL_ERROR
+    "ISAAC_VITA_DISPLAY_CENTER_Y centres the native 960x544 raster; a scaled "
+    "ISAAC_VITA_DISPLAY_RASTER (${ISAAC_VITA_DISPLAY_RASTER}) already centres "
+    "its own viewport")
+endif()
 option(ISAAC_VITA_FIRST_FRAME_PROBE
        "Run the bounded clear/blit/postprocess-bypass diagnostic" OFF)
 option(ISAAC_VITA_FBO_RASTER_SCALE
@@ -969,6 +1866,17 @@ option(ISAAC_VITA_STOCK_FBO_RT_REUSE_LEASE
   "EXPERIMENTAL: retain the sole eligible native RT for one extra purge rotation, with original-deadline-witnessed pressure drain" OFF)
 option(ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE
   "Keep the existing unexpired same-owner spare across supported small-size interludes; no additional spare or extended deadline" OFF)
+# 0034: stock vitaGL ignores setup_render_target/sceGxmBeginScene failures in
+# scene_reset (sceGxmCreateRenderTarget refuses under driver-memory pressure,
+# seen at Ultra Greed's death) and glClear then writes its clear uniforms
+# through an uninitialised pointer (Vita C2-12828-1).  The guard tracks the
+# open scene, skips those uniform writes and draws, and counts them.
+option(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD
+       "Exact native RGB24-to-RGBA32 subupload rows and guarded full-overwrite COW copy elision in stock vitaGL" OFF)
+option(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE
+       "Lossless large grayscale RGBA pages as U8_RRRR/A8L8, with transactional RGBA deopt on mutation/attachment" OFF)
+option(ISAAC_VITA_VITAGL_SCENE_GUARD
+  "Stock vitaGL fails closed when no GXM scene could be opened: skip the clear and scissor-mask uniform writes and draws, count them (0034 patch)" OFF)
 set(ISAAC_VITA_STOCK_FBO_RT_SCENES OFF CACHE STRING
     "Stock profile: GXM scenes per frame for offscreen (FBO) render targets: OFF/1 = vitaGL default, 2..8 = 0007 patch with that count, ON = 8")
 string(TOUPPER "${ISAAC_VITA_STOCK_FBO_RT_SCENES}"
@@ -1168,6 +2076,19 @@ endif()
 # never stored).  Native clears 7 -> 4 per frame; ph120.e gains a and d.
 option(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP
        "FBO_CLEAR_ELISION sub-mode: depth/stencil debt only, dropped exactly at the owing FBO's colour re-attach instead of replayed" OFF)
+# GitHub issue #10: the game tints the dirt/Hole layer under burrowing
+# enemies with a 1x1 glReadPixels of its pre-rendered Floor Surface; stock
+# vitaGL waits for the GPU only when the read framebuffer is the in-use
+# one, so that read can return unwritten (zero) texels: a black hole.
+option(ISAAC_VITA_FBO_READBACK_FIX
+       "Serve an offscreen glReadPixels from the attached RGBA8 texture's memory at the rows the game drew (stock vitaGL applies the display's row flip to framebuffer textures it renders already flipped and reads padding), after draining the GXM context when that texture was drawn or cleared since the last drain" OFF)
+# GitHub issue #15: Wavy Cap and the Downpour Mirror World composite their
+# capture surface into the outer surface right after a pop, with no clear,
+# relying on desktop GL's persistent FBO depth (cleared to 0 by the pass end,
+# tested GL_GREATER).  vitaGL starts every re-attached scene at depth 1.0, so
+# the composite is rejected and the world goes black.
+option(ISAAC_VITA_FBO_DEPTH_CARRY
+       "Replay an offscreen framebuffer's last depth clear into the new vitaGL scene before its first draw, while that clear is still the last depth write the desktop contract knows (issue #15)" OFF)
 option(ISAAC_VITA_VITAGL_CACHED_MEM
        "Call vglUseCachedMem(GL_TRUE) before vglInit so vitaGL pools are cacheable" OFF)
 option(ISAAC_VITA_VITAGL_GPU_DRAW_OPTIMIZATIONS
@@ -1379,6 +2300,8 @@ if(ISAAC_VITA_PNG_PREMULTIPLY_LINEAR_NEON AND
 endif()
 option(ISAAC_VITA_TEXEL_SCRATCH_8M
        "Diagnostic A/B: cap texel scratch requests at 8 MiB" OFF)
+option(ISAAC_VITA_TEXEL_SCRATCH_32M
+       "Chinese font atlases (issue #4): 32 MiB + one page texel scratch reserved before vitaGL instead of the lazy 0x00bd6000 block; the vitaGL RAM pool shrinks by 0x02001000 bytes" OFF)
 option(ISAAC_VITA_TEXTURE_ALIGN8_POLICY
        "Use KAGE's existing 8-pixel texture backing alignment policy" OFF)
 option(ISAAC_VITA_ANM2_SCRATCH
@@ -1387,6 +2310,16 @@ option(ISAAC_VITA_ANM2_POOL_INIT
        "Initialize the six live ANM2 scratch pools with exact native loops" OFF)
 option(ISAAC_VITA_ANM2_MISSING_LAYER_GUARD
        "Skip absent signed ANM2 layer-map entries before array indexing" OFF)
+option(ISAAC_VITA_BACKDROP_WATERGFX_GUARD
+       "Skip the Backdrop::LoadGraphics watergfx call on a NULL image and log unresolved image paths (issue 5.4/5.17)" OFF)
+option(ISAAC_VITA_INTRO_PLAY
+       "Issue #14: play the stock startup Intro (cutscene 1) instead of forcing ACTION_MENUCONFIRM into it; Cross skips it through the game's own path (OFF keeps the port's auto-skip)" OFF)
+option(ISAAC_VITA_TROPHIES
+       "Mirror Isaac achievements (TryUnlock) as PS Vita trophies via NoTrpDrm packs" OFF)
+option(ISAAC_VITA_TROPHY_TEST_REQUEST
+       "Diagnostic: honour ux0:data/isaacr001/trophy-test.req" OFF)
+set(ISAAC_VITA_TROPHY_PACK_DIR "" CACHE PATH
+    "Directory with ISAC00000_00..05/TROPHY.TRP (user-supplied packs, see recomp/vita/TROPHIES.md); empty = no trophy packs in the VPK (only with ISAAC_VITA_TROPHIES=ON)")
 option(ISAAC_VITA_FXLAYERS_NULL_ROLLBACK
        "Rollback the exact last FXLayers record after a NULL image load" OFF)
 option(ISAAC_VITA_HEAP_LEDGER_MEMBLOCK
@@ -1395,14 +2328,32 @@ option(ISAAC_VITA_HEAP_LEDGER_BACKSHIFT
        "Delete guest ownership entries without tombstones or same-size rehashes" ON)
 option(ISAAC_VITA_HEAP_OVERFLOW_MSPACE
        "Add a bounded USER_RW SceClibMspace after newlib exhaustion" OFF)
+set(ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES "0x007d5000" CACHE STRING
+    "Byte size of the USER_RW SceClibMspace served after newlib exhaustion (0x + 8 hex digits, lowest set bit 0x1000, 0x007d5000..0x03ffd000; retained span is +4 KiB; only meaningful with ISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON)")
 option(ISAAC_VITA_HEAP_TERMINAL_FASTPATH
        "Read the terminal heap latch atomically without taking the allocator lock" OFF)
 option(ISAAC_VITA_ROOM_ENTRY_SLAB
        "Pack exact frozen RoomConfig Entry arrays into retained mspace pages" OFF)
+option(ISAAC_VITA_HEAP_LEAN_IMPORT
+       "Skip the measurement-only floor-lifetime sidecars on every guest heap ledger insert/remove (stage-memory/census floor totals then report invalid; ownership, leases and returned pointers unchanged)" OFF)
+if(ISAAC_VITA_HEAP_LEAN_IMPORT AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_HEAP_OVERFLOW_MSPACE OR
+    ISAAC_VITA_STAGE_MEMORY_DIAGNOSTICS))
+  message(FATAL_ERROR
+    "ISAAC_VITA_HEAP_LEAN_IMPORT requires translated runtime and HEAP_OVERFLOW_MSPACE, and excludes STAGE_MEMORY_DIAGNOSTICS (its floor records would be empty)")
+endif()
+option(ISAAC_VITA_HEAP_STAGE_PROFILE
+       "Profiling: count guest malloc/free import routes and time each stage 1-in-64 (ph120.hc/hf/hm)" OFF)
+option(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH
+       "Reject non-slab frees in the immutable initialized newlib forbidden range before the redundant slab lock/search; generic ownership/lease/Vorbis/free validation and all allocator policies are unchanged" OFF)
+option(ISAAC_VITA_HEAP_FREE_PREFILTER
+       "Guest free: one range test against the published OGG-emergency/ANM2/texel blocks skips their three free routes for every pointer outside all of them (each would return NOT_HANDLED without side effects); routes, results and faults unchanged" OFF)
 option(ISAAC_VITA_ROOM_ENTRY_HYBRID
        "Extend the RoomConfig Entry slab with bounded lazy USER_RW chunks" OFF)
 option(ISAAC_VITA_GUEST_STACK_GUARD
        "Range-check generated synthetic-stack operations" ON)
+option(ISAAC_VITA_GUEST_STACK_MEMBLOCK
+       "Back the 4 MiB guest stack with a dedicated USER_RW memblock (0x401000 request) instead of newlib memalign; OFF keeps guest.c/entry_vita.c byte-identical" OFF)
 option(ISAAC_VITA_MEMORY_RANGE_GUARD
        "Validate catastrophic guest movers against Vita memblock bounds" OFF)
 option(ISAAC_VITA_CLOCK_BOOST
@@ -1433,14 +2384,55 @@ if(ISAAC_VITA_KAGE_REFCOUNT_SEAM AND
     "ISAAC_VITA_KAGE_REFCOUNT_SEAM requires ISAAC_VITA_TRANSLATED_CPU=ON and "
     "ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL=ON (GUEST_FLAGS_LOCAL=1 corpus)")
 endif()
+if(ISAAC_VITA_RENDER_CHAIN_NATIVE AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_TRANSLATED_CPU OR
+    NOT ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL))
+  # The replay writes nothing to c->fl, like the camera ring replay.
+  message(FATAL_ERROR
+    "ISAAC_VITA_RENDER_CHAIN_NATIVE requires the generated guest runtime, "
+    "ISAAC_VITA_TRANSLATED_CPU and ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL=ON")
+endif()
+if(ISAAC_VITA_HASCOLLECTIBLE_NATIVE AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_TRANSLATED_CPU OR
+    NOT ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL))
+  # The replay writes nothing to c->fl, like the render chain replay; the
+  # TU carries the same #error and receives the mirrored define below.
+  message(FATAL_ERROR
+    "ISAAC_VITA_HASCOLLECTIBLE_NATIVE requires the generated guest runtime, "
+    "ISAAC_VITA_TRANSLATED_CPU and ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL=ON")
+endif()
+if(ISAAC_VITA_CAMERA_RING_NATIVE AND NOT ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL)
+  # The replay writes nothing to c->fl; the translated body's ucomiss/test/add
+  # producers stay in a body local only in the GUEST_FLAGS_LOCAL=1 corpus.
+  # The replay TU carries the same #error.
+  message(FATAL_ERROR
+    "ISAAC_VITA_CAMERA_RING_NATIVE requires ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL=ON")
+endif()
 option(ISAAC_VITA_TRANSLATED_CPU_LEAF_INLINE
        "TRANSLATED_CPU: at direct call sites of proven tiny leaf callees compile the copied statements instead of the C call (GUEST_LEAF_INLINE=1; the corpus carries both spellings, OFF selects the call by relink)" ON)
 option(ISAAC_VITA_TRANSLATED_CPU_SSE_LOWER
        "TRANSLATED_CPU: expand the emitter's GUEST_XMM_* tokens to NEON vector operations and direct float relations (GUEST_SSE_LOWER=1); OFF spells the legacy lane loops" OFF)
 option(ISAAC_VITA_TRANSLATED_CPU_F32_VFP
        "TRANSLATED_CPU: scalar float guest loads and stores (guest.h ldf/stf: movss, addss/mulss/comiss/... memory operands, fld/fstp dword) as VFP vldr/vstr behind a word-alignment test (GUEST_F32_VFP_ACCESS=1); OFF keeps the memcpy pun (ldr/str + vmov core<->VFP transfers). Header-only, no corpus change; turn ON in perf builds" OFF)
+option(ISAAC_VITA_TRANSLATED_CPU_GPR_FLUSH_MASK
+  "TRANSLATED_CPU + GPR_LOCAL: GUEST_GPR_FLUSH_MASK(c, m) stores only the registers that may be dirty (GUEST_GPR_FLUSH_MASKED=1). Needs a corpus generated with GUEST_GPR_FLUSH_MASK=1 (recomp/gpr_flush_mask.py); OFF compiles the same corpus to the old full publication" OFF)
 option(ISAAC_VITA_TRANSLATED_CPU_COLD_REST
        "TRANSLATED_CPU: mark every translated function outside the hot set cold (-Os, .text.unlikely)" OFF)
+if(ISAAC_VITA_LUA_BINDING_REPLAY AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_TRANSLATED_CPU OR
+    NOT ISAAC_VITA_TRANSLATED_CPU_GPR_LOCAL OR
+    NOT ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL OR
+    ISAAC_VITA_GUEST_STACK_GUARD OR ISAAC_VITA_STALL_PROBE))
+  # The mirrors are the corpus text of the GUEST_GPR_LOCAL=1 /
+  # GUEST_FLAGS_LOCAL=1 / raw-stack units (the host oracle proves exactly
+  # those modes), and an emulated crossing records none of the dispatch
+  # breadcrumbs ISAAC_VITA_STALL_PROBE reads.  The TU repeats the checks.
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_BINDING_REPLAY requires the generated guest runtime, "
+    "ISAAC_VITA_TRANSLATED_CPU=ON with TRANSLATED_CPU_GPR_LOCAL=ON and "
+    "TRANSLATED_CPU_FLAGS_LOCAL=ON, ISAAC_VITA_GUEST_STACK_GUARD=OFF and "
+    "ISAAC_VITA_STALL_PROBE=OFF")
+endif()
 option(ISAAC_VITA_LAYOUT_HUB
        "Link .text as [cold generated half A][hot region + runtime + libraries][cold half B] from a generated GNU ld script so no Thumb-2 BL/B.W needs an ARM-state long-branch veneer (pure placement, objects untouched)" OFF)
 set(ISAAC_VITA_LAYOUT_HUB_ORDER
@@ -1547,6 +2539,9 @@ if(ISAAC_VITA_HEAP_OVERFLOW_MSPACE AND
     "ISAAC_VITA_HEAP_MB=81, HEAP_LEDGER_MEMBLOCK=ON and "
     "HEAP_LEDGER_BACKSHIFT=ON")
 endif()
+include("${ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES_MODULE}")
+isaac_validate_heap_overflow_mspace_bytes(
+  "${ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES}" "${ISAAC_VITA_HEAP_OVERFLOW_MSPACE}")
 if(ISAAC_VITA_HEAP_TERMINAL_FASTPATH AND
    (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_HEAP_OVERFLOW_MSPACE))
   message(FATAL_ERROR
@@ -1566,6 +2561,29 @@ if(ISAAC_VITA_ROOM_ENTRY_HYBRID AND
     "ISAAC_VITA_ROOM_ENTRY_SLAB=ON and "
     "ISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON")
 endif()
+if(ISAAC_VITA_HEAP_STAGE_PROFILE AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_PHASE_PROFILE OR
+    NOT ISAAC_VITA_HEAP_OVERFLOW_MSPACE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_HEAP_STAGE_PROFILE requires translated runtime, PHASE_PROFILE and HEAP_OVERFLOW_MSPACE")
+endif()
+if(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_ROOM_ENTRY_SLAB OR
+    NOT ISAAC_VITA_HEAP_OVERFLOW_MSPACE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH requires translated runtime, ROOM_ENTRY_SLAB and HEAP_OVERFLOW_MSPACE")
+endif()
+option(ISAAC_VITA_HEAP_FREE_COST_PROFILE
+       "Profiling: ph120.hg splits the free ledger span g into lookup/lease/remove 1-in-64 sub-spans plus exact probe/scan/move counts; ph120.hv counts free-prefilter decisions and the Vorbis observer's live slots. Ledger behaviour unchanged" OFF)
+if(ISAAC_VITA_HEAP_FREE_COST_PROFILE AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_HEAP_STAGE_PROFILE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_HEAP_FREE_COST_PROFILE extends ISAAC_VITA_HEAP_STAGE_PROFILE (translated runtime, PHASE_PROFILE, HEAP_OVERFLOW_MSPACE)")
+endif()
+if(ISAAC_VITA_HEAP_FREE_PREFILTER AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_HEAP_FREE_PREFILTER requires the translated runtime (the OGG emergency module that exports its range record)")
+endif()
 
 if(ISAAC_VITA_IO_PROFILE AND
    (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
@@ -1575,6 +2593,10 @@ endif()
 if(ISAAC_VITA_MEMORY_RANGE_GUARD AND ISAAC_VITA_SCAFFOLD_ONLY)
   message(FATAL_ERROR
     "ISAAC_VITA_MEMORY_RANGE_GUARD requires the translated guest runtime")
+endif()
+if(ISAAC_VITA_GUEST_STACK_MEMBLOCK AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_GUEST_STACK_MEMBLOCK requires the translated runtime")
 endif()
 if(ISAAC_VITA_STALL_PROBE AND NOT ISAAC_VITA_KAGE)
   message(FATAL_ERROR "ISAAC_VITA_STALL_PROBE requires ISAAC_VITA_KAGE=ON")
@@ -1588,11 +2610,31 @@ endif()
 if(ISAAC_VITA_LOG_ASYNC_FILE_BATCH AND NOT ISAAC_VITA_LOG_ASYNC)
   message(FATAL_ERROR "ISAAC_VITA_LOG_ASYNC_FILE_BATCH requires ISAAC_VITA_LOG_ASYNC=ON")
 endif()
+if(ISAAC_VITA_LOG_ASYNC_PRINTF_FILE AND NOT ISAAC_VITA_LOG_ASYNC)
+  message(FATAL_ERROR "ISAAC_VITA_LOG_ASYNC_PRINTF_FILE requires ISAAC_VITA_LOG_ASYNC=ON")
+endif()
 if(NOT ISAAC_VITA_LOG_ASYNC_RING_KB MATCHES "^[1-9][0-9]*$" OR
    ISAAC_VITA_LOG_ASYNC_RING_KB LESS 4)
   message(FATAL_ERROR
     "ISAAC_VITA_LOG_ASYNC_RING_KB must be an integer >= 4 (KiB), got "
     "'${ISAAC_VITA_LOG_ASYNC_RING_KB}'")
+endif()
+if(ISAAC_VITA_GAME_LOG_ASYNC AND NOT ISAAC_VITA_LOG_ASYNC)
+  # The abort/assert drain hooks __wrap_abort, whose only owner is the
+  # asynchronous runtime logger.
+  message(FATAL_ERROR "ISAAC_VITA_GAME_LOG_ASYNC requires ISAAC_VITA_LOG_ASYNC=ON")
+endif()
+if(NOT ISAAC_VITA_GAME_LOG_ASYNC_RING_KB MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_GAME_LOG_ASYNC_RING_KB LESS 32 OR
+   ISAAC_VITA_GAME_LOG_ASYNC_RING_KB GREATER 1024)
+  message(FATAL_ERROR
+    "ISAAC_VITA_GAME_LOG_ASYNC_RING_KB must be an integer in 32..1024: "
+    "${ISAAC_VITA_GAME_LOG_ASYNC_RING_KB}")
+endif()
+if(NOT ISAAC_VITA_GAME_LOG_ASYNC_DURABLE_SEVERITY MATCHES "^[0-4]$")
+  message(FATAL_ERROR
+    "ISAAC_VITA_GAME_LOG_ASYNC_DURABLE_SEVERITY must be 0..4: "
+    "${ISAAC_VITA_GAME_LOG_ASYNC_DURABLE_SEVERITY}")
 endif()
 if(ISAAC_VITA_PHASE_PROFILE AND
    (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
@@ -1721,9 +2763,21 @@ if(ISAAC_VITA_GUEST_SAMPLER AND NOT ISAAC_VITA_PHASE_PROFILE)
   message(FATAL_ERROR
     "ISAAC_VITA_GUEST_SAMPLER requires ISAAC_VITA_PHASE_PROFILE=ON")
 endif()
+if(ISAAC_VITA_GPU_FRAME_PROFILE AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE OR
+    NOT ISAAC_VITA_PHASE_PROFILE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_GPU_FRAME_PROFILE requires the KAGE runtime and ISAAC_VITA_PHASE_PROFILE=ON")
+endif()
 if(ISAAC_VITA_PROFILE_FUNCTION_ENTRIES AND NOT ISAAC_VITA_PHASE_PROFILE)
   message(FATAL_ERROR
     "ISAAC_VITA_PROFILE_FUNCTION_ENTRIES requires ISAAC_VITA_PHASE_PROFILE=ON")
+endif()
+if(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS AND NOT ISAAC_VITA_GUEST_SAMPLER)
+  # The phase word, the census rows and the ph120.fe reporter live in the
+  # sampler TU (which itself requires KAGE and PHASE_PROFILE).
+  message(FATAL_ERROR
+    "ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS requires ISAAC_VITA_GUEST_SAMPLER=ON")
 endif()
 if(ISAAC_VITA_PROFILE_FUNCTION_ENTRIES AND NOT ISAAC_VITA_PROFILE_IMPORT_KINDS)
   # ent= is printed only by the ph120.ik record the census owns; without it
@@ -1754,6 +2808,17 @@ if(ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE AND NOT ISAAC_VITA_STOCK_FBO_RT_REUSE
   message(FATAL_ERROR "ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE requires ISAAC_VITA_STOCK_FBO_RT_REUSE=ON")
 endif()
 message(STATUS "Isaac Vita offscreen RT interlude reuse: ${ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE} (same owner, existing spare, unchanged deadline)")
+if(ISAAC_VITA_VITAGL_SCENE_GUARD AND NOT ISAAC_VITA_VITAGL_STOCK_REFERENCE)
+  message(FATAL_ERROR "ISAAC_VITA_VITAGL_SCENE_GUARD requires ISAAC_VITA_VITAGL_STOCK_REFERENCE=ON")
+endif()
+if(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD AND NOT ISAAC_VITA_VITAGL_STOCK_REFERENCE)
+  message(FATAL_ERROR "ISAAC_VITA_VITAGL_RGB_SUBUPLOAD requires ISAAC_VITA_VITAGL_STOCK_REFERENCE=ON")
+endif()
+if(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE AND
+   (NOT ISAAC_VITA_KAGE OR NOT ISAAC_VITA_VITAGL_STOCK_REFERENCE))
+  message(FATAL_ERROR "ISAAC_VITA_VITAGL_INTENSITY_TEXTURE requires KAGE=ON and VITAGL_STOCK_REFERENCE=ON")
+endif()
+message(STATUS "Isaac Vita vitaGL scene guard: ${ISAAC_VITA_VITAGL_SCENE_GUARD} (0034: no clear/scissor-mask uniform writes or draws without an open GXM scene)")
 if(ISAAC_VITA_STOCK_FBO_RT_REUSE_LEASE)
   message(STATUS "Isaac Vita offscreen RT reuse: ON (EXPERIMENTAL one owner, one extra purge rotation, original-deadline-witnessed pressure drain)")
 else()
@@ -1852,6 +2917,21 @@ if((ISAAC_VITA_FBO_RASTER_SCALE OR ISAAC_VITA_FBO_CLEAR_ELISION) AND
   message(FATAL_ERROR
     "ISAAC_VITA_FBO_RASTER_SCALE / ISAAC_VITA_FBO_CLEAR_ELISION require the translated KAGE runtime")
 endif()
+if(ISAAC_VITA_FBO_READBACK_FIX AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_FBO_READBACK_FIX requires the translated KAGE runtime")
+endif()
+if(ISAAC_VITA_FBO_DEPTH_CARRY AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_FBO_DEPTH_CARRY requires the translated KAGE runtime")
+endif()
+if(ISAAC_VITA_DISPLAY_CENTER_Y AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_DISPLAY_CENTER_Y requires the translated KAGE runtime")
+endif()
 if(ISAAC_VITA_FBO_RASTER_SCALE)
   if(NOT ISAAC_VITA_FBO_RASTER_SCALE_NUM MATCHES "^[1-9][0-9]*$" OR
      NOT ISAAC_VITA_FBO_RASTER_SCALE_DEN MATCHES "^[1-9][0-9]*$" OR
@@ -1920,6 +3000,15 @@ if(ISAAC_VITA_TEXEL_SCRATCH_8M AND NOT ISAAC_VITA_TEXEL_SCRATCH)
   message(FATAL_ERROR
     "ISAAC_VITA_TEXEL_SCRATCH_8M requires ISAAC_VITA_TEXEL_SCRATCH=ON")
 endif()
+if(ISAAC_VITA_TEXEL_SCRATCH_32M AND NOT ISAAC_VITA_TEXEL_SCRATCH)
+  message(FATAL_ERROR
+    "ISAAC_VITA_TEXEL_SCRATCH_32M requires ISAAC_VITA_TEXEL_SCRATCH=ON")
+endif()
+if(ISAAC_VITA_TEXEL_SCRATCH_32M AND ISAAC_VITA_TEXEL_SCRATCH_8M)
+  message(FATAL_ERROR
+    "ISAAC_VITA_TEXEL_SCRATCH_32M and ISAAC_VITA_TEXEL_SCRATCH_8M select "
+    "one texel scratch capacity each; enable at most one")
+endif()
 if(ISAAC_VITA_TEXTURE_ALIGN8_POLICY AND NOT ISAAC_VITA_KAGE)
   message(FATAL_ERROR
     "ISAAC_VITA_TEXTURE_ALIGN8_POLICY requires ISAAC_VITA_KAGE=ON")
@@ -1933,6 +3022,15 @@ if(ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE AND
    (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
   message(FATAL_ERROR
     "ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE requires the translated KAGE runtime")
+endif()
+if(ISAAC_VITA_EFFECTS_PROFILE_WATER AND NOT ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_EFFECTS_PROFILE_WATER requires ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE=ON")
+endif()
+if(ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER AND
+   NOT ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER requires ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE=ON")
 endif()
 if(ISAAC_VITA_PILL_BLOOM_BYPASS AND
    (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
@@ -2022,6 +3120,10 @@ if(ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH AND
     "ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH requires translated KAGE and "
     "ISAAC_VITA_HEAP_OVERFLOW_MSPACE=ON")
 endif()
+if(ISAAC_VITA_INFLATE_TABLE_MEMO AND NOT ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH)
+  message(FATAL_ERROR
+    "ISAAC_VITA_INFLATE_TABLE_MEMO requires ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH=ON")
+endif()
 if(ISAAC_VITA_WAV_BUFFERED_REWIND AND
    (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE OR
     NOT ISAAC_VITA_HEAP_OVERFLOW_MSPACE))
@@ -2040,6 +3142,38 @@ if(ISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH AND NOT ISAAC_VITA_ARCHIVE_XOR_FASTPATH
   message(FATAL_ERROR
     "ISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH requires ISAAC_VITA_ARCHIVE_XOR_FASTPATH=ON")
 endif()
+if(ISAAC_VITA_THEORA_PRECACHE_FRAMES GREATER 0 AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_THEORA_PRECACHE_FRAMES requires the translated KAGE runtime")
+endif()
+if(ISAAC_VITA_THEORA_WORKER_PUMP GREATER 0 AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_THEORA_WORKER_PUMP requires the translated KAGE runtime")
+endif()
+if(ISAAC_VITA_THEORA_CADENCE_PROFILE AND
+   (NOT ISAAC_VITA_NATIVE_THEORA OR NOT ISAAC_VITA_FULLSPEED_SCHEDULER OR
+    NOT ISAAC_VITA_THEORA_WORKER_PUMP GREATER 0))
+  message(FATAL_ERROR
+    "ISAAC_VITA_THEORA_CADENCE_PROFILE requires NATIVE_THEORA=ON, THEORA_WORKER_PUMP>0 and FULLSPEED_SCHEDULER=ON")
+endif()
+if(ISAAC_VITA_THEORA_RENDER_PRIORITY AND
+   (NOT ISAAC_VITA_FULLSPEED_SCHEDULER OR
+    NOT ISAAC_VITA_THEORA_WORKER_PUMP GREATER 0))
+  message(FATAL_ERROR
+    "ISAAC_VITA_THEORA_RENDER_PRIORITY requires THEORA_WORKER_PUMP>0 and FULLSPEED_SCHEDULER=ON")
+endif()
+if(ISAAC_VITA_UNIFORM_SET_RECEIPT AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_UNIFORM_SET_RECEIPT requires the translated KAGE runtime")
+endif()
+if(ISAAC_VITA_ARCHIVE_READ_TRAIL AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_ARCHIVE_READ_TRAIL requires the translated KAGE runtime")
+endif()
 if(ISAAC_VITA_POOP_FX_SINGLE_CLOUD AND NOT ISAAC_VITA_POOP_FX_PROFILE)
   message(FATAL_ERROR
     "ISAAC_VITA_POOP_FX_SINGLE_CLOUD requires ISAAC_VITA_POOP_FX_PROFILE=ON for proof counters")
@@ -2056,6 +3190,30 @@ endif()
 if(ISAAC_VITA_ANM2_MISSING_LAYER_GUARD AND ISAAC_VITA_SCAFFOLD_ONLY)
   message(FATAL_ERROR
     "ISAAC_VITA_ANM2_MISSING_LAYER_GUARD requires the translated guest runtime")
+endif()
+if(ISAAC_VITA_BACKDROP_WATERGFX_GUARD AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_BACKDROP_WATERGFX_GUARD requires the translated guest runtime")
+endif()
+if(ISAAC_VITA_INTRO_PLAY AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_INTRO_PLAY requires the translated guest runtime")
+endif()
+if(ISAAC_VITA_TROPHIES AND ISAAC_VITA_SCAFFOLD_ONLY)
+  message(FATAL_ERROR
+    "ISAAC_VITA_TROPHIES requires the translated guest runtime")
+endif()
+if(ISAAC_VITA_TROPHIES AND NOT ISAAC_VITA_KAGE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_TROPHIES requires ISAAC_VITA_KAGE=ON (the setup dialogs run in the KAGE vitaGL backend)")
+endif()
+if(ISAAC_VITA_TROPHY_TEST_REQUEST AND NOT ISAAC_VITA_TROPHIES)
+  message(FATAL_ERROR
+    "ISAAC_VITA_TROPHY_TEST_REQUEST requires ISAAC_VITA_TROPHIES=ON")
+endif()
+if(NOT "${ISAAC_VITA_TROPHY_PACK_DIR}" STREQUAL "" AND NOT ISAAC_VITA_TROPHIES)
+  message(FATAL_ERROR
+    "ISAAC_VITA_TROPHY_PACK_DIR requires ISAAC_VITA_TROPHIES=ON")
 endif()
 if(ISAAC_VITA_RENDERFRAME_FASTPATH AND
    (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
@@ -2295,6 +3453,32 @@ if(ISAAC_VITA_KAGE)
       "${CMAKE_CURRENT_BINARY_DIR}/isaac-vitagl-fbo-rt-interlude-reuse.mode")
   file(GENERATE OUTPUT "${ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE_MODE_FILE}"
        CONTENT "${ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE_MODE}\n")
+  if(ISAAC_VITA_VITAGL_SCENE_GUARD)
+    set(ISAAC_VITA_VITAGL_SCENE_GUARD_MODE 1)
+  else()
+    set(ISAAC_VITA_VITAGL_SCENE_GUARD_MODE 0)
+  endif()
+  set(ISAAC_VITA_VITAGL_SCENE_GUARD_MODE_FILE
+      "${CMAKE_CURRENT_BINARY_DIR}/isaac-vitagl-scene-guard.mode")
+  file(GENERATE OUTPUT "${ISAAC_VITA_VITAGL_SCENE_GUARD_MODE_FILE}"
+       CONTENT "${ISAAC_VITA_VITAGL_SCENE_GUARD_MODE}\n")
+  if(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD)
+    set(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD_MODE 1)
+  else()
+    set(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD_MODE 0)
+  endif()
+  set(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD_MODE_FILE
+      "${CMAKE_CURRENT_BINARY_DIR}/isaac-vitagl-rgb-subupload.mode")
+  file(GENERATE OUTPUT "${ISAAC_VITA_VITAGL_RGB_SUBUPLOAD_MODE_FILE}"
+       CONTENT "${ISAAC_VITA_VITAGL_RGB_SUBUPLOAD_MODE}\n")
+  set(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE 0)
+  if(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE)
+    set(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE 1)
+  endif()
+  set(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE_FILE
+      "${CMAKE_CURRENT_BINARY_DIR}/isaac-vitagl-intensity-texture.mode")
+  file(GENERATE OUTPUT "${ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE_FILE}"
+       CONTENT "${ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE}\n")
   if(ISAAC_VITA_NATIVE_RESOURCE_PROFILE)
     set(ISAAC_VITA_NATIVE_RESOURCE_PROFILE_MODE 1)
   else()
@@ -2580,6 +3764,9 @@ if(ISAAC_VITA_KAGE)
               "ISAAC_FBO_RT_REUSE=${ISAAC_VITA_STOCK_FBO_RT_REUSE_MODE}"
               "ISAAC_FBO_RT_REUSE_LEASE=${ISAAC_VITA_STOCK_FBO_RT_REUSE_LEASE_MODE}"
               "ISAAC_FBO_RT_INTERLUDE_REUSE=${ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE_MODE}"
+              "ISAAC_SCENE_GUARD=${ISAAC_VITA_VITAGL_SCENE_GUARD_MODE}"
+              "ISAAC_RGB_SUBUPLOAD=${ISAAC_VITA_VITAGL_RGB_SUBUPLOAD_MODE}"
+              "ISAAC_INTENSITY_TEXTURE=${ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE}"
               "ISAAC_FBO_RT_SCENES=${ISAAC_VITA_STOCK_FBO_RT_SCENES_MODE}"
               "ISAAC_COLOROFFSET_FS_PROBE=${ISAAC_VITA_COLOROFFSET_FS_PROBE_MODE}"
               "ISAAC_COLOROFFSET_STAGING_PROOF=${ISAAC_VITA_COLOROFFSET_STAGING_PROOF_MODE}"
@@ -2650,6 +3837,14 @@ if(ISAAC_VITA_KAGE)
         "${CMAKE_CURRENT_SOURCE_DIR}/vitagl-stock-reference/0024-isaac-fbo-rt-bounded-lease.patch"
         "${ISAAC_VITA_STOCK_FBO_RT_INTERLUDE_REUSE_MODE_FILE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/vitagl-stock-reference/0033-isaac-fbo-rt-interlude-reuse.patch"
+        "${ISAAC_VITA_VITAGL_SCENE_GUARD_MODE_FILE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vitagl-stock-reference/0034-isaac-scene-guard.patch"
+        "${ISAAC_VITA_VITAGL_RGB_SUBUPLOAD_MODE_FILE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vitagl-stock-reference/0035-isaac-rgb-subupload.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vitagl-stock-reference/isaac_rgb_subupload.h"
+        "${ISAAC_VITA_VITAGL_INTENSITY_TEXTURE_MODE_FILE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vitagl-stock-reference/0037-isaac-intensity-texture.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vitagl-stock-reference/isaac_intensity_texture.h"
         "${ISAAC_VITA_VITAGL_FBO_RT_SCENES_PATCH}"
         "${ISAAC_VITA_STOCK_FBO_RT_SCENES_MODE_FILE}"
         "${ISAAC_VITA_COLOROFFSET_FS_PROBE_PATCH}"
@@ -2713,7 +3908,7 @@ if(ISAAC_VITA_KAGE)
         "${ISAAC_VITA_LASER_ATLAS_NEAREST_MODE_FILE}"
         "${ISAAC_VITA_LASER_ATLAS_NEAREST_PATCH}"
         "${ISAAC_VITA_LASER_ATLAS_NEAREST_POLICY}"
-      COMMENT "Building pinned stock vitaGL 73dd57a with gpu-draw=${ISAAC_VITA_VITAGL_GPU_DRAW_OPTIMIZATIONS_MODE}, shader-cache=${ISAAC_VITA_VITAGL_SHADER_CACHE_MODE}, quad=${ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY_MODE}, state=${ISAAC_VITA_GXM_STATE_SHADOW_MODE}, coloroffset=${ISAAC_VITA_COLOROFFSET_GPU_OPTIMIZATIONS_MODE}, profile=${ISAAC_VITA_PHASE_PROFILE_MODE}, gl-time=${ISAAC_VITA_GL_TIME_PROFILE_MODE}, fbo-rt-scenes=${ISAAC_VITA_STOCK_FBO_RT_SCENES_MODE}, coloroffset-fs-probe=${ISAAC_VITA_COLOROFFSET_FS_PROBE_MODE}, staging-proof=${ISAAC_VITA_COLOROFFSET_STAGING_PROOF_MODE}, p8-safe=${ISAAC_VITA_VITAGL_P8_SAFE_UPLOAD_MODE}, laser-p8=${ISAAC_VITA_LASER_ATLAS_P8_MODE}, fbo-valid-region=${ISAAC_VITA_STOCK_FBO_VALID_REGION_PATCH_MODE}"
+      COMMENT "Building pinned stock vitaGL 73dd57a with gpu-draw=${ISAAC_VITA_VITAGL_GPU_DRAW_OPTIMIZATIONS_MODE}, shader-cache=${ISAAC_VITA_VITAGL_SHADER_CACHE_MODE}, quad=${ISAAC_VITA_CANONICAL_QUAD_ZERO_COPY_MODE}, state=${ISAAC_VITA_GXM_STATE_SHADOW_MODE}, coloroffset=${ISAAC_VITA_COLOROFFSET_GPU_OPTIMIZATIONS_MODE}, profile=${ISAAC_VITA_PHASE_PROFILE_MODE}, gl-time=${ISAAC_VITA_GL_TIME_PROFILE_MODE}, fbo-rt-scenes=${ISAAC_VITA_STOCK_FBO_RT_SCENES_MODE}, coloroffset-fs-probe=${ISAAC_VITA_COLOROFFSET_FS_PROBE_MODE}, staging-proof=${ISAAC_VITA_COLOROFFSET_STAGING_PROOF_MODE}, p8-safe=${ISAAC_VITA_VITAGL_P8_SAFE_UPLOAD_MODE}, laser-p8=${ISAAC_VITA_LASER_ATLAS_P8_MODE}, fbo-valid-region=${ISAAC_VITA_STOCK_FBO_VALID_REGION_PATCH_MODE}, scene-guard=${ISAAC_VITA_VITAGL_SCENE_GUARD_MODE}"
       VERBATIM USES_TERMINAL)
   else()
     # Compile and consume the existing diagnostic overlay without mutating
@@ -2842,6 +4037,14 @@ set(ISAAC_VPK_LIVEAREA_FILES
        "sce_sys/livearea/contents/nicalis.png"
   FILE "${ISAAC_VITA_PACKAGE_ASSETS_DIR}/livearea/contents/startup.png"
        "sce_sys/livearea/contents/startup.png"
+  FILE "${ISAAC_VITA_PACKAGE_ASSETS_DIR}/livearea/contents/1.png"
+       "sce_sys/livearea/contents/1.png"
+  FILE "${ISAAC_VITA_PACKAGE_ASSETS_DIR}/livearea/contents/2.png"
+       "sce_sys/livearea/contents/2.png"
+  FILE "${ISAAC_VITA_PACKAGE_ASSETS_DIR}/livearea/contents/3.png"
+       "sce_sys/livearea/contents/3.png"
+  FILE "${ISAAC_VITA_PACKAGE_ASSETS_DIR}/livearea/contents/4.png"
+       "sce_sys/livearea/contents/4.png"
   FILE "${ISAAC_VITA_PACKAGE_ASSETS_DIR}/livearea/contents/template.xml"
        "sce_sys/livearea/contents/template.xml")
 set(ISAAC_VPK_MANAGER_FILE
@@ -2880,6 +4083,185 @@ target_link_libraries(isaac_manager PRIVATE
   SceKernelThreadMgr_stub
   SceLibKernel_stub)
 
+# Opt-in: the manager backs up and restores gamestateN.dat (the slot's run
+# state) together with persistentgamedataN.dat under one backup index. OFF
+# leaves every manager object byte-identical: the definition is per-target
+# (manager_storage.h changes struct manager_save_slot / manager_save_backup
+# under it, so every TU of isaac_manager - the settings units added below
+# included - must see one layout) and every edit sits under
+# #if defined(ISAAC_VITA_MANAGER_SAVE_GAMESTATE).  tools/build_vita.py
+# --manager-save-gamestate; release/v0.1.1-alpha.cmake pins it OFF.
+option(ISAAC_VITA_MANAGER_SAVE_GAMESTATE
+       "Manager backs up and restores gamestateN.dat with each save slot" OFF)
+if(ISAAC_VITA_MANAGER_SAVE_GAMESTATE)
+  target_compile_definitions(isaac_manager PRIVATE
+    ISAAC_VITA_MANAGER_SAVE_GAMESTATE=1)
+  message(STATUS
+    "Isaac Vita manager save slots: persistentgamedataN.dat + gamestateN.dat "
+    "pairs (slotN-NNNN.dat + slotN-NNNN.gamestate.dat)")
+endif()
+
+# Opt-in: the ISAAC SETTINGS page (one manager page: the FPS LOCK row,
+# SAVE / DEFAULTS / UNDO over
+# ux0:/data/isaacr001/port.ini).  It needs a game that reads the file, hence
+# the FATAL below; an eboot-only deploy is still detected at run time from
+# the last boot log (GAME BUILD IGNORES PORT.INI).  OFF leaves every manager
+# object byte-identical: the units are added with target_sources() after the
+# pinned add_executable() text, the definition is per-target and every edit
+# in manager_main.c / manager_storage.c sits under its #if defined() fence.
+option(ISAAC_VITA_MANAGER_SETTINGS_UI
+       "Manager shows the ISAAC SETTINGS page (FPS LOCK) and writes ux0:/data/isaacr001/port.ini" OFF)
+if(ISAAC_VITA_MANAGER_SETTINGS_UI AND NOT ISAAC_VITA_RUNTIME_SETTINGS)
+  message(FATAL_ERROR
+    "ISAAC_VITA_MANAGER_SETTINGS_UI requires ISAAC_VITA_RUNTIME_SETTINGS=ON (the game must read port.ini)")
+endif()
+if(ISAAC_VITA_MANAGER_SETTINGS_UI)
+  target_sources(isaac_manager PRIVATE
+    manager_settings.c
+    manager_settings_ui.c
+    "${ISAAC_RUNTIME}/host_vita_settings_parse.c")
+  target_compile_definitions(isaac_manager PRIVATE MANAGER_SETTINGS_UI=1)
+  target_include_directories(isaac_manager PRIVATE "${ISAAC_RUNTIME}")
+  message(STATUS
+    "Isaac Vita manager settings page: enabled (port.ini FPS LOCK; "
+    "SAVE / DEFAULTS / UNDO through .manager-backups/port-NNNN.ini)")
+endif()
+
+# --- manager UI2 ------------------------------------------------------------
+# Opt-in: the manager's pages HOME / MODS / SAVES / SETTINGS / ACHIEVEMENTS /
+# CONTROLS / ABOUT in a proportional DejaVu font with Cyrillic, themes
+# game / dark / light and lang auto / en / ru from
+# ux0:/data/isaacr001/manager.ini.  It reuses the settings page model, hence
+# the FATAL below.  The three font atlases and the DejaVu licence ship in the
+# VPK only when this is ON (ISAAC_VPK_MANAGER_ASSET_FILES is empty OFF).  OFF
+# leaves every manager object byte-identical: the units are added with
+# target_sources() after the pinned add_executable() text, the definitions
+# are per-target and every manager_main.c edit sits under an
+# #if defined(MANAGER_UI2) / #if !defined(MANAGER_UI2) fence.  SceAppUtil is
+# linked for the system language (lang=auto).  tools/build_vita.py
+# --manager-ui2; release/v0.1.1-alpha.cmake pins it OFF.
+option(ISAAC_VITA_MANAGER_UI2
+       "Manager: proportional-font list UI, HOME/MODS/SAVES/SETTINGS/ACHIEVEMENTS/CONTROLS/ABOUT, font atlas shipped in the VPK" OFF)
+if(ISAAC_VITA_MANAGER_UI2 AND NOT ISAAC_VITA_MANAGER_SETTINGS_UI)
+  message(FATAL_ERROR
+    "ISAAC_VITA_MANAGER_UI2 requires ISAAC_VITA_MANAGER_SETTINGS_UI=ON (UI2 reuses the settings page model)")
+endif()
+set(ISAAC_VPK_MANAGER_ASSET_FILES)
+if(ISAAC_VITA_MANAGER_UI2)
+  target_sources(isaac_manager PRIVATE
+    manager_font.c
+    manager_canvas.c
+    manager_theme.c
+    manager_strings.c
+    manager_ui.c
+    manager_ui_draw.c
+    manager_mods_meta.c
+    manager_ini.c
+    manager_assets_vita.c)
+  target_compile_definitions(isaac_manager PRIVATE
+    MANAGER_UI2=1
+    ISAAC_VITA_BUILD_ID=\"${ISAAC_VITA_GUEST_LINK_ID}\"
+    MANAGER_APP_VERSION=\"${ISAAC_APP_VERSION}\")
+  target_link_libraries(isaac_manager PRIVATE
+    SceAppUtil_stub)
+  set(ISAAC_VPK_MANAGER_ASSET_FILES
+    FILE "${CMAKE_CURRENT_SOURCE_DIR}/assets/manager/font-title-24.imf"
+         "manager/font-title-24.imf"
+    FILE "${CMAKE_CURRENT_SOURCE_DIR}/assets/manager/font-body-16.imf"
+         "manager/font-body-16.imf"
+    FILE "${CMAKE_CURRENT_SOURCE_DIR}/assets/manager/font-small-12.imf"
+         "manager/font-small-12.imf"
+    FILE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dejavu/LICENSE"
+         "licenses/dejavu.txt")
+  message(STATUS
+    "Isaac Vita manager UI2: enabled (DejaVu atlases in manager/, themes "
+    "game/dark/light, manager.ini)")
+endif()
+# --- end manager UI2 --------------------------------------------------------
+# --- manager UI2 game skin ------------------------------------------------
+# Sits directly after the ISAAC_VITA_MANAGER_UI2 block and requires it.
+#
+# Opt-in: the manager draws with the game's own menu sheets and Team Meat
+# fonts, read at run time from ux0:/data/isaacr001/resources/packed (nothing
+# of the game is packaged).  The units are the skin itself (theme=game of
+# manager.ini; the light theme and a status line when the files are missing
+# or do not decode), an ARCH000
+# reader, a PNG subset decoder, a BMFont reader, a second copy of the
+# runtime's archive tinfl under its own symbol with a reserved-symbol guard
+# (it #includes the runtime source, hence the runtime include directory; the
+# eboot's object of that source is not affected) and the sceIo blob layer.
+# The decoded art lives in one USER_RW memblock manager_main.c allocates
+# when the skin is first selected.  OFF leaves every manager object
+# byte-identical: the units are added with target_sources() after the pinned
+# add_executable() text, the definition is per-target and the manager_main.c
+# wiring sits under #if defined(MANAGER_UI2_GAME_SKIN).
+# tools/build_vita.py --manager-ui2-game-skin; release/v0.1.1-alpha.cmake
+# pins it OFF.
+option(ISAAC_VITA_MANAGER_UI2_GAME_SKIN
+       "Manager UI2: draw with the game's own menu sheets and Team Meat fonts read from ux0:data/isaacr001/resources/packed; flat skin when they are absent" OFF)
+if(ISAAC_VITA_MANAGER_UI2_GAME_SKIN AND NOT ISAAC_VITA_MANAGER_UI2)
+  message(FATAL_ERROR
+    "ISAAC_VITA_MANAGER_UI2_GAME_SKIN requires ISAAC_VITA_MANAGER_UI2=ON (the game skin draws the UI2 pages)")
+endif()
+if(ISAAC_VITA_MANAGER_UI2_GAME_SKIN)
+  target_sources(isaac_manager PRIVATE
+    manager_skin_game.c
+    manager_arch.c
+    manager_png.c
+    manager_bmfont.c
+    manager_tinfl.c
+    manager_blob_vita.c)
+  target_compile_definitions(isaac_manager PRIVATE MANAGER_UI2_GAME_SKIN=1)
+  target_include_directories(isaac_manager PRIVATE "${ISAAC_RUNTIME}")
+  message(STATUS
+    "Isaac Vita manager game skin: enabled (menu sheets and fonts from "
+    "resources/packed at run time, flat skin fallback)")
+endif()
+# --- end manager UI2 game skin --------------------------------------------
+# --- manager trophy import row ---------------------------------------------
+# Opt-in: the UI2 ACHIEVEMENTS page gets "Grant trophies from save" with a
+# File 1-3 choice.  It writes the game runtime's request file
+# ux0:/data/isaacr001/trophy-import.req (one digit; the trophy-enabled game
+# consumes it at its next start) and shows the last trophy-import.res line.
+# Meant for builds whose game has ISAAC_VITA_TROPHIES on; without it the
+# request simply waits.  No unit is added: the row lives in the UI2 units
+# under #if defined(MANAGER_TROPHY_IMPORT), so OFF leaves every manager
+# object byte-identical.  release/v0.1.1-alpha.cmake pins it OFF.
+option(ISAAC_VITA_MANAGER_TROPHY_IMPORT
+       "Manager UI2: ACHIEVEMENTS row that asks the game to grant trophies from a save slot (trophy-import.req)" OFF)
+if(ISAAC_VITA_MANAGER_TROPHY_IMPORT AND NOT ISAAC_VITA_MANAGER_UI2)
+  message(FATAL_ERROR
+    "ISAAC_VITA_MANAGER_TROPHY_IMPORT requires ISAAC_VITA_MANAGER_UI2=ON (the row is on the UI2 ACHIEVEMENTS page)")
+endif()
+if(ISAAC_VITA_MANAGER_TROPHY_IMPORT)
+  target_compile_definitions(isaac_manager PRIVATE MANAGER_TROPHY_IMPORT=1)
+  message(STATUS
+    "Isaac Vita manager trophy import row: enabled (trophy-import.req / .res)")
+endif()
+# --- end manager trophy import row ----------------------------------------
+# --- manager debug overlay row ---------------------------------------------
+# Opt-in, for debug/test builds: the UI2 SETTINGS page gets "Debug overlay"
+# off / compact / full, saved as the flat port.ini key debug_overlay through
+# the shared parser's generic key API.  The row appears only when the shared
+# port.ini parser knows debug_overlay with exactly those values (default
+# off); with a parser that does not, it stays absent.  No unit is
+# added: the row lives in the UI2 units under
+# #if defined(MANAGER_DEBUG_OVERLAY_ROW), so OFF leaves every manager object
+# byte-identical.  release/v0.1.1-alpha.cmake pins it OFF.
+option(ISAAC_VITA_MANAGER_DEBUG_OVERLAY_ROW
+       "Manager UI2: SETTINGS row for port.ini debug_overlay (off/compact/full; debug builds of the game draw it)" OFF)
+if(ISAAC_VITA_MANAGER_DEBUG_OVERLAY_ROW AND NOT ISAAC_VITA_MANAGER_UI2)
+  message(FATAL_ERROR
+    "ISAAC_VITA_MANAGER_DEBUG_OVERLAY_ROW requires ISAAC_VITA_MANAGER_UI2=ON (the row is on the UI2 SETTINGS page)")
+endif()
+if(ISAAC_VITA_MANAGER_DEBUG_OVERLAY_ROW)
+  target_compile_definitions(isaac_manager PRIVATE MANAGER_DEBUG_OVERLAY_ROW=1)
+  message(STATUS
+    "Isaac Vita manager debug overlay row: enabled (port.ini debug_overlay, "
+    "shown when the settings parser knows the key)")
+endif()
+# --- end manager debug overlay row ----------------------------------------
+
 add_executable(isaac_first_arm_fault
   main.c
   fixed_image.c
@@ -2906,6 +4288,117 @@ if(ISAAC_VITA_LUA)
   isaac_validate_strict_absolute_path(
     "${ISAAC_LUA53_SOURCE_DIR}" "ISAAC_LUA53_SOURCE_DIR")
   include("${CMAKE_CURRENT_SOURCE_DIR}/lua53_vanilla.cmake")
+  if(ISAAC_VITA_LUA_GC_FINALIZER_PACE)
+    # The derived lgc.c takes the pristine one's place in the source list (the
+    # archive member order is part of the raw allocator gate's closure); the
+    # gate re-derives it from the manifest-verified pristine file and refuses
+    # any other bytes.  Includes still resolve through the pristine src dir.
+    if(NOT Python3_EXECUTABLE)
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    endif()
+    set(ISAAC_VITA_LUA_GC_FINALIZER_PACE_SCRIPT
+      "${CMAKE_CURRENT_SOURCE_DIR}/lua53_gc_finalizer_pace.py")
+    set(ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE
+      "${ISAAC_LUA53_SOURCE_DIR}/src/lgc.c")
+    set(ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC
+      "${CMAKE_BINARY_DIR}/lua53-gc-finalizer-pace/lgc.c")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}"
+        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_SCRIPT}"
+        --input "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}"
+        --output "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC}"
+        --max "${ISAAC_VITA_LUA_GC_FINALIZER_MAX}"
+        --cost "${ISAAC_VITA_LUA_GC_FINALIZER_COST}"
+        --sweep-cost "${ISAAC_VITA_LUA_GC_SWEEP_COST}"
+      RESULT_VARIABLE ISAAC_VITA_LUA_GC_FINALIZER_PACE_RESULT
+      OUTPUT_VARIABLE ISAAC_VITA_LUA_GC_FINALIZER_PACE_OUTPUT
+      ERROR_VARIABLE ISAAC_VITA_LUA_GC_FINALIZER_PACE_ERROR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT ISAAC_VITA_LUA_GC_FINALIZER_PACE_RESULT EQUAL 0)
+      message(FATAL_ERROR
+        "ISAAC_VITA_LUA_GC_FINALIZER_PACE: deriving lgc.c failed: "
+        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_ERROR}")
+    endif()
+    list(FIND ISAAC_LUA53_C_SOURCES
+      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}"
+      ISAAC_VITA_LUA_GC_FINALIZER_PACE_INDEX)
+    if(ISAAC_VITA_LUA_GC_FINALIZER_PACE_INDEX LESS 0)
+      message(FATAL_ERROR
+        "ISAAC_VITA_LUA_GC_FINALIZER_PACE: lgc.c is not in the Lua source list")
+    endif()
+    list(REMOVE_AT ISAAC_LUA53_C_SOURCES
+      ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_INDEX})
+    list(INSERT ISAAC_LUA53_C_SOURCES
+      ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_INDEX}
+      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_SCRIPT}"
+      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}")
+    message(STATUS
+      "Isaac Lua: __gc finalizers paced (${ISAAC_VITA_LUA_GC_FINALIZER_PACE_OUTPUT}); "
+      "isaac_lua53 compiles ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC}")
+  endif()
+  if(ISAAC_VITA_LUA_INTEGER2STR)
+    # Same contract as the paced lgc.c above: the derived lobject.c takes the
+    # pristine one's slot in the source list, the raw allocator gate
+    # re-derives it (lua_integer2str_sources) and refuses any other bytes, and
+    # includes still resolve through the pristine src dir.
+    if(NOT Python3_EXECUTABLE)
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    endif()
+    set(ISAAC_VITA_LUA_INTEGER2STR_SCRIPT
+      "${CMAKE_CURRENT_SOURCE_DIR}/lua53_integer2str.py")
+    set(ISAAC_VITA_LUA_INTEGER2STR_PRISTINE
+      "${ISAAC_LUA53_SOURCE_DIR}/src/lobject.c")
+    set(ISAAC_VITA_LUA_INTEGER2STR_LOBJECT
+      "${CMAKE_BINARY_DIR}/lua53-integer2str/lobject.c")
+    set(ISAAC_VITA_LUA_INTEGER2STR_ARGS
+      --input "${ISAAC_VITA_LUA_INTEGER2STR_PRISTINE}"
+      --output "${ISAAC_VITA_LUA_INTEGER2STR_LOBJECT}")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}"
+        "${ISAAC_VITA_LUA_INTEGER2STR_SCRIPT}"
+        ${ISAAC_VITA_LUA_INTEGER2STR_ARGS}
+      RESULT_VARIABLE ISAAC_VITA_LUA_INTEGER2STR_RESULT
+      OUTPUT_VARIABLE ISAAC_VITA_LUA_INTEGER2STR_OUTPUT
+      ERROR_VARIABLE ISAAC_VITA_LUA_INTEGER2STR_ERROR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT ISAAC_VITA_LUA_INTEGER2STR_RESULT EQUAL 0)
+      message(FATAL_ERROR
+        "ISAAC_VITA_LUA_INTEGER2STR: deriving lobject.c failed: "
+        "${ISAAC_VITA_LUA_INTEGER2STR_ERROR}")
+    endif()
+    list(FIND ISAAC_LUA53_C_SOURCES
+      "${ISAAC_VITA_LUA_INTEGER2STR_PRISTINE}"
+      ISAAC_VITA_LUA_INTEGER2STR_INDEX)
+    if(ISAAC_VITA_LUA_INTEGER2STR_INDEX LESS 0)
+      message(FATAL_ERROR
+        "ISAAC_VITA_LUA_INTEGER2STR: lobject.c is not in the Lua source list")
+    endif()
+    list(REMOVE_AT ISAAC_LUA53_C_SOURCES ${ISAAC_VITA_LUA_INTEGER2STR_INDEX})
+    list(INSERT ISAAC_LUA53_C_SOURCES ${ISAAC_VITA_LUA_INTEGER2STR_INDEX}
+      "${ISAAC_VITA_LUA_INTEGER2STR_LOBJECT}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${ISAAC_VITA_LUA_INTEGER2STR_SCRIPT}"
+      "${ISAAC_VITA_LUA_INTEGER2STR_PRISTINE}")
+    # A deleted or stale derived file is rewritten by the build, not only by
+    # a reconfigure; the script rewrites its output when the bytes differ or
+    # it is older than the script or the pristine file, so the rule converges.
+    add_custom_command(
+      OUTPUT "${ISAAC_VITA_LUA_INTEGER2STR_LOBJECT}"
+      COMMAND "${Python3_EXECUTABLE}"
+        "${ISAAC_VITA_LUA_INTEGER2STR_SCRIPT}"
+        ${ISAAC_VITA_LUA_INTEGER2STR_ARGS}
+      DEPENDS
+        "${ISAAC_VITA_LUA_INTEGER2STR_SCRIPT}"
+        "${ISAAC_VITA_LUA_INTEGER2STR_PRISTINE}"
+      COMMENT "Deriving the integer2str Lua 5.3.3 lobject.c"
+      VERBATIM)
+    message(STATUS
+      "Isaac Lua: luaO_tostring integers by digit loop "
+      "(${ISAAC_VITA_LUA_INTEGER2STR_OUTPUT}); "
+      "isaac_lua53 compiles ${ISAAC_VITA_LUA_INTEGER2STR_LOBJECT}")
+  endif()
   # Keep pristine upstream sources in a separate archive.  The production
   # bridge creates both default and guest-allocator states through lua_newstate;
   # therefore lauxlib's private realloc/free luaL_newstate section is dead and
@@ -2914,9 +4407,14 @@ if(ISAAC_VITA_LUA)
   target_include_directories(isaac_lua53 PUBLIC
     "${ISAAC_LUA53_SOURCE_DIR}/src")
   target_compile_features(isaac_lua53 PRIVATE c_std_11)
+  if(ISAAC_VITA_LUA_CORE_ARM)
+    set(ISAAC_LUA53_ISA -marm)
+  else()
+    set(ISAAC_LUA53_ISA -mthumb)
+  endif()
   target_compile_options(isaac_lua53 PRIVATE
     -std=gnu11 -O2
-    -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=softfp -mthumb
+    -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=softfp ${ISAAC_LUA53_ISA}
     -fno-strict-aliasing -ffunction-sections -fdata-sections
     -Wall -Wextra)
 endif()
@@ -3175,14 +4673,21 @@ else()
       # reached RunScript, and the frozen mod loader gates main.lua on an
       # _access probe of disable.it/update.it/main.lua (owner 0x00563120).
       # vita_sync_services.c adds the bounded userspace-mutex wait receipt;
-      # host_vita_lua.c adds the startup beat thread (see the file comments).
+      # host_vita_lua.c adds the startup beat thread (see the file comments);
+      # entry_vita.c stops that thread's guest stack sampling before
+      # guest_stack_free (isaac_vita_lua_beat_stop).
       set_property(SOURCE
         "${ISAAC_RUNTIME}/host_vita_lua.c"
         "${ISAAC_RUNTIME}/host_vita_filesystem.c"
         "${ISAAC_RUNTIME}/vita_sync_services.c"
+        "${ISAAC_RUNTIME}/entry_vita.c"
         APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_RECEIPT=1)
       message(STATUS
         "Isaac Lua: [isaac-lua] load/pcall/access/newstate receipts, startup beat and mutex-wait receipt enabled (bounded)")
+    endif()
+    if(ISAAC_VITA_LUA_CALL_ERROR_CATCH)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_CALL_ERROR_CATCH=1)
     endif()
     if(ISAAC_VITA_LUA_GCSTEP_CLAMP_KB GREATER 0)
       set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
@@ -3214,6 +4719,87 @@ else()
         message(STATUS
           "Isaac Lua: GC profile ([isaac-lua] gc window per 120 LuaEngine::Update steps)")
       endif()
+    endif()
+    if(ISAAC_VITA_LUA_CORE_ARM)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_CORE_ARM=1)
+      message(STATUS "Isaac Lua: Lua 5.3.3 archive compiled in ARM mode")
+    endif()
+    if(ISAAC_VITA_LUA_COST_PROFILE)
+      # Bridge hooks at the pcall import and the callback trampoline; the GC
+      # and allocator edges are link-time wraps of the pristine Lua archive
+      # (references from other Lua objects only, as GNU ld --wrap does).
+      list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+        "${ISAAC_RUNTIME}/host_vita_lua_cost.c")
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_lua.c"
+        "${ISAAC_RUNTIME}/host_vita_lua_cost.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_COST_PROFILE=1)
+      target_link_options(isaac_first_arm_fault PRIVATE
+        -Wl,--wrap=luaC_step
+        -Wl,--wrap=luaM_realloc_)
+      message(STATUS
+        "Isaac Lua: cost profile ([isaac-lua] cost / cost-top per ~2 s window)")
+    endif()
+    if(ISAAC_VITA_LUA_LOADFILE_RETRY)
+      # Link-time retry wrap.  GNU ld --wrap rewrites every
+      # undefined reference to luaL_loadfilex from another object -- the
+      # bridge import (host_vita_lua.c vita_lua_loadfilex_import: require,
+      # include, LuaEngine::RunScript), lbaselib.c loadfile/dofile and
+      # loadlib.c searcher_Lua -- to the retry wrapper; lauxlib.c has no
+      # internal caller.  host_vita_lua.c and every isaac_lua53 member
+      # compile unchanged; kage_vita_loading.c gains one guarded STATS line
+      # at loading-complete.  The probe adds the sceIo wraps (test eboots).
+      list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+        "${ISAAC_RUNTIME}/host_vita_lua_loadfile.c")
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_lua_loadfile.c"
+        "${ISAAC_RUNTIME}/kage_vita_loading.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_LOADFILE_RETRY=1)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua_loadfile.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_LUA_LOADFILE_RETRY_MAX=${ISAAC_VITA_LUA_LOADFILE_RETRY_MAX}U)
+      target_link_options(isaac_first_arm_fault PRIVATE
+        -Wl,--wrap=luaL_loadfilex)
+      message(STATUS
+        "Isaac Lua: luaL_loadfilex read-error retry max=${ISAAC_VITA_LUA_LOADFILE_RETRY_MAX} (KAGE VITA LUA LOADFILE receipts)")
+      if(ISAAC_VITA_LUA_LOADFILE_IO_PROBE)
+        set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua_loadfile.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_LUA_LOADFILE_IO_PROBE=1)
+        if(NOT ISAAC_VITA_LUA_LOADFILE_IO_INJECT STREQUAL "")
+          string(REGEX MATCH "^(.+)@([1-9][0-9]*)$"
+            ISAAC_VITA_LUA_LOADFILE_IO_INJECT_MATCH
+            "${ISAAC_VITA_LUA_LOADFILE_IO_INJECT}")
+          set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua_loadfile.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_LUA_LOADFILE_IO_INJECT_SUFFIX=\"${CMAKE_MATCH_1}\"
+              ISAAC_VITA_LUA_LOADFILE_IO_INJECT_READ=${CMAKE_MATCH_2}U)
+        endif()
+        target_link_options(isaac_first_arm_fault PRIVATE
+          -Wl,--wrap=sceIoOpen
+          -Wl,--wrap=sceIoRead
+          -Wl,--wrap=sceIoClose)
+        message(STATUS
+          "Isaac Lua: luaL_loadfilex IO probe (sceIoOpen/Read/Close wraps, TEST EBOOT ONLY) inject='${ISAAC_VITA_LUA_LOADFILE_IO_INJECT}'")
+      endif()
+    endif()
+    if(ISAAC_VITA_LUA_INTEGER2STR AND ISAAC_VITA_LUA_COST_PROFILE)
+      # Profile builds only: one timed snprintf-vs-digit-loop comparison on
+      # the console at the first LuaEngine state ([isaac-lua] i2s selftest).
+      list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+        "${ISAAC_RUNTIME}/host_vita_lua_integer2str_selftest.c")
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_lua.c"
+        "${ISAAC_RUNTIME}/host_vita_lua_integer2str_selftest.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_LUA_INTEGER2STR_SELFTEST=1)
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_lua_integer2str_selftest.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_LUA_INTEGER2STR_BUILD_ID=\"${ISAAC_VITA_GUEST_LINK_ID}\")
+      message(STATUS
+        "Isaac Lua: integer2str boot self-test ([isaac-lua] i2s selftest)")
     endif()
     if(NOT ISAAC_VITA_LUA_SCOPE_FASTPATH)
       # host_vita_lua.c defaults the macro to 1; only the OFF state needs a
@@ -3319,15 +4905,210 @@ else()
           APPEND PROPERTY COMPILE_DEFINITIONS
             ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY=1)
       endif()
+      if(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+        # Lua 5.3.3 internals (lstate.h, ltable.h, ...) resolve through the
+        # pristine src dir isaac_lua53 already exports.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_lua_getclass.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_LUA_GETCLASS_DIRECT=1)
+      endif()
       target_link_options(isaac_first_arm_fault PRIVATE
         -Wl,--wrap=sub_003f8e30
         -Wl,--wrap=sub_003f8c80)
       message(STATUS
         "Isaac Lua: native Userdata::getClass/getExact seam enabled "
-        "(0x3f8e30/0x3f8c80 wrapped, verify=${ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY})")
+        "(0x3f8e30/0x3f8c80 wrapped, verify=${ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY}, "
+        "direct=${ISAAC_VITA_LUA_GETCLASS_DIRECT})")
     else()
       message(STATUS
         "Isaac Lua: Userdata::getClass/getExact stay translated")
+    endif()
+    if(ISAAC_VITA_LUA_BINDING_REPLAY)
+      # host_vita_lua_binding_table.h (rows and pins, mapped PE bytes) and
+      # host_vita_lua_binding_mirror.h (the corpus text of the replayed
+      # bodies) are game-derived, so they are not tracked: the generator
+      # recomp/vita/lua_binding_replay_table.py writes both from ISAAC_PE_PATH
+      # and ISAAC_GENERATED_DIR into this build tree, and only the replay TU
+      # gets that directory on its include path.  The generator pins both
+      # outputs by sha256 to the text the host oracle verified, so another PE
+      # or corpus fails here instead of compiling an unverified replay.
+      # Configure-time gate on the generated pair: re-derive the corpus half
+      # of the table header (owner units, coverage ids, dense import ids, call
+      # sequences, body sha256s) and the whole mirror from the corpus this
+      # build compiles.  The script also proves each body is defined once,
+      # has no in-unit reference (GNU ld --wrap redirects cross-unit
+      # references only) and shares no unit with getClass.
+      if(NOT Python3_EXECUTABLE)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+      endif()
+      set(ISAAC_LBR_TABLE_SCRIPT
+          "${CMAKE_CURRENT_SOURCE_DIR}/lua_binding_replay_table.py")
+      set(ISAAC_LBR_GENERATED_INCLUDE
+          "${CMAKE_CURRENT_BINARY_DIR}/isaac-lua-binding-replay")
+      set(ISAAC_LBR_TABLE_HEADER
+          "${ISAAC_LBR_GENERATED_INCLUDE}/host_vita_lua_binding_table.h")
+      set(ISAAC_LBR_MIRROR_HEADER
+          "${ISAAC_LBR_GENERATED_INCLUDE}/host_vita_lua_binding_mirror.h")
+      # A quoted #include searches the including file's own directory first,
+      # so a stray copy next to the replay TU would win over the generated one.
+      foreach(ISAAC_LBR_HEADER_NAME IN ITEMS
+              host_vita_lua_binding_table.h host_vita_lua_binding_mirror.h)
+        if(EXISTS "${ISAAC_RUNTIME}/${ISAAC_LBR_HEADER_NAME}")
+          message(FATAL_ERROR
+            "ISAAC_VITA_LUA_BINDING_REPLAY: ${ISAAC_RUNTIME}/${ISAAC_LBR_HEADER_NAME} "
+            "would shadow the header this configure generates; delete it")
+        endif()
+      endforeach()
+      execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${ISAAC_LBR_TABLE_SCRIPT}"
+          --write --pe "${ISAAC_PE_PATH}" --generated "${ISAAC_GENERATED_DIR}"
+          --out-dir "${ISAAC_LBR_GENERATED_INCLUDE}"
+        RESULT_VARIABLE ISAAC_LBR_GENERATE_RC
+        OUTPUT_VARIABLE ISAAC_LBR_GENERATE_OUTPUT
+        ERROR_VARIABLE ISAAC_LBR_GENERATE_OUTPUT)
+      if(NOT ISAAC_LBR_GENERATE_RC EQUAL 0)
+        message(FATAL_ERROR
+          "ISAAC_VITA_LUA_BINDING_REPLAY: lua_binding_replay_table.py could not "
+          "generate the binding headers from ISAAC_PE_PATH and "
+          "ISAAC_GENERATED_DIR: ${ISAAC_LBR_GENERATE_OUTPUT}")
+      endif()
+      execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${ISAAC_LBR_TABLE_SCRIPT}"
+          --check-corpus --generated "${ISAAC_GENERATED_DIR}"
+          --header "${ISAAC_LBR_TABLE_HEADER}"
+          --mirror "${ISAAC_LBR_MIRROR_HEADER}"
+        RESULT_VARIABLE ISAAC_LBR_CHECK_RC
+        OUTPUT_VARIABLE ISAAC_LBR_CHECK_SUMMARY
+        ERROR_VARIABLE ISAAC_LBR_CHECK_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+      if(NOT ISAAC_LBR_CHECK_RC EQUAL 0)
+        message(FATAL_ERROR
+          "ISAAC_VITA_LUA_BINDING_REPLAY: the corpus is not the one the mirror "
+          "was generated from (regenerate with lua_binding_replay_table.py "
+          "--write against this corpus and re-run the host oracle "
+          "recomp/test_vita_lua_binding_replay.py): "
+          "${ISAAC_LBR_CHECK_ERROR}${ISAAC_LBR_CHECK_SUMMARY}")
+      endif()
+      # Re-run the generation when the generator or one of its inputs changes
+      # (the PE and every corpus unit the generator scans).
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${ISAAC_LBR_TABLE_SCRIPT}" "${ISAAC_PE_PATH}"
+        "${ISAAC_GENERATED_DIR}/guest_table.c" ${ISAAC_GENERATED_CANONICAL_C})
+      # Owner units named by the gate: present in the canonical corpus and
+      # not replaced by a build-derived source (the mirror is their text).
+      string(REGEX MATCH "units=([a-z0-9_.,]+)" ISAAC_LBR_UNITS_MATCH
+             "${ISAAC_LBR_CHECK_SUMMARY}")
+      string(REPLACE "," ";" ISAAC_LBR_OWNER_UNITS "${CMAKE_MATCH_1}")
+      list(LENGTH ISAAC_LBR_OWNER_UNITS ISAAC_LBR_OWNER_UNIT_COUNT)
+      if(ISAAC_LBR_OWNER_UNIT_COUNT LESS 2)
+        message(FATAL_ERROR
+          "ISAAC_VITA_LUA_BINDING_REPLAY: no owner units in the gate summary: "
+          "${ISAAC_LBR_CHECK_SUMMARY}")
+      endif()
+      set(ISAAC_LBR_OWNER_SOURCES)
+      foreach(ISAAC_LBR_UNIT IN LISTS ISAAC_LBR_OWNER_UNITS)
+        if(ISAAC_VITA_DIRECT_DEFAULT AND
+           ISAAC_LBR_UNIT STREQUAL ISAAC_VITA_DIRECT_DEFAULT_SOURCE_NAME)
+          message(FATAL_ERROR
+            "ISAAC_VITA_LUA_BINDING_REPLAY: owner ${ISAAC_LBR_UNIT} is replaced "
+            "by the direct-default derived source")
+        endif()
+        list(FIND ISAAC_GENERATED_CANONICAL_C
+          "${ISAAC_GENERATED_DIR}/${ISAAC_LBR_UNIT}" ISAAC_LBR_UNIT_INDEX)
+        if(ISAAC_LBR_UNIT_INDEX LESS 0)
+          message(FATAL_ERROR
+            "ISAAC_VITA_LUA_BINDING_REPLAY: owner ${ISAAC_LBR_UNIT} is not a "
+            "compiled generated unit")
+        endif()
+        list(APPEND ISAAC_LBR_OWNER_SOURCES
+          "${ISAAC_GENERATED_DIR}/${ISAAC_LBR_UNIT}")
+      endforeach()
+      # The --wrap list: the 51 template-A rows of the table header plus the
+      # three single bodies, per enabled family.  (MATCHALL over the text,
+      # not file(STRINGS): every row line ends in a macro continuation
+      # backslash, which would escape the list separator after it.)
+      file(READ "${ISAAC_LBR_TABLE_HEADER}" ISAAC_LBR_TABLE_TEXT)
+      string(REGEX MATCHALL "\n    X\\(sub_[0-9a-f]+, " ISAAC_LBR_ROW_LINES
+             "${ISAAC_LBR_TABLE_TEXT}")
+      set(ISAAC_LBR_WRAPPED)
+      if(ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK GREATER 0)
+        math(EXPR ISAAC_LBR_HAS_SCALAR "${ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK} & 1")
+        math(EXPR ISAAC_LBR_HAS_GETDATA "${ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK} & 2")
+        math(EXPR ISAAC_LBR_HAS_BOOLII "${ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK} & 4")
+        math(EXPR ISAAC_LBR_HAS_INDEX2 "${ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK} & 8")
+      endif()
+      set(ISAAC_LBR_ROW_COUNT 0)
+      foreach(ISAAC_LBR_ROW_LINE IN LISTS ISAAC_LBR_ROW_LINES)
+        string(REGEX REPLACE "^\n    X\\((sub_[0-9a-f]+), $" "\\1"
+               ISAAC_LBR_ROW_SYMBOL "${ISAAC_LBR_ROW_LINE}")
+        math(EXPR ISAAC_LBR_ROW_COUNT "${ISAAC_LBR_ROW_COUNT} + 1")
+        if(ISAAC_LBR_HAS_SCALAR)
+          list(APPEND ISAAC_LBR_WRAPPED "${ISAAC_LBR_ROW_SYMBOL}")
+        endif()
+      endforeach()
+      if(NOT ISAAC_LBR_ROW_COUNT EQUAL 51)
+        message(FATAL_ERROR
+          "ISAAC_VITA_LUA_BINDING_REPLAY: ${ISAAC_LBR_ROW_COUNT} scalar rows in "
+          "host_vita_lua_binding_table.h (expected 51)")
+      endif()
+      if(ISAAC_LBR_HAS_GETDATA)
+        list(APPEND ISAAC_LBR_WRAPPED sub_00446d90)
+      endif()
+      if(ISAAC_LBR_HAS_BOOLII)
+        list(APPEND ISAAC_LBR_WRAPPED sub_00433870)
+      endif()
+      if(ISAAC_LBR_HAS_INDEX2)
+        list(APPEND ISAAC_LBR_WRAPPED sub_003f90b0)
+      endif()
+      list(LENGTH ISAAC_LBR_WRAPPED ISAAC_LBR_WRAPPED_COUNT)
+      foreach(ISAAC_LBR_SYMBOL IN LISTS ISAAC_LBR_WRAPPED)
+        target_link_options(isaac_first_arm_fault PRIVATE
+          "-Wl,--wrap=${ISAAC_LBR_SYMBOL}")
+      endforeach()
+      list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+        "${ISAAC_RUNTIME}/host_vita_lua_binding_replay.c")
+      # The generated headers resolve for the replay TU only.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_lua_binding_replay.c"
+        APPEND PROPERTY INCLUDE_DIRECTORIES "${ISAAC_LBR_GENERATED_INCLUDE}")
+      # Only the new TU sees the knob: host_vita_lua.c, the seam and every
+      # generated unit keep their commands.  The generated-unit code
+      # generation definitions are copied from the owner units after the
+      # translated-CPU block below.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_lua_binding_replay.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_LUA_BINDING_REPLAY=1
+          ISAAC_VITA_LUA_NATIVE_GETCLASS=1
+          ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK=${ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK}U
+          ISAAC_VITA_LUA_BINDING_REPLAY_BUILD_ID=\"${ISAAC_VITA_GUEST_LINK_ID}\")
+      if(ISAAC_VITA_LUA_IMPORT_FASTDISPATCH)
+        # the pins accept the typed endpoint a slot is bound to
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_lua_binding_replay.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_LUA_IMPORT_FASTDISPATCH=1)
+      endif()
+      if(ISAAC_VITA_PROFILE_FUNCTION_ENTRIES)
+        # target-wide already; spelled out like the other mirroring seams so
+        # the replayed guest_coverage_function() keeps ph120.ik ent= exact
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_lua_binding_replay.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_PROFILE_FUNCTION_ENTRIES=1)
+      endif()
+      if(ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_lua_binding_replay.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY=1)
+      endif()
+      message(STATUS
+        "Isaac Lua: LuaBridge binding replay: ${ISAAC_LBR_WRAPPED_COUNT} bodies wrapped "
+        "(families=${ISAAC_VITA_LUA_BINDING_REPLAY_FAMILIES} "
+        "mask=${ISAAC_VITA_LUA_BINDING_REPLAY_FAMILY_MASK} "
+        "verify=${ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY}); ${ISAAC_LBR_CHECK_SUMMARY}")
     endif()
   endif()
   if(ISAAC_VITA_CRT_ATOF_SMALLINT)
@@ -4069,6 +5850,145 @@ else()
       "Isaac Vita floor: authenticated inline import at the thunk root in "
       "${ISAAC_VITA_FLOOR_THUNK_FASTPATH_OWNER}")
   endif()
+  if(ISAAC_VITA_GL_THREAD_RECORD)
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/gl_record_backend.c"
+      "${ISAAC_RUNTIME}/gl_record_ring.c"
+      "${ISAAC_RUNTIME}/gl_record_locations.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/gl_record_backend.c"
+      "${ISAAC_RUNTIME}/gl_record_ring.c"
+      "${ISAAC_RUNTIME}/gl_record_locations.c"
+      "${ISAAC_RUNTIME}/gl_bridge.c"
+      "${ISAAC_RUNTIME}/gl_vita_backend.c"
+      "${ISAAC_RUNTIME}/kage_vita_backend.c"
+      "${ISAAC_RUNTIME}/manual_kage_vita.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GL_THREAD_RECORD=1)
+    message(STATUS "Isaac Vita GL recorder: ON")
+  endif()
+  if(ISAAC_VITA_GL_THREAD_WORKER)
+    set(ISAAC_GL_WORKER_DEFINES ISAAC_VITA_GL_THREAD_WORKER=1)
+    if(ISAAC_VITA_GL_THREAD_WORKER_PROOF)
+      list(APPEND ISAAC_GL_WORKER_DEFINES ISAAC_VITA_GL_THREAD_WORKER_PROOF=1)
+    endif()
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/gl_record_backend.c"
+      "${ISAAC_RUNTIME}/gl_record_ring.c"
+      "${ISAAC_RUNTIME}/gl_bridge.c"
+      "${ISAAC_RUNTIME}/gl_vita_backend.c"
+      "${ISAAC_RUNTIME}/kage_vita_backend.c"
+      "${ISAAC_RUNTIME}/manual_kage_vita.c"
+      "${ISAAC_RUNTIME}/kage_vita_loading.c"
+      "${ISAAC_RUNTIME}/host_vita_debug_overlay.c"
+      "${ISAAC_RUNTIME}/host_vita_audio_refill.c"
+      "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      "${ISAAC_RUNTIME}/kage_vita_guest_sampler.c"
+      "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ${ISAAC_GL_WORKER_DEFINES})
+    if(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION)
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/kage_vita_backend.c"
+        "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GL_THREAD_RENDER_ADMISSION=1)
+      message(STATUS "Isaac Vita GL render admission: interpolated Render declined while the render thread is a frame behind")
+    endif()
+    if(ISAAC_VITA_IMAGE_RETAIN OR ISAAC_VITA_HEAP_CENSUS)
+      # Their readers link kage_vita_backend_vgl_mem(): no snapshot, no link.
+      set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_backend.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GL_THREAD_VGL_MEM_SNAPSHOT=1)
+    endif()
+    message(STATUS "Isaac Vita GL render thread: ON (USER_1), proof=${ISAAC_VITA_GL_THREAD_WORKER_PROOF}")
+  endif()
+  if(ISAAC_VITA_GL_RECORD_OPCODE_CENSUS)
+    # Measurement only (FATAL above without PHASE_PROFILE + GL_THREAD_WORKER):
+    # the recorder counts, the phase profile prints; no other unit changes.
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/gl_record_backend.c"
+      "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_GL_RECORD_OPCODE_CENSUS=1)
+    message(STATUS "Isaac Vita GL recorder opcode census: ph120.ro + ph120.rop per window")
+  endif()
+  if(ISAAC_VITA_GL_OWNER_CHECK)
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES "${ISAAC_RUNTIME}/gl_owner_check.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/gl_owner_check.c"
+      "${ISAAC_RUNTIME}/gl_record_backend.c"
+      "${ISAAC_RUNTIME}/kage_vita_backend.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GL_OWNER_CHECK=1)
+    # One --wrap per measured vitaGL entry (gl_owner_check_entries.h).
+    file(STRINGS "${ISAAC_RUNTIME}/gl_owner_check_entries.h" ISAAC_GL_OWNER_LINES
+         REGEX "^ISAAC_GL_OWNER_ENTRY\\([A-Za-z0-9_]+\\)$")
+    set(ISAAC_GL_OWNER_COUNT 0)
+    foreach(ISAAC_GL_OWNER_LINE IN LISTS ISAAC_GL_OWNER_LINES)
+      string(REGEX REPLACE "^ISAAC_GL_OWNER_ENTRY\\(([A-Za-z0-9_]+)\\)$" "\\1"
+             ISAAC_GL_OWNER_SYMBOL "${ISAAC_GL_OWNER_LINE}")
+      target_link_options(isaac_first_arm_fault PRIVATE "-Wl,--wrap=${ISAAC_GL_OWNER_SYMBOL}")
+      math(EXPR ISAAC_GL_OWNER_COUNT "${ISAAC_GL_OWNER_COUNT} + 1")
+    endforeach()
+    if(NOT ISAAC_GL_OWNER_COUNT EQUAL 79)
+      message(FATAL_ERROR "GL_OWNER_CHECK: expected 79 measured entries, found ${ISAAC_GL_OWNER_COUNT}")
+    endif()
+    message(STATUS "Isaac Vita GL owner check: ${ISAAC_GL_OWNER_COUNT} vitaGL entries wrapped (log only)")
+  endif()
+  if(ISAAC_VITA_SHADER_SAMPLER_FASTPATH)
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_shader_sampler_fastpath.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_shader_sampler_fastpath.c"
+      "${ISAAC_RUNTIME}/gl_vita_backend.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_SHADER_SAMPLER_FASTPATH=1)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_shader_sampler_fastpath.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS GUEST_STACK_REQUIRED=1
+        ISAAC_VITA_SHADER_ATTRIB_FASTPATH=1 ISAAC_VITA_GL_SHIM_FASTDISPATCH=1)
+    if(NOT ISAAC_VITA_GUEST_STACK_GUARD)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_shader_sampler_fastpath.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_GENERATED_STACK_GUARD=0)
+    endif()
+    if(ISAAC_VITA_PROFILE_FUNCTION_ENTRIES)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_shader_sampler_fastpath.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_PROFILE_FUNCTION_ENTRIES=1)
+    endif()
+    target_link_options(isaac_first_arm_fault PRIVATE -Wl,--wrap=sub_00567430)
+    message(STATUS "Isaac Vita Shader sampler: native exact SetUniformInt replay; original GL calls/order/math, translated fallback")
+  endif()
+  if(ISAAC_VITA_KAGE_BIND_PACKET)
+    # The only reference to sub_005671d0 outside its own unit is the
+    # guest_table.c registration (Bind is reached through the Shader vtable),
+    # so the seam is a link-time --wrap and the corpus is unchanged.  Only the
+    # seam TU and the recorder see the define (and the phase profile with the
+    # opcode census, whose slot count it sizes); every other object - and
+    # these with the option OFF - stays byte-identical.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_kage_bind_packet.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_kage_bind_packet.c"
+      "${ISAAC_RUNTIME}/gl_record_backend.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_KAGE_BIND_PACKET=1)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_kage_bind_packet.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS GUEST_STACK_REQUIRED=1
+        ISAAC_VITA_SHADER_ATTRIB_FASTPATH=1 ISAAC_VITA_GL_SHIM_FASTDISPATCH=1
+        ISAAC_VITA_GL_THREAD_RECORD=1 ISAAC_VITA_GL_THREAD_WORKER=1)
+    # The seam reproduces the stack low water and the body-entry census of
+    # the generated units, so it sees their stack-guard and leaf spellings.
+    if(NOT ISAAC_VITA_GUEST_STACK_GUARD)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_kage_bind_packet.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_GENERATED_STACK_GUARD=0)
+    endif()
+    if(ISAAC_VITA_TRANSLATED_CPU AND NOT ISAAC_VITA_TRANSLATED_CPU_LEAF_INLINE)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_kage_bind_packet.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_LEAF_INLINE=0)
+    endif()
+    if(ISAAC_VITA_GUEST_SAMPLER)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_kage_bind_packet.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GUEST_SAMPLER=1)
+    endif()
+    if(ISAAC_VITA_GL_RECORD_OPCODE_CENSUS)
+      set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_KAGE_BIND_PACKET=1)
+    endif()
+    target_link_options(isaac_first_arm_fault PRIVATE -Wl,--wrap=sub_005671d0)
+    message(STATUS "Isaac Vita KAGE bind packet: native Shader::Bind into one GL recorder record (opcode 81); translated fallback")
+  endif()
   if(ISAAC_VITA_SHADER_ATTRIB_FASTPATH)
     # gen_all.py pins both Shader bodies (bytes, CFG order, format jump
     # tables, unique vtable slots, GL slot call operands) before emitting one
@@ -4183,6 +6103,16 @@ else()
         set(_isaac_attrib_memo
           "location memo ON (glGetAttribLocation crossings ~1000 -> ~0 per present on hits)")
       endif()
+      # RENDER60 S2b: only the replay TU sizes the memo; 16 adds no
+      # definition, so that object is the 16-entry one byte for byte.
+      if(NOT ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES STREQUAL "16")
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_shader_attrib_fastpath.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES=${ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES})
+      endif()
+      string(APPEND _isaac_attrib_memo
+        ", ${ISAAC_VITA_SHADER_ATTRIB_LOCATION_MEMO_ENTRIES} entries")
     else()
       set(_isaac_attrib_memo "location memo OFF")
     endif()
@@ -4214,6 +6144,30 @@ else()
       "${_isaac_attrib_memo}; ${_isaac_attrib_direct}")
     unset(_isaac_attrib_memo)
     unset(_isaac_attrib_direct)
+    if(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+      # RENDER60 S4 (FATAL above without GL_THREAD_RECORD + GL_THREAD_WORKER
+      # + LOCATION_MEMO, or with MEMO_VERIFY / DIRECT_STATE).  Two owners: the
+      # replay TU (the memo-hit branch) and the recorder (opcodes 79/80, the
+      # producer shadow notes, the consumer unpack).  With the opcode census
+      # the census reader sizes its copy from the same opcode bound
+      # (gl_record_backend.h ISAAC_GL_RECORD_OPCODE_SLOTS, 79 -> 81).  The
+      # typed backend, the bridge, the dispatcher and the generated units
+      # stay byte-identical.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_shader_attrib_fastpath.c"
+        "${ISAAC_RUNTIME}/gl_record_backend.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_GL_RECORD_ATTRIB_BATCH=1)
+      if(ISAAC_VITA_GL_RECORD_OPCODE_CENSUS)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_GL_RECORD_ATTRIB_BATCH=1)
+      endif()
+      message(STATUS
+        "Isaac Vita GL record attrib batch: ON (one ring record per "
+        "memo-hit Enable/Disable replay; opcodes 79/80)")
+    endif()
   endif()
   if(ISAAC_VITA_KAGE_QUAD_FASTPATH)
     # gen_all.py pins the Image::PushQuad root (bytes, CFG order, the three
@@ -4323,10 +6277,368 @@ else()
     else()
       set(_isaac_kage_quad_mode "ON (handled quads retire natively)")
     endif()
+    if(ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE)
+      # The native select mirrors the generated 005608ea seam of the
+      # vanilla/KAGE bundle, so its TU sees the same switch as the owner.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_kage_quad_fastpath.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_KAGE_QUAD_SELECT_NATIVE=1)
+      if(ISAAC_VITA_VANILLA_KAGE_BUNDLE)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_kage_quad_fastpath.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_KAGE_QUAD_SELECT_VANILLA_SEAM=1)
+      endif()
+      string(APPEND _isaac_kage_quad_mode
+        "; native select (vanilla seam "
+        "${ISAAC_VITA_VANILLA_KAGE_BUNDLE})")
+    endif()
     message(STATUS
       "Isaac Vita Image::PushQuad: host replay at the root in "
       "${ISAAC_VITA_KAGE_QUAD_FASTPATH_OWNER}; ${_isaac_kage_quad_mode}")
     unset(_isaac_kage_quad_mode)
+  endif()
+  if(ISAAC_VITA_UPDATE_PROBE)
+    # Profiling only: one --wrap seam per function listed in
+    # host_vita_update_probe.h; each seam counts and times the translated
+    # body and calls __real_.  Every symbol must be defined exactly once in
+    # the corpus, or the list has drifted from it.
+    file(READ "${ISAAC_RUNTIME}/host_vita_update_probe.h" _isaac_uprobe_h)
+    string(REGEX MATCHALL "X\\([0-9a-f]+\\)" _isaac_uprobe_items
+      "${_isaac_uprobe_h}")
+    set(_isaac_uprobe_syms)
+    set(_isaac_uprobe_hex)
+    foreach(_isaac_uprobe_item IN LISTS _isaac_uprobe_items)
+      string(REGEX REPLACE "X\\(([0-9a-f]+)\\)" "\\1" _isaac_uprobe_rva
+        "${_isaac_uprobe_item}")
+      list(APPEND _isaac_uprobe_hex "${_isaac_uprobe_rva}")
+      list(APPEND _isaac_uprobe_syms "sub_${_isaac_uprobe_rva}")
+    endforeach()
+    list(LENGTH _isaac_uprobe_syms _isaac_uprobe_count)
+    list(JOIN _isaac_uprobe_hex "|" _isaac_uprobe_alt)
+    set(_isaac_uprobe_found)
+    foreach(ISAAC_GENERATED_SOURCE IN LISTS ISAAC_GENERATED_CANONICAL_C)
+      if(EXISTS "${ISAAC_GENERATED_SOURCE}")
+        isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+          _isaac_uprobe_match
+          REGEX "^void sub_(${_isaac_uprobe_alt})\\(CPU \\*__restrict c\\)$")
+        list(APPEND _isaac_uprobe_found ${_isaac_uprobe_match})
+      endif()
+    endforeach()
+    list(LENGTH _isaac_uprobe_found _isaac_uprobe_defs)
+    if(NOT _isaac_uprobe_count EQUAL 62 OR
+       NOT _isaac_uprobe_defs EQUAL _isaac_uprobe_count)
+      message(FATAL_ERROR
+        "update probe: ${_isaac_uprobe_count} listed (expected 62), "
+        "${_isaac_uprobe_defs} generated definitions found")
+    endif()
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_update_probe.c")
+    foreach(_isaac_uprobe_sym IN LISTS _isaac_uprobe_syms)
+      target_link_options(isaac_first_arm_fault PRIVATE
+        "-Wl,--wrap=${_isaac_uprobe_sym}")
+    endforeach()
+    set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_UPDATE_PROBE=1)
+    # ph120.uc reads the dispatcher's import census; give the probe TU the
+    # same switches guest.c gets, so the extern is the real array.
+    set(_isaac_uprobe_census 0)
+    if(ISAAC_VITA_DISPATCH_TABLE)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_update_probe.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GUEST_DISPATCH_TABLE=1)
+      set(_isaac_uprobe_census 1)
+    endif()
+    if(ISAAC_VITA_PROFILE_IMPORT_KINDS)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_update_probe.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_PROFILE_IMPORT_KINDS=1)
+      set(_isaac_uprobe_census 1)
+    endif()
+    if(_isaac_uprobe_census)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_update_probe.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_PHASE_PROFILE=1
+          ISAAC_VITA_UPDATE_PROBE_CENSUS=1)
+    endif()
+    message(STATUS
+      "Isaac Vita update probe: ${_isaac_uprobe_count} --wrap timers, import census ${_isaac_uprobe_census}")
+  endif()
+  if(ISAAC_VITA_GFUEL_SEED_NATIVE)
+    # sub_0039cb10 and sub_0039cb80 share one generated unit whose only edge
+    # to either is 0x39cb8b (inside sub_0039cb80, reached on a decline);
+    # every other edge (101 direct sites in 16 units) and the guest_table.c
+    # slot is in another unit, so GNU ld --wrap catches it and __real_ keeps
+    # the translated bodies.  No generated unit changes.  Both roots must
+    # resolve to exactly one shared owner so a corpus change fails loudly.
+    set(ISAAC_GFUEL_OWNER)
+    foreach(ISAAC_GENERATED_SOURCE IN LISTS ISAAC_GENERATED_CANONICAL_C)
+      if(EXISTS "${ISAAC_GENERATED_SOURCE}")
+        foreach(ISAAC_GFUEL_SYMBOL IN ITEMS sub_0039cb10 sub_0039cb80)
+          isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+            ISAAC_GFUEL_MATCH
+            LIMIT_COUNT 2
+            REGEX "^void ${ISAAC_GFUEL_SYMBOL}\\(CPU \\*__restrict c\\)$")
+          foreach(ISAAC_GFUEL_LINE IN LISTS ISAAC_GFUEL_MATCH)
+            list(APPEND ISAAC_GFUEL_OWNER "${ISAAC_GENERATED_SOURCE}")
+          endforeach()
+        endforeach()
+      endif()
+    endforeach()
+    list(LENGTH ISAAC_GFUEL_OWNER ISAAC_GFUEL_DEFINITIONS)
+    list(REMOVE_DUPLICATES ISAAC_GFUEL_OWNER)
+    list(LENGTH ISAAC_GFUEL_OWNER ISAAC_GFUEL_OWNER_COUNT)
+    if(NOT ISAAC_GFUEL_OWNER_COUNT EQUAL 1 OR
+       NOT ISAAC_GFUEL_DEFINITIONS EQUAL 2)
+      message(FATAL_ERROR
+        "G FUEL seed seam needs sub_0039cb10 and sub_0039cb80 defined once "
+        "in one shared generated unit; found owners=${ISAAC_GFUEL_OWNER_COUNT}, "
+        "definitions=${ISAAC_GFUEL_DEFINITIONS}")
+    endif()
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_gfuel_seed_native.c")
+    target_link_options(isaac_first_arm_fault PRIVATE
+      -Wl,--wrap=sub_0039cb10
+      -Wl,--wrap=sub_0039cb80)
+    # ph120.gf: the phase profiler prints the seams' verdict counters.
+    set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GFUEL_SEED_NATIVE=1)
+    if(ISAAC_VITA_PHASE_PROFILE)
+      # Profiling builds only, count and time without the sampler: entries
+      # into the translated sub_000206b0 by return word (the translated
+      # lookup under sub_0039cb10 vs other call sites) and HasCollectible's
+      # entries by call site, top-level vs nested (GetTrinketMultiplier
+      # sub_0038d4c0 and sub_0039ba90 re-enter it); every HasCollectible body
+      # by caller through its first call (ItemConfig::GetCollectible
+      # sub_002fe5e0 from 0x33af4e); 1-in-64 wall-clock spans of both G FUEL
+      # wrappers, those sub_000206b0 entries, top-level HasCollectible and
+      # GetTrinketMultiplier outside HasCollectible.
+      target_link_options(isaac_first_arm_fault PRIVATE
+        -Wl,--wrap=sub_000206b0
+        -Wl,--wrap=sub_0033af30
+        -Wl,--wrap=sub_002fe5e0
+        -Wl,--wrap=sub_0038d4c0
+        -Wl,--wrap=sub_0039ba90)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_gfuel_seed_native.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_GFUEL_SEED_NATIVE_PROFILE=1)
+    endif()
+    message(STATUS
+      "Isaac Vita G FUEL seed queries: native --wrap seams on "
+      "sub_0039cb10/sub_0039cb80 in ${ISAAC_GFUEL_OWNER}; "
+      "profiling seams (sub_000206b0, sub_0033af30, sub_002fe5e0, sub_0038d4c0, "
+      "sub_0039ba90) ${ISAAC_VITA_PHASE_PROFILE}")
+  endif()
+  if(ISAAC_VITA_HASCOLLECTIBLE_NATIVE)
+    # sub_0033af30 is defined once; GNU ld --wrap sends every edge from
+    # another unit (2678 of its 2798 direct call sites) and the guest_table.c
+    # slot to the replay, and __real_ keeps the translated body for its
+    # declines.  The 120 call sites inside the owner unit (its own two calls
+    # among them) keep the translated body; no corpus symbol tail-jumps to it.
+    # No generated unit changes (test_vita_hascoll_native.py pins the census).
+    set(ISAAC_HASCOLL_OWNER)
+    set(ISAAC_HASCOLL_DEFINITIONS 0)
+    foreach(ISAAC_GENERATED_SOURCE IN LISTS ISAAC_GENERATED_CANONICAL_C)
+      if(EXISTS "${ISAAC_GENERATED_SOURCE}")
+        isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+          ISAAC_HASCOLL_MATCH
+          LIMIT_COUNT 2
+          REGEX "^void sub_0033af30\\(CPU \\*__restrict c\\)$")
+        list(LENGTH ISAAC_HASCOLL_MATCH ISAAC_HASCOLL_COUNT)
+        if(ISAAC_HASCOLL_COUNT GREATER 0)
+          list(APPEND ISAAC_HASCOLL_OWNER "${ISAAC_GENERATED_SOURCE}")
+          math(EXPR ISAAC_HASCOLL_DEFINITIONS
+            "${ISAAC_HASCOLL_DEFINITIONS} + ${ISAAC_HASCOLL_COUNT}")
+        endif()
+      endif()
+    endforeach()
+    if(NOT ISAAC_HASCOLL_DEFINITIONS EQUAL 1)
+      message(FATAL_ERROR
+        "HasCollectible seam needs sub_0033af30 defined once in the corpus; "
+        "found definitions=${ISAAC_HASCOLL_DEFINITIONS} in ${ISAAC_HASCOLL_OWNER}")
+    endif()
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_hascoll_native.c")
+    if(ISAAC_VITA_GFUEL_SEED_NATIVE AND ISAAC_VITA_PHASE_PROFILE)
+      # The G FUEL profiling seams already --wrap sub_0033af30 (entry counts,
+      # 1-in-64 timer, ph120.gu/gh/gn); that wrapper hands each entry to
+      # isaac_vita_hascoll_native_call, and the replay TU leaves
+      # __wrap_sub_0033af30 to it.
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_hascoll_native.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HASCOLL_NATIVE_CHAINED=1)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_gfuel_seed_native.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HASCOLLECTIBLE_NATIVE=1)
+    else()
+      target_link_options(isaac_first_arm_fault PRIVATE
+        -Wl,--wrap=sub_0033af30)
+    endif()
+    # ph120.hn: the phase profiler prints the replay's verdict counters.
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_hascoll_native.c"
+      "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_HASCOLLECTIBLE_NATIVE=1)
+    # Mirrors the corpus flag model (the TU's #error checks it).
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_hascoll_native.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS GUEST_FLAGS_LOCAL=1)
+    message(STATUS
+      "Isaac Vita HasCollectible: native replay of sub_0033af30 in "
+      "${ISAAC_HASCOLL_OWNER} (chained behind the G FUEL profiling wrapper: "
+      "${ISAAC_VITA_PHASE_PROFILE} with G FUEL ${ISAAC_VITA_GFUEL_SEED_NATIVE})")
+  endif()
+  if(ISAAC_VITA_SFX_FLOOR_PRELOAD)
+    # Level::Init (sub_00311e60, owner guest_0083.c) has ten direct calls in
+    # four other units (guest_0062/0073/0075/0140.c: Console, Game start,
+    # reset, rerun, daily, debug, the floor transition) and none in its own;
+    # GNU ld --wrap rebinds every edge from another unit and the
+    # guest_table.c slot, and __real_ keeps the translated body.  The
+    # replay calls SoundEffect::Load (sub_00488070) by name, the edge Play
+    # takes.  Confirm both are defined once and that the Level::Init owner
+    # holds no direct sub_00311e60(c) call (it would bypass the seam), so a
+    # corpus change fails loudly.  No generated unit changes.
+    set(ISAAC_SFXP_OWNER)
+    set(ISAAC_SFXP_LOAD_DEFS 0)
+    foreach(ISAAC_GENERATED_SOURCE IN LISTS ISAAC_GENERATED_CANONICAL_C)
+      if(EXISTS "${ISAAC_GENERATED_SOURCE}")
+        isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+          ISAAC_SFXP_MATCH
+          LIMIT_COUNT 2
+          REGEX "^void sub_00311e60\\(CPU \\*__restrict c\\)$")
+        foreach(ISAAC_SFXP_LINE IN LISTS ISAAC_SFXP_MATCH)
+          list(APPEND ISAAC_SFXP_OWNER "${ISAAC_GENERATED_SOURCE}")
+        endforeach()
+        isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+          ISAAC_SFXP_LOAD_MATCH
+          LIMIT_COUNT 2
+          REGEX "^void sub_00488070\\(CPU \\*__restrict c\\)$")
+        list(LENGTH ISAAC_SFXP_LOAD_MATCH ISAAC_SFXP_LOAD_N)
+        math(EXPR ISAAC_SFXP_LOAD_DEFS
+          "${ISAAC_SFXP_LOAD_DEFS} + ${ISAAC_SFXP_LOAD_N}")
+      endif()
+    endforeach()
+    list(LENGTH ISAAC_SFXP_OWNER ISAAC_SFXP_OWNER_COUNT)
+    if(NOT ISAAC_SFXP_OWNER_COUNT EQUAL 1 OR NOT ISAAC_SFXP_LOAD_DEFS EQUAL 1)
+      message(FATAL_ERROR
+        "SFX floor preload needs Level::Init sub_00311e60 and SoundEffect::Load "
+        "sub_00488070 defined once; found ${ISAAC_SFXP_OWNER_COUNT} and "
+        "${ISAAC_SFXP_LOAD_DEFS}")
+    endif()
+    file(STRINGS "${ISAAC_SFXP_OWNER}" ISAAC_SFXP_INSIDE
+      REGEX "[^_a-zA-Z0-9]sub_00311e60\\(c\\)")
+    if(ISAAC_SFXP_INSIDE)
+      message(FATAL_ERROR
+        "SFX floor preload: a direct sub_00311e60(c) inside its owner "
+        "${ISAAC_SFXP_OWNER} would bypass --wrap")
+    endif()
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_sfx_floor_preload.c")
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_sfx_floor_preload.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_SFX_FLOOR_PRELOAD=1
+        ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB=${ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB}
+        ISAAC_VITA_SFX_FLOOR_PRELOAD_BUILD_ID=\"${ISAAC_VITA_GUEST_LINK_ID}\")
+    target_link_options(isaac_first_arm_fault PRIVATE
+      -Wl,--wrap=sub_00311e60)
+    message(STATUS
+      "Isaac Vita SFX floor preload: Level::Init sub_00311e60 wrapped in "
+      "${ISAAC_SFXP_OWNER}, reserve ${ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB} MiB")
+    if(ISAAC_VITA_SFX_FIGHT_PRELOAD)
+      # Same unit, one more list; no new source, link option or symbol.
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_sfx_floor_preload.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_SFX_FIGHT_PRELOAD=1)
+      message(STATUS
+        "Isaac Vita SFX fight preload: 22-sound fight list after the floor lists")
+    endif()
+  endif()
+  if(ISAAC_VITA_CAMERA_RING_NATIVE)
+    # gen_all.py pins sub_0049df90 (bytes, CFG order, the seven callers in
+    # Camera::UpdateUltrasmooth as its only references, the logger calls, the
+    # idiv, ret 8) before emitting one root seam.  All callers share the
+    # owner unit, so --wrap cannot replace them; only the owner and the replay
+    # TU see the definition, so every other object - and these two with the
+    # option OFF - stays byte-identical.
+    set(ISAAC_CAMERA_RING_SYMBOL "sub_0049df90")
+    set(ISAAC_CAMERA_RING_OWNER)
+    set(ISAAC_CAMERA_RING_DEFINITIONS 0)
+    set(ISAAC_CAMERA_RING_SEAMS 0)
+    foreach(ISAAC_GENERATED_SOURCE IN LISTS ISAAC_GENERATED_CANONICAL_C)
+      if(EXISTS "${ISAAC_GENERATED_SOURCE}")
+        set(ISAAC_CAMERA_RING_ROOT_MATCH)
+        set(ISAAC_CAMERA_RING_SEAM_MATCH)
+        isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+          ISAAC_CAMERA_RING_ROOT_MATCH
+          LIMIT_COUNT 2
+          REGEX "^void ${ISAAC_CAMERA_RING_SYMBOL}\\(CPU \\*__restrict c\\)$")
+        file(STRINGS "${ISAAC_GENERATED_SOURCE}"
+          ISAAC_CAMERA_RING_SEAM_MATCH
+          LIMIT_COUNT 2
+          REGEX "Authenticated camera ring average host replay")
+        list(LENGTH ISAAC_CAMERA_RING_ROOT_MATCH ISAAC_CAMERA_RING_ROOT_COUNT)
+        list(LENGTH ISAAC_CAMERA_RING_SEAM_MATCH ISAAC_CAMERA_RING_SEAM_COUNT)
+        math(EXPR ISAAC_CAMERA_RING_DEFINITIONS
+          "${ISAAC_CAMERA_RING_DEFINITIONS} + ${ISAAC_CAMERA_RING_ROOT_COUNT}")
+        math(EXPR ISAAC_CAMERA_RING_SEAMS
+          "${ISAAC_CAMERA_RING_SEAMS} + ${ISAAC_CAMERA_RING_SEAM_COUNT}")
+        if(ISAAC_CAMERA_RING_ROOT_COUNT GREATER 0)
+          if(NOT ISAAC_CAMERA_RING_ROOT_COUNT EQUAL 1 OR
+             NOT ISAAC_CAMERA_RING_SEAM_COUNT EQUAL 1)
+            message(FATAL_ERROR
+              "camera ring owner ${ISAAC_CAMERA_RING_SYMBOL} has a missing or "
+              "duplicate seam: ${ISAAC_GENERATED_SOURCE}")
+          endif()
+          list(APPEND ISAAC_CAMERA_RING_OWNER "${ISAAC_GENERATED_SOURCE}")
+        elseif(ISAAC_CAMERA_RING_SEAM_COUNT GREATER 0)
+          message(FATAL_ERROR
+            "camera ring seam ${ISAAC_CAMERA_RING_SYMBOL} escaped its frozen "
+            "owner: ${ISAAC_GENERATED_SOURCE}")
+        endif()
+      endif()
+    endforeach()
+    list(LENGTH ISAAC_CAMERA_RING_OWNER ISAAC_CAMERA_RING_OWNER_COUNT)
+    if(NOT ISAAC_CAMERA_RING_OWNER_COUNT EQUAL 1 OR
+       NOT ISAAC_CAMERA_RING_DEFINITIONS EQUAL 1 OR
+       NOT ISAAC_CAMERA_RING_SEAMS EQUAL 1)
+      message(FATAL_ERROR
+        "camera ring replay requires one generated owner/seam for "
+        "${ISAAC_CAMERA_RING_SYMBOL} (regenerate the corpus with this "
+        "gen_all.py); found owners=${ISAAC_CAMERA_RING_OWNER_COUNT}, "
+        "definitions=${ISAAC_CAMERA_RING_DEFINITIONS}, "
+        "seams=${ISAAC_CAMERA_RING_SEAMS}")
+    endif()
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_camera_ring_native.c")
+    # The phase profiler sees it too: ph120.cr prints the verdict counters.
+    set_property(SOURCE
+      ${ISAAC_CAMERA_RING_OWNER}
+      "${ISAAC_RUNTIME}/host_vita_camera_ring_native.c"
+      "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_CAMERA_RING_NATIVE=1)
+    # Mirrors the corpus flag model (the TU's #error checks it).
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_camera_ring_native.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS GUEST_FLAGS_LOCAL=1)
+    message(STATUS
+      "Isaac Vita camera ring average: host replay at the root in "
+      "${ISAAC_CAMERA_RING_OWNER}")
+  endif()
+  if(ISAAC_VITA_RENDER_CHAIN_NATIVE)
+    # sub_0025af60 and sub_0055f610 have no direct caller inside their own
+    # generated units (test_vita_render_chain_native.py pins it); every
+    # caller, including the guest_table.c dispatch slot, is in another unit,
+    # so GNU ld --wrap catches them and __real_ keeps the translated bodies.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_render_chain_native.c")
+    target_link_options(isaac_first_arm_fault PRIVATE
+      -Wl,--wrap=sub_0025af60
+      -Wl,--wrap=sub_0055f610)
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_render_chain_native.c"
+      "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_RENDER_CHAIN_NATIVE=1)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_render_chain_native.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS GUEST_FLAGS_LOCAL=1)
+    message(STATUS
+      "Isaac Vita render chain: native --wrap seams on sub_0025af60 and "
+      "sub_0055f610")
   endif()
   if(ISAAC_VITA_FIOS_CACHE)
     list(APPEND ISAAC_VITA_RUNTIME_SOURCES
@@ -4365,6 +6677,19 @@ else()
       APPEND PROPERTY COMPILE_DEFINITIONS
         ISAAC_VITA_HEAP_LEDGER_MEMBLOCK=1)
   endif()
+  if(ISAAC_VITA_GUEST_STACK_MEMBLOCK)
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/guest_stack_memblock.c")
+    # Only the stack owner and the boot receipt see the switch; guest.h and
+    # generated units never do (default OFF adds no definition).
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/guest.c"
+      "${ISAAC_RUNTIME}/entry_vita.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_GUEST_STACK_MEMBLOCK=1)
+    message(STATUS
+      "Isaac Vita guest stack: dedicated USER_RW memblock (request 0x401000, retained 0x402000)")
+  endif()
   if(ISAAC_VITA_HEAP_LEDGER_BACKSHIFT)
     # This is solely an implementation policy of the ownership table.  Keep
     # its A/B macro off headers, generated units and unrelated boundaries.
@@ -4383,6 +6708,23 @@ else()
       "${ISAAC_RUNTIME}/entry_vita.c"
       APPEND PROPERTY COMPILE_DEFINITIONS
         ISAAC_VITA_HEAP_OVERFLOW_MSPACE=1)
+    message(STATUS
+      "Isaac Vita heap: overflow mspace ${ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES_NORMALIZED} "
+      "bytes (${ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES_DECIMAL}), retained +4 KiB")
+    if(NOT ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES_IS_DEFAULT)
+      # Pool-size knob: one definition on the five units that see the pool
+      # constants; RETAINED, the combined ledger+pool budgets and the slab
+      # remainder derive in the headers.  The default emits nothing, so the
+      # default build's compile commands and objects are unchanged.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_heap.c"
+        "${ISAAC_RUNTIME}/entry_vita.c"
+        "${ISAAC_RUNTIME}/host_vita_heap_overflow_mspace.c"
+        "${ISAAC_RUNTIME}/host_vita_room_entry_slab.c"
+        "${ISAAC_RUNTIME}/host_vita_room_entry_external.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES=${ISAAC_VITA_HEAP_OVERFLOW_MSPACE_BYTES_NORMALIZED}U)
+    endif()
   endif()
   if(ISAAC_VITA_HEAP_TERMINAL_FASTPATH)
     set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
@@ -4411,6 +6753,56 @@ else()
       "${ISAAC_RUNTIME}/host_vita_room_entry_slab.c"
       APPEND PROPERTY COMPILE_DEFINITIONS
         ISAAC_VITA_ROOM_ENTRY_HYBRID=1)
+  endif()
+  if(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH=1)
+    message(STATUS "Isaac heap: immutable-domain non-slab free rejection (ownership and allocator choice unchanged)")
+  endif()
+  if(ISAAC_VITA_HEAP_FREE_PREFILTER)
+    # The heap TU reads the range records that only the block modules define
+    # under this knob, so a module missing the define fails the link instead
+    # of being skipped.  ANM2/texel modules exist only with their own knobs.
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_heap.c"
+      "${ISAAC_RUNTIME}/host_vita_ogg_emergency.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_FREE_PREFILTER=1)
+    message(STATUS "Isaac heap: free prefilter (one range test skips the OGG/ANM2/texel free routes for foreign pointers; routes and results unchanged)")
+  endif()
+  # Top-level AND blocks, not blocks nested in the prefilter block: the ANM2
+  # and texel scratch selection blocks are found by their exact if() lines
+  # (test_anm2_scratch_integration.py).
+  if(ISAAC_VITA_HEAP_FREE_PREFILTER AND ISAAC_VITA_ANM2_SCRATCH)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_anm2_scratch.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_FREE_PREFILTER=1)
+  endif()
+  if(ISAAC_VITA_HEAP_FREE_PREFILTER AND ISAAC_VITA_TEXEL_SCRATCH)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_texel_scratch.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_FREE_PREFILTER=1)
+  endif()
+  if(ISAAC_VITA_HEAP_FREE_COST_PROFILE)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
+                        "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_FREE_COST_PROFILE=1)
+    if(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+      # The observer's live-slot census (ph120.hv nv=) exists only with the
+      # live mask; without it the heap's weak reference prints zeros.
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_native_vorbis.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_HEAP_FREE_COST_PROFILE=1)
+    endif()
+    message(STATUS "Isaac heap: free cost profile ph120.hg/hv (ledger lookup/lease/remove split, prefilter and Vorbis live-slot census)")
+  endif()
+  if(ISAAC_VITA_HEAP_STAGE_PROFILE)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
+                        "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_STAGE_PROFILE=1)
+    message(STATUS "Isaac heap: stage profile ph120.hc/hf/hm (counters + 1-in-64 spans)")
+  endif()
+  if(ISAAC_VITA_HEAP_LEAN_IMPORT)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_LEAN_IMPORT=1)
+    message(STATUS "Isaac heap: lean import (measurement-only floor-lifetime sidecars off)")
   endif()
   # Keep generic Vita guest.c oracles on the established name-dispatch ABI.
   # Only the production target links the full validated dense-ID closure.
@@ -4478,6 +6870,25 @@ else()
     list(APPEND ISAAC_VITA_RUNTIME_SOURCES
       "${ISAAC_RUNTIME}/host_vita_archive_receipt.c")
   endif()
+  if(ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR)
+    # The generated FileManager::LoadArchiveFile owner (sub_00563880) calls
+    # isaac_vita_archive_receipt_begin in the receipt module, a
+    # cross-object edge; --wrap routes it through the sidecar check without
+    # changing any generated object or the receipt module.  OFF adds no
+    # source, no definition and no link option.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_archive_sidecar.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_archive_sidecar.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR=1
+        ISAAC_VITA_ARCHIVE_SIDECAR_BUILD_ID=\"${ISAAC_VITA_GUEST_LINK_ID}\")
+    target_link_options(isaac_first_arm_fault PRIVATE
+      -Wl,--wrap=isaac_vita_archive_receipt_begin)
+    message(STATUS
+      "Isaac Vita archive validation sidecar: <archive>.receipt next to a "
+      "rewritten packed archive is trusted after size/header/index/sample checks")
+  endif()
   if(ISAAC_VITA_ASYNC_SAVE_WRITE)
     # Bundle35 evidence: the guest rewrites gamestateN.dat (68,741 bytes) on
     # every room change through a 1 KiB-buffered newlib "wb" FILE, so ~68
@@ -4503,6 +6914,41 @@ else()
       "Isaac Vita asynchronous save writer: Documents/*.dat images "
       "written by one SceKernel worker thread")
   endif()
+  if(ISAAC_VITA_GAME_LOG_ASYNC)
+    # Mom's Heart death (2026-09-10, nt2p): the frozen logger flushes
+    # log.txt after every record and the CRT hands that flush to a 1 KiB-
+    # buffered newlib FILE, one synchronous sceIoWrite of 15-25 ms on the
+    # game thread.  Only the CRT FILE-token owner, the four path-based import
+    # owners that must observe read-your-writes, the process-exit tail, the
+    # abort hook owner and the lane module see the macro.  Generated guest
+    # units retain byte-identical commands.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_game_log.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_crt.c"
+      "${ISAAC_RUNTIME}/host_vita_filesystem.c"
+      "${ISAAC_RUNTIME}/host_vita_startup.c"
+      "${ISAAC_RUNTIME}/host_vita_find.c"
+      "${ISAAC_RUNTIME}/entry_vita.c"
+      "${ISAAC_RUNTIME}/host_vita_log_async.c"
+      "${ISAAC_RUNTIME}/host_vita_game_log.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_GAME_LOG_ASYNC=1)
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_game_log.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_GAME_LOG_ASYNC_RING_KB=${ISAAC_VITA_GAME_LOG_ASYNC_RING_KB}U
+        ISAAC_VITA_GAME_LOG_ASYNC_DURABLE_SEVERITY=${ISAAC_VITA_GAME_LOG_ASYNC_DURABLE_SEVERITY}U
+        ISAAC_VITA_GAME_LOG_BUILD_ID=\"${ISAAC_VITA_GUEST_LINK_ID}\")
+    message(STATUS
+      "Isaac Vita game log write-behind: log.txt bytes appended by one "
+      "worker thread; ${ISAAC_VITA_GAME_LOG_ASYNC_RING_KB} KiB ring, "
+      "severity >= ${ISAAC_VITA_GAME_LOG_ASYNC_DURABLE_SEVERITY} synchronous")
+  else()
+    message(STATUS
+      "Isaac Vita game log write-behind: disabled (log.txt is a "
+      "1 KiB-buffered newlib FILE flushed on the game thread)")
+  endif()
   if(ISAAC_VITA_CRT_SEEK_SHADOW)
     # prof-v6 sampler: File::GetSize = ftell; fseek(0,SEEK_END); ftell;
     # fseek(pos,SEEK_SET) burned 5.65 s of one 9.9 s floor load in newlib
@@ -4526,21 +6972,115 @@ else()
     # FILE-token owner retains each read-only token's native path and, once
     # per failed fread/fseek, reopens it at the logical cursor and redoes the
     # call (arcdiag descriptor-recover-v1 receipt per recovery, KAGE VITA CRT
-    # DESCRIPTOR RECOVER counters).  No other TU sees the macro.
+    # DESCRIPTOR RECOVER counters).  The archive cache, which owns every
+    # newlib fclose of a FILE token, also sees it: a dead descriptor's refused
+    # close would otherwise keep one of newlib's 253 fds for good.  No other
+    # TU sees the macro.
     set_property(SOURCE
       "${ISAAC_RUNTIME}/host_vita_crt.c"
+      "${ISAAC_RUNTIME}/host_vita_archive_cache.c"
       APPEND PROPERTY COMPILE_DEFINITIONS
         ISAAC_VITA_CRT_DESCRIPTOR_RECOVER=1)
     message(STATUS
       "Isaac Vita CRT descriptor recovery: ENODEV read-only FILE tokens "
       "reopened at their cursor (arcdiag descriptor-recover-v1 receipts)")
   endif()
+  if(ISAAC_VITA_TIMEGETTIME_RECIPROCAL)
+    # RENDER60 S6 leg 2 (see the option): only the timeGetTime handler's TU
+    # sees the macro.
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_post_com.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_TIMEGETTIME_RECIPROCAL=1)
+    message(STATUS
+      "Isaac Vita timeGetTime: exact multiply-high u64/1000 (KAGE VITA TGT "
+      "RECIPROCAL self-test line at the first call)")
+  endif()
+  if(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+    # RENDER60 S6 leg 1 (see the option): the handler's TU here; the phase
+    # profile TU gets the same mode in the PHASE_PROFILE block (ph120.tl).
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_post_com.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE=${ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE})
+    message(STATUS
+      "Isaac Vita Clear expiry clock latch: "
+      "${ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_NAME} (KAGE VITA CLEAR LATCH "
+      "line at the first loop call)")
+  endif()
+  if(ISAAC_VITA_CRT_FREAD_COMPLETE)
+    # The ArchivedFile block reader ignores fread's count; one short read
+    # on a packed-archive stream without an EOF/error flag shifts the
+    # cursor and a later header read dies on "block header is invalid"
+    # (tour 1, 2026-09-17: 48 bytes short on repentance.a).  The CRT
+    # FILE-token owner completes such a read from the cursor it left,
+    # bounded, on packed-archive tokens only (KAGE VITA CRT FREAD SHORT
+    # receipts for the first eight, KAGE VITA CRT FREAD COMPLETE counters
+    # with every seek-shadow report and at shutdown).  No other TU sees
+    # the macro.
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_crt.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_CRT_FREAD_COMPLETE=1)
+    message(STATUS
+      "Isaac Vita CRT fread completion: short packed-archive reads "
+      "completed in place (KAGE VITA CRT FREAD SHORT receipts)")
+  endif()
+  if(ISAAC_VITA_ACCESS_NEGATIVE_CACHE)
+    # Device hot profile 2026-10-12: 45 % of mid-fight stall
+    # samples were _access probes of mods/<mod>/resources*/<path>, two per
+    # enabled mod per new resource path, nearly all negative.  The _access
+    # owner asks the cache; the CRT FILE-token owner (write-mode fopen,
+    # descriptor recovery, reports) and CreateDirectoryA's owner invalidate
+    # it.  No other TU sees the macro.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_access_cache.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_filesystem.c"
+      "${ISAAC_RUNTIME}/host_vita_crt.c"
+      "${ISAAC_RUNTIME}/host_vita_startup.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_ACCESS_NEGATIVE_CACHE=1)
+    message(STATUS
+      "Isaac Vita _access negative cache: probes below an absent mods/ "
+      "directory answered without a stat (KAGE VITA ACCESS CACHE counters)")
+  endif()
+  if(ISAAC_VITA_LAUNCH_ARGS_FILE)
+    # Input-free benchmark runs (launch arguments from a file).  Only the CRT argv owner
+    # sees the macro.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_launch_args.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_crt.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_LAUNCH_ARGS_FILE=1)
+    message(STATUS
+      "Isaac Vita launch args: guest argv extended from launch-args.txt "
+      "(ISAAC VITA LAUNCH ARGS receipt)")
+  endif()
+  if(ISAAC_VITA_ARCHIVE_DIAG_VERBOSE)
+    # The ring lives in the archive cache TU and the CRT FILE-token owner
+    # fills and dumps it; both must agree on the 1024-event capacity.  No
+    # other TU sees the macro.
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_crt.c"
+      "${ISAAC_RUNTIME}/host_vita_archive_cache.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_ARCHIVE_DIAG_VERBOSE=1)
+    message(STATUS
+      "Isaac Vita archive diag verbose: every archive fread/fseek/ftell/"
+      "fclose retained (1024-event arcdiag ring dumped at ArchivedFile fatals)")
+  endif()
   if(ISAAC_VITA_LOG_ASYNC)
     # Exactly these owners see the macro: the durable logger (platform.c),
-    # the exit/flush path, the module, the ph120 emitter and the four other
+    # the exit/flush path, the module, the ph120 emitter and the five other
     # game-thread per-window/per-event record owners.  Generated units and
     # the translated CPU core keep byte-identical commands; abort() is
     # wrapped so a failed assert drains the ring before the process dies.
+    # The GPU frame profile TU is listed even when that knob is OFF (it is
+    # then not compiled): without the macro its ph120.gpu record falls back
+    # to sceClibPrintf and never reaches first-arm-fault.log (int-final-a
+    # 2026-10-25: banner logged, 143 windows, 0 ph120.gpu records).
     list(APPEND ISAAC_VITA_RUNTIME_SOURCES
       "${ISAAC_RUNTIME}/host_vita_log_async.c")
     set_property(SOURCE
@@ -4552,9 +7092,14 @@ else()
       "${ISAAC_RUNTIME}/kage_vita_backend.c"
       "${ISAAC_RUNTIME}/kage_vita_input.c"
       "${ISAAC_RUNTIME}/kage_vita_generated_hooks.c"
+      "${ISAAC_RUNTIME}/kage_vita_gpu_frame_profile.c"
       APPEND PROPERTY COMPILE_DEFINITIONS
         ISAAC_VITA_LOG_ASYNC=1)
+    # The ring owner sizes s_ring from this macro and platform.c prints the
+    # same macro as ring_kb= in the KAGE VITA LOG ASYNC banner; both must see
+    # the configured value or the banner reports the header default (256).
     set_property(SOURCE
+      platform.c
       "${ISAAC_RUNTIME}/host_vita_log_async.c"
       APPEND PROPERTY COMPILE_DEFINITIONS
         ISAAC_VITA_LOG_ASYNC_RING_KB=${ISAAC_VITA_LOG_ASYNC_RING_KB})
@@ -4576,6 +7121,15 @@ else()
     message(STATUS
       "Isaac Vita native async FILE batching: adjacent queued records only, "
       "8 records/4096 bytes, no hold timer; debug record boundaries unchanged")
+  endif()
+  if(ISAAC_VITA_LOG_ASYNC_PRINTF_FILE)
+    set_property(SOURCE
+      platform.c
+      "${ISAAC_RUNTIME}/host_vita_log_async.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LOG_ASYNC_PRINTF_FILE=1)
+    message(STATUS
+      "Isaac Vita diagnostic printf file transport: existing FILE+debug sink; "
+      "bounded records preserve bytes/order; overlong debug-only with file receipt")
   endif()
   if(ISAAC_VITA_ARCHIVE_VALIDATION_SKIP)
     # The generator places the frozen seam in exactly one numbered unit, but
@@ -4706,6 +7260,56 @@ else()
     message(STATUS
       "Isaac Vita original effects profile: C/S/F disabled in owner "
       "${ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE_OWNER}")
+    if(ISAAC_VITA_EFFECTS_PROFILE_WATER)
+      # Same owner unit: the generator emits the two water stores (+0x83
+      # EnableWaterSurface, +0x84 latch) under !defined(...KEEP_WATER).
+      set_property(SOURCE
+        ${ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE_OWNER}
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_EFFECTS_PROFILE_KEEP_WATER=1)
+      message(STATUS
+        "Isaac Vita original effects profile: water surface kept "
+        "(ISAAC_VITA_EFFECTS_PROFILE_WATER=ON)")
+    endif()
+    if(ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER)
+      # Same owner unit: the generator emits the EnableColorModifier store
+      # (+0x85) only on the knob-OFF branch, and the kept branch logs the
+      # six profile bytes once per seam (issue #5, item 15-i).
+      set_property(SOURCE
+        ${ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE_OWNER}
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER=1)
+      # keep-color-modifier corpus check begin
+      # The define only acts on a corpus whose owner carries the knob fence
+      # (gen_all.py VITA_ORIGINAL_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER_FENCE,
+      # one per profile block).  An older corpus builds cleanly, still clears
+      # the byte and prints no receipt, so refuse it here.
+      file(STRINGS "${ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE_OWNER}"
+        ISAAC_VITA_EFFECTS_PROFILE_BLOCK_LINES
+        REGEX "^#if defined\\(__vita__\\) && defined\\(ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE\\)$")
+      file(STRINGS "${ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE_OWNER}"
+        ISAAC_VITA_EFFECTS_PROFILE_COLOR_FENCE_LINES
+        REGEX "^#if !defined\\(ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER\\)$")
+      list(LENGTH ISAAC_VITA_EFFECTS_PROFILE_BLOCK_LINES
+        ISAAC_VITA_EFFECTS_PROFILE_BLOCK_COUNT)
+      list(LENGTH ISAAC_VITA_EFFECTS_PROFILE_COLOR_FENCE_LINES
+        ISAAC_VITA_EFFECTS_PROFILE_COLOR_FENCE_COUNT)
+      if(ISAAC_VITA_EFFECTS_PROFILE_BLOCK_COUNT EQUAL 0 OR
+          NOT ISAAC_VITA_EFFECTS_PROFILE_COLOR_FENCE_COUNT EQUAL
+            ISAAC_VITA_EFFECTS_PROFILE_BLOCK_COUNT)
+        message(FATAL_ERROR
+          "ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER needs a corpus "
+          "generated with its fence: owner "
+          "${ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE_OWNER} has "
+          "${ISAAC_VITA_EFFECTS_PROFILE_COLOR_FENCE_COUNT} fence(s) for "
+          "${ISAAC_VITA_EFFECTS_PROFILE_BLOCK_COUNT} profile block(s); "
+          "regenerate it with this tree's gen_all.py")
+      endif()
+      # keep-color-modifier corpus check end
+      message(STATUS
+        "Isaac Vita original effects profile: floor colour modifier kept "
+        "(ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER=ON)")
+    endif()
   endif()
   if(ISAAC_VITA_PILL_BLOOM_BYPASS)
     # The generator pins both pill-timer Bloom branches inside Game::Render.
@@ -5102,6 +7706,23 @@ else()
     message(STATUS
       "Isaac Vita archive MiniZ fast path: guarded native coroutine in owner "
       "${ISAAC_VITA_ARCHIVE_MINIZ_OWNER}")
+    if(ISAAC_VITA_INFLATE_TABLE_MEMO)
+      # Only the archive tinfl translation unit takes the definition; the
+      # PNG entry (host_vita_native_png_miniz.c) includes the same decoder
+      # source without it and is unchanged.  No generated unit, wrap or
+      # heap source is touched.
+      list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+        "${ISAAC_RUNTIME}/host_vita_inflate_table_memo.c")
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_archive_miniz_native.c"
+        "${ISAAC_RUNTIME}/host_vita_inflate_table_memo.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_INFLATE_TABLE_MEMO=1
+          ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS=${ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS})
+      message(STATUS
+        "Isaac Vita inflate table memo: fixed tables kept, "
+        "${ISAAC_VITA_INFLATE_TABLE_MEMO_SLOTS} dynamic slots")
+    endif()
   endif()
   if(ISAAC_VITA_WAV_BUFFERED_REWIND)
     set(ISAAC_VITA_WAV_REWIND_OWNER)
@@ -5203,6 +7824,328 @@ else()
       message(STATUS
         "Isaac Vita archive XOR: guarded native words, original PRNG refresh")
     endif()
+  endif()
+  if(ISAAC_VITA_THEORA_PRECACHE_FRAMES GREATER 0)
+    # TheoraFrameQueue::setSize (005a4c60, guest_0174.c) is called from the
+    # clip load path (005a9f2a, guest_0175.c) and the restart path (005950cc,
+    # guest_0172.c); --wrap rewrites the count argument on the guest stack
+    # before the untouched translated body runs, so no generated object
+    # changes and the OFF build links no wrapper at all.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_theora_precache.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_theora_precache.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_THEORA_PRECACHE_FRAMES=${ISAAC_VITA_THEORA_PRECACHE_FRAMES})
+    if(ISAAC_VITA_TRANSLATED_CPU AND ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_theora_precache.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_FLAGS_LOCAL=1)
+    endif()
+    if(NOT ISAAC_VITA_GUEST_STACK_GUARD)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_theora_precache.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_GENERATED_STACK_GUARD=0)
+    endif()
+    target_link_options(isaac_first_arm_fault PRIVATE -Wl,--wrap=sub_005a4c60)
+    message(STATUS
+      "Isaac Vita theora: frame queue capped at ${ISAAC_VITA_THEORA_PRECACHE_FRAMES} frames per clip")
+  endif()
+  if(ISAAC_VITA_THEORA_WORKER_PUMP GREATER 0)
+    # gen_all's THEORAPLAYER_PC_WORKER_BYPASS leaves TheoraVideoManager without
+    # a decoder worker whenever the KAGE backend is up (CreateThread is
+    # unresolved on the Vita).  The pump keeps a host-resident
+    # TheoraWorkerThread and runs one bounded slice of the untouched worker
+    # loop (005c2dc0, guest_0178.c) through guest_call from the game's own
+    # per-frame TheoraVideoManager::update (00598d60, guest_0172.c; the first
+    # call of every main-loop iteration); the decodeNextFrame seam (005aa6d0,
+    # guest_0175.c) bounds the decodes per slice and the Sleep shim ends a
+    # slice instead of delaying.  No generated object changes and the OFF
+    # build links no wrapper and compiles host_vita_sync.c unchanged.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_theora_worker_pump.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_theora_worker_pump.c"
+      "${ISAAC_RUNTIME}/host_vita_sync.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_THEORA_WORKER_PUMP=${ISAAC_VITA_THEORA_WORKER_PUMP})
+    if(ISAAC_VITA_TRANSLATED_CPU AND ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_theora_worker_pump.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_FLAGS_LOCAL=1)
+    endif()
+    if(NOT ISAAC_VITA_GUEST_STACK_GUARD)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_theora_worker_pump.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_GENERATED_STACK_GUARD=0)
+    endif()
+    target_link_options(isaac_first_arm_fault PRIVATE
+      -Wl,--wrap=sub_00598d60 -Wl,--wrap=sub_005aa6d0)
+    message(STATUS
+      "Isaac Vita theora: decoder worker pumped from the main thread, ${ISAAC_VITA_THEORA_WORKER_PUMP} decode(s) per slice")
+    if(ISAAC_VITA_THEORA_RENDER_PRIORITY)
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_theora_worker_pump.c"
+        "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_THEORA_RENDER_PRIORITY=1)
+      message(STATUS "Isaac Vita theora: single-clip/no-Game Render priority ON")
+    endif()
+    if(ISAAC_VITA_THEORA_WORKER_PUMP_WATCHDOG)
+      # Diagnostic only: a reader thread that reports the pump, clip and
+      # guest-stack state when no slice completes for five seconds.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_theora_worker_pump.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_THEORA_WORKER_PUMP_WATCHDOG=1)
+      message(STATUS
+        "Isaac Vita theora: pump watchdog ON (diagnostic; reports a five-second slice silence)")
+    endif()
+  endif()
+  if(ISAAC_VITA_NATIVE_THEORA)
+    if(ISAAC_VITA_THEORA_CADENCE_PROFILE)
+      # Three existing, allocator-gated TUs. No generated or scheduler change.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_theora_worker_pump.c"
+        "${ISAAC_RUNTIME}/host_vita_native_theora.c"
+        "${ISAAC_RUNTIME}/gl_vita_backend.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_THEORA_CADENCE_PROFILE=1)
+      target_link_options(isaac_first_arm_fault PRIVATE -Wl,--wrap=sub_00599db0)
+      message(STATUS "Isaac Vita theora cadence profile ON: tc.s/tc.n/tc.r, 2048 intervals, diagnostic only")
+    endif()
+    # TheoraVideoClip_Theora (guest_0175.c) reaches libtheora's public decoder
+    # API (guest_0181.c: 005da480 th_decode_alloc, 005da4f0 th_decode_ctl,
+    # 005da670 th_decode_free, 005da6d0 th_decode_packetin, 005db3c0
+    # th_decode_ycbcr_out, 005db3f0 th_comment_clear, 005db440 th_comment_init,
+    # 005db450 th_info_clear, 005db470 th_info_init, 005dbac0
+    # th_decode_headerin, 005dbb10 th_setup_free; guest_0182.c: 005ddb60
+    # th_granule_frame, 005ddc10 th_granule_time) only through direct
+    # cross-unit calls, so GNU ld --wrap routes every one of them to the native
+    # libtheoradec; the translated bodies stay linked but unreached.
+    # TheoraVideoFrame::decode (005bf7f0, guest_0177.c) is wrapped as a timed
+    # pass-through so the YUV->RGB cost is a number in the log, and so is
+    # vorbis_synthesis (005c2910), the clip's audio decode that decodeNextFrame
+    # runs on the translated libvorbis before every video packet.  No generated
+    # object changes and the OFF build links neither wrapper nor libtheoradec.
+    # libtheoradec allocates through malloc/calloc/realloc/free, which on the
+    # Vita is the 81 MiB newlib arena the guest heap fills to the brim by the
+    # end of a run (nt1 device run 2026-09-10: th_decode_alloc answered NULL
+    # for the ending video and th_granule_frame read it, C2-12828-1), so the
+    # archive is copied with those four imports renamed to the seam's pool
+    # allocator (isaac_vita_theora_*: a private memblock mspace per video with
+    # the guest heap as fallback); the raw archive is never linked.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_native_theora.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_native_theora.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_NATIVE_THEORA=1)
+    if(ISAAC_VITA_TRANSLATED_CPU AND ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_native_theora.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_FLAGS_LOCAL=1)
+    endif()
+    if(NOT ISAAC_VITA_GUEST_STACK_GUARD)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_native_theora.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_GENERATED_STACK_GUARD=0)
+    endif()
+    target_link_options(isaac_first_arm_fault PRIVATE
+      -Wl,--wrap=sub_005da480 -Wl,--wrap=sub_005da4f0 -Wl,--wrap=sub_005da670
+      -Wl,--wrap=sub_005da6d0 -Wl,--wrap=sub_005db3c0 -Wl,--wrap=sub_005db3f0
+      -Wl,--wrap=sub_005db440 -Wl,--wrap=sub_005db450 -Wl,--wrap=sub_005db470
+      -Wl,--wrap=sub_005dbac0 -Wl,--wrap=sub_005dbb10 -Wl,--wrap=sub_005ddb60
+      -Wl,--wrap=sub_005ddc10 -Wl,--wrap=sub_005bf7f0 -Wl,--wrap=sub_005c2910)
+    # Which archive: the sysroot's (libtheora 1.1.1, C only) or a replacement
+    # built from the 1.2.0 release with the ARM/NEON assembly by the same
+    # softfp toolchain, installed under ISAAC_VITA_THEORADEC_PREFIX.  The seam's
+    # _Static_asserts must see the header that belongs to the archive, so the
+    # replacement's include directory is added to the seam source only; every
+    # other unit keeps the sysroot's headers.  The archive's vendor string
+    # (th_version_string's OC_VENDOR_STRING) is read at configure time and
+    # printed with the status line; the seam prints the linked one at
+    # th_decode_alloc, since the guest's own th_version_string is not wrapped.
+    if(ISAAC_VITA_THEORADEC_SOURCE STREQUAL "vitasdk")
+      set(ISAAC_VITA_THEORADEC_LIBRARY "${VITASDK}/arm-vita-eabi/lib/libtheoradec.a")
+    elseif(ISAAC_VITA_THEORADEC_SOURCE STREQUAL "master")
+      if(NOT ISAAC_VITA_THEORADEC_PREFIX)
+        message(FATAL_ERROR
+          "ISAAC_VITA_THEORADEC_SOURCE=master needs ISAAC_VITA_THEORADEC_PREFIX: the install "
+          "prefix holding lib/libtheoradec.a and include/theora/*.h built per "
+          "THEORA-ARM-ASM-PLAN-2026-09-10 section 2 (no default)")
+      endif()
+      set(ISAAC_VITA_THEORADEC_LIBRARY "${ISAAC_VITA_THEORADEC_PREFIX}/lib/libtheoradec.a")
+      if(NOT EXISTS "${ISAAC_VITA_THEORADEC_PREFIX}/include/theora/theoradec.h")
+        message(FATAL_ERROR
+          "ISAAC_VITA_THEORADEC_SOURCE=master needs the archive's own headers: "
+          "'${ISAAC_VITA_THEORADEC_PREFIX}/include/theora/theoradec.h' is missing")
+      endif()
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_native_theora.c"
+        APPEND PROPERTY INCLUDE_DIRECTORIES "${ISAAC_VITA_THEORADEC_PREFIX}/include")
+    else()
+      message(FATAL_ERROR
+        "ISAAC_VITA_THEORADEC_SOURCE must be vitasdk or master, got '${ISAAC_VITA_THEORADEC_SOURCE}'")
+    endif()
+    if(NOT EXISTS "${ISAAC_VITA_THEORADEC_LIBRARY}" OR NOT CMAKE_OBJCOPY)
+      message(FATAL_ERROR
+        "ISAAC_VITA_NATIVE_THEORA needs the selected libtheoradec.a and objcopy "
+        "(source='${ISAAC_VITA_THEORADEC_SOURCE}' library='${ISAAC_VITA_THEORADEC_LIBRARY}' "
+        "objcopy='${CMAKE_OBJCOPY}')")
+    endif()
+    # Unanchored: in the 1.2.0 archive the vendor literal shares its string
+    # run with the printable tail of the preceding constant ("pGXiph.Org ..."),
+    # so the vendor is the suffix of the first run naming it.
+    file(STRINGS "${ISAAC_VITA_THEORADEC_LIBRARY}" ISAAC_VITA_THEORADEC_VENDOR
+      REGEX "Xiph\\.Org libtheora " LIMIT_COUNT 1)
+    string(REGEX REPLACE "^.*(Xiph\\.Org libtheora )" "\\1"
+      ISAAC_VITA_THEORADEC_VENDOR "${ISAAC_VITA_THEORADEC_VENDOR}")
+    # The vendor is a configure-time read while the pooled copy below re-runs
+    # on the archive's mtime: rebuilding the archive in place must reconfigure
+    # too, or the status line would keep naming the previous archive.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${ISAAC_VITA_THEORADEC_LIBRARY}")
+    if(NOT ISAAC_VITA_THEORADEC_VENDOR)
+      message(WARNING
+        "no 'Xiph.Org libtheora ' vendor string in '${ISAAC_VITA_THEORADEC_LIBRARY}'")
+      set(ISAAC_VITA_THEORADEC_VENDOR "(none)")
+    endif()
+    if(ISAAC_VITA_NATIVE_THEORA_PLANE_DIGEST)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_native_theora.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_NATIVE_THEORA_PLANE_DIGEST=1)
+      message(STATUS
+        "Isaac Vita native theora: plane digest receipts ON (diagnostic; CRC32 per plane after every packet)")
+    endif()
+    # The pooled copy's imports are audited after the rename: the four
+    # isaac_vita_theora_* entry points must be there and no raw allocator name
+    # (the script's FORBIDDEN tuple: malloc, calloc, realloc, free, memalign,
+    # posix_memalign, aligned_alloc, strdup, valloc, pvalloc, _malloc_r and
+    # the newlib/BSD spellings) or symbol starting with ogg may remain,
+    # because the raw allocator gate scans objects and the Lua archive only,
+    # not LINK_LIBRARIES archives, so the rename is the only protection and a
+    # future archive that grows an import would otherwise reach the poisoned
+    # newlib heap unnoticed.  The audit deletes a failing copy so the link
+    # cannot pick it up.
+    if(NOT Python3_EXECUTABLE)
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    endif()
+    if(NOT CMAKE_NM OR NOT EXISTS "${CMAKE_NM}")
+      find_program(ISAAC_VITA_THEORADEC_NM arm-vita-eabi-nm
+        HINTS "${VITASDK}/bin" REQUIRED)
+    else()
+      set(ISAAC_VITA_THEORADEC_NM "${CMAKE_NM}")
+    endif()
+    set(ISAAC_VITA_THEORADEC_IMPORT_AUDIT
+      "${CMAKE_CURRENT_SOURCE_DIR}/vita_theoradec_import_audit.py")
+    set(ISAAC_VITA_THEORADEC_POOLED
+      "${CMAKE_CURRENT_BINARY_DIR}/libtheoradec_isaac_pool.a")
+    # --enable-deterministic-archives: objcopy 2.34 otherwise stamps every
+    # member header with the current time, uid and gid, so two builds of the
+    # same archive differ in sha although the linker sees identical members.
+    add_custom_command(OUTPUT "${ISAAC_VITA_THEORADEC_POOLED}"
+      COMMAND "${CMAKE_OBJCOPY}"
+        --enable-deterministic-archives
+        --redefine-sym malloc=isaac_vita_theora_malloc
+        --redefine-sym calloc=isaac_vita_theora_calloc
+        --redefine-sym realloc=isaac_vita_theora_realloc
+        --redefine-sym free=isaac_vita_theora_free
+        "${ISAAC_VITA_THEORADEC_LIBRARY}" "${ISAAC_VITA_THEORADEC_POOLED}"
+      COMMAND "${Python3_EXECUTABLE}" "${ISAAC_VITA_THEORADEC_IMPORT_AUDIT}"
+        --nm "${ISAAC_VITA_THEORADEC_NM}" --delete-on-failure
+        "${ISAAC_VITA_THEORADEC_POOLED}"
+      DEPENDS "${ISAAC_VITA_THEORADEC_LIBRARY}" "${ISAAC_VITA_THEORADEC_IMPORT_AUDIT}"
+      COMMENT "libtheoradec: renaming malloc/calloc/realloc/free to the Isaac theora pool allocator and auditing the copy's imports"
+      VERBATIM)
+    add_custom_target(isaac_vita_theoradec_pooled
+      DEPENDS "${ISAAC_VITA_THEORADEC_POOLED}")
+    add_dependencies(isaac_first_arm_fault isaac_vita_theoradec_pooled)
+    target_link_libraries(isaac_first_arm_fault PRIVATE
+      "${ISAAC_VITA_THEORADEC_POOLED}")
+    message(STATUS
+      "Isaac Vita native theora: enabled (source=${ISAAC_VITA_THEORADEC_SOURCE} archive=${ISAAC_VITA_THEORADEC_LIBRARY} vendor='${ISAAC_VITA_THEORADEC_VENDOR}'; thirteen th_* seams, allocator renamed to the memblock pool and audited, YUV->RGB timed)")
+  endif()
+  if(ISAAC_VITA_NATIVE_THEORA_PLANE_DIGEST AND NOT ISAAC_VITA_NATIVE_THEORA)
+    message(FATAL_ERROR
+      "ISAAC_VITA_NATIVE_THEORA_PLANE_DIGEST requires ISAAC_VITA_NATIVE_THEORA=ON")
+  endif()
+  # The archive source is checked whatever the decoder knob says, like the
+  # digest and RGB knobs: a misspelled value, or master while the decoder knob
+  # is OFF, would otherwise configure silently into a translated-theora eboot
+  # (an A/B build that dropped -DISAAC_VITA_NATIVE_THEORA=ON would be
+  # mislabelled).  Checks only; no build input, OFF stays identical.
+  if(NOT ISAAC_VITA_THEORADEC_SOURCE MATCHES "^(vitasdk|master)$")
+    message(FATAL_ERROR
+      "ISAAC_VITA_THEORADEC_SOURCE must be vitasdk or master, got '${ISAAC_VITA_THEORADEC_SOURCE}'")
+  endif()
+  if(NOT ISAAC_VITA_NATIVE_THEORA AND NOT ISAAC_VITA_THEORADEC_SOURCE STREQUAL "vitasdk")
+    message(FATAL_ERROR
+      "ISAAC_VITA_THEORADEC_SOURCE=${ISAAC_VITA_THEORADEC_SOURCE} requires ISAAC_VITA_NATIVE_THEORA=ON")
+  endif()
+  if(ISAAC_VITA_NATIVE_THEORA_RGB)
+    if(NOT ISAAC_VITA_NATIVE_THEORA)
+      message(FATAL_ERROR
+        "ISAAC_VITA_NATIVE_THEORA_RGB requires ISAAC_VITA_NATIVE_THEORA=ON")
+    endif()
+    # theoraplayer's two conversion-table entries (005c2ad0 RGB, 005c2c30 BGR;
+    # guest_0177.c) are the only callers of libyuv's I420ToRGB24Matrix
+    # (005ce3f0, guest_0180.c): two direct calls, no address-taken reference,
+    # so GNU ld --wrap routes both to host_vita_native_yuv.c, which reproduces
+    # libyuv's C reference row math in NEON on the same memory (guest address
+    # == host address) with the coefficients read from the constants table the
+    # caller passes.  On the device the translated conversion cost 86 ms per
+    # 960x544 frame (nt2, 2026-09-10), more than the native packet decode.
+    # No generated object changes; the OFF build links no wrapper.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_native_yuv.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_native_yuv.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_NATIVE_THEORA_RGB=1)
+    if(ISAAC_VITA_TRANSLATED_CPU AND ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_native_yuv.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_FLAGS_LOCAL=1)
+    endif()
+    if(NOT ISAAC_VITA_GUEST_STACK_GUARD)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_native_yuv.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_GENERATED_STACK_GUARD=0)
+    endif()
+    target_link_options(isaac_first_arm_fault PRIVATE
+      -Wl,--wrap=sub_005ce3f0)
+    message(STATUS
+      "Isaac Vita native theora: YUV->RGB conversion native (NEON I420ToRGB24 behind one --wrap seam)")
+  endif()
+  if(ISAAC_VITA_UNIFORM_SET_RECEIPT)
+    # KAGE Shader::Bind (005671d0), Shader::ApplyUniforms (00567b50),
+    # Shader::SetUniform (00567490), Shader::SetUniformInt (00567430) and
+    # Shader::Collapse (005679e0), all in guest_0167.c and all reached
+    # through the Shader vtable (0x75e0a8 slots 4/7/8/3) from the dispatch
+    # table guest_table.c; --wrap counts the entry state and runs the
+    # untouched translated body, so no generated object changes and the OFF
+    # build links no wrapper at all.
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_uniform_set_receipt.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_uniform_set_receipt.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_UNIFORM_SET_RECEIPT=1)
+    if(ISAAC_VITA_TRANSLATED_CPU AND ISAAC_VITA_TRANSLATED_CPU_FLAGS_LOCAL)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_uniform_set_receipt.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_FLAGS_LOCAL=1)
+    endif()
+    if(NOT ISAAC_VITA_GUEST_STACK_GUARD)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_uniform_set_receipt.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS GUEST_GENERATED_STACK_GUARD=0)
+    endif()
+    if(ISAAC_VITA_PHASE_PROFILE)
+      # The phase profiler takes the window counters and emits ph120.us
+      # after kq; only that TU sees the define.
+      set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_UNIFORM_SET_RECEIPT=1)
+      set(_isaac_uniform_receipt_sink "ph120.us per window + file log")
+    else()
+      set(_isaac_uniform_receipt_sink "file log only (no PHASE_PROFILE)")
+    endif()
+    target_link_options(isaac_first_arm_fault PRIVATE
+      -Wl,--wrap=sub_005671d0 -Wl,--wrap=sub_00567b50
+      -Wl,--wrap=sub_00567490 -Wl,--wrap=sub_00567430
+      -Wl,--wrap=sub_005679e0)
+    message(STATUS
+      "Isaac Vita uniform set receipt: Shader::Bind/ApplyUniforms/SetUniform/"
+      "SetUniformInt/Collapse wrapped; ${_isaac_uniform_receipt_sink}")
+    unset(_isaac_uniform_receipt_sink)
   endif()
   if(ISAAC_VITA_PNG_DECODE_PROFILE OR ISAAC_VITA_PNG_WINDOW_PROFILE)
     # gen_all proves eight unique frozen owners.  Six public roots contain the
@@ -5318,6 +8261,156 @@ else()
       "Isaac Vita ANM2 missing-layer guard: enabled in owner "
       "${ISAAC_VITA_ANM2_MISSING_LAYER_GUARD_OWNER}")
   endif()
+  if(ISAAC_VITA_BACKDROP_WATERGFX_GUARD)
+    # gen_all.py pins the NULL-holder skip in Backdrop::LoadGraphics and the
+    # resolver-NULL log in the image loader.  Find both exact public
+    # definitions rather than batching-derived guest_XXXX.c names; only
+    # those owners and the log helper see the definition, so OFF (and every
+    # other unit when ON) compiles exactly the unguarded text.
+    set(ISAAC_VITA_BACKDROP_WATERGFX_GUARD_OWNERS)
+    foreach(ISAAC_BACKDROP_WATERGFX_ROOT IN ITEMS sub_00498850 sub_0056c7e0)
+      set(ISAAC_BACKDROP_WATERGFX_ROOT_OWNER)
+      foreach(ISAAC_GENERATED_SOURCE IN LISTS ISAAC_GENERATED_C)
+        if(EXISTS "${ISAAC_GENERATED_SOURCE}")
+          isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+            ISAAC_BACKDROP_WATERGFX_OWNER_MATCH
+            LIMIT_COUNT 1
+            REGEX "^void ${ISAAC_BACKDROP_WATERGFX_ROOT}\\(CPU \\*__restrict c\\)$")
+          if(ISAAC_BACKDROP_WATERGFX_OWNER_MATCH)
+            list(APPEND ISAAC_BACKDROP_WATERGFX_ROOT_OWNER
+              "${ISAAC_GENERATED_SOURCE}")
+          endif()
+        endif()
+      endforeach()
+      list(LENGTH ISAAC_BACKDROP_WATERGFX_ROOT_OWNER
+        ISAAC_BACKDROP_WATERGFX_ROOT_OWNER_COUNT)
+      if(NOT ISAAC_BACKDROP_WATERGFX_ROOT_OWNER_COUNT EQUAL 1)
+        message(FATAL_ERROR
+          "Backdrop watergfx guard root ${ISAAC_BACKDROP_WATERGFX_ROOT} must "
+          "own exactly one generated source; found "
+          "${ISAAC_BACKDROP_WATERGFX_ROOT_OWNER_COUNT}")
+      endif()
+      list(APPEND ISAAC_VITA_BACKDROP_WATERGFX_GUARD_OWNERS
+        ${ISAAC_BACKDROP_WATERGFX_ROOT_OWNER})
+    endforeach()
+    list(REMOVE_DUPLICATES ISAAC_VITA_BACKDROP_WATERGFX_GUARD_OWNERS)
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/kage_vita_backdrop_watergfx.c")
+    set_property(SOURCE
+      ${ISAAC_VITA_BACKDROP_WATERGFX_GUARD_OWNERS}
+      "${ISAAC_RUNTIME}/kage_vita_backdrop_watergfx.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_BACKDROP_WATERGFX_GUARD=1)
+    message(STATUS
+      "Isaac Vita Backdrop watergfx guard: enabled in owners "
+      "${ISAAC_VITA_BACKDROP_WATERGFX_GUARD_OWNERS}")
+  endif()
+  if(ISAAC_VITA_INTRO_PLAY)
+    # gen_all.py emits the automatic-Intro ACTION_MENUCONFIRM seam (site
+    # 0x004b78fb) in the cutscene update sub_004b78d0, guarded by
+    # guest_kage_intro_skip_ready().  guest.h aliases that name to
+    # guest_kage_pc_handoff_ready unless this definition is visible, so only
+    # the one owner and the two KAGE boundary sources (whichever is linked)
+    # see it; OFF and every other unit compile exactly the pre-knob tokens.
+    set(ISAAC_VITA_INTRO_PLAY_OWNER)
+    foreach(ISAAC_GENERATED_SOURCE IN LISTS ISAAC_GENERATED_C)
+      if(EXISTS "${ISAAC_GENERATED_SOURCE}")
+        isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+          ISAAC_INTRO_PLAY_OWNER_MATCH
+          LIMIT_COUNT 1
+          REGEX "^void sub_004b78d0\\(CPU \\*__restrict c\\)$")
+        if(ISAAC_INTRO_PLAY_OWNER_MATCH)
+          list(APPEND ISAAC_VITA_INTRO_PLAY_OWNER
+            "${ISAAC_GENERATED_SOURCE}")
+        endif()
+      endif()
+    endforeach()
+    list(LENGTH ISAAC_VITA_INTRO_PLAY_OWNER ISAAC_VITA_INTRO_PLAY_OWNER_COUNT)
+    if(NOT ISAAC_VITA_INTRO_PLAY_OWNER_COUNT EQUAL 1)
+      message(FATAL_ERROR
+        "Intro play: cutscene update root sub_004b78d0 must own exactly one "
+        "generated source; found ${ISAAC_VITA_INTRO_PLAY_OWNER_COUNT}")
+    endif()
+    file(STRINGS "${ISAAC_VITA_INTRO_PLAY_OWNER}"
+      ISAAC_VITA_INTRO_PLAY_GUARD_LINES
+      REGEX "guest_kage_intro_skip_ready\\(\\)")
+    list(LENGTH ISAAC_VITA_INTRO_PLAY_GUARD_LINES
+      ISAAC_VITA_INTRO_PLAY_GUARD_COUNT)
+    if(NOT ISAAC_VITA_INTRO_PLAY_GUARD_COUNT EQUAL 1)
+      message(FATAL_ERROR
+        "Intro play: ${ISAAC_VITA_INTRO_PLAY_OWNER} must call "
+        "guest_kage_intro_skip_ready() exactly once (found "
+        "${ISAAC_VITA_INTRO_PLAY_GUARD_COUNT}); regenerate the corpus with "
+        "the generator of this tree")
+    endif()
+    set_property(SOURCE
+      ${ISAAC_VITA_INTRO_PLAY_OWNER}
+      "${ISAAC_RUNTIME}/manual_kage_vita.c"
+      "${ISAAC_RUNTIME}/manual_kage_disabled.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_INTRO_PLAY=1)
+    message(STATUS
+      "Isaac Vita Intro play (issue #14): enabled in owner "
+      "${ISAAC_VITA_INTRO_PLAY_OWNER}")
+  else()
+    message(STATUS
+      "Isaac Vita Intro play (issue #14): disabled (Intro auto-confirmed)")
+  endif()
+  if(ISAAC_VITA_TROPHIES)
+    # gen_all.py emits the knob-fenced observer at the entry of
+    # PersistentGameData::TryUnlock (sub_00484c80) and of its tail-jump copy
+    # inside sub_00485ab0 (challenge completion).  Find both exact public
+    # definitions; only those owners, the trophy runtime and its two hook
+    # sites (Stage A, Stage B) see the definition, so OFF (and every other
+    # unit when ON) compiles exactly today's text.  recomp/vita/TROPHIES.md.
+    set(ISAAC_VITA_TROPHIES_OWNERS)
+    foreach(ISAAC_TROPHIES_ROOT IN ITEMS sub_00484c80 sub_00485ab0)
+      set(ISAAC_TROPHIES_ROOT_OWNER)
+      foreach(ISAAC_GENERATED_SOURCE IN LISTS ISAAC_GENERATED_C)
+        if(EXISTS "${ISAAC_GENERATED_SOURCE}")
+          isaac_generated_definition_lines("${ISAAC_GENERATED_SOURCE}"
+            ISAAC_TROPHIES_OWNER_MATCH
+            LIMIT_COUNT 1
+            REGEX "^void ${ISAAC_TROPHIES_ROOT}\\(CPU \\*__restrict c\\)$")
+          if(ISAAC_TROPHIES_OWNER_MATCH)
+            list(APPEND ISAAC_TROPHIES_ROOT_OWNER
+              "${ISAAC_GENERATED_SOURCE}")
+          endif()
+        endif()
+      endforeach()
+      list(LENGTH ISAAC_TROPHIES_ROOT_OWNER ISAAC_TROPHIES_ROOT_OWNER_COUNT)
+      if(NOT ISAAC_TROPHIES_ROOT_OWNER_COUNT EQUAL 1)
+        message(FATAL_ERROR
+          "Vita trophies root ${ISAAC_TROPHIES_ROOT} must own exactly one "
+          "generated source; found ${ISAAC_TROPHIES_ROOT_OWNER_COUNT}")
+      endif()
+      list(APPEND ISAAC_VITA_TROPHIES_OWNERS ${ISAAC_TROPHIES_ROOT_OWNER})
+    endforeach()
+    list(REMOVE_DUPLICATES ISAAC_VITA_TROPHIES_OWNERS)
+    list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_trophies.c")
+    set_property(SOURCE
+      ${ISAAC_VITA_TROPHIES_OWNERS}
+      "${ISAAC_RUNTIME}/host_vita_trophies.c"
+      "${ISAAC_RUNTIME}/entry_vita.c"
+      "${ISAAC_RUNTIME}/kage_vita_backend.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_TROPHIES=1)
+    if(ISAAC_VITA_TROPHY_TEST_REQUEST)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_trophies.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_TROPHY_TEST_REQUEST=1)
+    endif()
+    if("${ISAAC_VITA_TROPHY_PACK_DIR}" STREQUAL "")
+      set(ISAAC_VITA_TROPHIES_PACKS "no packs")
+    else()
+      set(ISAAC_VITA_TROPHIES_PACKS "packs ${ISAAC_VITA_TROPHY_PACK_DIR}")
+    endif()
+    message(STATUS
+      "Isaac Vita trophies: enabled in owners ${ISAAC_VITA_TROPHIES_OWNERS}; "
+      "test request ${ISAAC_VITA_TROPHY_TEST_REQUEST}; "
+      "${ISAAC_VITA_TROPHIES_PACKS}")
+  endif()
   if(ISAAC_VITA_RENDERFRAME_FASTPATH)
     # gen_all.py authenticates the complete J835 RenderFrame body, all nine
     # getter calls and four pure-consumer seams, the getter/SmartPointer/
@@ -5403,6 +8496,22 @@ else()
         "${ISAAC_RUNTIME}/host_vita_texel_scratch.c"
         APPEND PROPERTY COMPILE_DEFINITIONS
           ISAAC_VITA_TEXEL_SCRATCH_8M=1)
+    endif()
+    if(ISAAC_VITA_TEXEL_SCRATCH_32M)
+      # Chinese font atlases: 32 MiB + one page capacity in the texel owner
+      # and its reservation at entry before the guest's first KAGE call runs
+      # vglInit* (same contract as the Lua arena, OpenAL and native PNG
+      # reserves above).  The imported heap boundary reads no capacity
+      # constant, so it and the generated guest code are not rebuilt; with
+      # the option OFF both objects stay byte-identical to the lazy
+      # 0x00bd6000 build.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/entry_vita.c"
+        "${ISAAC_RUNTIME}/host_vita_texel_scratch.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_TEXEL_SCRATCH_32M=1)
+      message(STATUS
+        "Isaac Vita texel scratch: 32 MiB + page (0x02001000) reserved before vitaGL for the Chinese font atlases")
     endif()
   endif()
   if(ISAAC_VITA_ROOM_GRID_INIT_NATIVE)
@@ -5887,6 +8996,30 @@ else()
         "${ISAAC_RUNTIME}/host_vita_audio_cooperative.c"
         "${ISAAC_RUNTIME}/manual_kage_vita.c"
         APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_AUDIO=1)
+      if(ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN)
+        # The entry tail's isaac_vita_audio_shutdown_active runs
+        # alcDestroyContext/alcCloseDevice, which join the OpenAL event and
+        # mixer pthreads.  Under the heap exhaustion behind a guest
+        # bad_alloc, pthread-embedded's exit path lazily calloc's the TCB
+        # cancelLock, stores NULL on failure and pthread_mutex_unlock then
+        # data-aborts (C2-12828-1; the guest stop:/bad_alloc diagnostic:
+        # lines may be lost).  With the option ON an abort stop (any stop
+        # that is not exit/_exit) leaves the OpenAL owner to the process exit
+        # and logs "KAGE VITA AUDIO ABORT: owner=..." + "KAGE VITA AUDIO
+        # SHUTDOWN: skipped (abort stop; ...)"; Exit game keeps today's
+        # teardown.  Only the entry owner and the adapter see the macro.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/entry_vita.c"
+          "${ISAAC_RUNTIME}/host_vita_audio.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_ABORT_SKIP_AUDIO_TEARDOWN=1)
+        message(STATUS
+          "Isaac Vita abort audio teardown: skipped on abort stops "
+          "(OpenAL context/device left to process exit; Exit game unchanged)")
+      else()
+        message(STATUS
+          "Isaac Vita abort audio teardown: full OpenAL teardown on every stop")
+      endif()
       if(ISAAC_VITA_AUDIO_WORKER OR ISAAC_VITA_AUDIO_REFILL_RECEIPT)
         # Bundle29 phase A: with audio ON the service phase p95 is 77-155 ms
         # because every layered music stream decodes a 64 KiB slot through
@@ -5911,6 +9044,46 @@ else()
             "${ISAAC_RUNTIME}/host_vita_audio_refill.c"
             APPEND PROPERTY COMPILE_DEFINITIONS
               ISAAC_VITA_AUDIO_REFILL_REPLAYS=1)
+        endif()
+        if(ISAAC_VITA_AUDIO_STARVATION_SHIELD)
+          # GitHub issue 5 (music cuts out after a room change): the
+          # MusicManager per-slot update (0x3a18f0) drops a slot whose stream
+          # still owns an AL source but is neither playing nor paused, and
+          # on the Vita a load stall longer than the queued PCM drains the
+          # source to AL_STOPPED before the main-loop refill can restart it.
+          # The shield lives at the alGetSourcei adapter for the one
+          # IsPlaying site (0x5be808) and the registry in the refill module;
+          # only the two audio objects see the macro.
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_audio.c"
+            "${ISAAC_RUNTIME}/host_vita_audio_refill.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_AUDIO_STARVATION_SHIELD=1)
+          message(STATUS
+            "Isaac Vita audio starvation shield: enabled (IsPlaying 0x5be808 "
+            "answers AL_PLAYING for a live starved stream, replays fresh PCM; "
+            "receipt KAGE VITA AUDIO SHIELD, first 8 then every 64th)")
+        else()
+          message(STATUS "Isaac Vita audio starvation shield: disabled")
+        endif()
+        if(ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT)
+          # The slot reset sub_0056e9a0 (guest_0168.c) is called from the
+          # MusicManager update in guest_0107.c, so GNU ld --wrap catches the
+          # edge at link time; the receipt filters on the drop's return
+          # marker (0x3a1a71) and hands the CPU to __real_ untouched.
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_audio.c"
+            "${ISAAC_RUNTIME}/host_vita_audio_refill.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_AUDIO_MUSIC_DROP_RECEIPT=1)
+          target_link_options(isaac_first_arm_fault PRIVATE
+            -Wl,--wrap=sub_0056e9a0)
+          message(STATUS
+            "Isaac Vita audio music drop receipt: enabled "
+            "(--wrap=sub_0056e9a0; KAGE VITA AUDIO MUSIC DROP, first 16 "
+            "drops then every 16th)")
+        else()
+          message(STATUS "Isaac Vita audio music drop receipt: disabled")
         endif()
         if(ISAAC_VITA_AUDIO_WORKER)
           set_property(SOURCE
@@ -5967,6 +9140,20 @@ else()
           -Wl,--wrap=sub_005b7740
           -Wl,--wrap=sub_005bb260
           -Wl,--wrap=sub_005bd310)
+        if(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_native_vorbis.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH=1)
+        endif()
+        if(ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_native_vorbis.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK=1)
+          message(STATUS
+            "Isaac Vita native vorbis: free observer scans live slots only (FREE_WATCH_MASK)")
+        endif()
         if(ISAAC_VITA_NATIVE_VORBIS_ASYNC)
           # stb_vorbis_open_file (0x5bd740, guest_0177.c) is called from
           # StreamSourceOgg::Open (guest_0174.c) and the dispatch table, so
@@ -5993,6 +9180,37 @@ else()
           "Isaac Vita native Vorbis: enabled, stb_vorbis v1.04 mirrors, "
           "${ISAAC_VITA_NATIVE_VORBIS_MODE}, receipt=${ISAAC_VITA_NATIVE_VORBIS_RECEIPT}, "
           "verify=${ISAAC_VITA_NATIVE_VORBIS_VERIFY}, ${ISAAC_VITA_NATIVE_VORBIS_ASYNC_MODE}")
+        if(ISAAC_VITA_OGG_READAHEAD)
+          # newlib's stdio (__sread/__sseek/__sclose in lib_a-stdio.o) and
+          # the archive cache's close repair reach _read_r/_lseek_r/_close_r
+          # across objects, so GNU ld --wrap routes every call through the
+          # read-ahead; descriptors it never registered go straight to
+          # newlib.  host_vita_crt.c registers (fread) and releases (fclose)
+          # descriptors and the native Vorbis guest-call seam sets the
+          # context; no generated unit changes.
+          list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+            "${ISAAC_RUNTIME}/host_vita_ogg_readahead.c")
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_ogg_readahead.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_OGG_READAHEAD=1
+              ISAAC_OGG_RA_CHUNKS=${ISAAC_VITA_OGG_READAHEAD_CHUNKS}U
+              ISAAC_OGG_RA_WAIT_US=${ISAAC_VITA_OGG_READAHEAD_WAIT_US}U
+              ISAAC_OGG_RA_PRIORITY=${ISAAC_VITA_OGG_READAHEAD_PRIORITY})
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_crt.c"
+            "${ISAAC_RUNTIME}/host_vita_native_vorbis.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_OGG_READAHEAD=1)
+          target_link_options(isaac_first_arm_fault PRIVATE
+            -Wl,--wrap=_read_r
+            -Wl,--wrap=_lseek_r
+            -Wl,--wrap=_close_r)
+          message(STATUS
+            "Isaac Vita OGG read-ahead: enabled, ${ISAAC_VITA_OGG_READAHEAD_CHUNKS} x 16 KiB "
+            "per stream on CPU 2 (prio ${ISAAC_VITA_OGG_READAHEAD_PRIORITY}), "
+            "wait ${ISAAC_VITA_OGG_READAHEAD_WAIT_US} us")
+        endif()
       else()
         message(STATUS "Isaac Vita native Vorbis: disabled (translated stb_vorbis)")
       endif()
@@ -6469,6 +9687,19 @@ else()
         "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
         "${ISAAC_RUNTIME}/entry_vita.c"
         APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_IMAGE_RETAIN=1)
+      if(ISAAC_VITA_IMAGE_RETAIN_GHOST)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+          "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_IMAGE_RETAIN_GHOST=1)
+        message(STATUS "Isaac Vita image retain ghost: ph120.irg / ph120.irm")
+      endif()
+      if(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT=1)
+        message(STATUS "Isaac Vita image retain headroom: RAM+VRAM+PHYCONT")
+      endif()
       target_link_options(isaac_first_arm_fault PRIVATE
         -Wl,--wrap=sub_0056d8c0)
       message(STATUS
@@ -6585,6 +9816,14 @@ else()
         "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
         APPEND PROPERTY COMPILE_DEFINITIONS
           ISAAC_VITA_PHASE_PROFILE_BUILD_ID=\"${ISAAC_VITA_GUEST_LINK_ID}\")
+      if(ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE)
+        # ph120.tl directly after ph120.a: window deltas of the handler's
+        # cumulative latch counters (host_vita_post_com.c owns them).
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE=${ISAAC_VITA_CLEAR_EXPIRY_CLOCK_LATCH_MODE})
+      endif()
       message(STATUS
         "Isaac Vita aggregate phase profile: enabled (120 completed loops)")
       if(ISAAC_VITA_ROOM_LOG_MARKERS)
@@ -6593,6 +9832,27 @@ else()
           "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
           APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_ROOM_LOG_MARKERS=1)
         message(STATUS "Isaac Vita room log markers: authenticated format events, queue=8, deferred phase report (not arrival/completion)")
+      endif()
+      if(ISAAC_VITA_ARCHIVE_READ_TRAIL)
+        # The CRT FILE-token owner records one run per packed-archive seek
+        # (basename, logical offset, bytes returned, fread calls, process
+        # time) under its existing FILE-registry lock; the phase reporter
+        # takes the bounded store once per window (try-lock, never waits)
+        # and prints ph120.rts plus up to CAP ph120.rt records.  Only these
+        # two owners and the pure accumulator see the macro; generated units
+        # and every other host boundary keep byte-identical commands.
+        list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+          "${ISAAC_RUNTIME}/host_vita_archive_trail.c")
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_crt.c"
+          "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+          "${ISAAC_RUNTIME}/host_vita_archive_trail.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_ARCHIVE_READ_TRAIL=1
+            ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP=${ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP}U)
+        message(STATUS
+          "Isaac Vita archive read trail: ph120.rts/rt, "
+          "${ISAAC_VITA_ARCHIVE_READ_TRAIL_CAP} recorded runs per window")
       endif()
       if(ISAAC_VITA_FRAME_SPIKE_PROFILE)
         set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
@@ -6849,6 +10109,17 @@ else()
         message(STATUS
           "Isaac Vita texture-churn profile: enabled (one aggregate x record per phase window)")
       endif()
+      if(ISAAC_VITA_GL_TEXTURE_UPLOAD_LOG)
+        # Diagnostic: one KAGE VITA TEX UPLOAD line per glTexImage2D of at
+        # least 1 MiB (extent, formats, vitaGL VRAM/RAM/PHYCONT free before and
+        # after, glGetError, wall time).  Reaches only the typed GL edge.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/gl_vita_backend.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_GL_TEXTURE_UPLOAD_LOG=1)
+        message(STATUS
+          "Isaac Vita GL texture upload log: enabled (uploads >= 1 MiB)")
+      endif()
       if(ISAAC_VITA_GUEST_SAMPLER)
         # A second-core SceKernel thread samples the guest stack every 1 ms
         # and the phase reporter prints ph120.hot/hotc/hs after ph120.t.
@@ -6876,6 +10147,55 @@ else()
         message(STATUS
           "Isaac Vita guest sampler: 1 ms return-marker sampling on CPU 1, "
           "per-phase ph120.hot/hotc/hs records")
+        if(ISAAC_VITA_GUEST_SAMPLER_CHAIN)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/kage_vita_guest_sampler.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_GUEST_SAMPLER_CHAIN=1)
+          message(STATUS
+            "Isaac Vita guest sampler: render-phase inclusive chain view "
+            "(ph120.hoti/hci)")
+        endif()
+        if(ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/kage_vita_guest_sampler.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_GUEST_SAMPLER_PRESENT_LABEL=1)
+        endif()
+        if(ISAAC_VITA_GUEST_SAMPLER_RESIDUAL)
+          # Residual attribution: the sampler TU (Lua boundary link, residual
+          # records) and the Lua bridge, which publishes the address of each
+          # live callback boundary word so the walk never links a stale copy
+          # of the word; every other object is unchanged.
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/kage_vita_guest_sampler.c"
+            "${ISAAC_RUNTIME}/host_vita_lua.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_GUEST_SAMPLER_RESIDUAL=1)
+          message(STATUS
+            "Isaac Vita guest sampler: render residual records "
+            "(ph120.hotw/hotl/hotu/hcl, Lua boundary links)")
+        endif()
+      endif()
+      if(ISAAC_VITA_GPU_FRAME_PROFILE)
+        # Profile only.  The definition reaches the profile TU, the present
+        # owner (swap bracket) and the phase reporter (render flag, record);
+        # generated units and vitaGL see no macro.  Reads vitaGL's existing
+        # query_fence; no vitaGL patch.
+        list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+          "${ISAAC_RUNTIME}/kage_vita_gpu_frame_profile.c")
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_gpu_frame_profile.c"
+          "${ISAAC_RUNTIME}/kage_vita_backend.c"
+          "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_GPU_FRAME_PROFILE=1)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_gpu_frame_profile.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_GPU_FRAME_PROFILE_PERIOD_US=${ISAAC_VITA_GPU_FRAME_PROFILE_PERIOD_US}u)
+        message(STATUS
+          "Isaac Vita GPU frame profile: ON, poll ${ISAAC_VITA_GPU_FRAME_PROFILE_PERIOD_US} us on CPU 2 (ph120.gpu)")
       endif()
     endif()
     if(ISAAC_VITA_STAGE_HEARTBEAT)
@@ -7038,6 +10358,46 @@ else()
         message(STATUS
           "Isaac Vita cadence: Exit-to-menu zero-frame returns accepted")
       endif()
+      if(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
+        # int2j device tour 3, light rooms (2026-09-17): p=100 and
+        # skip(a,l,n,f)=20,0,20,0 per 120 loops at rnd50 6.4 ms; every fifth
+        # swap waited ~10.7 ms and the inclusive Render cost refused the next
+        # interpolated frame.  Experimental: in the host oracle this gives
+        # 120 presents at exactly 30 UPS only when the wait ends on a 60-Hz
+        # edge; a fixed-length wait (what the tour's constant rnd95 - rnd50
+        # suggests) gives 120 presents at 29.73 UPS.  Only the scheduler
+        # unit changes; one clock read per Present.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT=1)
+        message(STATUS
+          "Isaac Vita cadence: interpolated-frame admission cost=Render body + recurring Present wait (experimental)")
+      endif()
+      if(ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE)
+        # S5: the scheduler unit (policy + counters) and the phase profile
+        # (ph120.fd/fs) only; OFF appends nothing, so every object stays
+        # byte-identical to a build without the knob.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_FULLSPEED_FLOOR_DEBT=${ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE}
+            ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US=${ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US})
+        if(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US GREATER 0)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US=${ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US})
+        endif()
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_FULLSPEED_FLOOR_DEBT=${ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE})
+        message(STATUS
+          "Isaac Vita cadence: floor debt=${ISAAC_VITA_FULLSPEED_FLOOR_DEBT_UPPER} "
+          "cap=${ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US}us "
+          "admit-slack=${ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US}us")
+      endif()
       message(STATUS
         "Isaac Vita cadence: fixed 60-Hz wrapper, native ~30-Hz Game parity, "
         "full-phase Render only; owners "
@@ -7132,6 +10492,12 @@ else()
         "Isaac Vita presentation: stable 30 Hz, one completed-phase render; "
         "owners ${ISAAC_VITA_STABLE30_GENERATED_OWNERS}")
     endif()
+    if(ISAAC_VITA_CXX_THROW_DIAG)
+      set_property(SOURCE "${ISAAC_RUNTIME}/guest.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_CXX_THROW_DIAG=1)
+      message(STATUS
+        "Isaac Vita C++ throw diagnostic: on (guest.c only; logs before the stop on an unresolved C++ throw import)")
+    endif()
     if(ISAAC_VITA_GUEST_LOOKUP_CACHE)
       # Keep this experiment off every generated translation unit; only the
       # dispatch owner plus the already optional profiler record owner see it.
@@ -7143,6 +10509,202 @@ else()
       message(STATUS
         "Isaac Vita guest lookup cache: enabled (256 exact keys; "
         "confirmed dispatch bypass; dense IAT)")
+    endif()
+    if(ISAAC_VITA_RUNTIME_SETTINGS)
+      # port.ini settings (written by the manager's SETTINGS page).  The
+      # shared parser TU and the boot-time loader are linked only here; the
+      # two existing owners (the entry_vita.c hook and the scheduler's duty
+      # term) and the two new units receive the definition per source, so
+      # with the option OFF every object is byte-identical to the base.  The
+      # loader learns whether a fullspeed scheduler is compiled only through
+      # the nested definition below (its setter call sits under that #if);
+      # a STABLE_30 or scheduler-less build reports
+      # fps_lock=N(ignored:no-fullspeed-scheduler).  Generated units are
+      # untouched: the duty term reuses the existing Render-gate seam.
+      list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+        "${ISAAC_RUNTIME}/host_vita_settings_parse.c"
+        "${ISAAC_RUNTIME}/host_vita_runtime_settings.c")
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/entry_vita.c"
+        "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+        "${ISAAC_RUNTIME}/host_vita_settings_parse.c"
+        "${ISAAC_RUNTIME}/host_vita_runtime_settings.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_RUNTIME_SETTINGS=1)
+      if(ISAAC_VITA_FULLSPEED_SCHEDULER)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_runtime_settings.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_FULLSPEED_SCHEDULER=1)
+      endif()
+      # The design's display_raster default is the build raster (section
+      # 1.3); the shared parser cannot see it, so the loader substitutes it
+      # whenever port.ini leaves the key unset and reports it in the receipt.
+      # Width only (the loader derives the height); the RASTER_720 gate and
+      # the NUM/DEN geometry stay with the two graphics owners.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/host_vita_runtime_settings.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_DISPLAY_RASTER_WIDTH=${ISAAC_VITA_DISPLAY_RASTER_WIDTH})
+      if(ISAAC_VITA_RENDER_SCALE_DEFAULT)
+        # Owner decision 2026-09-16: the render_scale key (default 1) is
+        # pushed into the game's options.ini MaxRenderScale by a normalizer
+        # the loader calls after its receipt.  The normalizer TU and the
+        # loader are the only owners of the definition; with the option
+        # OFF the loader object is byte-identical to the block above.
+        list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+          "${ISAAC_RUNTIME}/host_vita_render_scale.c")
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_runtime_settings.c"
+          "${ISAAC_RUNTIME}/host_vita_render_scale.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_RENDER_SCALE_DEFAULT=1)
+        message(STATUS
+          "Isaac Vita render scale default: port.ini render_scale (1|2) "
+          "written into options.ini MaxRenderScale at boot")
+      endif()
+      if(ISAAC_VITA_DEBUG_OVERLAY)
+        # On-screen debug overlay (host_vita_debug_overlay.h).  The parser
+        # gains the debug_overlay key, the loader its receipt word and push,
+        # the backend the two present hooks; the scheduler and the Lua bridge
+        # only export figures they already keep.  Every edit sits under
+        # #if defined(ISAAC_VITA_DEBUG_OVERLAY), so with the option OFF each
+        # of these objects is byte-identical to the base.  The owner-feature
+        # definitions below reach the overlay TU alone.
+        list(APPEND ISAAC_VITA_RUNTIME_SOURCES
+          "${ISAAC_RUNTIME}/host_vita_debug_overlay.c")
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_debug_overlay.c"
+          "${ISAAC_RUNTIME}/host_vita_settings_parse.c"
+          "${ISAAC_RUNTIME}/host_vita_runtime_settings.c"
+          "${ISAAC_RUNTIME}/kage_vita_backend.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_DEBUG_OVERLAY=1)
+        if(ISAAC_VITA_FULLSPEED_SCHEDULER)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_DEBUG_OVERLAY=1)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_debug_overlay.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_DEBUG_OVERLAY_SCHEDULER=1)
+        endif()
+        if(ISAAC_VITA_LUA)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_lua.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_DEBUG_OVERLAY=1)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_debug_overlay.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_DEBUG_OVERLAY_LUA_ARENA=1)
+        endif()
+        if(ISAAC_VITA_HEAP_OVERFLOW_MSPACE)
+          # The overflow pool's telemetry snapshot is already exported; the
+          # overlay TU opens host_vita_heap.h's declaration itself.
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_debug_overlay.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_DEBUG_OVERLAY_HEAP_TELEMETRY=1)
+        endif()
+        if(ISAAC_VITA_AUDIO_ACTIVE)
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_debug_overlay.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_DEBUG_OVERLAY_OPENAL_POOL=1)
+        endif()
+        if(ISAAC_VITA_DISPLAY_RASTER_SCALED)
+          # Like the loading presenter: the scanout geometry, never the
+          # RASTER_720 gate.
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_debug_overlay.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_DISPLAY_RASTER_WIDTH=${ISAAC_VITA_DISPLAY_RASTER_WIDTH}
+              ISAAC_VITA_DISPLAY_RASTER_HEIGHT=${ISAAC_VITA_DISPLAY_RASTER_HEIGHT})
+        endif()
+        # The RAM ledger: every memblock (crt0's newlib heap, vitaGL's pools,
+        # each isaac_* reservation) and every thread stack the eboot creates.
+        target_link_options(isaac_first_arm_fault PRIVATE
+          -Wl,--wrap=sceKernelAllocMemBlock
+          -Wl,--wrap=kuKernelAllocMemBlock
+          -Wl,--wrap=sceKernelFreeMemBlock
+          -Wl,--wrap=sceKernelCreateThread
+          -Wl,--wrap=sceKernelDeleteThread
+          -Wl,--wrap=sceKernelExitDeleteThread)
+        # The overlay owns __wrap_sceKernelFreeMemBlock; it also bumps the GL
+        # recorder's memory-admission generation (GL_THREAD_WORKER).
+        set(ISAAC_GL_FREE_WRAP_BY_OVERLAY ON)
+        # sceKernelGetModuleIdByAddr / sceKernelGetModuleInfo (eboot segments).
+        target_link_libraries(isaac_first_arm_fault PRIVATE
+          SceKernelModulemgr_stub)
+        if(ISAAC_VITA_MANAGER_SETTINGS_UI)
+          # The manager compiles the same parser TU (the source property above
+          # reaches it too); every manager unit must see the same struct.
+          target_compile_definitions(isaac_manager PRIVATE
+            ISAAC_VITA_DEBUG_OVERLAY=1)
+        endif()
+        message(STATUS
+          "Isaac Vita debug overlay: compiled (port.ini debug_overlay="
+          "off|compact|full; memblock/thread ledger via --wrap)")
+      endif()
+      message(STATUS
+        "Isaac Vita runtime settings: port.ini read once at boot "
+        "(fps_lock -> fullspeed scheduler duty when compiled; remap keys "
+        "parsed and reported, applied from WP3)")
+    endif()
+    if(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_STANDALONE AND NOT ISAAC_GL_FREE_WRAP_BY_OVERLAY)
+      # No overlay in this link: the recorder owns the one free wrap.  Both
+      # owners bump isaac_gl_record_memblock_freeing() before the real free;
+      # GNU ld refuses a second __wrap_ definition ("multiple definition").
+      list(APPEND ISAAC_VITA_RUNTIME_SOURCES "${ISAAC_RUNTIME}/gl_record_free_wrap.c")
+      set_property(SOURCE "${ISAAC_RUNTIME}/gl_record_free_wrap.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ${ISAAC_GL_WORKER_DEFINES} ISAAC_GL_RECORD_FREE_WRAP_OWNER_RECORDER=1)
+      target_link_options(isaac_first_arm_fault PRIVATE
+        -Wl,--wrap=sceKernelFreeMemBlock)
+      # Plain variable, like ISAAC_GL_FREE_WRAP_BY_OVERLAY: never cached.
+      set(ISAAC_GL_FREE_WRAP_BY_RECORDER ON)
+    endif()
+    if(ISAAC_VITA_GL_THREAD_WORKER AND
+       (ISAAC_GL_FREE_WRAP_BY_OVERLAY OR ISAAC_GL_FREE_WRAP_BY_RECORDER))
+      # The recorder caches its last memory-admission answers; the one
+      # sceKernelFreeMemBlock wrap in the link (the overlay's, or the
+      # recorder's own with GL_RECORD_ADMISSION_CACHE_STANDALONE) invalidates
+      # them.  Without a wrap every admission check queries the kernel.  One
+      # statement for both owners: gl_record_backend.c sees the same
+      # definitions in the A and B shapes.
+      set_property(SOURCE "${ISAAC_RUNTIME}/gl_record_backend.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_GL_RECORD_ADMISSION_CACHE=1)
+    endif()
+    if(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_STANDALONE)
+      if(ISAAC_GL_FREE_WRAP_BY_OVERLAY AND ISAAC_GL_FREE_WRAP_BY_RECORDER)
+        message(FATAL_ERROR "GL_RECORD_ADMISSION_CACHE_STANDALONE: two sceKernelFreeMemBlock wrap owners")
+      elseif(ISAAC_GL_FREE_WRAP_BY_OVERLAY)
+        set(ISAAC_GL_FREE_WRAP_OWNER overlay)
+      elseif(ISAAC_GL_FREE_WRAP_BY_RECORDER)
+        set(ISAAC_GL_FREE_WRAP_OWNER recorder)
+      else()
+        message(FATAL_ERROR "GL_RECORD_ADMISSION_CACHE_STANDALONE: no sceKernelFreeMemBlock wrap owner")
+      endif()
+      # Boot receipt in kvb_worker_ensure; the only change to
+      # kage_vita_backend.c, and only with this knob ON.
+      set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_backend.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_GL_RECORD_ADMISSION_RECEIPT=\"${ISAAC_GL_FREE_WRAP_OWNER}\")
+      if(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_VERIFY)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/gl_record_backend.c"
+          "${ISAAC_RUNTIME}/kage_vita_backend.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_GL_RECORD_ADMISSION_CACHE_VERIFY=1)
+      endif()
+      message(STATUS "Isaac Vita GL recorder admission cache: on (free wrap owner="
+                     "${ISAAC_GL_FREE_WRAP_OWNER}, verify=${ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_VERIFY})")
+    elseif(ISAAC_VITA_GL_THREAD_WORKER AND NOT ISAAC_GL_FREE_WRAP_BY_OVERLAY)
+      message(WARNING
+        "GL_THREAD_WORKER without the debug overlay and without "
+        "GL_RECORD_ADMISSION_CACHE_STANDALONE: the recorder's admission cache is OFF and every "
+        "check is a sceKernelGetMemBlockInfoByAddr call (ESTIMATED +6-15 ms per render, RENDER60-DESIGN-S1.md)")
     endif()
     if(ISAAC_VITA_DISPATCH_TABLE)
       # Owner scope (the lookup cache's two owners plus the import-ID map):
@@ -7232,7 +10794,7 @@ else()
           "Isaac Vita GL shim fast dispatch: enabled (0x7e-first probe; direct token index; plain owner word; location cache OFF - default until a LOCATION_CACHE_VERIFY device run logs ph120.a m=0)")
       endif()
       if(ISAAC_VITA_GL_SHIM_TABLE_TOKENS)
-        # Three owners (wf/opt-gltok): the table builder/verifier (guest.c),
+        # Three owners: the table builder/verifier (guest.c),
         # the trampolines and their census (gl_bridge.c, which therefore also
         # sees the table define and, in profile builds, the profile define
         # guest.c compiles with) and the ph120.d / derived-g(l) reader.
@@ -7411,6 +10973,17 @@ else()
       message(STATUS
         "Isaac Vita display/default-FBO raster: 960x544 (native panel)")
     endif()
+    if(ISAAC_VITA_DISPLAY_CENTER_Y)
+      # Lives entirely in the GL boundary object (issue #5, 5.8b); the guest
+      # keeps its byte-identical 960x540 viewport commands.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/gl_vita_backend.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_DISPLAY_CENTER_Y=1)
+      message(STATUS
+        "Isaac Vita display centre: guest default-framebuffer viewport Y + 2 "
+        "rows inside the 960x544 panel (issue #5, 5.8b)")
+    endif()
     if(ISAAC_VITA_FBO_RASTER_SCALE)
       # Only the typed guest-GL boundary allocates and scales offscreen colour
       # targets; the phase profiler prints the ph120.e counters.  Generated
@@ -7458,6 +11031,27 @@ else()
           "Isaac Vita offscreen clear elision: colour no-op clears absorbed, "
           "depth/stencil clears owed to the first draw of the same GXM scene")
       endif()
+    endif()
+    if(ISAAC_VITA_FBO_READBACK_FIX)
+      # Offscreen readback sync lives entirely in the GL boundary object.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/gl_vita_backend.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_FBO_READBACK_FIX=1)
+      message(STATUS
+        "Isaac Vita offscreen readback sync: sceGxmFinish before a "
+        "glReadPixels of a colour texture written since the last drain "
+        "(issue #10)")
+    endif()
+    if(ISAAC_VITA_FBO_DEPTH_CARRY)
+      # Lives entirely in the GL boundary object (issue #15).
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/gl_vita_backend.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_FBO_DEPTH_CARRY=1)
+      message(STATUS
+        "Isaac Vita offscreen depth carry: last depth clear replayed into a "
+        "re-attached vitaGL scene before its first draw (issue #15)")
     endif()
     if(ISAAC_VITA_VITAGL_STOCK_REFERENCE)
       # Only the vitaGL lifecycle owner selects the stock initialization and
@@ -7531,6 +11125,39 @@ else()
         message(STATUS
           "Isaac Vita graphics: stock-vitagl-reference source=73dd57a "
           "fbo valid-region=off (no 0009 patch)")
+      endif()
+      if(ISAAC_VITA_VITAGL_SCENE_GUARD)
+        # Same single owner: the lifecycle owner logs the startup receipt and,
+        # after a swap on which the 0034 counters changed, their snapshot
+        # (first eight changes, then every 256th).
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_backend.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_VITAGL_SCENE_GUARD=1)
+        message(STATUS
+          "Isaac Vita graphics: stock-vitagl-reference source=73dd57a "
+          "scene guard=on (0034-isaac-scene-guard.patch)")
+      else()
+        message(STATUS
+          "Isaac Vita graphics: stock-vitagl-reference source=73dd57a "
+          "scene guard=off (no 0034 patch)")
+      endif()
+      if(ISAAC_VITA_VITAGL_RGB_SUBUPLOAD)
+        set_property(SOURCE "${ISAAC_RUNTIME}/gl_vita_backend.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_VITAGL_RGB_SUBUPLOAD=1)
+        message(STATUS "Isaac Vita RGB subupload: exact NEON rows + full-overwrite copy elision ON")
+      endif()
+      if(ISAAC_VITA_VITAGL_INTENSITY_TEXTURE)
+        # The 0037 helper prints "Isaac intensity:" lines to the Cat-A-Log tty
+        # only.  One runtime TU, and only when ON, copies its counters into
+        # native.log: "KAGE VITA INTENSITY: armed patch=0037" once, then one
+        # cumulative line per texture call that printed tty lines
+        # (vglIsaacIntensitySnapshot).
+        set_property(SOURCE "${ISAAC_RUNTIME}/gl_vita_backend.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_VITAGL_INTENSITY_TEXTURE=1)
+        message(STATUS
+          "Isaac Vita graphics: stock-vitagl-reference source=73dd57a "
+          "intensity texture=on (0037-isaac-intensity-texture.patch)")
       endif()
     endif()
     if(ISAAC_VITA_FIRST_FRAME_PROBE)
@@ -7710,6 +11337,51 @@ else()
     message(STATUS
       "Isaac Vita body-entry census: enabled (ph120.ik ent=, every unit)")
   endif()
+  if(ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS)
+    # Per-function entries of the render watch list (guest_entry_census.h).
+    # Configure-time: the coverage ids are a pure function of the watch list
+    # and the corpus's guest_coverage.json, and the corpus outputs are
+    # already configure dependencies (manifest check above).  Target-wide
+    # like FUNCTION_ENTRIES: every generated body's hook folds to one phase
+    # load and increment (watched id) or to nothing.
+    if(NOT Python3_EXECUTABLE)
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    endif()
+    set(ISAAC_VITA_ENTRY_CENSUS_SCRIPT
+        "${CMAKE_CURRENT_SOURCE_DIR}/vita_render_watch.py")
+    set(ISAAC_VITA_ENTRY_CENSUS_WATCH
+        "${ISAAC_RUNTIME}/kage_vita_render_watch.h")
+    set(ISAAC_VITA_ENTRY_CENSUS_DIR
+        "${CMAKE_BINARY_DIR}/isaac-generated-overrides/entry-census")
+    file(MAKE_DIRECTORY "${ISAAC_VITA_ENTRY_CENSUS_DIR}")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" "${ISAAC_VITA_ENTRY_CENSUS_SCRIPT}"
+        --watch "${ISAAC_VITA_ENTRY_CENSUS_WATCH}"
+        --coverage "${ISAAC_GENERATED_DIR}/guest_coverage.json"
+        --output "${ISAAC_VITA_ENTRY_CENSUS_DIR}/guest_entry_census_ids.h"
+      RESULT_VARIABLE ISAAC_VITA_ENTRY_CENSUS_RC
+      OUTPUT_VARIABLE ISAAC_VITA_ENTRY_CENSUS_SUMMARY
+      ERROR_VARIABLE ISAAC_VITA_ENTRY_CENSUS_ERROR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT ISAAC_VITA_ENTRY_CENSUS_RC EQUAL 0)
+      message(FATAL_ERROR
+        "entry census ids failed: ${ISAAC_VITA_ENTRY_CENSUS_ERROR}")
+    endif()
+    # The ids come from the corpus's guest_coverage.json: name it too, so a
+    # regenerated corpus re-runs the script even where the manifest check
+    # does not cover the file.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${ISAAC_VITA_ENTRY_CENSUS_SCRIPT}"
+      "${ISAAC_VITA_ENTRY_CENSUS_WATCH}"
+      "${ISAAC_GENERATED_DIR}/guest_coverage.json")
+    target_include_directories(isaac_first_arm_fault PRIVATE
+      "${ISAAC_VITA_ENTRY_CENSUS_DIR}")
+    target_compile_definitions(isaac_first_arm_fault PRIVATE
+      ISAAC_VITA_PROFILE_FUNCTION_ENTRY_CENSUS=1)
+    message(STATUS
+      "Isaac Vita render watch entry census: ${ISAAC_VITA_ENTRY_CENSUS_SUMMARY} "
+      "(ph120.fe, every unit)")
+  endif()
   if(ISAAC_VITA_LUA_OFF_CLOSE_NOOP)
     # Only the dense import-ID dispatcher sees the macro; generated guest
     # units and every other runtime object keep byte-identical commands.
@@ -7815,6 +11487,27 @@ else()
         COMPILE_DEFINITIONS GUEST_IMPORT_DIRECT=1)
       message(STATUS "Isaac Vita translated CPU: IAT sites dispatch directly (GUEST_IMPORT_DIRECT=1)")
     endif()
+    if(ISAAC_VITA_TRANSLATED_CPU_GPR_FLUSH_MASK)
+      if(NOT ISAAC_VITA_TRANSLATED_CPU_GPR_LOCAL)
+        message(FATAL_ERROR
+          "ISAAC_VITA_TRANSLATED_CPU_GPR_FLUSH_MASK requires ISAAC_VITA_TRANSLATED_CPU_GPR_LOCAL=ON")
+      endif()
+      # guest.h: the FLUSH statements the generator proved partial
+      # (gpr_flush_mask.py, a corpus generated with GUEST_GPR_FLUSH_MASK=1)
+      # store only their possibly-dirty registers.  Every other field already
+      # holds its local, so the CPU state at each boundary is unchanged.
+      file(GLOB ISAAC_VITA_GPR_FLUSH_MASK_PROBE "${ISAAC_GENERATED_DIR}/guest_0000.c")
+      file(STRINGS "${ISAAC_VITA_GPR_FLUSH_MASK_PROBE}" ISAAC_VITA_GPR_FLUSH_MASK_HITS
+        REGEX "GUEST_GPR_FLUSH_MASK\\(c, 0x" LIMIT_COUNT 1)
+      if(NOT ISAAC_VITA_GPR_FLUSH_MASK_HITS)
+        message(FATAL_ERROR
+          "ISAAC_VITA_TRANSLATED_CPU_GPR_FLUSH_MASK: the corpus has no masks "
+          "(regenerate with GUEST_GPR_FLUSH_MASK=1)")
+      endif()
+      set_property(SOURCE ${ISAAC_GENERATED_C} APPEND PROPERTY
+        COMPILE_DEFINITIONS GUEST_GPR_FLUSH_MASKED=1)
+      message(STATUS "Isaac Vita translated CPU: dirty-only GPR publication (GUEST_GPR_FLUSH_MASKED=1)")
+    endif()
     if(NOT ISAAC_VITA_TRANSLATED_CPU_LEAF_INLINE)
       # guest.h defaults GUEST_LEAF_INLINE to 1; a corpus generated with
       # leaf inlining then compiles the copied callee statements at every
@@ -7899,6 +11592,47 @@ else()
       "fs_base_inline=${ISAAC_VITA_TRANSLATED_CPU_FS_BASE_INLINE} "
       "hot_layout=${ISAAC_VITA_TRANSLATED_CPU_HOT_LAYOUT} "
       "cold_rest=${ISAAC_VITA_TRANSLATED_CPU_COLD_REST}")
+  endif()
+  if(ISAAC_VITA_LUA_BINDING_REPLAY)
+    # The mirrors must compile in exactly the code generation mode of the
+    # bodies they mirror: copy every GUEST_* definition the owner units carry
+    # (GPR/flags locals, raw stack, coverage hooks, IAT direct, flush mask,
+    # leaf/SSE/VFP spellings) to the replay TU, after every source-scoped
+    # corpus setting above.  The owner units must agree with each other.
+    set(ISAAC_LBR_GUEST_DEFS)
+    set(ISAAC_LBR_GUEST_DEFS_FROM)
+    foreach(ISAAC_LBR_OWNER_SOURCE IN LISTS ISAAC_LBR_OWNER_SOURCES)
+      get_source_file_property(ISAAC_LBR_OWNER_DEFS
+        "${ISAAC_LBR_OWNER_SOURCE}" COMPILE_DEFINITIONS)
+      if(NOT ISAAC_LBR_OWNER_DEFS)
+        set(ISAAC_LBR_OWNER_DEFS)
+      endif()
+      list(FILTER ISAAC_LBR_OWNER_DEFS INCLUDE REGEX "^GUEST_")
+      list(REMOVE_DUPLICATES ISAAC_LBR_OWNER_DEFS)
+      list(SORT ISAAC_LBR_OWNER_DEFS)
+      if(NOT ISAAC_LBR_GUEST_DEFS_FROM)
+        set(ISAAC_LBR_GUEST_DEFS ${ISAAC_LBR_OWNER_DEFS})
+        set(ISAAC_LBR_GUEST_DEFS_FROM "${ISAAC_LBR_OWNER_SOURCE}")
+      elseif(NOT "${ISAAC_LBR_OWNER_DEFS}" STREQUAL "${ISAAC_LBR_GUEST_DEFS}")
+        message(FATAL_ERROR
+          "ISAAC_VITA_LUA_BINDING_REPLAY: owner units disagree on the generated "
+          "code generation definitions: ${ISAAC_LBR_GUEST_DEFS_FROM} has "
+          "'${ISAAC_LBR_GUEST_DEFS}', ${ISAAC_LBR_OWNER_SOURCE} has "
+          "'${ISAAC_LBR_OWNER_DEFS}'")
+      endif()
+    endforeach()
+    foreach(ISAAC_LBR_REQUIRED IN ITEMS GUEST_GPR_LOCAL=1 GUEST_FLAGS_LOCAL=1
+            GUEST_GENERATED_STACK_GUARD=0)
+      if(NOT ISAAC_LBR_REQUIRED IN_LIST ISAAC_LBR_GUEST_DEFS)
+        message(FATAL_ERROR
+          "ISAAC_VITA_LUA_BINDING_REPLAY: the owner units lack ${ISAAC_LBR_REQUIRED} "
+          "(have '${ISAAC_LBR_GUEST_DEFS}')")
+      endif()
+    endforeach()
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua_binding_replay.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ${ISAAC_LBR_GUEST_DEFS})
+    message(STATUS
+      "Isaac Lua: LuaBridge binding replay compiles with the owner units' ${ISAAC_LBR_GUEST_DEFS}")
   endif()
   # main.c and guest.c print the same deterministic link identity.  Keeping it
   # source-scoped prevents every label change from invalidating all 171
@@ -8000,6 +11734,14 @@ if(ISAAC_VITA_KAGE)
     # kage_vita_screenshot_probe.h owns the pinned app-side declaration.
     target_link_libraries(isaac_first_arm_fault PRIVATE
       SceScreenShot_stub_weak
+      SceSysmodule_stub)
+  endif()
+  if(ISAAC_VITA_TROPHIES)
+    # NP trophy imports; host_vita_trophies.c owns the prototypes (VitaSDK
+    # ships the stub but no header).  The setup-dialog functions are
+    # SceCommonDialog exports, linked above.
+    target_link_libraries(isaac_first_arm_fault PRIVATE
+      SceNpTrophy_stub
       SceSysmodule_stub)
   endif()
   if(ISAAC_VITA_STALL_PROBE)
@@ -8155,12 +11897,60 @@ if(ISAAC_VITA_AUDIO_ACTIVE)
          "${ISAAC_VITA_OPENAL_CONFIG_DESTINATION}")
 endif()
 
+# Trophy packs (recomp/vita/TROPHIES.md): six user-supplied TROPHY.TRP
+# (game-derived, never committed), checked here at
+# configure time.  OFF or an empty directory: no members, packer argv and
+# param.sfo unchanged.  The NP comm id base (== host_vita_trophies.h
+# ISAAC_VITA_TROPHY_COMM_BASE) is not the title id: device run 2026-10-09
+# refused ISAACR001_0N at the setup dialog (C0-11133-9); ISAC00000_0N works.
+set(ISAAC_VPK_TROPHY_FILES)
+if(ISAAC_VITA_TROPHIES AND NOT "${ISAAC_VITA_TROPHY_PACK_DIR}" STREQUAL "")
+  set(ISAAC_VITA_TROPHY_COMM_BASE "ISAC00000")
+  isaac_validate_strict_absolute_path(
+    "${ISAAC_VITA_TROPHY_PACK_DIR}" "ISAAC_VITA_TROPHY_PACK_DIR")
+  set(ISAAC_TROPHY_PACK_FILES)
+  foreach(ISAAC_TROPHY_SET RANGE 0 5)
+    set(ISAAC_TROPHY_PACK
+      "${ISAAC_VITA_TROPHY_PACK_DIR}/${ISAAC_VITA_TROPHY_COMM_BASE}_0${ISAAC_TROPHY_SET}/TROPHY.TRP")
+    if(NOT EXISTS "${ISAAC_TROPHY_PACK}" OR IS_DIRECTORY "${ISAAC_TROPHY_PACK}")
+      message(FATAL_ERROR
+        "ISAAC_VITA_TROPHY_PACK_DIR: ${ISAAC_TROPHY_PACK} is not a regular file")
+    endif()
+    list(APPEND ISAAC_TROPHY_PACK_FILES "${ISAAC_TROPHY_PACK}")
+    list(APPEND ISAAC_VPK_TROPHY_FILES
+      FILE "${ISAAC_TROPHY_PACK}"
+           "sce_sys/trophy/${ISAAC_VITA_TROPHY_COMM_BASE}_0${ISAAC_TROPHY_SET}/TROPHY.TRP")
+  endforeach()
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/trophy_pack_check.py"
+      --pack-dir "${ISAAC_VITA_TROPHY_PACK_DIR}"
+      --comm-base "${ISAAC_VITA_TROPHY_COMM_BASE}" --sets 6
+    RESULT_VARIABLE ISAAC_TROPHY_PACK_CHECK_RESULT
+    OUTPUT_VARIABLE ISAAC_TROPHY_PACK_CHECK_OUTPUT
+    ERROR_VARIABLE ISAAC_TROPHY_PACK_CHECK_OUTPUT)
+  if(NOT ISAAC_TROPHY_PACK_CHECK_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "trophy_pack_check.py rejected ISAAC_VITA_TROPHY_PACK_DIR:\n"
+      "${ISAAC_TROPHY_PACK_CHECK_OUTPUT}")
+  endif()
+  message(STATUS "${ISAAC_TROPHY_PACK_CHECK_OUTPUT}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${ISAAC_TROPHY_PACK_FILES}
+    "${CMAKE_CURRENT_SOURCE_DIR}/trophy_pack_check.py")
+elseif(ISAAC_VITA_TROPHIES)
+  message(STATUS
+    "Isaac Vita trophies: WARNING ISAAC_VITA_TROPHY_PACK_DIR is empty - the "
+    "VPK carries no trophy packs (failure-policy build)")
+endif()
+
 if(ISAAC_VITA_SCAFFOLD_ONLY)
   vita_create_vpk(${ISAAC_VPK_NAME}.vpk ${ISAAC_TITLE_ID} eboot.bin
     VERSION ${ISAAC_APP_VERSION} NAME "${ISAAC_APP_NAME} (scaffold)"
     ${ISAAC_VPK_LIVEAREA_FILES}
     ${ISAAC_VPK_MANAGER_FILE}
     ${ISAAC_VPK_MANAGER_LICENSE_FILE}
+    ${ISAAC_VPK_MANAGER_ASSET_FILES}
     ${ISAAC_VPK_AUDIO_FILES})
 else()
   vita_create_vpk(${ISAAC_VPK_NAME}.vpk ${ISAAC_TITLE_ID} eboot.bin
@@ -8168,8 +11958,10 @@ else()
     ${ISAAC_VPK_LIVEAREA_FILES}
     ${ISAAC_VPK_MANAGER_FILE}
     ${ISAAC_VPK_MANAGER_LICENSE_FILE}
+    ${ISAAC_VPK_MANAGER_ASSET_FILES}
     FILE "${ISAAC_PE_PATH}" isaac-ng.exe.unpacked.exe
-    ${ISAAC_VPK_AUDIO_FILES})
+    ${ISAAC_VPK_AUDIO_FILES}
+    ${ISAAC_VPK_TROPHY_FILES})
 endif()
 isaac_append_deterministic_vpk_dependencies(
   "${CMAKE_CURRENT_BINARY_DIR}/${ISAAC_VPK_NAME}.vpk.out"

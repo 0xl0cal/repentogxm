@@ -46,6 +46,7 @@ from gpr_locals import (BOUNDARY_CALLS_RE as GPR_BOUNDARY_CALLS_RE,  # noqa: E40
                         bracket_seam_regions, collapse_leaf_inline,
                         legacy_statements, legacy_text)
 import leaf_inline                                           # noqa: E402
+import gpr_flush_mask                                        # noqa: E402
 import bounds as Bounds                                      # noqa: E402
 import build_contract as BC                                  # noqa: E402
 import funcs as Funcs                                        # noqa: E402
@@ -115,9 +116,11 @@ GUEST_STACK_CODEGEN_CENSUS_BY_IMAGE_BASE = {
         "adjust_generated": 6338,
         "address_generated": 60279,
         "address_at": 3,
-        "push_generated": 472425,
+        # +6 pushes / +7 pops since 2026-09-09 (popfd, sub_005e0050), same
+        # delta as the 0x98000000 entry; unverified at this base.
+        "push_generated": 472431,
         "push_at": 6,
-        "pop_generated": 59134,
+        "pop_generated": 59141,
         "pop_at": 4,
     },
     0x98000000: {
@@ -128,9 +131,11 @@ GUEST_STACK_CODEGEN_CENSUS_BY_IMAGE_BASE = {
         # the consumer's single one (244 adjacent sites).
         "address_generated": 60254,
         "address_at": 3,
-        "push_generated": 472388,
+        # 2026-09-09: popfd translated, so libtheora's CPUID probe
+        # (sub_005e0050: 6 pushes, 6 pops + ret) left guest_stubs.c.
+        "push_generated": 472394,
         "push_at": 6,
-        "pop_generated": 59114,
+        "pop_generated": 59121,
         "pop_at": 4,
     },
 }
@@ -932,6 +937,41 @@ VITA_KAGE_QUAD_FASTPATH_GUARD = (
     "#if defined(__vita__) && defined(ISAAC_VITA_KAGE_QUAD_FASTPATH)")
 VITA_KAGE_QUAD_FASTPATH_MARKER = "Authenticated Image::PushQuad host fast path"
 VITA_KAGE_QUAD_FASTPATH_HELPER = "isaac_vita_kage_quad_try"
+
+# Camera ring average (sub_0049df90; Camera::UpdateUltrasmooth's weighted
+# mean of a Vector2 history ring {data, cap, count, start}): 12 calls and
+# ~1,178 loop steps per game tick measured on the PC build of this image
+# (hcount.dll, 2026-10-12), every step an int64 __aeabi_ldivmod on ARM for
+# the ring index.  The host owner (runtime/host_vita_camera_ring_native.c)
+# replays the body with the same single-precision operation order and
+# declines (no side effect) into the translated body on a frame/argument
+# overlap, a non-positive capacity, or a state that reaches the
+# InverseLerp logger.  All seven direct callers are inside
+# Camera::UpdateUltrasmooth in the same generated unit, so a link-time
+# --wrap seam cannot see them: the seam is at the root.
+VITA_CAMERA_RING_ROOT_RVA = 0x0049DF90
+VITA_CAMERA_RING_ROOT_END_RVA = 0x0049E0EC
+VITA_CAMERA_RING_ROOT_INSNS = 98
+VITA_CAMERA_RING_ROOT_LAST_RVA = 0x0049E0E9
+VITA_CAMERA_RING_ROOT_BODY_SHA256 = (
+    "4c789228913f8d2d3d16b0286044334d"
+    "556479b21bb81513e7fb15a477979127"
+)
+VITA_CAMERA_RING_ROOT_ORDER_SHA256 = (
+    "b5a139aacbddbfd9134bc66d2709f4bf"
+    "5a99a588a2fb321cf9cf65772115eb4d"
+)
+VITA_CAMERA_RING_CALLERS = (
+    0x0049F16A, 0x0049F17F, 0x0049F194, 0x0049F1A6, 0x0049F2F7, 0x0049F6A4,
+    0x0049FA93)
+# The two InverseLerp logger calls the replay declines before reaching.
+VITA_CAMERA_RING_CALL_SITES = {0x0049E00C: 0x0055E330,
+                               0x0049E03B: 0x0055E330}
+VITA_CAMERA_RING_IDIV_SITE = 0x0049E06C
+VITA_CAMERA_RING_GUARD = (
+    "#if defined(__vita__) && defined(ISAAC_VITA_CAMERA_RING_NATIVE)")
+VITA_CAMERA_RING_MARKER = "Authenticated camera ring average host replay"
+VITA_CAMERA_RING_HELPER = "isaac_vita_camera_ring_try"
 
 MANUAL_KAGE_HEADER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "runtime", "manual_kage.h"
@@ -2617,6 +2657,218 @@ VITA_ANM2_MISSING_LAYER_GUARD_SITES = frozenset(
 if (len(VITA_ANM2_MISSING_LAYER_GUARD_SPECS) != 3 or
         len(VITA_ANM2_MISSING_LAYER_GUARD_SITES) != 3):
     raise RuntimeError("ANM2 missing-layer guard specification changed")
+
+# Backdrop::LoadGraphics (sub_00498850) loads the entry's `watergfx` image
+# through the mod-aware loader (sub_004b3340 at 00498cbc), stores the returned
+# SmartPointer<ImageBase> at Backdrop+0x2c, then immediately dereferences the
+# raw object for a (0, 0) virtual call: `mov ecx,[esi+0x2c]; push 0; push 0;
+# mov eax,[ecx]; call [eax+0x44]` (00498cda..00498ce3).  When the loader
+# returned an empty pair (an unresolved or failed image, e.g. a modded
+# gfx/backdrop/water_blood.png) ECX is NULL and 00498ce1 faults (GitHub issue
+# 5 items 5.4/5.17, rc3 crash dump).  Slot 0x44 of all three concrete image
+# vftables the loader constructs (0x00766028/0x00765e90/0x007662f0) is
+# sub_005b0b00, a wrap-mode setter (glBindTexture + two glTexParameteri,
+# stores +0x2c/+0x30) ending in `ret 8`; the caller never reads its EAX.  The
+# guard tests the holder right after the load at 00498cda, i.e. before either
+# argument push, so the skip edge leaves ESP exactly where the callee's
+# `ret 8` would have; EAX/ECX/EDX are caller-saved and every one is rewritten
+# before its next read (00498ce6, 00498cec..00498cf8), and the flags are next
+# produced by `add eax, -9` at 00498d01.  The fall-through 00498ce6 has no C
+# label of its own, so the skip edge replicates that single load and rejoins
+# at the existing L_00498cec (also the target of the empty-name `jbe` at
+# 00498c9f, which reaches it with ECX = the same id).
+# The frozen loader (sub_0056c7e0) returns an empty pair silently when the
+# path resolver (sub_00563120 at 0056c826) yields NULL: 0056c834..0056c850
+# never reach the `Failed to load image` logger at 0056cc0c.  A second,
+# log-only seam at 0056c834 names the path (still in EDI, callee-saved
+# across the resolver call, loaded from [ebp+0xc] at 0056c816).
+VITA_BACKDROP_WATERGFX_GUARD_PE_SIZE = 8_650_240
+VITA_BACKDROP_WATERGFX_GUARD_PE_SHA256 = (
+    "31846486979cfa07c8c968221553052c"
+    "3ff603518681ca11912d445f96ca9404"
+)
+VITA_BACKDROP_WATERGFX_GUARD_ROOT_RVA = 0x00498850
+VITA_BACKDROP_WATERGFX_GUARD_END_RVA = 0x00499544
+VITA_BACKDROP_WATERGFX_GUARD_LAST_RVA = 0x00499543
+# The instruction order includes the six switch labels of the table at
+# 00498dc8 (the translation always receives the proved switch entries).
+VITA_BACKDROP_WATERGFX_GUARD_INSNS = 927
+VITA_BACKDROP_WATERGFX_GUARD_BODY_SHA256 = (
+    "003d90f6c35c513135adfc276aa8cdb3"
+    "a49f0ae9b7b6192a138ef13f171439b9"
+)
+VITA_BACKDROP_WATERGFX_GUARD_ORDER_SHA256 = (
+    "eefd23ef46e94edb92097ca19ef1a8d8"
+    "3c11ddb5ad3c7496f1ea43ce8210b1af"
+)
+VITA_BACKDROP_WATERGFX_GUARD_SITE_RVA = 0x00498CDA
+VITA_BACKDROP_WATERGFX_GUARD_SITE_MACHINE = bytes.fromhex("8b4e2c")
+VITA_BACKDROP_WATERGFX_GUARD_SITE_STATEMENT = (
+    "c->ecx = (uint32_t)(ld32((uint32_t)(c->esi + 0x2cU)));"
+)
+VITA_BACKDROP_WATERGFX_GUARD_PUSH_RVAS = (0x00498CDD, 0x00498CDF)
+VITA_BACKDROP_WATERGFX_GUARD_PUSH_MACHINE = bytes.fromhex("6a00")
+VITA_BACKDROP_WATERGFX_GUARD_DEREF_RVA = 0x00498CE1
+VITA_BACKDROP_WATERGFX_GUARD_DEREF_MACHINE = bytes.fromhex("8b01")
+VITA_BACKDROP_WATERGFX_GUARD_CALL_RVA = 0x00498CE3
+VITA_BACKDROP_WATERGFX_GUARD_CALL_MACHINE = bytes.fromhex("ff5044")
+VITA_BACKDROP_WATERGFX_GUARD_NEXT_RVA = 0x00498CE6
+VITA_BACKDROP_WATERGFX_GUARD_NEXT_MACHINE = bytes.fromhex("8b8e50010000")
+VITA_BACKDROP_WATERGFX_GUARD_NEXT_STATEMENT = (
+    "c->ecx = (uint32_t)(ld32((uint32_t)(c->esi + 0x150U)));"
+)
+VITA_BACKDROP_WATERGFX_GUARD_SKIP_RVA = 0x00498CEC
+VITA_BACKDROP_WATERGFX_GUARD_WINDOW_SHA256 = (
+    "686429ebf0a271d7b108ab0285db6c96"
+    "13364b413739e89eb5943126bcadbe17"
+)
+# Backdrop layout copied from the frozen owner (00498c8b..00498cae): the id
+# at +0x150 selects entry +0x154 + id*0x13c, whose water string sits at +0x1c
+# (MSVC std::string: buffer/pointer at +0, size at +0x10, capacity at +0x14).
+VITA_BACKDROP_WATERGFX_GUARD_ID_OFFSET = 0x150
+VITA_BACKDROP_WATERGFX_GUARD_WATER_STRING_OFFSET = 0x170
+VITA_BACKDROP_WATERGFX_GUARD_ENTRY_STRIDE = 0x13C
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_ROOT_RVA = 0x0056C7E0
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_END_RVA = 0x0056CC85
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_LAST_RVA = 0x0056CC82
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_INSNS = 403
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_BODY_SHA256 = (
+    "573bc51d81c204b13b95a104ebe2084f"
+    "9c086c8c079cb48d05d160d9df8cc8ee"
+)
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_ORDER_SHA256 = (
+    "d2898c792d1d043668caba8ca217b944"
+    "266e9b6dc76048ed165eb6db1b808f32"
+)
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_PATH_RVA = 0x0056C816
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_PATH_MACHINE = bytes.fromhex("8b7d0c")
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_RESOLVE_RVA = 0x0056C826
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_RESOLVE_MACHINE = bytes.fromhex(
+    "e8f568ffff")
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_RESOLVER_RVA = 0x00563120
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_TEST_RVA = 0x0056C830
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_TEST_MACHINE = bytes.fromhex("85f6")
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_RVA = 0x0056C832
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_MACHINE = bytes.fromhex("7521")
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_TARGET_RVA = 0x0056C855
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_RVA = 0x0056C834
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_MACHINE = bytes.fromhex("8b7508")
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_STATEMENT = (
+    "c->esi = (uint32_t)(ld32((uint32_t)(c->ebp + 0x8U)));"
+)
+VITA_BACKDROP_WATERGFX_GUARD_LOADER_WINDOW_SHA256 = (
+    "c674ab0a4ededdfb1aa2bfb85f236ceb"
+    "7cf1c345eff8ca0ffef4bd626593b5ed"
+)
+VITA_BACKDROP_WATERGFX_GUARD_SITES = frozenset((
+    VITA_BACKDROP_WATERGFX_GUARD_SITE_RVA,
+    VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_RVA,
+))
+VITA_BACKDROP_WATERGFX_GUARD_SITE_ROOTS = {
+    VITA_BACKDROP_WATERGFX_GUARD_SITE_RVA:
+        VITA_BACKDROP_WATERGFX_GUARD_ROOT_RVA,
+    VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_RVA:
+        VITA_BACKDROP_WATERGFX_GUARD_LOADER_ROOT_RVA,
+}
+
+# PersistentGameData::TryUnlock(id) (sub_00484c80) is the only path that
+# unlocks an achievement at run time (the save readers set the bytes only at
+# load time).  thiscall: this = ECX = PGD, id = [esp+4] at entry, `ret 4`,
+# AL = 1 on a fresh unlock.  Guards in order: 00484c8e `cmp byte [edi+1],0`
+# (PGD ReadOnly), 00484c9b `test ebx,ebx` (id == 0; no upper bound),
+# 00484ca3 `cmp byte [ebx+edi+0x38],0` (already unlocked); after them the body
+# has no other exit and marks the id at 00484caf.  An observe-only entry seam
+# (ISAAC_VITA_TROPHIES, host_vita_trophies.c) replicates those pure reads and
+# always falls through into the translated body, so guest behaviour is the
+# same with the knob on or off.  Facts: trophies-20260927 U1 section 1 and U3
+# 1.2 (re-measured through this generator's own translation, R1 report).
+VITA_TROPHY_UNLOCK_PE_SIZE = 8_650_240
+VITA_TROPHY_UNLOCK_PE_SHA256 = (
+    "31846486979cfa07c8c968221553052c"
+    "3ff603518681ca11912d445f96ca9404"
+)
+VITA_TROPHY_UNLOCK_ROOT_RVA = 0x00484C80
+VITA_TROPHY_UNLOCK_END_RVA = 0x00484D95
+VITA_TROPHY_UNLOCK_LAST_RVA = 0x00484D92
+VITA_TROPHY_UNLOCK_INSNS = 89
+# sha256 of img.code_at(root, end - root) on the DEFAULT_BASE pin image, like
+# F.  (U3 1.2's 2132d9c7... is the same range in the unrelocated file image;
+# the two differ only in the relocated absolute of 00484cb9, pinned below.)
+VITA_TROPHY_UNLOCK_BODY_SHA256 = (
+    "ff318dd3e6addfa68fc9519d2555b965"
+    "00391791bd6b32116fe921d0a3baa2f9"
+)
+VITA_TROPHY_UNLOCK_ORDER_SHA256 = (
+    "b128f5fb2eca80d1d9fbe5dc5911dd52"
+    "5443deeb1e42cbc67f6bc45d0120a82c"
+)
+# The manager pointer the observer compares `this` against: the body itself
+# reads it at 00484cb9 (`mov esi, [0xbfd680]`, VA; RVA 0x7fd680).  That load
+# carries a relocated absolute, so it is checked against the DEFAULT_BASE pin
+# image's bytes (the decoded instructions come from the emit image).
+VITA_TROPHY_UNLOCK_MANAGER_PTR_RVA = 0x007FD680
+VITA_TROPHY_UNLOCK_MANAGER_LOAD_RVA = 0x00484CB9
+VITA_TROPHY_UNLOCK_MANAGER_LOAD_MACHINE = (
+    bytes.fromhex("8b35") +
+    (DEFAULT_BASE + VITA_TROPHY_UNLOCK_MANAGER_PTR_RVA).to_bytes(4, "little"))
+# (rva, mnemonic, op_str, machine bytes) as capstone decodes the body; none
+# of these carries an absolute, so they are the same at every image base.
+VITA_TROPHY_UNLOCK_PINNED = (
+    (0x00484C80, "push", "ebp", bytes.fromhex("55")),
+    (0x00484C8C, "mov", "edi, ecx", bytes.fromhex("8bf9")),
+    (0x00484C8E, "cmp", "byte ptr [edi + 1], 0",
+     bytes.fromhex("807f0100")),
+    (0x00484C92, "jne", "0x484d8a", bytes.fromhex("0f85f2000000")),
+    (0x00484C98, "mov", "ebx, dword ptr [ebp + 8]",
+     bytes.fromhex("8b5d08")),
+    (0x00484C9B, "test", "ebx, ebx", bytes.fromhex("85db")),
+    (0x00484C9D, "je", "0x484d8a", bytes.fromhex("0f84e7000000")),
+    (0x00484CA3, "cmp", "byte ptr [ebx + edi + 0x38], 0",
+     bytes.fromhex("807c3b3800")),
+    (0x00484CA8, "jne", "0x484d8a", bytes.fromhex("0f85dc000000")),
+    (0x00484CAF, "mov", "byte ptr [ebx + edi + 0x38], 1",
+     bytes.fromhex("c6443b3801")),
+    # The body's only two exits: nothing falls through out of a copy.
+    (0x00484D87, "ret", "4", bytes.fromhex("c20400")),
+    (0x00484D92, "ret", "4", bytes.fromhex("c20400")),
+)
+VITA_TROPHY_UNLOCK_FIRST_STATEMENT = (
+    "gpush_generated(c, c->ebp); GUEST_STACK_CALLSITE_BARRIER();"
+)
+# The translator inlines a tail-jump target into the jumping root, so the
+# TryUnlock body has a second translated copy: sub_00485ab0 (the challenge
+# completion method: `cmp byte [ecx+1],0`, `mov byte [eax+ecx+0xdff],1`,
+# `jmp [eax*4+0x885d30]`) ends each of its 45 switch cases with
+# `mov dword [ebp+8], <id>; pop ebp; jmp 0x884c80`.  At the copy's label the
+# entry contract is exact (ECX = PGD untouched, [esp] = the return address of
+# the sub_00485ab0 call, [esp+4] = the replaced id), and those 45 ids unlock
+# through no other path, so the copy carries the same observer block.
+VITA_TROPHY_UNLOCK_TAIL_ROOT_RVA = 0x00485AB0
+VITA_TROPHY_UNLOCK_TAIL_END_RVA = 0x00485D2F
+VITA_TROPHY_UNLOCK_TAIL_LAST_RVA = 0x00485D2C
+# 149 own instructions + the 89 of the inlined TryUnlock copy.
+VITA_TROPHY_UNLOCK_TAIL_INSNS = 238
+VITA_TROPHY_UNLOCK_TAIL_BODY_SHA256 = (
+    "0ccb4a02c150b9512581c675cb3852c3"
+    "306ee576b61b8948bcdc50891912c385"
+)
+VITA_TROPHY_UNLOCK_TAIL_ORDER_SHA256 = (
+    "c665a8a32f7b70d4f44c1f9ffa8b9e14"
+    "d068b6c6ea8dc0343bf08825f0af56ea"
+)
+# The id each case stores before its tail jump, in case address order
+# (= challenge 1..45; the 0x885d30 jump table lists the cases in the same
+# order).  Decoded from the frozen PE, R-work/tail_root_ids.py.
+VITA_TROPHY_UNLOCK_TAIL_IDS = (
+    89, 90, 91, 92, 93, 94, 120, 96, 97, 98, 99, 100, 60, 63, 101, 102,
+    103, 104, 62, 95, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233,
+    331, 332, 333, 334, 335, 517, 518, 519, 520, 521, 522, 531, 532, 533,
+    538,
+)
+VITA_TROPHY_UNLOCK_ROOTS = frozenset((
+    VITA_TROPHY_UNLOCK_ROOT_RVA,
+    VITA_TROPHY_UNLOCK_TAIL_ROOT_RVA,
+))
 
 # AnimationLayer::RenderFrame in the frozen J835 binary asks the same
 # LayerState for a SmartPointer<ImageBase> at nine physical sites.  The
@@ -11002,6 +11254,93 @@ def vita_original_effects_profile_for_body(
     return True
 
 
+VITA_ORIGINAL_EFFECTS_PROFILE_KEEP_WATER_FENCE = (
+    "#if !defined(ISAAC_VITA_EFFECTS_PROFILE_KEEP_WATER)")
+VITA_ORIGINAL_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER_FENCE = (
+    "#if !defined(ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER)")
+VITA_ORIGINAL_EFFECTS_PROFILE_WATER_FIELDS = (
+    VITA_ORIGINAL_EFFECTS_PROFILE_WATER_OFFSET,
+    VITA_ORIGINAL_EFFECTS_PROFILE_WATER_LATCH_OFFSET,
+)
+VITA_ORIGINAL_EFFECTS_PROFILE_COLOR_MODIFIER_FIELDS = (
+    VITA_ORIGINAL_EFFECTS_PROFILE_COLOR_MODIFIER_OFFSET,
+)
+# Store order of the injected block (shockwave and caustics swapped against
+# VITA_ORIGINAL_EFFECTS_PROFILE_FIELDS since the first emission, 2026-08).
+VITA_ORIGINAL_EFFECTS_PROFILE_STORE_ORDER = (
+    VITA_ORIGINAL_EFFECTS_PROFILE_CAUSTICS_OFFSET,
+    VITA_ORIGINAL_EFFECTS_PROFILE_SHOCKWAVE_OFFSET,
+    VITA_ORIGINAL_EFFECTS_PROFILE_FILTER_OFFSET,
+    VITA_ORIGINAL_EFFECTS_PROFILE_WATER_OFFSET,
+    VITA_ORIGINAL_EFFECTS_PROFILE_WATER_LATCH_OFFSET,
+    VITA_ORIGINAL_EFFECTS_PROFILE_COLOR_MODIFIER_OFFSET,
+)
+# The injected block as emitted before either knob existed (copied from
+# 2bbbc4d^:recomp/gen_all.py render_vita_original_effects_profile): with
+# both knobs OFF the preprocessed owner must still be exactly this, and the
+# unit packing budget is that of this text.
+VITA_ORIGINAL_EFFECTS_PROFILE_PRE_KNOB_BLOCK = (
+    "#if defined(__vita__) && "
+    "defined(ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE)",
+    "    /* PCSB00676 effects plus no Repentance water/ColorModifier paths. */",
+    "    st8((uint32_t)(c->ebx + 0x7fU), (uint8_t)(0U));",
+    "    st8((uint32_t)(c->ebx + 0x7eU), (uint8_t)(0U));",
+    "    st8((uint32_t)(c->ebx + 0x80U), (uint8_t)(0U));",
+    "    st8((uint32_t)(c->ebx + 0x83U), (uint8_t)(0U));",
+    "    st8((uint32_t)(c->ebx + 0x84U), (uint8_t)(0U));",
+    "    st8((uint32_t)(c->ebx + 0x85U), (uint8_t)(0U));",
+    "#endif",
+)
+VITA_ORIGINAL_EFFECTS_PROFILE_COLOR_MODIFIER_RECEIPT = (
+    "KAGE VITA EFFECTS PROFILE: color_modifier=kept shockwave=%u "
+    "caustics=%u filter=%u water=%u latch=%u color_modifier=%u")
+
+
+def _vita_original_effects_profile_stores(kept):
+    """The store lines of one leaf: every profile field not in `kept`."""
+    return tuple(
+        "    st8((uint32_t)(c->ebx + 0x%02xU), (uint8_t)(0U));" % offset
+        for offset in VITA_ORIGINAL_EFFECTS_PROFILE_STORE_ORDER
+        if offset not in kept)
+
+
+def _vita_original_effects_profile_color_modifier_receipt():
+    """Once per seam per boot, after that seam's stores: the six profile
+    bytes as the game will read them.  The call is a host seam of its own
+    (gpr_locals brackets it), and only the KEEP_COLOR_MODIFIER branch has
+    it, so the knob-OFF owner is unchanged.
+
+    The extern declaration sits inside the once-only branch on purpose:
+    gpr_flush_mask reads `isaac_vita_log(` in a declaration as a host call,
+    and the pass merges every preprocessor branch, so a declaration at
+    block level left a HOST bit on the path that skips the branch and
+    turned the owner's next two call-site masks (0x47fc6f 0x3b, 0x47fe43
+    0x13) into full FLUSHes in every build, knob OFF included.  Inside the
+    branch it only makes the branch's own (cold) FLUSH a full one, and the
+    RELOAD after the call leaves both paths clean."""
+    loads = ", ".join(
+        "(unsigned)ld8((uint32_t)(c->ebx + 0x%02xU))" % offset
+        for offset in (
+            VITA_ORIGINAL_EFFECTS_PROFILE_SHOCKWAVE_OFFSET,
+            VITA_ORIGINAL_EFFECTS_PROFILE_CAUSTICS_OFFSET,
+            VITA_ORIGINAL_EFFECTS_PROFILE_FILTER_OFFSET,
+            VITA_ORIGINAL_EFFECTS_PROFILE_WATER_OFFSET,
+            VITA_ORIGINAL_EFFECTS_PROFILE_WATER_LATCH_OFFSET,
+            VITA_ORIGINAL_EFFECTS_PROFILE_COLOR_MODIFIER_OFFSET,
+        ))
+    return (
+        "    {",
+        "        static uint8_t s_effects_profile_receipt;",
+        "        if (!s_effects_profile_receipt) {",
+        "            extern void isaac_vita_log(const char *format, ...);",
+        "            s_effects_profile_receipt = 1u;",
+        '            isaac_vita_log("%s", %s);' % (
+            VITA_ORIGINAL_EFFECTS_PROFILE_COLOR_MODIFIER_RECEIPT, loads),
+        "        }",
+        "    }",
+    )
+
+
 def render_vita_original_effects_profile():
     """Render register-neutral target values at both OptionsConfig seams.
 
@@ -11009,27 +11348,80 @@ def render_vita_original_effects_profile():
     and after the last GetBool store (0x47fe31, reached only when
     resources/config.ini exists).  Identical stores at both seams keep the
     result independent of whether the file is present.
+
+    CMake adds ISAAC_VITA_EFFECTS_PROFILE_KEEP_WATER to the same owner unit
+    for ISAAC_VITA_EFFECTS_PROFILE_WATER=ON (drops the EnableWaterSurface
+    store and its copied latch) and ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_
+    MODIFIER for ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER=ON (drops
+    the EnableColorModifier store and logs one receipt).  Every leaf of the
+    two nested fences is a complete store list on purpose: gpr_locals
+    brackets each preprocessor block as its own FLUSH ... RELOAD seam, so a
+    fence inside the store run would split the seam and leave extra sync
+    statements in the knob-OFF preprocessed owner.  With both knobs OFF the
+    kept leaf is the pre-knob text, so the preprocessed owner is unchanged;
+    with only KEEP_WATER it is the 2026-09-20 water leaf, unchanged too.
     """
+    water = VITA_ORIGINAL_EFFECTS_PROFILE_WATER_FIELDS
+    color = VITA_ORIGINAL_EFFECTS_PROFILE_COLOR_MODIFIER_FIELDS
     return (
-        "#if defined(__vita__) && "
-        "defined(ISAAC_VITA_ORIGINAL_EFFECTS_PROFILE)",
-        "    /* PCSB00676 effects plus no Repentance water/ColorModifier paths. */",
-        "    st8((uint32_t)(c->ebx + 0x7fU), (uint8_t)(0U));",
-        "    st8((uint32_t)(c->ebx + 0x7eU), (uint8_t)(0U));",
-        "    st8((uint32_t)(c->ebx + 0x80U), (uint8_t)(0U));",
-        "    st8((uint32_t)(c->ebx + 0x83U), (uint8_t)(0U));",
-        "    st8((uint32_t)(c->ebx + 0x84U), (uint8_t)(0U));",
-        "    st8((uint32_t)(c->ebx + 0x85U), (uint8_t)(0U));",
-        "#endif",
+        (VITA_ORIGINAL_EFFECTS_PROFILE_PRE_KNOB_BLOCK[0],
+         VITA_ORIGINAL_EFFECTS_PROFILE_PRE_KNOB_BLOCK[1],
+         VITA_ORIGINAL_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER_FENCE,
+         VITA_ORIGINAL_EFFECTS_PROFILE_KEEP_WATER_FENCE) +
+        _vita_original_effects_profile_stores(()) +
+        ("#else",) +
+        _vita_original_effects_profile_stores(water) +
+        ("#endif",
+         "#else",
+         VITA_ORIGINAL_EFFECTS_PROFILE_KEEP_WATER_FENCE) +
+        _vita_original_effects_profile_stores(color) +
+        ("#else",) +
+        _vita_original_effects_profile_stores(water + color) +
+        ("#endif",) +
+        _vita_original_effects_profile_color_modifier_receipt() +
+        ("#endif",
+         "#endif")
     )
 
 
-def vita_original_effects_profile_host_oracle(options):
-    """Pure host model used to prove that only the six target bytes move."""
+def vita_original_effects_profile_knob_bytes():
+    """legacy_text() bytes the two knob fences add to one injected block.
+
+    Unit membership is frozen (unit_packing_size): everything the block
+    gained since the pre-knob text (both fences, the three alternative
+    leaves, the receipt) is new text, so the owner's packing budget drops
+    it and every function stays in the unit it had before the knobs.  The
+    alternative leaves' own FLUSH/RELOAD pairs are removed by legacy_text()
+    and cost nothing.
+    """
+    block = render_vita_original_effects_profile()
+    pre = VITA_ORIGINAL_EFFECTS_PROFILE_PRE_KNOB_BLOCK
+    # The pre-knob block is the knob-OFF path through the new one.
+    cursor = 0
+    for line in pre:
+        cursor = block.index(line, cursor) + 1
+    return (sum(len(line) + 1 for line in block) -
+            sum(len(line) + 1 for line in pre))
+
+
+def vita_original_effects_profile_host_oracle(
+        options, keep_water=False, keep_color_modifier=False):
+    """Pure host model used to prove that only the six target bytes move.
+
+    keep_water models ISAAC_VITA_EFFECTS_PROFILE_KEEP_WATER: the two water
+    bytes are left as the loader stored them.  keep_color_modifier models
+    ISAAC_VITA_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER: EnableColorModifier is
+    left as the loader stored it.
+    """
     result = bytearray(options)
     if len(result) <= max(VITA_ORIGINAL_EFFECTS_PROFILE_FIELDS):
         raise ValueError("OptionsConfig host image is too small")
     for offset in VITA_ORIGINAL_EFFECTS_PROFILE_FIELDS:
+        if keep_water and offset in VITA_ORIGINAL_EFFECTS_PROFILE_WATER_FIELDS:
+            continue
+        if (keep_color_modifier and
+                offset in VITA_ORIGINAL_EFFECTS_PROFILE_COLOR_MODIFIER_FIELDS):
+            continue
         result[offset] = 0
     return bytes(result)
 
@@ -13283,6 +13675,358 @@ def vita_anm2_missing_layer_guard_host_oracle(
         return None, guest_esp & 0xFFFFFFFF
     return (spec["skip"],
             (guest_esp + spec["pending_stack_bytes"]) & 0xFFFFFFFF)
+
+
+def vita_backdrop_watergfx_guard_for_body(
+        img, root_rva, em, insns, order, body):
+    """Select and prove the two Backdrop watergfx seams.
+
+    Returns the tuple of seam sites owned by this root: the NULL-holder guard
+    in Backdrop::LoadGraphics (sub_00498850) or the resolver-NULL log in the
+    image loader (sub_0056c7e0).  Every other root returns ().  PE identity,
+    body/order hashes, the exact machine bytes of every instruction the skip
+    edge reasons about, the emitted statements it reuses and the rejoin label
+    are all pinned, so a drift fails closed instead of guarding a lookalike.
+    """
+    members = frozenset(order)
+    reached = members & VITA_BACKDROP_WATERGFX_GUARD_SITES
+    if not reached:
+        return ()
+    expected_root = {
+        VITA_BACKDROP_WATERGFX_GUARD_SITE_ROOTS[site] for site in reached
+    }
+    if expected_root != {root_rva}:
+        raise RuntimeError(
+            "unexpected Backdrop watergfx seam membership at root %08x" %
+            root_rva)
+    if (img.base != DEFAULT_BASE or
+            os.path.getsize(img.path) !=
+            VITA_BACKDROP_WATERGFX_GUARD_PE_SIZE or
+            _vita_anm2_missing_layer_guard_file_sha256(img.path) !=
+            VITA_BACKDROP_WATERGFX_GUARD_PE_SHA256):
+        raise RuntimeError("Backdrop watergfx input PE identity changed")
+    emitted_by_rva = {
+        ins.address: legacy_statements(statements) for ins, statements in body
+    }
+
+    def machine(rva, mnemonic, operand, expected):
+        ins = insns.get(rva)
+        return (ins is not None and ins.mnemonic == mnemonic and
+                ins.op_str == operand and bytes(ins.bytes) == expected)
+
+    if root_rva == VITA_BACKDROP_WATERGFX_GUARD_ROOT_RVA:
+        start = VITA_BACKDROP_WATERGFX_GUARD_ROOT_RVA
+        end = VITA_BACKDROP_WATERGFX_GUARD_END_RVA
+        raw = img.code_at(start, end - start)
+        site = VITA_BACKDROP_WATERGFX_GUARD_SITE_RVA
+        window = img.code_at(site, VITA_BACKDROP_WATERGFX_GUARD_SKIP_RVA - site)
+        if (reached != {site} or
+                hashlib.sha256(raw).hexdigest() !=
+                VITA_BACKDROP_WATERGFX_GUARD_BODY_SHA256 or
+                not order or order[0] != start or
+                order[-1] != VITA_BACKDROP_WATERGFX_GUARD_LAST_RVA or
+                max(order) != VITA_BACKDROP_WATERGFX_GUARD_LAST_RVA or
+                len(order) != VITA_BACKDROP_WATERGFX_GUARD_INSNS or
+                rva_sequence_sha256(order) !=
+                VITA_BACKDROP_WATERGFX_GUARD_ORDER_SHA256 or
+                hashlib.sha256(window).hexdigest() !=
+                VITA_BACKDROP_WATERGFX_GUARD_WINDOW_SHA256 or
+                not machine(site, "mov", "ecx, dword ptr [esi + 0x2c]",
+                            VITA_BACKDROP_WATERGFX_GUARD_SITE_MACHINE) or
+                emitted_by_rva.get(site) !=
+                (VITA_BACKDROP_WATERGFX_GUARD_SITE_STATEMENT,) or
+                any(not machine(rva, "push", "0",
+                                VITA_BACKDROP_WATERGFX_GUARD_PUSH_MACHINE)
+                    for rva in VITA_BACKDROP_WATERGFX_GUARD_PUSH_RVAS) or
+                not machine(VITA_BACKDROP_WATERGFX_GUARD_DEREF_RVA, "mov",
+                            "eax, dword ptr [ecx]",
+                            VITA_BACKDROP_WATERGFX_GUARD_DEREF_MACHINE) or
+                not machine(VITA_BACKDROP_WATERGFX_GUARD_CALL_RVA, "call",
+                            "dword ptr [eax + 0x44]",
+                            VITA_BACKDROP_WATERGFX_GUARD_CALL_MACHINE) or
+                not machine(VITA_BACKDROP_WATERGFX_GUARD_NEXT_RVA, "mov",
+                            "ecx, dword ptr [esi + 0x150]",
+                            VITA_BACKDROP_WATERGFX_GUARD_NEXT_MACHINE) or
+                emitted_by_rva.get(VITA_BACKDROP_WATERGFX_GUARD_NEXT_RVA) !=
+                (VITA_BACKDROP_WATERGFX_GUARD_NEXT_STATEMENT,) or
+                any(rva not in members for rva in
+                    (*VITA_BACKDROP_WATERGFX_GUARD_PUSH_RVAS,
+                     VITA_BACKDROP_WATERGFX_GUARD_DEREF_RVA,
+                     VITA_BACKDROP_WATERGFX_GUARD_CALL_RVA,
+                     VITA_BACKDROP_WATERGFX_GUARD_NEXT_RVA,
+                     VITA_BACKDROP_WATERGFX_GUARD_SKIP_RVA)) or
+                VITA_BACKDROP_WATERGFX_GUARD_SKIP_RVA not in em.labels):
+            raise RuntimeError(
+                "Backdrop watergfx owner/CFG/machine identity changed")
+        return (site,)
+
+    start = VITA_BACKDROP_WATERGFX_GUARD_LOADER_ROOT_RVA
+    end = VITA_BACKDROP_WATERGFX_GUARD_LOADER_END_RVA
+    raw = img.code_at(start, end - start)
+    site = VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_RVA
+    path_rva = VITA_BACKDROP_WATERGFX_GUARD_LOADER_PATH_RVA
+    window = img.code_at(
+        path_rva, VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_TARGET_RVA - path_rva)
+    resolve = insns.get(VITA_BACKDROP_WATERGFX_GUARD_LOADER_RESOLVE_RVA)
+    branch = insns.get(VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_RVA)
+    if (reached != {site} or
+            hashlib.sha256(raw).hexdigest() !=
+            VITA_BACKDROP_WATERGFX_GUARD_LOADER_BODY_SHA256 or
+            not order or order[0] != start or
+            order[-1] != VITA_BACKDROP_WATERGFX_GUARD_LOADER_LAST_RVA or
+            max(order) != VITA_BACKDROP_WATERGFX_GUARD_LOADER_LAST_RVA or
+            len(order) != VITA_BACKDROP_WATERGFX_GUARD_LOADER_INSNS or
+            rva_sequence_sha256(order) !=
+            VITA_BACKDROP_WATERGFX_GUARD_LOADER_ORDER_SHA256 or
+            hashlib.sha256(window).hexdigest() !=
+            VITA_BACKDROP_WATERGFX_GUARD_LOADER_WINDOW_SHA256 or
+            not machine(path_rva, "mov", "edi, dword ptr [ebp + 0xc]",
+                        VITA_BACKDROP_WATERGFX_GUARD_LOADER_PATH_MACHINE) or
+            resolve is None or resolve.mnemonic != "call" or
+            bytes(resolve.bytes) !=
+            VITA_BACKDROP_WATERGFX_GUARD_LOADER_RESOLVE_MACHINE or
+            int(resolve.op_str, 16) !=
+            VITA_BACKDROP_WATERGFX_GUARD_LOADER_RESOLVER_RVA or
+            not machine(VITA_BACKDROP_WATERGFX_GUARD_LOADER_TEST_RVA, "test",
+                        "esi, esi",
+                        VITA_BACKDROP_WATERGFX_GUARD_LOADER_TEST_MACHINE) or
+            branch is None or branch.mnemonic != "jne" or
+            bytes(branch.bytes) !=
+            VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_MACHINE or
+            int(branch.op_str, 16) !=
+            VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_TARGET_RVA or
+            not machine(site, "mov", "esi, dword ptr [ebp + 8]",
+                        VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_MACHINE) or
+            emitted_by_rva.get(site) !=
+            (VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_STATEMENT,) or
+            any(rva not in members for rva in
+                (path_rva, VITA_BACKDROP_WATERGFX_GUARD_LOADER_RESOLVE_RVA,
+                 VITA_BACKDROP_WATERGFX_GUARD_LOADER_TEST_RVA,
+                 VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_RVA)) or
+            VITA_BACKDROP_WATERGFX_GUARD_LOADER_BRANCH_TARGET_RVA
+            not in em.labels):
+        raise RuntimeError(
+            "Backdrop watergfx loader owner/CFG/machine identity changed")
+    return (site,)
+
+
+def render_vita_backdrop_watergfx_guard(site):
+    """Render one validated Backdrop watergfx seam after its site statement.
+
+    Both blocks are written in the memory-mode spelling on purpose: the
+    seam-sync pass brackets them in GUEST_GPR_FLUSH/RELOAD and reloads the
+    locals on the skip edge.  The native helpers only read guest memory and
+    log (kage_vita_backdrop_watergfx.c); the loader block only logs.
+    """
+    if site == VITA_BACKDROP_WATERGFX_GUARD_SITE_RVA:
+        return (
+            "#if defined(__vita__) && "
+            "defined(ISAAC_VITA_BACKDROP_WATERGFX_GUARD)",
+            "    /* Vita: a NULL watergfx holder would fault at 00498ce1. */",
+            "    /* Skip both pushes and the ret-8 call: ESP is already the */",
+            "    /* post-call ESP, EAX/EDX/flags are dead at 00498cec and ECX */",
+            "    /* gets the 00498ce6 load (no C label of its own). */",
+            "    extern void isaac_vita_backdrop_watergfx_skipped("
+            "uint32_t backdrop);",
+            "    if (c->ecx == 0U) {",
+            "        isaac_vita_backdrop_watergfx_skipped(c->esi);",
+            "        %s" % VITA_BACKDROP_WATERGFX_GUARD_NEXT_STATEMENT,
+            "        goto L_%08x;" % VITA_BACKDROP_WATERGFX_GUARD_SKIP_RVA,
+            "    }",
+            "#endif",
+        )
+    if site == VITA_BACKDROP_WATERGFX_GUARD_LOADER_SITE_RVA:
+        return (
+            "#if defined(__vita__) && "
+            "defined(ISAAC_VITA_BACKDROP_WATERGFX_GUARD)",
+            "    /* Vita: the resolver returned NULL for the path in EDI */",
+            "    /* (0056c816); the frozen loader returns an empty pair silently. */",
+            "    extern void isaac_vita_backdrop_watergfx_resolve_failed("
+            "uint32_t path);",
+            "    isaac_vita_backdrop_watergfx_resolve_failed(c->edi);",
+            "#endif",
+        )
+    raise RuntimeError("unknown Backdrop watergfx seam site %08x" % site)
+
+
+def vita_backdrop_watergfx_guard_packing_bytes(sites):
+    """Bytes the seams add to a body's legacy_text(): subtracted from the
+    packing size so unit membership stays that of the unguarded corpus (the
+    bracket/sync lines are dropped by legacy_text() already)."""
+    return sum(len(line) + 1
+               for site in sites
+               for line in render_vita_backdrop_watergfx_guard(site))
+
+
+def vita_backdrop_watergfx_guard_host_oracle(image_holder, backdrop_id,
+                                             guest_esp):
+    """Model the generated NULL test: (target label, final esp, final ecx).
+
+    A non-NULL holder falls through to the original pushes/call (target None,
+    ECX unchanged = the holder).  A NULL holder never touches ESP (both
+    argument pushes are skipped, the callee would have popped them with
+    `ret 8`) and rejoins at L_00498cec with ECX carrying the replicated
+    backdrop id load, exactly the ECX the original 00498ce6 produces.
+    """
+    holder = image_holder & 0xFFFFFFFF
+    if holder != 0:
+        return None, guest_esp & 0xFFFFFFFF, holder
+    return (VITA_BACKDROP_WATERGFX_GUARD_SKIP_RVA, guest_esp & 0xFFFFFFFF,
+            backdrop_id & 0xFFFFFFFF)
+
+
+def _vita_trophy_unlock_branch_target(ins):
+    """The immediate target of a direct jmp/jcc/call, else None."""
+    if not (ins.mnemonic.startswith("j") or ins.mnemonic == "call"):
+        return None
+    try:
+        return int(ins.op_str, 16)
+    except ValueError:
+        return None
+
+
+def vita_trophy_unlock_seam_for_body(img, root_rva, em, insns, order, body):
+    """Select and prove the PersistentGameData::TryUnlock entry seam.
+
+    True for the two roots that translate the TryUnlock body: its owner
+    sub_00484c80 and the tail-jump copy inside sub_00485ab0.  Every other
+    root returns False; any other root whose order reaches the body would run
+    an unlock without the observer, so it fails closed.  For both roots the PE
+    identity, the raw body and instruction-order hashes of the copy, every
+    guard instruction the native observer replicates (and the manager-pointer
+    load it compares `this` against) and the first emitted statement are
+    pinned; the owner has no entry label, the copy is reachable only through
+    its label from the 45 proved tail jumps.  Any drift raises instead of
+    observing a lookalike.
+    """
+    root = VITA_TROPHY_UNLOCK_ROOT_RVA
+    end = VITA_TROPHY_UNLOCK_END_RVA
+    reaches = any(root <= rva < end for rva in order)
+    if root_rva not in VITA_TROPHY_UNLOCK_ROOTS:
+        if reaches:
+            raise RuntimeError(
+                "unexpected Vita trophy TryUnlock seam membership at root "
+                "%08x" % root_rva)
+        return False
+    if (img.base != DEFAULT_BASE or
+            os.path.getsize(img.path) != VITA_TROPHY_UNLOCK_PE_SIZE or
+            _vita_anm2_missing_layer_guard_file_sha256(img.path) !=
+            VITA_TROPHY_UNLOCK_PE_SHA256):
+        raise RuntimeError("Vita trophy TryUnlock input PE identity changed")
+    members = frozenset(order)
+    copy = [rva for rva in order if root <= rva < end]
+    raw = img.code_at(root, end - root)
+    last = insns.get(VITA_TROPHY_UNLOCK_LAST_RVA)
+    emitted_by_rva = {
+        ins.address: legacy_statements(statements) for ins, statements in body
+    }
+
+    def machine(rva, mnemonic, operand, expected):
+        ins = insns.get(rva)
+        return (rva in members and ins is not None and
+                ins.mnemonic == mnemonic and ins.op_str == operand and
+                bytes(ins.bytes) == expected)
+
+    if (hashlib.sha256(raw).hexdigest() != VITA_TROPHY_UNLOCK_BODY_SHA256 or
+            not copy or copy[0] != root or
+            copy[-1] != VITA_TROPHY_UNLOCK_LAST_RVA or
+            len(copy) != VITA_TROPHY_UNLOCK_INSNS or
+            rva_sequence_sha256(copy) != VITA_TROPHY_UNLOCK_ORDER_SHA256 or
+            last is None or last.address + last.size != end or
+            any(not machine(rva, mnemonic, operand, expected)
+                for rva, mnemonic, operand, expected
+                in VITA_TROPHY_UNLOCK_PINNED) or
+            VITA_TROPHY_UNLOCK_MANAGER_LOAD_RVA not in members or
+            getattr(insns.get(VITA_TROPHY_UNLOCK_MANAGER_LOAD_RVA),
+                    "mnemonic", None) != "mov" or
+            bytes(img.code_at(
+                VITA_TROPHY_UNLOCK_MANAGER_LOAD_RVA,
+                len(VITA_TROPHY_UNLOCK_MANAGER_LOAD_MACHINE))) !=
+            VITA_TROPHY_UNLOCK_MANAGER_LOAD_MACHINE or
+            emitted_by_rva.get(root) !=
+            (VITA_TROPHY_UNLOCK_FIRST_STATEMENT,)):
+        raise RuntimeError(
+            "Vita trophy TryUnlock owner/CFG/machine identity changed")
+    if root_rva == root:
+        if list(order) != copy or root in em.labels:
+            raise RuntimeError(
+                "Vita trophy TryUnlock owner/CFG/machine identity changed")
+        return True
+
+    tail = VITA_TROPHY_UNLOCK_TAIL_ROOT_RVA
+    tail_end = VITA_TROPHY_UNLOCK_TAIL_END_RVA
+    tail_raw = img.code_at(tail, tail_end - tail)
+    tail_last = insns.get(VITA_TROPHY_UNLOCK_TAIL_LAST_RVA)
+    entries = []
+    for rva in order:
+        if root <= rva < end:
+            continue
+        ins = insns.get(rva)
+        target = (_vita_trophy_unlock_branch_target(ins)
+                  if ins is not None else None)
+        if target is not None and root <= target < end:
+            entries.append((rva, ins.mnemonic, target))
+    ids = []
+    shape_ok = True
+    for rva, mnemonic, target in entries:
+        pop = insns.get(rva - 1)
+        store = insns.get(rva - 8)
+        if (mnemonic != "jmp" or target != root or
+                pop is None or pop.mnemonic != "pop" or
+                pop.op_str != "ebp" or bytes(pop.bytes) != b"\x5d" or
+                rva - 1 not in members or rva - 8 not in members or
+                store is None or store.mnemonic != "mov" or
+                bytes(store.bytes)[:3] != bytes.fromhex("c74508") or
+                store.size != 7):
+            shape_ok = False
+            break
+        ids.append(int.from_bytes(bytes(store.bytes)[3:7], "little"))
+    if (hashlib.sha256(tail_raw).hexdigest() !=
+            VITA_TROPHY_UNLOCK_TAIL_BODY_SHA256 or
+            order[0] != root or
+            order[-1] != VITA_TROPHY_UNLOCK_TAIL_LAST_RVA or
+            max(order) != VITA_TROPHY_UNLOCK_TAIL_LAST_RVA or
+            len(order) != VITA_TROPHY_UNLOCK_TAIL_INSNS or
+            rva_sequence_sha256(order) !=
+            VITA_TROPHY_UNLOCK_TAIL_ORDER_SHA256 or
+            tail_last is None or
+            tail_last.address + tail_last.size != tail_end or
+            any(not (root <= rva < end or tail <= rva < tail_end)
+                for rva in order) or
+            root not in em.labels or
+            not shape_ok or
+            tuple(ids) != VITA_TROPHY_UNLOCK_TAIL_IDS):
+        raise RuntimeError(
+            "Vita trophy TryUnlock tail-jump copy identity changed")
+    return True
+
+
+def render_vita_trophy_unlock_seam():
+    """The entry observer block, emitted before the first instruction.
+
+    Legacy CPU-struct spelling on purpose: the seam-sync pass brackets the
+    call line in GUEST_GPR_FLUSH/RELOAD inside the fence, so with the knob
+    off the preprocessed body is the unguarded one token for token.  Pure
+    fall-through: no return, no goto; the observer only reads guest memory
+    (host_vita_trophies.c).
+    """
+    return (
+        "#if defined(__vita__) && defined(ISAAC_VITA_TROPHIES)",
+        "    /* Vita trophies: observe PersistentGameData::TryUnlock(id); "
+        "the translated body always follows. */",
+        "    extern void isaac_vita_trophies_try_unlock_observe("
+        "uint32_t pgd, uint32_t id, uint32_t return_rva);",
+        "    isaac_vita_trophies_try_unlock_observe(c->ecx, "
+        "ld32((uint32_t)(c->esp + 4U)), ld32((uint32_t)c->esp));",
+        "#endif",
+    )
+
+
+def vita_trophy_unlock_seam_packing_bytes():
+    """Bytes the seam adds to the owner's legacy_text(): subtracted from the
+    packing size so unit membership stays that of the unguarded corpus (the
+    FLUSH/RELOAD lines are dropped by legacy_text() already)."""
+    return sum(len(line) + 1 for line in render_vita_trophy_unlock_seam())
 
 
 def _vita_renderframe_direct_call_xrefs(img, target_rva):
@@ -16170,6 +16914,74 @@ def _vita_kage_quad_packing_delta(text):
     return unit_packing_size(text) - unit_packing_size("\n".join(stripped))
 
 
+def vita_camera_ring_for_body(img, root_rva, insns, order):
+    """Authenticate the camera ring average root (sub_0049df90).
+
+    Returns the seam spec (marker, helper) or None.  Pins: the frozen PE, the
+    root body bytes and emitted CFG order, the seven direct callers as its
+    only references (no address word), the two logger call sites, the
+    `idiv [ecx+4]` and the `ret 8` epilogue."""
+    if root_rva != VITA_CAMERA_RING_ROOT_RVA:
+        return None
+    if (os.path.getsize(img.path) != VITA_EXIT_MENU_PROFILE_PE_SIZE or
+            _vita_pill_bloom_bypass_file_sha256(img.path) !=
+            VITA_EXIT_MENU_PROFILE_PE_SHA256):
+        raise RuntimeError("camera ring input PE identity changed")
+    raw_img = Image(img.path, img.orig_base)
+    raw = raw_img.code_at(
+        root_rva, VITA_CAMERA_RING_ROOT_END_RVA - root_rva)
+    if (hashlib.sha256(raw).hexdigest() !=
+            VITA_CAMERA_RING_ROOT_BODY_SHA256 or
+            len(order) != VITA_CAMERA_RING_ROOT_INSNS or
+            not order or order[0] != root_rva or
+            order[-1] != VITA_CAMERA_RING_ROOT_LAST_RVA or
+            rva_sequence_sha256(order) !=
+            VITA_CAMERA_RING_ROOT_ORDER_SHA256):
+        raise RuntimeError(
+            "camera ring body/CFG identity changed at %08x" % root_rva)
+    calls = _vita_png_decode_profile_rel32_xrefs(raw_img, root_rva)
+    address_refs = tuple(
+        rva for rva in sorted(raw_img.reloc_rvas)
+        if int.from_bytes(raw_img.code_at(rva, 4), "little") ==
+        raw_img.va(root_rva)
+    )
+    if calls != VITA_CAMERA_RING_CALLERS or address_refs:
+        raise RuntimeError(
+            "camera ring caller provenance changed at %08x" % root_rva)
+    for site, target in sorted(VITA_CAMERA_RING_CALL_SITES.items()):
+        instruction = insns.get(site)
+        if (instruction is None or instruction.mnemonic != "call" or
+                instruction.op_str != "0x%x" % target or site not in order):
+            raise RuntimeError(
+                "camera ring logger call changed at %08x" % site)
+    instruction = insns.get(VITA_CAMERA_RING_IDIV_SITE)
+    if (instruction is None or instruction.mnemonic != "idiv" or
+            instruction.op_str != "dword ptr [ecx + 4]"):
+        raise RuntimeError("camera ring index division changed")
+    instruction = insns.get(VITA_CAMERA_RING_ROOT_LAST_RVA)
+    if (instruction is None or instruction.mnemonic != "ret" or
+            instruction.op_str != "8"):
+        raise RuntimeError("camera ring epilogue changed")
+    return {"marker": VITA_CAMERA_RING_MARKER,
+            "helper": VITA_CAMERA_RING_HELPER}
+
+
+def _vita_camera_ring_packing_delta(text):
+    """Bytes the camera ring declaration/seam blocks add to a body's text."""
+    stripped = []
+    skipping = False
+    for line in text.split("\n"):
+        if line == VITA_CAMERA_RING_GUARD:
+            skipping = True
+            continue
+        if skipping:
+            if line == "#endif":
+                skipping = False
+            continue
+        stripped.append(line)
+    return unit_packing_size(text) - unit_packing_size("\n".join(stripped))
+
+
 def require_upstream_contracts():
     functions_recipe_id, _ = Funcs.contract_recipe()
     functions_manifest = BC.require_manifest(
@@ -16195,7 +17007,7 @@ def contract_recipe(functions_manifest, bounds_manifest):
     source_names = (
         "gen_all.py", "build_one.py", "emit.py", "trans.py", "image.py",
         "iat_meta.py", "sweep2.py", "build_contract.py", "leaf_inline.py",
-        "sse_lower.py", "gpr_locals.py",
+        "sse_lower.py", "gpr_locals.py", "gpr_flush_mask.py",
     )
     inputs = {
         "input/isaac-ng.exe.unpacked.exe": EXE,
@@ -16243,6 +17055,9 @@ def contract_recipe(functions_manifest, bounds_manifest):
                 leaf_inline.max_insns_from_environment()
                 if leaf_inline.enabled_by_environment() else 0
             ),
+            # Dirty-register publication masks (gpr_flush_mask.py) rewrite
+            # the FLUSH statements of every unit except guest_0144.c.
+            "gpr_flush_mask": gpr_flush_mask.enabled_by_environment(),
         },
         BC.tool_ids(),
     )
@@ -18020,6 +18835,8 @@ LUA_CALLBACK_NEUTRAL_TRANSLATION = {
     "vita_archive_validation_skip": False,
     "vita_vanilla_kage_bundle_sites": (),
     "vita_anm2_missing_layer_guard_sites": (),
+    "vita_backdrop_watergfx_guard_sites": (),
+    "vita_trophy_unlock_seam": False,
     "vita_renderframe_fastpath_sites": (),
     "vita_refcount_direct_edges": (),
     "vita_refcount_sync_iat_sites": (),
@@ -18036,6 +18853,7 @@ LUA_CALLBACK_NEUTRAL_TRANSLATION = {
     "vita_floor_thunk_fastpath": False,
     "vita_shader_attrib_fastpath": None,
     "vita_kage_quad_fastpath": False,
+    "vita_camera_ring": False,
     "pc_clock": False,
     "pc_clock_inline_seams": (),
     "pc_display_dimension": None,
@@ -22934,6 +23752,11 @@ def _translate_function(img, fn, known, switch_info,
     vita_anm2_missing_layer_guard = \
         vita_anm2_missing_layer_guard_for_body(
             pin_img, rva, em, _insns, order, body)
+    vita_backdrop_watergfx_guard = \
+        vita_backdrop_watergfx_guard_for_body(
+            pin_img, rva, em, _insns, order, body)
+    vita_trophy_unlock_seam = vita_trophy_unlock_seam_for_body(
+        pin_img, rva, em, _insns, order, body)
     vita_renderframe_fastpath = vita_renderframe_fastpath_for_body(
         pin_img, rva, em, _insns, order, body)
     vita_renderframe_fastpath_by_site = {
@@ -22988,6 +23811,7 @@ def _translate_function(img, fn, known, switch_info,
         pin_img, rva, _insns, order, img.base)
     vita_kage_quad_fastpath = vita_kage_quad_fastpath_for_body(
         pin_img, rva, _insns, order)
+    vita_camera_ring = vita_camera_ring_for_body(pin_img, rva, _insns, order)
     vita_rooted_file_probe = vita_rooted_file_probe_for_body(
         pin_img, rva, em, order)
     vita_stable30_manager_guard_label = (
@@ -23157,6 +23981,11 @@ def _translate_function(img, fn, known, switch_info,
         lines.append(
             "    extern int %s(CPU *__restrict);" %
             vita_kage_quad_fastpath["helper"])
+        lines.append("#endif")
+    if vita_camera_ring:
+        lines.append(VITA_CAMERA_RING_GUARD)
+        lines.append(
+            "    extern int %s(CPU *__restrict);" % vita_camera_ring["helper"])
         lines.append("#endif")
     if vita_archive_validation_skip:
         lines.append(
@@ -24116,6 +24945,9 @@ def _translate_function(img, fn, known, switch_info,
             lines.extend(render_vita_kage_mutex_seam(vita_kage_mutex_seam))
         if vita_kage_refcount_seam and ins.address == rva:
             lines.extend(render_vita_kage_mutex_seam(vita_kage_refcount_seam))
+        if (vita_trophy_unlock_seam and
+                ins.address == VITA_TROPHY_UNLOCK_ROOT_RVA):
+            lines.extend(render_vita_trophy_unlock_seam())
         if (vita_floor_thunk_fastpath and
                 ins.address == VITA_FLOOR_THUNK_FASTPATH_ROOT_RVA):
             iat_address = ((img.base +
@@ -24152,6 +24984,14 @@ def _translate_function(img, fn, known, switch_info,
                 vita_kage_quad_fastpath["marker"])
             lines.append(
                 "    if (%s(c))" % vita_kage_quad_fastpath["helper"])
+            lines.append("        return;")
+            lines.append("#endif")
+        if vita_camera_ring and ins.address == rva:
+            lines.append(VITA_CAMERA_RING_GUARD)
+            lines.append(
+                "    /* %s; exact translated fallback follows. */" %
+                vita_camera_ring["marker"])
+            lines.append("    if (%s(c))" % vita_camera_ring["helper"])
             lines.append("        return;")
             lines.append("#endif")
         stage_reuse = VITA_STAGE_MEMORY_REUSE_SPECS.get(
@@ -24889,7 +25729,7 @@ def _translate_function(img, fn, known, switch_info,
             lines.append(
                 "        uint32_t _intro_manager = "
                 "ld32((uint32_t)(GUEST_IMAGE_BASE + 0x007fd680U));")
-            lines.append("        if (guest_kage_pc_handoff_ready() &&")
+            lines.append("        if (guest_kage_intro_skip_ready() &&")
             lines.append("                _intro_manager != 0U &&")
             lines.append(
                 "                c->edi == _intro_manager + 0x20a00U &&")
@@ -25146,6 +25986,8 @@ def _translate_function(img, fn, known, switch_info,
                  if spec["site"] == ins.address), None)
             if guard_spec is not None:
                 lines.extend(render_vita_anm2_missing_layer_guard(guard_spec))
+        if ins.address in vita_backdrop_watergfx_guard:
+            lines.extend(render_vita_backdrop_watergfx_guard(ins.address))
         if (ins.address in vita_sfx_advisory_call_to_count or
                 ins.address in vita_sfx_advisory_count_to_call):
             lines.append("#if defined(__vita__)")
@@ -25250,10 +26092,25 @@ def _translate_function(img, fn, known, switch_info,
     legacy_size_delta -= vita_anm2_outer_seam_bytes
     legacy_size_delta -= vita_deep_profile_seam_bytes
     legacy_size_delta -= vita_wav_rewind_seam_bytes
+    legacy_size_delta -= vita_backdrop_watergfx_guard_packing_bytes(
+        vita_backdrop_watergfx_guard)
+    if vita_trophy_unlock_seam:
+        # The observer block is new text; keep the unit packing what it was.
+        legacy_size_delta -= vita_trophy_unlock_seam_packing_bytes()
     if vita_shader_attrib_fastpath:
         legacy_size_delta -= _vita_shader_attrib_packing_delta(text)
     if vita_kage_quad_fastpath:
         legacy_size_delta -= _vita_kage_quad_packing_delta(text)
+    if vita_camera_ring:
+        legacy_size_delta -= _vita_camera_ring_packing_delta(text)
+    if vita_original_effects_profile:
+        # The KEEP_WATER/KEEP_COLOR_MODIFIER fences are new text (the outer
+        # fence appears once per injected block); keep the unit packing what
+        # it was before either knob.
+        legacy_size_delta -= (
+            text.count(
+                VITA_ORIGINAL_EFFECTS_PROFILE_KEEP_COLOR_MODIFIER_FENCE) *
+            vita_original_effects_profile_knob_bytes())
     return {
         "rva": rva, "public_name": public_name, "name": name,
         "manual": rva in MANUAL_RVAS, "stub": None,
@@ -25316,6 +26173,9 @@ def _translate_function(img, fn, known, switch_info,
             spec["site"] for spec in vita_vanilla_kage_bundle),
         "vita_anm2_missing_layer_guard_sites": tuple(
             spec["site"] for spec in vita_anm2_missing_layer_guard),
+        "vita_backdrop_watergfx_guard_sites": tuple(
+            vita_backdrop_watergfx_guard),
+        "vita_trophy_unlock_seam": bool(vita_trophy_unlock_seam),
         "vita_renderframe_fastpath_sites": tuple(
             spec["site"] for spec in vita_renderframe_fastpath),
         "vita_refcount_direct_edges": tuple(
@@ -25345,6 +26205,7 @@ def _translate_function(img, fn, known, switch_info,
             vita_shader_attrib_fastpath["kind"]
             if vita_shader_attrib_fastpath else None),
         "vita_kage_quad_fastpath": bool(vita_kage_quad_fastpath),
+        "vita_camera_ring": bool(vita_camera_ring),
         "pc_clock": bool(pc_clock),
         "pc_clock_inline_seams": tuple(
             spec["site"] for spec in pc_clock_inline_seams),
@@ -25954,6 +26815,10 @@ def _main(force=False, reanalyse=False, jobs=1):
     vita_anm2_missing_layer_guard_site_roots = {
         site: set() for site in VITA_ANM2_MISSING_LAYER_GUARD_SITES
     }
+    vita_backdrop_watergfx_guard_site_roots = {
+        site: set() for site in VITA_BACKDROP_WATERGFX_GUARD_SITES
+    }
+    vita_trophy_unlock_seam_roots = set()
     vita_renderframe_fastpath_site_roots = {
         site: set() for site in VITA_RENDERFRAME_FASTPATH_SITES
     }
@@ -25987,6 +26852,7 @@ def _main(force=False, reanalyse=False, jobs=1):
     leaf_inline_sites = []
     leaf_inline_refused = collections.Counter()
     leaf_inline_text_delta = 0
+    gpr_flush_mask_stats = {}
 
     def flush():
         nonlocal unit, unit_bytes
@@ -25994,14 +26860,23 @@ def _main(force=False, reanalyse=False, jobs=1):
             return
         idx = len(files)
         path = os.path.join(OUTDIR, "guest_%04d.c" % idx)
+        body_text = "".join(text + "\n" for text in unit)
+        # GUEST_GPR_FLUSH_MASK=1: dirty-register publication masks, applied
+        # to the final rendered unit (seams included) after packing, so unit
+        # membership is unchanged.  The direct-default owner keeps its pinned
+        # identity (CMake / vita_direct_default_codegen.py hash it).
+        if (gpr_flush_mask.enabled_by_environment() and
+                os.path.basename(path) != "guest_0144.c"):
+            masked = gpr_flush_mask.mask_unit(body_text, gpr_flush_mask_stats)
+            if gpr_flush_mask.legacy_text(masked) != body_text:
+                raise RuntimeError("flush mask changed more than FLUSH: " + path)
+            body_text = masked
         with _open_generated_text(path) as fh:
             fh.write("/* GENERATED by recomp/gen_all.py -- do not edit. */\n")
             fh.write("#include <math.h>\n#include \"guest.h\"\n")
             fh.write("#include \"guest_funcs.h\"\n\n")
             fh.write(vita_deep_profile_unit_include(unit))
-            for text in unit:
-                fh.write(text)
-                fh.write("\n")
+            fh.write(body_text)
         files.append((path, unit_bytes, len(unit)))
         unit = []
         unit_bytes = 0
@@ -26163,6 +27038,10 @@ def _main(force=False, reanalyse=False, jobs=1):
                 vita_vanilla_kage_bundle_site_roots[site].add(rva)
             for site in result["vita_anm2_missing_layer_guard_sites"]:
                 vita_anm2_missing_layer_guard_site_roots[site].add(rva)
+            for site in result["vita_backdrop_watergfx_guard_sites"]:
+                vita_backdrop_watergfx_guard_site_roots[site].add(rva)
+            if result["vita_trophy_unlock_seam"]:
+                vita_trophy_unlock_seam_roots.add(rva)
             for site in result["vita_renderframe_fastpath_sites"]:
                 vita_renderframe_fastpath_site_roots[site].add(rva)
             for site in result["vita_stage_memory_hooks"]:
@@ -26554,6 +27433,22 @@ def _main(force=False, reanalyse=False, jobs=1):
                    ",".join("%08x" % r for r in sorted(actual)),
                    ",".join("%08x" % r for r in sorted(expected))))
     for site, actual in sorted(
+            vita_backdrop_watergfx_guard_site_roots.items()):
+        expected = {VITA_BACKDROP_WATERGFX_GUARD_SITE_ROOTS[site]}
+        if actual != expected:
+            raise RuntimeError(
+                "Backdrop watergfx seam membership changed at %08x: %s != %s"
+                % (site,
+                   ",".join("%08x" % r for r in sorted(actual)),
+                   ",".join("%08x" % r for r in sorted(expected))))
+    if vita_trophy_unlock_seam_roots != VITA_TROPHY_UNLOCK_ROOTS:
+        raise RuntimeError(
+            "Vita trophy TryUnlock seam membership changed: %s != %s" %
+            (",".join("%08x" % r for r in sorted(
+                vita_trophy_unlock_seam_roots)),
+             ",".join("%08x" % r for r in sorted(
+                 VITA_TROPHY_UNLOCK_ROOTS))))
+    for site, actual in sorted(
             vita_renderframe_fastpath_site_roots.items()):
         expected = {VITA_RENDERFRAME_FASTPATH_ROOT_RVA}
         if actual != expected:
@@ -26668,6 +27563,12 @@ def _main(force=False, reanalyse=False, jobs=1):
         if unit_bytes >= TARGET_BYTES:
             flush()
     flush()
+    if gpr_flush_mask.enabled_by_environment():
+        reasons = gpr_flush_mask_stats.pop("reasons", {})
+        print("gpr flush mask census      : %s" % ", ".join(
+            "%s=%d" % kv for kv in sorted(gpr_flush_mask_stats.items())))
+        for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print("  gpr flush mask refused %5d: %s" % (n, why))
     if leaf_inline_table is not None:
         leaf_inline.census_report(
             leaf_inline_table, leaf_inline_sites, leaf_inline_refused,

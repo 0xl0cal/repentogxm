@@ -222,6 +222,20 @@ static uint32_t bucket_hdr(uint32_t b) { return va(OFF_BUCKETS) + b * 12U; }
 static uint32_t s_free_ram = 160U << 20, s_free_vram = 40U << 20;
 uint32_t isaac_ir_oracle_free_ram(void)  { return s_free_ram; }
 uint32_t isaac_ir_oracle_free_vram(void) { return s_free_vram; }
+#if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+static uint32_t s_free_phycont;
+uint32_t isaac_ir_oracle_free_phycont(void) { return s_free_phycont; }
+/* Every read advances 1 s unless frozen, so the reading cache never hits in
+ * the shared scenarios and they see the free-memory model live. */
+static uint64_t s_now_us;
+static int s_clock_frozen;
+uint64_t isaac_ir_oracle_now_us(void)
+{
+    if (!s_clock_frozen)
+        s_now_us += 1000000U;
+    return s_now_us;
+}
+#endif
 
 /* ------------------------------------------------------------- events ----- */
 
@@ -735,6 +749,10 @@ static void begin(const char *name, uint32_t budget_mb, uint32_t headroom_mb)
     isaac_ir_oracle_set_env(&env);
     isaac_ir_oracle_set_budget(budget_mb << 20, headroom_mb << 20);
     s_free_ram = 160U << 20; s_free_vram = 40U << 20;
+#if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+    s_free_phycont = 0U;
+    s_clock_frozen = 0;
+#endif
     s_nested_image = 0U; s_unreg_break_esp = 0;
     s_observer = wrapper_entry;
     s_deadlock = 0;
@@ -827,6 +845,59 @@ static void memory_hostile_scenarios(void)
 {
     uint32_t image, ctrl, image2, ctrl2, i;
     uint32_t imgs[16], ctrls[16];
+
+#if defined(ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT)
+    /* M0. PHYCONT counts toward the headroom (the English device map: RAM+VRAM
+     *     ~4 MiB free, PHYCONT ~26 MiB).  Budget 12 / headroom 16 as shipped:
+     *     4 + 0 + 26 >= 16 retains; 4 + 0 + 11 < 16 hands the next candidate
+     *     to the real observer after releasing the LRU tail. */
+    begin("headroom-counts-phycont", 12, 16);
+    s_free_ram = 4U << 20; s_free_vram = 0U; s_free_phycont = 26U << 20;
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "P1", 512, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    CHECK(retained_events_only() && isaac_ir_oracle_live_records() == 1);
+    CHECK(st()->headroom_pass == 0 && manager_present(image) == 1);
+    s_free_phycont = 11U << 20; s_deferred_free = 1;
+    image2 = mk(va(ISAAC_IR_VT_PNG_RVA), "P2", 512, 512, 4, 1, &ctrl2);
+    offer(image2, ctrl2);
+    CHECK(st()->headroom_pass == 1 && st()->headroom_evict == 1);
+    CHECK(manager_present(image) == 0 && manager_present(image2) == 0);
+    CHECK(isaac_ir_oracle_live_records() == 0);
+
+    /* M0b. Reading cache: offers inside IR_FREE_CACHE_US reuse one reading;
+     *      once the window is over the model is read live again. */
+    begin("headroom-reading-cache", 12, 16);
+    s_clock_frozen = 1;
+    s_free_ram = 4U << 20; s_free_vram = 0U; s_free_phycont = 26U << 20;
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "C1", 512, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    s_free_phycont = 0U;                                   /* 4 < 16, not yet seen */
+    image2 = mk(va(ISAAC_IR_VT_PNG_RVA), "C2", 512, 512, 4, 1, &ctrl2);
+    offer(image2, ctrl2);
+    CHECK(isaac_ir_oracle_live_records() == 2 && st()->headroom_pass == 0);
+    s_now_us += 4000U;
+    imgs[0] = mk(va(ISAAC_IR_VT_PNG_RVA), "C3", 512, 512, 4, 1, &ctrls[0]);
+    offer(imgs[0], ctrls[0]);
+    CHECK(st()->headroom_pass == 1 && st()->headroom_evict == 2);
+    CHECK(isaac_ir_oracle_live_records() == 0 && manager_present(imgs[0]) == 0);
+
+    /* M0c. Our own eviction invalidates the reading: an unused sheet's texture
+     *      is freed at once, so one tail can restore the headroom. */
+    begin("headroom-evict-invalidates-cache", 12, 16);
+    s_clock_frozen = 1;
+    s_free_ram = 4U << 20; s_free_vram = 0U; s_free_phycont = 26U << 20;
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "E1", 512, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    image2 = mk(va(ISAAC_IR_VT_PNG_RVA), "E2", 512, 512, 4, 1, &ctrl2);
+    offer(image2, ctrl2);
+    s_now_us += 4000U;
+    s_free_phycont = 11U << 20;                            /* 15 < 16 */
+    imgs[0] = mk(va(ISAAC_IR_VT_PNG_RVA), "E3", 512, 512, 4, 1, &ctrls[0]);
+    offer(imgs[0], ctrls[0]);                              /* E1 freed: 16 */
+    CHECK(st()->headroom_evict == 1 && st()->headroom_pass == 0);
+    CHECK(manager_present(image) == 0 && manager_present(image2) == 1 &&
+          manager_present(imgs[0]) == 1 && isaac_ir_oracle_live_records() == 2);
+#endif
 
     /* M1. Headroom pressure with vitaGL's deferred frees: free memory does
      *     not rise when a texture is destroyed.  One hook call must release
