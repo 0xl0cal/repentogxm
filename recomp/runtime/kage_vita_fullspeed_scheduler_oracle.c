@@ -5,6 +5,9 @@
 #include <string.h>
 
 #include "kage_vita_fullspeed_scheduler.h"
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+# include "kage_vita_backend.h"
+#endif
 
 static uint64_t s_now;
 static uint32_t s_log_calls;
@@ -196,6 +199,232 @@ static uint64_t s_present_wait_gpu_done[4];
 static uint64_t s_present_wait_flip[4];
 static uint64_t s_present_wait_max_us;
 
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+/* GL render thread timeline (R60-DRYADMIT-SPEC-20261028.md).  Present waits
+ * for the previous present closure (kage_vita_backend_present: worker_wait
+ * on the last position, the hold), then posts closure k, which completes at
+ *   WORKER:       start + base, or start + tail when k % period == period-1
+ *                 (and one stall closure), start = post time after the hold;
+ *   WORKER_QUEUE: as QUEUE_VBLANK on the render thread: the swap of closure
+ *                 k returns once frame k-2 has flipped (2 pending), frames
+ *                 flip one per 60-Hz edge after their GPU work (gpu_us).
+ * The admission stand-ins below read it: behind = closure k-1 not done. */
+#define PRESENT_WAIT_WORKER 5u
+#define PRESENT_WAIT_WORKER_QUEUE 6u
+static uint32_t s_wk_period, s_wk_tail_us, s_wk_base_us = 300u, s_wk_gpu_us;
+static uint32_t s_wk_stall_at = UINT32_MAX, s_wk_stall_us;
+static uint64_t s_wk_done_last;
+static uint32_t s_wk_posts, s_wk_holds, s_wk_rs;
+static uint64_t s_wk_hold_us;
+/* Backend fit check stand-in (kvb_admit_fit_check): e, a, miss_us, max. */
+static uint32_t s_wk_fit_armed, s_wk_fit_pos;
+static uint64_t s_wk_fit_latest;
+/* e, a, miss_us, miss_max_us, hd n, hd us (kage_vita_backend.c). */
+static uint32_t s_wk_fit[6];
+/* ON: Present hold on a closure admitted after a wait (kage_vita_backend.c
+ * s_admit_waited_*): arm at the admission, position = post index + 1 of
+ * that render's closure, the hold left for the next loop head. */
+static uint32_t s_wk_waited_arm, s_wk_waited_pos, s_wk_hold_take_us;
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+/* GL admit behind (R60-FABLE-PLAN.md lane B).  What the gate stand-in
+ * reports as the ring's outstanding bytes: OVER = UINT32_MAX (the default:
+ * every scenario of this file then runs the stock refusal), FIXED =
+ * s_ab_out_fixed, RATE = 8 bytes per microsecond the last closure still
+ * needs (8 ms left = 64000 bytes, inside the default bound; 9 ms = 72000,
+ * over it). */
+#  define ORACLE_AB_OUT_OVER 0u
+#  define ORACLE_AB_OUT_FIXED 1u
+#  define ORACLE_AB_OUT_RATE 2u
+static uint32_t s_ab_out_model, s_ab_out_fixed;
+/* Backend stand-ins (kage_vita_backend.c s_ab_*): the closure check armed
+ * by a refusal and read at the next Present, the pm/wp/phl/hd words, and
+ * the ON hold arm / chain / hold left for the next loop head. */
+static uint32_t s_ab_check_armed, s_ab_check_pos, s_ab_check_would;
+static uint64_t s_ab_check_present, s_ab_check_return, s_ab_check_head;
+static uint32_t s_ab_be[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS];
+/* What the scheduler has to predict at a behind gate, measured here on the
+ * seams themselves, not read from the scheduler: the last Render's body
+ * (entry to Present) and cost (entry to return), in us.  The refused
+ * stand-in holds the two instants it is handed against gate + these; the
+ * ordinal of the first refusal that disagrees is kept for the caller
+ * (ab_account, the directed runs).  split = refusals whose two instants
+ * differ, i.e. the ones that tell a Present from a Render return. */
+static uint64_t s_ab_ref_entry, s_ab_ref_body, s_ab_ref_cost;
+static uint32_t s_ab_ref_have, s_ab_ref_bad, s_ab_ref_checked, s_ab_ref_split;
+/* Directed runs: no Game::Update at all (a menu; run_debt_tick's menu). */
+static uint32_t s_ab_menu;
+#  if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+static uint32_t s_ab_arm, s_ab_chain, s_ab_hold_take_us;
+#  endif
+# endif
+# if defined(ORACLE_GL_ADMIT_BEHIND_TWIN)
+/* The knob-OFF twin of the ON "within" pass: the stock gate told that the
+ * render thread is never behind (Present still holds on it). */
+static uint32_t s_wk_gate_never_behind;
+# endif
+# if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE) && \
+    !(defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && \
+    !defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT) && \
+    !(defined(ISAAC_VITA_FULLSPEED_FLOOR_DEBT) && ISAAC_VITA_FULLSPEED_FLOOR_DEBT == 2)
+/* The worker cases (check_worker_cases) run only in the combination the
+ * admit wait is proven with: service reserve, stock render cost, no head
+ * advance, floor debt OFF or OBSERVE.  With floor debt ON gpuq-19-fight
+ * changes 1000 -> 600 presents: not this knob's contract, and the knob
+ * refuses that combination at compile time. */
+#  define ORACLE_GL_WORKER_CASES 1
+# endif
+# if defined(ORACLE_GL_WORKER_CASES) || \
+    (defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2)
+/* Render-thread wake latency after the closure completes (ON wait). */
+static uint32_t s_wk_wake_us;
+# endif
+# if defined(ORACLE_GL_WORKER_CASES)
+/* Seeded variation (review round 1 finding 2, round 2 findings 1-3): the
+ * loop's pre-Game service 500 us and the Render body each drawn uniformly
+ * in [x - J, x + J], and a closure tail on one post in N drawn at random
+ * instead of every period-th.  All three are 0 outside the rows that set
+ * them, so no other transcript moves.  xorshift32, one stream each. */
+static uint32_t s_wk_svc_jit_us, s_wk_body_jit_us, s_wk_tail_one_in;
+static uint32_t s_wk_rng[3];
+
+static uint32_t worker_rand(uint32_t stream)
+{
+    uint32_t x = s_wk_rng[stream];
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    s_wk_rng[stream] = x;
+    return x;
+}
+
+static uint32_t worker_jittered(uint32_t base, uint32_t jitter, uint32_t stream)
+{
+    if (!jitter || jitter > base)
+        return base;
+    return base - jitter + worker_rand(stream) % (2u * jitter + 1u);
+}
+# endif
+
+static int worker_behind_now(void)
+{
+    return s_wk_posts != 0u && s_wk_done_last > s_now;
+}
+
+static uint64_t present_wait_edge_at_or_after(uint64_t at_us);
+
+static uint64_t worker_present(void)
+{
+    uint64_t hold = 0u, start, done;
+    uint32_t k = s_wk_posts;
+
+    if (worker_behind_now()) {
+        hold = s_wk_done_last - s_now;
+        ++s_wk_holds;
+        s_wk_hold_us += hold;
+    }
+    if (s_wk_waited_pos && s_wk_waited_pos == k && hold) {
+        s_wk_hold_take_us = (uint32_t)hold;
+        ++s_wk_fit[4];
+        s_wk_fit[5] += (uint32_t)hold;
+    }
+    s_wk_waited_pos = 0u;
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+#  if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    /* kvb_admit_behind_hold_begin / _end. */
+    if ((s_ab_arm || (s_ab_chain && s_ab_chain == k)) && hold) {
+        s_ab_hold_take_us += (uint32_t)hold;
+        ++s_ab_be[9];
+        s_ab_be[10] += (uint32_t)hold;
+    }
+    s_ab_chain = 0u;
+#  endif
+    /* kvb_admit_behind_check: after worker_wait, before the post. */
+    if (s_ab_check_armed) {
+        s_ab_check_armed = 0u;
+        if (k != 0u && s_ab_check_pos == k) {
+            uint64_t miss = s_wk_done_last > s_ab_check_present ?
+                s_wk_done_last - s_ab_check_present : 0u;
+            ++s_ab_be[0];
+            if (s_ab_check_would)
+                ++s_ab_be[4];
+            if (!miss) {
+                ++s_ab_be[1];
+                if (s_ab_check_would)
+                    ++s_ab_be[5];
+            } else {
+                s_ab_be[2] += (uint32_t)miss;
+                if (miss > s_ab_be[3]) s_ab_be[3] = (uint32_t)miss;
+                if (s_ab_check_would) {
+                    s_ab_be[6] += (uint32_t)miss;
+                    if (miss > s_ab_be[7]) s_ab_be[7] = (uint32_t)miss;
+                }
+                if (s_ab_check_return + miss >= s_ab_check_head)
+                    ++s_ab_be[8];
+            }
+        }
+    }
+# endif
+    start = s_now + hold;
+    /* Backend fit check: after worker_wait, before the post. */
+    if (s_wk_fit_armed) {
+        if (s_wk_fit_pos == k) {
+            ++s_wk_fit[0];
+            if (s_wk_done_last <= s_wk_fit_latest) {
+                ++s_wk_fit[1];
+            } else {
+                uint64_t miss = s_wk_done_last - s_wk_fit_latest;
+                s_wk_fit[2] += (uint32_t)miss;
+                if (miss > s_wk_fit[3]) s_wk_fit[3] = (uint32_t)miss;
+            }
+        }
+        s_wk_fit_armed = 0u;
+    }
+    if (s_present_wait_kind == PRESENT_WAIT_WORKER) {
+        uint32_t cost = s_wk_base_us;
+        if (s_wk_period && k % s_wk_period == s_wk_period - 1u)
+            cost = s_wk_tail_us;
+#if defined(ORACLE_GL_WORKER_CASES)
+        if (s_wk_tail_one_in && worker_rand(2u) % s_wk_tail_one_in == 0u)
+            cost = s_wk_tail_us;
+#endif
+        if (k == s_wk_stall_at)
+            cost = s_wk_stall_us;
+        done = start + cost;
+    } else {
+        uint64_t replayed = start + s_wk_base_us, gpu_start, gpu_done, flip;
+        done = replayed;
+        if (k >= 2u && s_present_wait_flip[(k - 2u) & 3u] > done)
+            done = s_present_wait_flip[(k - 2u) & 3u];
+        gpu_start = replayed;
+        if (k != 0u && s_present_wait_gpu_done[(k - 1u) & 3u] > gpu_start)
+            gpu_start = s_present_wait_gpu_done[(k - 1u) & 3u];
+        gpu_done = gpu_start + s_wk_gpu_us;
+        flip = present_wait_edge_at_or_after(gpu_done);
+        if (k != 0u && flip <= s_present_wait_flip[(k - 1u) & 3u])
+            flip = present_wait_edge_at_or_after(
+                s_present_wait_flip[(k - 1u) & 3u] + 1u);
+        s_present_wait_gpu_done[k & 3u] = gpu_done;
+        s_present_wait_flip[k & 3u] = flip;
+    }
+    s_wk_done_last = done;
+    ++s_wk_posts;
+    if (s_wk_waited_arm) {
+        s_wk_waited_arm = 0u;
+        s_wk_waited_pos = s_wk_posts;
+    }
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    if (s_ab_arm) {
+        s_ab_arm = 0u;
+        s_ab_chain = s_wk_posts;
+    }
+# endif
+    ++s_present_wait_count;
+    if (hold > s_present_wait_max_us)
+        s_present_wait_max_us = hold;
+    return hold;
+}
+#endif
+
 /* First 60-Hz edge (50000 units of 1/3 us, at phase edge_us) at or after
  * at_us, rounded up to the next microsecond. */
 static uint64_t present_wait_edge_at_or_after(uint64_t at_us)
@@ -216,6 +445,11 @@ static uint64_t present_wait_us(void)
 
     if (s_present_wait_kind == PRESENT_WAIT_NONE)
         return 0u;
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+    if (s_present_wait_kind == PRESENT_WAIT_WORKER ||
+            s_present_wait_kind == PRESENT_WAIT_WORKER_QUEUE)
+        return worker_present();
+#endif
     if (s_present_wait_kind == PRESENT_WAIT_QUEUE ||
             s_present_wait_kind == PRESENT_WAIT_QUEUE_VBLANK) {
         uint64_t start, done, flip;
@@ -262,6 +496,8 @@ static int run_one_tick(
 #endif
 #if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
     s_now += s_test_service_us;
+#elif defined(ORACLE_GL_WORKER_CASES)
+    s_now += worker_jittered(500u, s_wk_svc_jit_us, 0u);
 #else
     s_now += 500u;
 #endif
@@ -270,7 +506,12 @@ static int run_one_tick(
         game->manager_pointer, game->manager_counter,
         interpolation_enabled, game->game_pointer, game->game_frame);
     ++game->wrapper_ticks_since_present;
+#if defined(ORACLE_GL_WORKER_CASES) && \
+    defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    if ((game->manager_counter & 1u) == 0u && !s_ab_menu) {
+#else
     if ((game->manager_counter & 1u) == 0u) {
+#endif
         kage_vita_fullspeed_scheduler_note_game_update_begin(
             game->manager_counter, game->game_pointer, game->game_frame);
         if (result->game_update_time_count >= ORACLE_MAX_GAME_UPDATES)
@@ -288,13 +529,30 @@ static int run_one_tick(
         game->manager_pointer, game->manager_counter,
         interpolation_enabled, game->game_pointer, game->game_frame);
     if (render) {
+#if defined(ORACLE_GL_WORKER_CASES) && \
+    defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+        s_ab_ref_entry = s_now;
+#endif
         kage_vita_fullspeed_scheduler_note_render_entry();
         kage_vita_fullspeed_scheduler_note_render_body(
             game->manager_pointer, game->manager_counter,
             interpolation_enabled);
+#if defined(ORACLE_GL_WORKER_CASES)
+        s_now += worker_jittered(render_us, s_wk_body_jit_us, 1u);
+#else
         s_now += render_us;
+#endif
+#if defined(ORACLE_GL_WORKER_CASES) && \
+    defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+        s_ab_ref_body = s_now - s_ab_ref_entry;
+#endif
         kage_vita_fullspeed_scheduler_note_present();
         s_now += present_wait_us();
+#if defined(ORACLE_GL_WORKER_CASES) && \
+    defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+        s_ab_ref_cost = s_now - s_ab_ref_entry;
+        s_ab_ref_have = 1u;
+#endif
         kage_vita_fullspeed_scheduler_note_render_return();
 #if defined(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE) && ISAAC_VITA_FULLSPEED_HEAD_ADVANCE
         if (result->present_time_count >= ORACLE_MAX_GAME_UPDATES * 2u)
@@ -398,17 +656,145 @@ static ScenarioResult run_scenario(
 
 #if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
 /* Stand-in for kage_vita_backend_render_admit (GL render thread one frame
- * behind).  Called only where an interpolated frame would otherwise render. */
+ * behind).  Called only where an interpolated frame would otherwise render.
+ * Behind = s_render_admit cleared, or the worker model's last closure not
+ * done.  Under ISAAC_VITA_GL_THREAD_ADMIT_WAIT the scheduler calls behind /
+ * refused / wait_until (ON) / fit_take instead (kage_vita_backend.c). */
 static int s_render_admit = 1;
 static uint32_t s_render_admit_calls, s_render_admit_denials;
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+/* GL admit behind stand-ins (kage_vita_backend.c). */
+static uint32_t worker_outstanding(void)
+{
+    uint64_t left;
+
+    if (s_ab_out_model == ORACLE_AB_OUT_FIXED)
+        return s_ab_out_fixed;
+    if (s_ab_out_model == ORACLE_AB_OUT_OVER)
+        return UINT32_MAX;
+    left = s_wk_done_last > s_now ? s_wk_done_last - s_now : 0u;
+    return left > 1000000u ? UINT32_MAX : (uint32_t)(left * 8u);
+}
+int kage_vita_backend_admit_behind_gate(uint32_t *outstanding)
+{
+    ++s_render_admit_calls;
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    s_ab_arm = 0u; /* an admitted Render that never reached Present */
+# endif
+    if (s_render_admit && !worker_behind_now())
+        return 0;
+    *outstanding = worker_outstanding();
+    return 1;
+}
+void kage_vita_backend_admit_behind_refused(
+    uint64_t present_us, uint64_t return_us, uint64_t head_due_us,
+    uint32_t would_admit)
+{
+    {
+        /* Present predicted at gate + the last Render's body, Render return
+         * at gate + its cost (both 0 before the first Render). */
+        uint64_t body = s_ab_ref_have ? s_ab_ref_body : 0u;
+        uint64_t cost = s_ab_ref_have ? s_ab_ref_cost : 0u;
+
+        ++s_ab_ref_checked;
+        if (body != cost)
+            ++s_ab_ref_split;
+        if (!s_ab_ref_bad &&
+                (present_us != s_now + body || return_us != s_now + cost))
+            s_ab_ref_bad = s_ab_ref_checked;
+    }
+    ++s_render_admit_denials;
+    ++s_wk_rs;
+    s_ab_check_armed = 1u;
+    s_ab_check_pos = s_wk_posts;
+    s_ab_check_present = present_us;
+    s_ab_check_return = return_us;
+    s_ab_check_head = head_due_us;
+    s_ab_check_would = would_admit;
+}
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+void kage_vita_backend_admit_behind_admitted(void)
+{
+    s_ab_arm = 1u;
+}
+uint32_t kage_vita_backend_admit_behind_hold_take(void)
+{
+    uint32_t hold_us = s_ab_hold_take_us;
+    s_ab_hold_take_us = 0u;
+    return hold_us;
+}
+# endif
+void kage_vita_backend_gl_admit_behind_take(
+    uint32_t out[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS])
+{
+    if (out)
+        memcpy(out, s_ab_be, sizeof s_ab_be);
+    memset(s_ab_be, 0, sizeof s_ab_be);
+}
+#elif !(defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT)
 int kage_vita_backend_render_admit(void)
 {
     ++s_render_admit_calls;
-    if (s_render_admit)
+# if defined(ORACLE_GL_ADMIT_BEHIND_TWIN)
+    if (s_wk_gate_never_behind)
+        return 1;
+# endif
+    if (s_render_admit && !worker_behind_now())
         return 1;
     ++s_render_admit_denials;
+    ++s_wk_rs;
     return 0;
 }
+#else
+int kage_vita_backend_render_behind(void)
+{
+    ++s_render_admit_calls;
+    return !s_render_admit || worker_behind_now();
+}
+void kage_vita_backend_render_refused(uint64_t latest_us)
+{
+    ++s_render_admit_denials;
+    ++s_wk_rs;
+    if (latest_us) {
+        s_wk_fit_armed = 1u;
+        s_wk_fit_pos = s_wk_posts;
+        s_wk_fit_latest = latest_us;
+    }
+}
+# if ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+int kage_vita_backend_render_wait_until(uint64_t deadline_us)
+{
+    int done;
+    if (s_render_admit && !worker_behind_now())
+        return 1;
+    if (s_render_admit && s_wk_done_last <= deadline_us) {
+        s_now = s_wk_done_last + s_wk_wake_us;
+        done = 1;
+    } else {
+        if (deadline_us > s_now)
+            s_now = deadline_us;
+        done = 0;
+    }
+    return done;
+}
+void kage_vita_backend_render_admitted_after_wait(void)
+{
+    s_wk_waited_arm = 1u;
+}
+uint32_t kage_vita_backend_admit_hold_take(void)
+{
+    uint32_t hold_us = s_wk_hold_take_us;
+    s_wk_hold_take_us = 0u;
+    return hold_us;
+}
+# endif
+void kage_vita_backend_gl_admit_fit_take(uint32_t out[6])
+{
+    if (out)
+        memcpy(out, s_wk_fit, sizeof s_wk_fit);
+    memset(s_wk_fit, 0, sizeof s_wk_fit);
+}
+#endif
 
 static ScenarioResult run_scenario(
     uint32_t duration_us, uint32_t render_us,
@@ -450,6 +836,1063 @@ static int check_render_admission(void)
            (unsigned)b->game_updates, (unsigned)a->game_updates);
     return 1;
 }
+
+/* GL admit wait worker cases (R60-DRYADMIT-SPEC-20261028.md section 6).
+ * 600 warm-up loops, then 10 windows of 120 loops; non-full work 600 us.
+ * Every printed field is pinned per mode: OFF and OBSERVE share the stock
+ * numbers (OBSERVE never changes behaviour), ON has its own, and the
+ * ph120.aw counters exist only under the knob.  ORACLE_GL_WORKER_CASES (at
+ * the worker model) selects the proven combination. */
+#if defined(ORACLE_GL_WORKER_CASES)
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+#  define ORACLE_GL_ADMIT_WAIT_MODE "on"
+# elif defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+#  define ORACLE_GL_ADMIT_WAIT_MODE "observe"
+# else
+#  define ORACLE_GL_ADMIT_WAIT_MODE "off"
+# endif
+typedef struct WorkerCase {
+    const char *name;
+    uint32_t kind, period, tail_us, base_us, gpu_us, edge_us;
+    uint32_t full_us, body_us, stall_at, stall_us, wake_us;
+    uint32_t svc_jit_us, body_jit_us, tail_one_in;
+} WorkerCase;
+
+/* One mode's printed numbers: presents (window min..max), non-full skips,
+ * GL refusals (ph120.rw rs), Present holds n/us, update gaps, the 1-s
+ * update maximum, wall, update span and the per-window/update digest.
+ * Every case also has g = 600 updates, lskip = 0, posts = presents,
+ * dis = seq = 0. */
+typedef struct WorkerExpect {
+    uint32_t presents, pmin, pmax, nonfull_skips, refused, holds, mingap, ups1s;
+    uint64_t hold_us, wall, span, maxgap, digest;
+} WorkerExpect;
+
+/* stock = OFF and OBSERVE.  observe = OBSERVE nw, fit(e,a), miss(us,max)
+ * (its aw is n = stock.refused, those five, everything else 0).  on_aw = n,
+ * ok, to, nw, bo, tt, us(sum,max), lt(c,us), hl(c,us), ov, fit(e,a),
+ * miss(us,max), hd(n,us).  Pinned from print-only runs of this oracle
+ * (ORACLE_GL_WORKER_PRINT_ONLY, clang 2026-10-28, review fix pass); the
+ * first 26 rows equal the spec's table in every field the spec has, except
+ * where R60-DRYADMIT-20261028.md "Review" lists a move. */
+typedef struct WorkerCaseExpect {
+    const char *name;
+    WorkerExpect stock;
+    uint32_t observe[5];
+    WorkerExpect on;
+    uint32_t on_aw[19];
+} WorkerCaseExpect;
+
+static const WorkerCaseExpect k_worker_expect[] = {
+    { "water-idle",
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t8",
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t9",
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t10",
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t11",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 71200u, 594u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t12",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 191200u, 1594u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t13",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 311200u, 2594u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t14",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 431200u, 3594u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t15",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 551200u, 4594u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t16",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 671200u, 5594u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "lda-t11-wake",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 95200u, 794u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t11",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 413200u, 3444u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t13",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 653200u, 5444u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t14",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 773200u, 6444u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t15",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 893200u, 7444u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t16",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 1013200u, 8444u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t17",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 0u, 93600u, 468u },
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 200u, 0u, 200u, 0u, 0u, 0u, 1795000u, 8975u, 0u, 0u, 0u, 0u, 0u, 200u, 0u, 93600u, 468u, 0u, 0u } },
+    { "stress-all",
+      { 600u, 60u, 60u, 600u, 600u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xa576f0e4d5b37493ull },
+      { 0u, 600u, 600u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 600u, 600u, 0u, 0u, 0u, 0u, 356000u, 594u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "every3-11",
+      { 900u, 90u, 90u, 300u, 300u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x6bef4383ac7c8023ull },
+      { 0u, 300u, 300u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 200u, 200u, 0u, 0u, 0u, 0u, 118800u, 594u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "eid-fight",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 0u, 439600u, 2198u },
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 200u, 0u, 200u, 0u, 0u, 0u, 1185000u, 5925u, 0u, 0u, 0u, 0u, 0u, 200u, 0u, 439600u, 2198u, 0u, 0u } },
+    { "stall-266ms",
+      { 999u, 99u, 100u, 201u, 200u, 1u, 33333u, 30u, 232666ull, 20212293ull, 20174660ull, 241126ull, 0x3a19c87ebe13ee45ull },
+      { 1u, 200u, 199u, 244327u, 244327u },
+      { 1197u, 117u, 120u, 3u, 2u, 1u, 33333u, 30u, 232666ull, 20207993ull, 20174660ull, 241126ull, 0x7c410d40709915c7ull },
+      { 121u, 119u, 1u, 1u, 0u, 0u, 81872u, 11266u, 0u, 0u, 0u, 0u, 0u, 1u, 0u, 244327u, 244327u, 0u, 0u } },
+    { "gpuq-19-fight",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1026u, 101u, 103u, 174u, 174u, 11u, 33333u, 30u, 34668ull, 20000200ull, 19966867ull, 33334ull, 0x4b9c7b3e38fbd6cfull },
+      { 383u, 209u, 55u, 22u, 97u, 0u, 585456u, 2833u, 0u, 0u, 11u, 41752u, 0u, 152u, 97u, 873950u, 15984u, 11u, 34668u } },
+    { "gpuq-19-light",
+      { 1053u, 105u, 106u, 147u, 147u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x369ca26395bc1524ull },
+      { 0u, 147u, 147u, 0u, 0u },
+      { 1052u, 104u, 106u, 148u, 148u, 11u, 33333u, 30u, 144221ull, 19997400ull, 19966867ull, 33334ull, 0xc0d521cc2c7dc809ull },
+      { 369u, 221u, 60u, 22u, 66u, 0u, 1272750u, 11267u, 0u, 0u, 11u, 41855u, 0u, 126u, 66u, 486050u, 8190u, 11u, 144221u } },
+    { "gpuq-11-water",
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "gpuq-5-dry",
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t14-svcj",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20057772ull, 20024565ull, 33902ull, 0x3cdd05a72d623092ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20057772ull, 20024565ull, 33902ull, 0x72bdfe653bb01beaull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 769521u, 7028u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t16-svcj",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20057772ull, 20024565ull, 33902ull, 0x3cdd05a72d623092ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20057772ull, 20024565ull, 33902ull, 0x72bdfe653bb01beaull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 1009521u, 9028u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t11-rjit",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 187u, 2390u, 430u },
+      { 1191u, 118u, 120u, 9u, 9u, 0u, 33333u, 30u, 0ull, 19996353ull, 19966867ull, 33334ull, 0x7e933abdc3b0273eull },
+      { 123u, 114u, 9u, 0u, 0u, 0u, 420069u, 6180u, 0u, 0u, 0u, 0u, 0u, 9u, 0u, 1704u, 419u, 0u, 0u } },
+    { "ldc-t14-rjit",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 119u, 133987u, 3430u },
+      { 1125u, 107u, 117u, 75u, 75u, 0u, 33333u, 30u, 0ull, 20002210ull, 19968465ull, 34214ull, 0xba54f7fa92637a36ull },
+      { 150u, 75u, 46u, 0u, 29u, 0u, 712873u, 7703u, 3u, 1600u, 0u, 0u, 0u, 75u, 17u, 96786u, 3430u, 0u, 0u } },
+    { "ldc-t16-rjit",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 57u, 354673u, 5430u },
+      { 1057u, 102u, 110u, 143u, 143u, 4u, 33333u, 30u, 4826ull, 20003062ull, 19969120ull, 34329ull, 0x12a93a336c40bee0ull },
+      { 177u, 34u, 89u, 0u, 54u, 0u, 839449u, 8579u, 5u, 2255u, 0u, 0u, 0u, 142u, 17u, 302145u, 5429u, 0u, 0u } },
+    { "ldc-rtail14",
+      { 1087u, 105u, 114u, 113u, 113u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x24607d87924260d8ull },
+      { 0u, 113u, 113u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 24u, 33333u, 30u, 30148ull, 20006643ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 113u, 113u, 0u, 0u, 0u, 0u, 735630u, 7700u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 24u, 30148u } },
+    { "ldc-rtail16",
+      { 1087u, 105u, 114u, 113u, 113u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x24607d87924260d8ull },
+      { 0u, 113u, 113u, 0u, 0u },
+      { 1189u, 116u, 120u, 11u, 11u, 23u, 33333u, 30u, 120895ull, 20000200ull, 19966867ull, 33334ull, 0x1cfc47559fd93586ull },
+      { 117u, 106u, 11u, 0u, 0u, 0u, 935913u, 8444u, 0u, 0u, 0u, 0u, 0u, 11u, 0u, 78237u, 9980u, 23u, 120895u } },
+    { "ldc-rtail14-w1",
+      { 1087u, 105u, 114u, 113u, 113u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x24607d87924260d8ull },
+      { 0u, 113u, 113u, 0u, 0u },
+      { 1189u, 116u, 120u, 11u, 5u, 23u, 33333u, 30u, 51895ull, 20000200ull, 19966867ull, 33334ull, 0x1cfc47559fd93586ull },
+      { 117u, 106u, 5u, 0u, 0u, 6u, 867253u, 7444u, 0u, 0u, 0u, 0u, 0u, 5u, 0u, 9897u, 1980u, 23u, 51895u } },
+    { "ldc-mix14",
+      { 1087u, 105u, 114u, 113u, 113u, 0u, 33333u, 30u, 0ull, 20053334ull, 20024565ull, 33902ull, 0xb5015a847d897a35ull },
+      { 0u, 113u, 69u, 85917u, 3427u },
+      { 1146u, 111u, 118u, 54u, 54u, 5u, 33333u, 30u, 9393ull, 20057683ull, 20025478ull, 34596ull, 0x86d4fb3a1f122862ull },
+      { 105u, 51u, 44u, 0u, 10u, 0u, 567622u, 7883u, 2u, 1407u, 0u, 0u, 0u, 54u, 7u, 83243u, 3588u, 5u, 9393u } },
+    { "ldc-t14-wake2",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1200u, 120u, 120u, 0u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0x92b6db943818f7ebull },
+      { 120u, 120u, 0u, 0u, 0u, 0u, 1013200u, 8444u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "ldc-t16-wake1",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1000u, 100u, 100u, 200u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 200u, 0u, 0u, 0u, 0u, 200u, 1888600u, 9443u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "gpuq-19-heavy",
+      { 600u, 60u, 60u, 600u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xa576f0e4d5b37493ull },
+      { 0u, 0u, 0u, 0u, 0u },
+      { 600u, 60u, 60u, 600u, 0u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xa576f0e4d5b37493ull },
+      { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+    { "gpuq-19-mid",
+      { 1000u, 100u, 100u, 200u, 200u, 0u, 33333u, 30u, 0ull, 20000200ull, 19966867ull, 33334ull, 0xdfe62d1a9133b8a3ull },
+      { 0u, 200u, 200u, 0u, 0u },
+      { 1021u, 101u, 103u, 179u, 179u, 13u, 33333u, 30u, 51656ull, 20002800ull, 19966867ull, 33334ull, 0x2a4b01db4295af04ull },
+      { 338u, 159u, 35u, 13u, 131u, 0u, 693471u, 7567u, 0u, 0u, 13u, 49498u, 0u, 166u, 131u, 412720u, 11899u, 13u, 51656u } },
+    { "gpuq-19-ljit",
+      { 1056u, 105u, 106u, 144u, 144u, 45u, 33333u, 30u, 241964ull, 20063301ull, 20024565ull, 33902ull, 0x61260591d46548eaull },
+      { 0u, 145u, 87u, 345206u, 14741u },
+      { 1056u, 105u, 106u, 144u, 144u, 81u, 33333u, 30u, 362514ull, 20058067ull, 20024618ull, 33902ull, 0xaf190c912a1b8a89ull },
+      { 263u, 119u, 89u, 12u, 43u, 0u, 1215110u, 12401u, 1u, 53u, 6u, 29390u, 0u, 132u, 41u, 711160u, 16004u, 37u, 120689u } },
+    { "render-bound",
+      { 600u, 60u, 60u, 600u, 0u, 0u, 39160u, 26u, 0ull, 23496000ull, 23456840ull, 39160ull, 0x9e8dabc6e4755943ull },
+      { 0u, 0u, 0u, 0u, 0u },
+      { 600u, 60u, 60u, 600u, 0u, 0u, 39160u, 26u, 0ull, 23496000ull, 23456840ull, 39160ull, 0x9e8dabc6e4755943ull },
+      { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } },
+};
+
+static void worker_reset(void)
+{
+    s_wk_done_last = 0u;
+    s_wk_posts = s_wk_holds = s_wk_rs = 0u;
+    s_wk_hold_us = 0u;
+    s_wk_fit_armed = s_wk_fit_pos = 0u;
+    s_wk_fit_latest = 0u;
+    memset(s_wk_fit, 0, sizeof s_wk_fit);
+    s_wk_waited_arm = s_wk_waited_pos = s_wk_hold_take_us = 0u;
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    s_ab_check_armed = s_ab_check_pos = s_ab_check_would = 0u;
+    s_ab_check_present = s_ab_check_return = s_ab_check_head = 0u;
+    memset(s_ab_be, 0, sizeof s_ab_be);
+    /* Every caller resets the scheduler next, which forgets its last
+     * Render too. */
+    s_ab_ref_entry = s_ab_ref_body = s_ab_ref_cost = 0u;
+    s_ab_ref_have = s_ab_ref_bad = 0u;
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    s_ab_arm = s_ab_chain = s_ab_hold_take_us = 0u;
+# endif
+#endif
+}
+
+/* The printed-line label of a worker pass ("worker": the pinned stock pass). */
+static const char *s_wk_label = "worker";
+
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+/* Per-tick ph120.ab accounting: take the scheduler's counters after every
+ * loop, add them up (s_ab_total) and hold each tick against a shadow of the
+ * back-off written from the knob's contract, not from the scheduler's code:
+ * a head that reports hl arms 30; every non-full phase from that tick on is
+ * inside the back-off while the count is non-zero, then spends one. */
+static KageVitaFullspeedGlAdmitBehindSnapshot s_ab_total;
+static uint32_t s_ab_shadow;
+
+static int ab_account(uint32_t nonfull_phases)
+{
+    KageVitaFullspeedGlAdmitBehindSnapshot d;
+    uint32_t live = 0u;
+
+    kage_vita_fullspeed_scheduler_gl_admit_behind_take(&d);
+    CHECK(s_ab_ref_bad == 0u);
+    s_ab_total.gates += d.gates;
+    s_ab_total.test_pass += d.test_pass;
+    s_ab_total.test_fail += d.test_fail;
+    s_ab_total.test_off += d.test_off;
+    s_ab_total.over += d.over;
+    s_ab_total.would += d.would;
+    s_ab_total.admitted += d.admitted;
+    s_ab_total.backoff += d.backoff;
+    s_ab_total.time_test += d.time_test;
+    s_ab_total.hold_late += d.hold_late;
+    s_ab_total.hold_late_us += d.hold_late_us;
+    if (d.out_max > s_ab_total.out_max)
+        s_ab_total.out_max = d.out_max;
+    CHECK(nonfull_phases <= 1u && d.gates <= nonfull_phases);
+    CHECK(d.out_count == d.gates);
+    CHECK(d.test_pass + d.test_fail + d.test_off == d.gates);
+    CHECK(d.over + d.would <= d.gates);
+    if (d.gates) {
+        uint32_t within = d.out[0] <=
+            kage_vita_fullspeed_scheduler_gl_admit_behind_bytes();
+        CHECK(d.out_max == d.out[0]);
+        CHECK(d.over == !within);
+        CHECK(d.would == (within && !d.test_fail));
+    }
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    CHECK(d.hold_late <= 1u);
+    if (d.hold_late)
+        s_ab_shadow = KAGE_VITA_GL_ADMIT_BEHIND_BACKOFF;
+    if (nonfull_phases) {
+        live = s_ab_shadow != 0u;
+        if (s_ab_shadow)
+            --s_ab_shadow;
+    }
+    if (d.gates && d.over) {
+        CHECK(d.admitted == 0u && d.backoff == 0u && d.time_test == 0u);
+    } else if (d.gates && live) {
+        CHECK(d.backoff == 1u && d.admitted == 0u && d.time_test == 0u);
+    } else if (d.gates) {
+        /* Within the bound, outside a back-off: the stock time test alone
+         * decides, and the gate's own copy of it agrees with it. */
+        CHECK(d.backoff == 0u && d.admitted + d.time_test == 1u);
+        CHECK(d.time_test == d.test_fail);
+    }
+# else
+    (void)live;
+    CHECK(d.admitted == 0u && d.backoff == 0u && d.time_test == 0u &&
+          d.hold_late == 0u && d.hold_late_us == 0u);
+# endif
+    return 1;
+}
+#endif
+
+static int run_worker_case(const WorkerCase *c, const WorkerCaseExpect *x,
+                           uint32_t *presents_out, uint32_t *refused_out)
+{
+    static ScenarioResult result;
+    OracleGame game;
+    KageVitaFullspeedSnapshot before, after;
+    uint32_t tick, window, first, i, pmin = UINT32_MAX, pmax = 0u;
+    uint32_t rs0, holds0, posts0, ups1s;
+    uint64_t hold_us0, start, span, digest = 1469598103934665603ull, mingap = UINT64_MAX, maxgap = 0u;
+    const WorkerExpect *e;
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    KageVitaFullspeedGlAdmitWaitSnapshot aw;
+    uint32_t fit[6], got[19], want[19];
+#endif
+
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+    e = x ? &x->on : NULL;
+#else
+    e = x ? &x->stock : NULL;
+#endif
+    if (x) {
+        CHECK(strcmp(c->name, x->name) == 0);
+    }
+    memset(&result, 0, sizeof result);
+    memset(&game, 0, sizeof game);
+    game.manager_pointer = 0x10000000u;
+    game.game_pointer = 0x20000000u;
+    game.game_frame = 100u;
+    s_now = 1000u;
+    s_delay_fail = 0u;
+    s_render_admit = 1;
+    s_present_wait_kind = c->kind;
+    s_present_wait_edge_us = c->edge_us;
+    s_present_wait_count = 0u;
+    memset(s_present_wait_gpu_done, 0, sizeof s_present_wait_gpu_done);
+    memset(s_present_wait_flip, 0, sizeof s_present_wait_flip);
+    s_wk_period = c->period;
+    s_wk_tail_us = c->tail_us;
+    s_wk_base_us = c->base_us;
+    s_wk_gpu_us = c->gpu_us;
+    s_wk_stall_at = c->stall_us ? c->stall_at : UINT32_MAX;
+    s_wk_stall_us = c->stall_us;
+    s_wk_wake_us = c->wake_us;
+    s_wk_svc_jit_us = c->svc_jit_us;
+    s_wk_body_jit_us = c->body_jit_us;
+    s_wk_tail_one_in = c->tail_one_in;
+    s_wk_rng[0] = 0x9e3779b9u;
+    s_wk_rng[1] = 0x85ebca6bu;
+    s_wk_rng[2] = 0xc2b2ae35u;
+    worker_reset();
+    kage_vita_fullspeed_scheduler_reset();
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    s_ab_shadow = 0u;
+    kage_vita_fullspeed_scheduler_gl_admit_behind_take(NULL);
+#endif
+    for (tick = 0u; tick < 600u; ++tick) {
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+        KageVitaFullspeedSnapshot tb, ta;
+        kage_vita_fullspeed_scheduler_snapshot(&tb);
+#endif
+        (void)run_one_tick(&game, c->full_us, 600u, c->body_us, 1u, &result);
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+        kage_vita_fullspeed_scheduler_snapshot(&ta);
+        if (!ab_account(ta.nonfull_phases - tb.nonfull_phases))
+            return 0;
+#endif
+    }
+    first = result.game_update_time_count;
+    rs0 = s_wk_rs; holds0 = s_wk_holds; hold_us0 = s_wk_hold_us; posts0 = s_wk_posts;
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    memset(&s_ab_total, 0, sizeof s_ab_total);
+    kage_vita_backend_gl_admit_behind_take(NULL);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    kage_vita_fullspeed_scheduler_gl_admit_wait_take(NULL);
+    kage_vita_backend_gl_admit_fit_take(fit);
+#endif
+    kage_vita_fullspeed_scheduler_snapshot(&before);
+    start = s_now;
+    for (window = 0u; window < 10u; ++window) {
+        KageVitaFullspeedSnapshot wb, wa;
+        uint32_t p;
+        kage_vita_fullspeed_scheduler_snapshot(&wb);
+        for (tick = 0u; tick < 120u; ++tick) {
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+            KageVitaFullspeedSnapshot tb, ta;
+            kage_vita_fullspeed_scheduler_snapshot(&tb);
+#endif
+            (void)run_one_tick(&game, c->full_us, 600u, c->body_us, 1u, &result);
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+            kage_vita_fullspeed_scheduler_snapshot(&ta);
+            if (!ab_account(ta.nonfull_phases - tb.nonfull_phases))
+                return 0;
+#endif
+        }
+        kage_vita_fullspeed_scheduler_snapshot(&wa);
+        p = wa.presents - wb.presents;
+        if (p < pmin) pmin = p;
+        if (p > pmax) pmax = p;
+        digest = (digest ^ p) * 1099511628211ull;
+    }
+    kage_vita_fullspeed_scheduler_snapshot(&after);
+    CHECK(result.game_update_time_count > first);
+    for (i = first; i < result.game_update_time_count; ++i) {
+        digest = (digest ^ result.game_update_times[i]) * 1099511628211ull;
+        if (i > first && result.game_update_times[i] -
+                result.game_update_times[i - 1u] < mingap)
+            mingap = result.game_update_times[i] - result.game_update_times[i - 1u];
+        if (i > first && result.game_update_times[i] -
+                result.game_update_times[i - 1u] > maxgap)
+            maxgap = result.game_update_times[i] - result.game_update_times[i - 1u];
+    }
+    span = result.game_update_times[result.game_update_time_count - 1u] -
+        result.game_update_times[first];
+    ups1s = maximum_game_updates_per_second(
+        result.game_update_times + first, result.game_update_time_count - first);
+    printf("span=%llu maxgap=%llu ", (unsigned long long)span,
+           (unsigned long long)maxgap);
+    printf("%s %-14s p=%u (%u..%u) g=%u wall=%llu ups=%.3f nskip=%u lskip=%u rs=%u "
+           "holds=%u/%llu posts=%u mingap=%llu dis=%u seq=%u ups1s=%u digest=%016llx",
+           s_wk_label, c->name, (unsigned)(after.presents - before.presents),
+           (unsigned)pmin, (unsigned)pmax,
+           (unsigned)(after.game_updates - before.game_updates),
+           (unsigned long long)(s_now - start),
+           (after.game_updates - before.game_updates) * 1e6 / (double)(s_now - start),
+           (unsigned)(after.nonfull_skips - before.nonfull_skips),
+           (unsigned)(after.late_full_skips - before.late_full_skips),
+           (unsigned)(s_wk_rs - rs0), (unsigned)(s_wk_holds - holds0),
+           (unsigned long long)(s_wk_hold_us - hold_us0),
+           (unsigned)(s_wk_posts - posts0),
+           (unsigned long long)mingap,
+           (unsigned)after.runtime_disables, (unsigned)after.sequence_violations,
+           (unsigned)ups1s, (unsigned long long)digest);
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    kage_vita_fullspeed_scheduler_gl_admit_wait_take(&aw);
+    kage_vita_backend_gl_admit_fit_take(fit);
+    printf(" | n=%u ok=%u to=%u nw=%u bo=%u tt=%u us=%u,%u lt=%u,%u hl=%u,%u ov=%u "
+           "fit=%u,%u miss=%u,%u hd=%u,%u",
+           aw.gates, aw.admitted, aw.timeouts, aw.no_window, aw.backoff,
+           aw.time_test, aw.wait_us, aw.wait_max_us, aw.late, aw.late_us,
+           aw.hold_late, aw.hold_late_us, aw.timeout_over_max_us,
+           fit[0], fit[1], fit[2], fit[3], fit[4], fit[5]);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    {
+        uint32_t be[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS];
+        const KageVitaFullspeedGlAdmitBehindSnapshot *t = &s_ab_total;
+
+        kage_vita_backend_gl_admit_behind_take(be);
+        printf(" | n=%u st=%u,%u,%u ov=%u wa=%u ok=%u bo=%u tt=%u obmax=%u hl=%u,%u "
+               "pm=%u,%u,%u,%u wp=%u,%u,%u,%u phl=%u hd=%u,%u\n",
+               t->gates, t->test_pass, t->test_fail, t->test_off, t->over,
+               t->would, t->admitted, t->backoff, t->time_test, t->out_max,
+               t->hold_late, t->hold_late_us, be[0], be[1], be[2], be[3],
+               be[4], be[5], be[6], be[7], be[8], be[9], be[10]);
+        /* rs (ph120.rw) = n - ok in both modes; the per-tick identities are
+         * ab_account's.  pm: at most one check per refusal, plus one armed
+         * before the window; wp and ok are subsets. */
+        CHECK(s_wk_rs - rs0 == t->gates - t->admitted);
+        CHECK(be[0] <= s_wk_rs - rs0 + 1u && be[1] <= be[0] &&
+              be[4] <= be[0] && be[5] <= be[4] && be[8] <= be[0] - be[1]);
+        if (s_ab_out_model == ORACLE_AB_OUT_OVER)
+            CHECK(t->over == t->gates && t->would == 0u && be[4] == 0u);
+        if (s_ab_out_model == ORACLE_AB_OUT_FIXED && s_ab_out_fixed == 0u)
+            CHECK(t->over == 0u && t->out_max == 0u);
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+        CHECK(t->gates == t->over + t->backoff + t->admitted + t->time_test);
+        CHECK(t->hold_late <= be[9] + 1u);
+# else
+        CHECK(be[9] == 0u && be[10] == 0u);
+# endif
+    }
+#else
+    printf("\n");
+#endif
+    s_present_wait_kind = PRESENT_WAIT_NONE;
+    s_wk_stall_at = UINT32_MAX;
+    s_wk_stall_us = 0u;
+    s_wk_svc_jit_us = s_wk_body_jit_us = s_wk_tail_one_in = 0u;
+    if (!x) {
+        /* Unpinned pass (print-only re-pinning, or a GL admit behind pass
+         * whose numbers a cross-build comparison holds instead). */
+        *presents_out += after.presents - before.presents;
+        *refused_out += s_wk_rs - rs0;
+        worker_reset();
+        return 1;
+    }
+
+    CHECK(after.presents - before.presents == e->presents);
+    CHECK(pmin == e->pmin && pmax == e->pmax);
+    CHECK(after.game_updates - before.game_updates == 600u);
+    CHECK(s_now - start == e->wall);
+    CHECK(after.nonfull_skips - before.nonfull_skips == e->nonfull_skips);
+    CHECK(after.late_full_skips == before.late_full_skips);
+    CHECK(s_wk_rs - rs0 == e->refused);
+    CHECK(s_wk_holds - holds0 == e->holds && s_wk_hold_us - hold_us0 == e->hold_us);
+    CHECK(s_wk_posts - posts0 == e->presents);
+    CHECK(mingap == e->mingap && maxgap == e->maxgap && span == e->span);
+    CHECK(after.runtime_disables == 0u && after.sequence_violations == 0u);
+    CHECK(ups1s == e->ups1s);
+    CHECK(digest == e->digest);
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    got[0] = aw.gates; got[1] = aw.admitted; got[2] = aw.timeouts;
+    got[3] = aw.no_window; got[4] = aw.backoff; got[5] = aw.time_test;
+    got[6] = aw.wait_us; got[7] = aw.wait_max_us; got[8] = aw.late;
+    got[9] = aw.late_us; got[10] = aw.hold_late; got[11] = aw.hold_late_us;
+    got[12] = aw.timeout_over_max_us;
+    for (i = 0u; i < 6u; ++i)
+        got[13u + i] = fit[i];
+# if ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+    memcpy(want, x->on_aw, sizeof want);
+# else
+    memset(want, 0, sizeof want);
+    want[0] = x->stock.refused;
+    want[3] = x->observe[0];
+    memcpy(want + 13, x->observe + 1, 4u * sizeof x->observe[0]);
+# endif
+    for (i = 0u; i < 19u; ++i) {
+        if (got[i] != want[i])
+            fprintf(stderr, "worker %s aw field %u: %u != %u\n",
+                    c->name, (unsigned)i, (unsigned)got[i], (unsigned)want[i]);
+        CHECK(got[i] == want[i]);
+    }
+    /* I1: rw rs == n - ok - tt.  I2: n >= ok + to + nw + bo + tt (ON:
+     * equality).  I3: fit e <= n - ok - tt - nw + 1 (one arm carried over
+     * the take edge).  I4 (OBSERVE): it never waits. */
+    CHECK(s_wk_rs - rs0 == aw.gates - aw.admitted - aw.time_test);
+    CHECK(aw.gates >= aw.admitted + aw.timeouts + aw.no_window +
+          aw.backoff + aw.time_test);
+    CHECK(fit[0] <= aw.gates - aw.admitted - aw.time_test - aw.no_window + 1u);
+# if ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+    CHECK(aw.gates == aw.admitted + aw.timeouts + aw.no_window +
+          aw.backoff + aw.time_test);
+# else
+    CHECK(aw.admitted == 0u && aw.timeouts == 0u && aw.backoff == 0u &&
+          aw.time_test == 0u && aw.late == 0u && aw.wait_us == 0u &&
+          aw.hold_late == 0u && aw.timeout_over_max_us == 0u &&
+          fit[4] == 0u && fit[5] == 0u);
+# endif
+#endif
+    *presents_out += after.presents - before.presents;
+    *refused_out += s_wk_rs - rs0;
+    worker_reset();
+    return 1;
+}
+
+static const WorkerCase k_worker_cases[] = {
+    /* name, kind, period, tail, base, gpu, edge, full, body, stall_at, stall_us, wake,
+     * svc_jit, body_jit, tail_one_in */
+    { "water-idle",    PRESENT_WAIT_WORKER, 0u, 0u, 300u, 0u, 0u, 3130u, 6110u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t8",        PRESENT_WAIT_WORKER, 5u, 8000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t9",        PRESENT_WAIT_WORKER, 5u, 9000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t10",       PRESENT_WAIT_WORKER, 5u, 10000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t11",       PRESENT_WAIT_WORKER, 5u, 11000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t12",       PRESENT_WAIT_WORKER, 5u, 12000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t13",       PRESENT_WAIT_WORKER, 5u, 13000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t14",       PRESENT_WAIT_WORKER, 5u, 14000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t15",       PRESENT_WAIT_WORKER, 5u, 15000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t16",       PRESENT_WAIT_WORKER, 5u, 16000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "lda-t11-wake",  PRESENT_WAIT_WORKER, 5u, 11000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 200u, 0u, 0u, 0u },
+    { "ldc-t11",       PRESENT_WAIT_WORKER, 5u, 11000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "ldc-t13",       PRESENT_WAIT_WORKER, 5u, 13000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "ldc-t14",       PRESENT_WAIT_WORKER, 5u, 14000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "ldc-t15",       PRESENT_WAIT_WORKER, 5u, 15000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "ldc-t16",       PRESENT_WAIT_WORKER, 5u, 16000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "ldc-t17",       PRESENT_WAIT_WORKER, 5u, 17000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "stress-all",    PRESENT_WAIT_WORKER, 1u, 11000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "every3-11",     PRESENT_WAIT_WORKER, 3u, 11000u, 300u, 0u, 0u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "eid-fight",     PRESENT_WAIT_WORKER, 5u, 11000u, 300u, 0u, 0u, 4750u, 9640u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "stall-266ms",   PRESENT_WAIT_WORKER, 5u, 11000u, 300u, 0u, 0u, 2560u, 4300u, 1200u, 266000u, 0u, 0u, 0u, 0u },
+    { "gpuq-19-fight", PRESENT_WAIT_WORKER_QUEUE, 0u, 0u, 300u, 19000u, 5000u, 4720u, 12090u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "gpuq-19-light", PRESENT_WAIT_WORKER_QUEUE, 0u, 0u, 300u, 19000u, 5000u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "gpuq-11-water", PRESENT_WAIT_WORKER_QUEUE, 0u, 0u, 300u, 11300u, 5000u, 3130u, 6110u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "gpuq-5-dry",    PRESENT_WAIT_WORKER_QUEUE, 0u, 0u, 300u, 5400u, 5000u, 2560u, 4300u, 0u, 0u, 0u, 0u, 0u, 0u },
+    /* Review fix pass (R60-DRYADMIT-20261028.md "Review"): seeded service
+     * jitter (svcj, round 1 finding 2), render-body jitter (rjit, round 2
+     * finding 2), random tails (rtail, round 2 finding 3), cross-core wake
+     * (wake), and GPU-queue rooms with heavier CPU (round 2 finding 1:
+     * heavy = LDC P4 U 15.12 + R 11.15 ms, analyze.txt). */
+    { "ldc-t14-svcj",    PRESENT_WAIT_WORKER, 5u, 14000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 300u, 0u, 0u },
+    { "ldc-t16-svcj",    PRESENT_WAIT_WORKER, 5u, 16000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 300u, 0u, 0u },
+    { "ldc-t11-rjit",    PRESENT_WAIT_WORKER, 5u, 11000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 3000u, 0u },
+    { "ldc-t14-rjit",    PRESENT_WAIT_WORKER, 5u, 14000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 3000u, 0u },
+    { "ldc-t16-rjit",    PRESENT_WAIT_WORKER, 5u, 16000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 3000u, 0u },
+    { "ldc-rtail14",     PRESENT_WAIT_WORKER, 0u, 14000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 0u, 5u },
+    { "ldc-rtail16",     PRESENT_WAIT_WORKER, 0u, 16000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 0u, 0u, 5u },
+    { "ldc-rtail14-w1",  PRESENT_WAIT_WORKER, 0u, 14000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 1000u, 0u, 0u, 5u },
+    { "ldc-mix14",       PRESENT_WAIT_WORKER, 0u, 14000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 0u, 300u, 3000u, 5u },
+    { "ldc-t14-wake2",   PRESENT_WAIT_WORKER, 5u, 14000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 2000u, 0u, 0u, 0u },
+    { "ldc-t16-wake1",   PRESENT_WAIT_WORKER, 5u, 16000u, 300u, 0u, 0u, 3120u, 6590u, 0u, 0u, 1000u, 0u, 0u, 0u },
+    { "gpuq-19-heavy",   PRESENT_WAIT_WORKER_QUEUE, 0u, 0u, 300u, 19000u, 5000u, 15120u, 11150u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "gpuq-19-mid",     PRESENT_WAIT_WORKER_QUEUE, 0u, 0u, 300u, 19000u, 5000u, 8000u, 8000u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { "gpuq-19-ljit",    PRESENT_WAIT_WORKER_QUEUE, 0u, 0u, 300u, 19000u, 5000u, 2560u, 4300u, 0u, 0u, 0u, 300u, 3000u, 0u },
+    { "render-bound",  PRESENT_WAIT_WORKER, 5u, 11000u, 300u, 0u, 0u, 2560u, 35000u, 0u, 0u, 0u, 0u, 0u, 0u },
+};
+
+
+static int check_worker_cases(void)
+{
+    uint32_t i, presents = 0u, refused = 0u;
+    const uint32_t count = (uint32_t)(sizeof k_worker_cases / sizeof k_worker_cases[0]);
+
+#if defined(ORACLE_GL_WORKER_PRINT_ONLY)
+    /* Re-pinning aid: print every case with nothing checked, then stop. */
+    (void)k_worker_expect;
+    for (i = 0u; i < count; ++i)
+        (void)run_worker_case(&k_worker_cases[i], NULL, &presents, &refused);
+    printf("Vita GL admit wait (" ORACLE_GL_ADMIT_WAIT_MODE "): PRINT ONLY (%u "
+           "worker cases)\n", (unsigned)count);
+    return 0;
+#endif
+    CHECK(count == 40u &&
+          sizeof k_worker_expect / sizeof k_worker_expect[0] == count);
+    for (i = 0u; i < count; ++i) {
+        if (!run_worker_case(&k_worker_cases[i], &k_worker_expect[i],
+                             &presents, &refused))
+            return 0;
+    }
+    printf("Vita GL admit wait (" ORACLE_GL_ADMIT_WAIT_MODE "): PASS (%u worker cases, "
+           "every printed field pinned; presents=%u refused=%u over 10x120 loops "
+           "per case, 600 updates each)\n",
+           (unsigned)count, (unsigned)presents, (unsigned)refused);
+    return 1;
+}
+
+#if (defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) || \
+    defined(ORACLE_GL_ADMIT_BEHIND_TWIN)
+/* One more pass over the 40 worker cases under another label.  pinned: every
+ * printed field against the stock numbers (k_worker_expect[].stock). */
+static int run_worker_pass(const char *label, int pinned,
+                           uint32_t *presents, uint32_t *refused)
+{
+    const uint32_t count = (uint32_t)(sizeof k_worker_cases / sizeof k_worker_cases[0]);
+    uint32_t i;
+
+    s_wk_label = label;
+    for (i = 0u; i < count; ++i) {
+        if (!run_worker_case(&k_worker_cases[i],
+                             pinned ? &k_worker_expect[i] : NULL,
+                             presents, refused))
+            return 0;
+    }
+    s_wk_label = "worker";
+    return 1;
+}
+#endif
+
+#if defined(ORACLE_GL_ADMIT_BEHIND_TWIN) && \
+    !(defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND)
+/* Knob OFF, the gate never told "behind": what stock does with a frame it
+ * admits.  The ON "within" pass must print the same numbers wherever its
+ * back-off never armed (test_kage_vita_fullspeed_scheduler.py compares). */
+static int check_admit_behind_cases(void)
+{
+    uint32_t presents = 0u, refused = 0u;
+
+    s_wk_gate_never_behind = 1u;
+    if (!run_worker_pass("within", 0, &presents, &refused))
+        return 0;
+    s_wk_gate_never_behind = 0u;
+    printf("Vita GL admit behind (twin): 40 cases with the stock gate never "
+           "behind; presents=%u refused=%u\n",
+           (unsigned)presents, (unsigned)refused);
+    return 1;
+}
+#endif
+
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+typedef struct AbDirected {
+    OracleGame game;
+    uint32_t nonfull, gates, over, ok, bo, tt, hl, hl_us;
+} AbDirected;
+
+/* One loop, light work (update 3000, non-full 600, Render 4000 us, no
+ * Present wait), the gate forced behind; adds the tick's counters to *a and
+ * returns them in *d. */
+static int ab_directed_tick(AbDirected *a, ScenarioResult *result,
+                            KageVitaFullspeedGlAdmitBehindSnapshot *d,
+                            uint32_t *nonfull)
+{
+    KageVitaFullspeedSnapshot before, after;
+
+    kage_vita_fullspeed_scheduler_snapshot(&before);
+    (void)run_one_tick(&a->game, 3000u, 600u, 4000u, 1u, result);
+    kage_vita_fullspeed_scheduler_snapshot(&after);
+    kage_vita_fullspeed_scheduler_gl_admit_behind_take(d);
+    *nonfull = after.nonfull_phases - before.nonfull_phases;
+    CHECK(*nonfull <= 1u && d->gates <= *nonfull);
+    CHECK(after.runtime_disables == 0u && after.sequence_violations == 0u);
+    CHECK(s_ab_ref_bad == 0u);
+    a->nonfull += *nonfull;
+    a->gates += d->gates;
+    a->over += d->over;
+    a->ok += d->admitted;
+    a->bo += d->backoff;
+    a->tt += d->time_test;
+    a->hl += d->hold_late;
+    a->hl_us += d->hold_late_us;
+    return 1;
+}
+
+static int ab_directed_run(AbDirected *a, ScenarioResult *result, uint32_t ticks)
+{
+    KageVitaFullspeedGlAdmitBehindSnapshot d;
+    uint32_t nonfull;
+
+    a->nonfull = a->gates = a->over = a->ok = a->bo = a->tt = a->hl = a->hl_us = 0u;
+    while (ticks-- != 0u) {
+        if (!ab_directed_tick(a, result, &d, &nonfull))
+            return 0;
+    }
+    return 1;
+}
+
+/* The bound and the back-off, with every input under the test's hand: the
+ * gate is behind at every non-full phase (s_render_admit = 0), outstanding
+ * bytes are what the test says, a Present hold is what the test leaves for
+ * the next loop head, and a late head is a clock step before it. */
+static int check_admit_behind_directed(uint32_t *refusals_out)
+{
+    static ScenarioResult result;
+    AbDirected a;
+    KageVitaFullspeedGlAdmitBehindSnapshot d;
+    const uint32_t bound = kage_vita_fullspeed_scheduler_gl_admit_behind_bytes();
+    uint32_t nonfull, phase, refusals = 0u, gate30 = 0u, gate31 = 0u;
+
+    CHECK(bound >= 1u && bound < UINT32_MAX);
+    memset(&result, 0, sizeof result);
+    memset(&a, 0, sizeof a);
+    a.game.manager_pointer = 0x10000000u;
+    a.game.game_pointer = 0x20000000u;
+    a.game.game_frame = 100u;
+    s_now = 1000u;
+    s_delay_fail = 0u;
+    s_present_wait_kind = PRESENT_WAIT_NONE;
+    worker_reset();
+    kage_vita_fullspeed_scheduler_reset();
+    kage_vita_fullspeed_scheduler_gl_admit_behind_take(NULL);
+    s_render_admit = 0;
+    s_ab_out_model = ORACLE_AB_OUT_FIXED;
+
+    /* 1. Exactly at the bound: every behind gate renders. */
+    s_ab_out_fixed = bound;
+    if (!ab_directed_run(&a, &result, 40u) || !ab_directed_run(&a, &result, 100u))
+        return 0;
+    CHECK(a.nonfull == 50u && a.gates == 50u && a.ok == 50u);
+    CHECK(a.over == 0u && a.bo == 0u && a.tt == 0u && a.hl == 0u);
+    /* 2. One byte over: every behind gate takes the stock refusal. */
+    s_ab_out_fixed = bound + 1u;
+    if (!ab_directed_run(&a, &result, 40u))
+        return 0;
+    CHECK(a.gates == 20u && a.over == 20u && a.ok == 0u && a.bo == 0u && a.hl == 0u);
+    s_ab_out_fixed = bound;
+    if (!ab_directed_run(&a, &result, 40u))
+        return 0;
+    CHECK(a.gates == 20u && a.ok == 20u && a.hl == 0u);
+    /* 3. A hold the loop absorbed (the next head still sleeps): nothing. */
+    CHECK((a.game.manager_counter & 1u) == 0u);
+    s_ab_hold_take_us = 700u;
+    if (!ab_directed_run(&a, &result, 40u))
+        return 0;
+    CHECK(s_ab_hold_take_us == 0u);
+    CHECK(a.gates == 20u && a.ok == 20u && a.bo == 0u && a.hl == 0u);
+    /* 4. A late head with no hold before it: nothing. */
+    s_now += 17000u;
+    if (!ab_directed_run(&a, &result, 40u))
+        return 0;
+    CHECK(a.bo == 0u && a.hl == 0u && a.over == 0u);
+    if (!ab_directed_run(&a, &result, 80u))
+        return 0;
+    CHECK(a.gates == 40u && a.ok == 40u && a.bo == 0u && a.hl == 0u);
+    /* 5. Hold and late head: hl, then exactly 30 non-full phases of stock
+     * refusals, the 31st renders again. */
+    CHECK((a.game.manager_counter & 1u) == 0u);
+    s_ab_hold_take_us = 700u;
+    s_now += 17000u;
+    if (!ab_directed_tick(&a, &result, &d, &nonfull))
+        return 0;
+    CHECK(d.hold_late == 1u && d.hold_late_us != 0u);
+    phase = nonfull;
+    for (;;) {
+        if (nonfull) {
+            if (phase <= 30u) {
+                CHECK(d.admitted == 0u && d.backoff == d.gates);
+                refusals += d.backoff;
+                if (phase == 30u)
+                    gate30 = d.gates;
+            } else {
+                CHECK(d.backoff == 0u && d.admitted == d.gates);
+                if (phase == 31u)
+                    gate31 = d.gates;
+            }
+        }
+        if (phase >= 45u)
+            break;
+        if (!ab_directed_tick(&a, &result, &d, &nonfull))
+            return 0;
+        CHECK(d.hold_late == 0u && d.over == 0u && d.time_test == 0u);
+        phase += nonfull;
+    }
+    /* Both sides of the edge were really asked. */
+    CHECK(gate30 == 1u && gate31 == 1u);
+    CHECK(refusals == KAGE_VITA_GL_ADMIT_BEHIND_BACKOFF);
+    s_render_admit = 1;
+    s_ab_out_model = ORACLE_AB_OUT_OVER;
+    s_ab_out_fixed = 0u;
+    worker_reset();
+    *refusals_out = refusals;
+    return 1;
+}
+# endif
+
+typedef struct AbTimeTest {
+    uint32_t nonfull, gates, pass, fail, off, over, would, ok, bo, tt, rs;
+} AbTimeTest;
+
+/* `ticks` loops (update 3000, non-full 600 us, no Present wait) at one
+ * Render cost with the gate forced behind; the counters of the last
+ * `measured` of them. */
+static int ab_time_test_run(OracleGame *game, ScenarioResult *result,
+                            uint32_t render_us, uint32_t ticks,
+                            uint32_t measured, AbTimeTest *a)
+{
+    uint32_t rs0 = s_render_admit_denials;
+
+    memset(a, 0, sizeof *a);
+    while (ticks != 0u) {
+        KageVitaFullspeedSnapshot before, after;
+        KageVitaFullspeedGlAdmitBehindSnapshot d;
+        uint32_t nonfull;
+
+        if (ticks == measured) {
+            memset(a, 0, sizeof *a);
+            rs0 = s_render_admit_denials;
+        }
+        --ticks;
+        kage_vita_fullspeed_scheduler_snapshot(&before);
+        (void)run_one_tick(game, 3000u, 600u, render_us, 1u, result);
+        kage_vita_fullspeed_scheduler_snapshot(&after);
+        kage_vita_fullspeed_scheduler_gl_admit_behind_take(&d);
+        nonfull = after.nonfull_phases - before.nonfull_phases;
+        CHECK(nonfull <= 1u && d.gates <= nonfull);
+        CHECK(after.runtime_disables == 0u && after.sequence_violations == 0u);
+        CHECK(s_ab_ref_bad == 0u);
+        CHECK(d.test_pass + d.test_fail + d.test_off == d.gates);
+        CHECK(d.hold_late == 0u);
+        a->nonfull += nonfull;
+        a->gates += d.gates;
+        a->pass += d.test_pass;
+        a->fail += d.test_fail;
+        a->off += d.test_off;
+        a->over += d.over;
+        a->would += d.would;
+        a->ok += d.admitted;
+        a->bo += d.backoff;
+        a->tt += d.time_test;
+    }
+    a->rs = s_render_admit_denials - rs0;
+    return 1;
+}
+
+/* The stock time test at a behind gate, with the gate behind at every
+ * non-full phase and the outstanding bytes under the test's hand.  Light
+ * work (update 3000 at the floor, Render 11000 us: gate near floor + 15100,
+ * predicted end near floor + 26100, the next floor at + 33333) passes it;
+ * Render 16000 us (gate near + 20100, end near + 36100) fails it; a menu
+ * (no Game::Update: the last floor is in the past) leaves it not live.
+ * OBSERVE classifies (st p / f / x, wa) and refuses all of them; ON renders
+ * p and x and refuses f by the stock time test (tt), unless the bytes are
+ * over the bound (ov), which comes first. */
+static int check_admit_behind_time_test(AbTimeTest out[4])
+{
+    static ScenarioResult result;
+    OracleGame game;
+    AbTimeTest a;
+    const uint32_t bound = kage_vita_fullspeed_scheduler_gl_admit_behind_bytes();
+
+    memset(&result, 0, sizeof result);
+    memset(&game, 0, sizeof game);
+    game.manager_pointer = 0x10000000u;
+    game.game_pointer = 0x20000000u;
+    game.game_frame = 100u;
+    s_now = 1000u;
+    s_delay_fail = 0u;
+    s_present_wait_kind = PRESENT_WAIT_NONE;
+    worker_reset();
+    kage_vita_fullspeed_scheduler_reset();
+    kage_vita_fullspeed_scheduler_gl_admit_behind_take(NULL);
+    s_render_admit = 0;
+    s_ab_out_model = ORACLE_AB_OUT_FIXED;
+    s_ab_out_fixed = 0u;
+
+    /* 1. The test passes: st p. */
+    if (!ab_time_test_run(&game, &result, 11000u, 140u, 100u, &a))
+        return 0;
+    CHECK(a.nonfull == 50u && a.gates == 50u);
+    CHECK(a.pass == 50u && a.fail == 0u && a.off == 0u);
+    CHECK(a.over == 0u && a.would == 50u && a.bo == 0u && a.tt == 0u);
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    CHECK(a.ok == 50u && a.rs == 0u);
+# else
+    CHECK(a.ok == 0u && a.rs == 50u);
+# endif
+    out[0] = a;
+    /* 2. The test fails: st f; ON refuses by the stock time test (tt), and
+     * rs counts every one of them in both modes. */
+    if (!ab_time_test_run(&game, &result, 16000u, 140u, 100u, &a))
+        return 0;
+    CHECK(a.nonfull == 50u && a.gates == 50u);
+    CHECK(a.pass == 0u && a.fail == 50u && a.off == 0u);
+    CHECK(a.over == 0u && a.would == 0u && a.bo == 0u && a.ok == 0u);
+    CHECK(a.rs == 50u);
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    CHECK(a.tt == 50u);
+# else
+    CHECK(a.tt == 0u);
+# endif
+    out[1] = a;
+    /* 3. Failing and one byte over the bound: ov, not tt. */
+    s_ab_out_fixed = bound + 1u;
+    if (!ab_time_test_run(&game, &result, 16000u, 100u, 100u, &a))
+        return 0;
+    CHECK(a.nonfull == 50u && a.gates == 50u);
+    CHECK(a.fail == 50u && a.over == 50u && a.would == 0u);
+    CHECK(a.tt == 0u && a.ok == 0u && a.bo == 0u && a.rs == 50u);
+    out[2] = a;
+    s_ab_out_fixed = 0u;
+    /* 4. A menu: the test is not live (st x) and stock admits. */
+    s_ab_menu = 1u;
+    if (!ab_time_test_run(&game, &result, 4000u, 140u, 100u, &a))
+        return 0;
+    s_ab_menu = 0u;
+    CHECK(a.gates != 0u && a.gates <= a.nonfull);
+    CHECK(a.pass == 0u && a.fail == 0u && a.off == a.gates);
+    CHECK(a.over == 0u && a.would == a.gates && a.bo == 0u && a.tt == 0u);
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    CHECK(a.ok == a.gates && a.rs == 0u);
+# else
+    CHECK(a.ok == 0u && a.rs == a.gates);
+# endif
+    out[3] = a;
+    s_render_admit = 1;
+    s_ab_out_model = ORACLE_AB_OUT_OVER;
+    worker_reset();
+    return 1;
+}
+
+static int check_admit_behind_cases(void)
+{
+    uint32_t presents[2] = { 0u, 0u }, refused[2] = { 0u, 0u };
+    AbTimeTest tt[4];
+    uint32_t i;
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    uint32_t refusals = 0u;
+    const int pinned = 0;
+# else
+    const int pinned = 1;
+# endif
+
+    /* The 40 pinned "worker" lines above ran with every behind gate over
+     * the bound.  Now within it at every gate, and mixed. */
+    s_ab_out_model = ORACLE_AB_OUT_FIXED;
+    s_ab_out_fixed = 0u;
+    if (!run_worker_pass("within", pinned, &presents[0], &refused[0]))
+        return 0;
+    s_ab_out_model = ORACLE_AB_OUT_RATE;
+    if (!run_worker_pass("mixed", pinned, &presents[1], &refused[1]))
+        return 0;
+    s_ab_out_model = ORACLE_AB_OUT_OVER;
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    if (!check_admit_behind_directed(&refusals))
+        return 0;
+    printf("Vita GL admit behind (on): PASS (over the bound: 40 worker cases "
+           "pinned to the stock numbers; within: presents=%u refused=%u; "
+           "mixed: presents=%u refused=%u; bound %u inclusive, bound+1 "
+           "refused; hold without late head and late head without hold arm "
+           "nothing; hold + late head: %u stock refusals over exactly %u "
+           "non-full phases)\n",
+           (unsigned)presents[0], (unsigned)refused[0], (unsigned)presents[1],
+           (unsigned)refused[1],
+           (unsigned)kage_vita_fullspeed_scheduler_gl_admit_behind_bytes(),
+           (unsigned)refusals, (unsigned)KAGE_VITA_GL_ADMIT_BEHIND_BACKOFF);
+# else
+    printf("Vita GL admit behind (observe): PASS (3 x 40 worker cases pinned "
+           "to the stock numbers: over the bound, within it, mixed; "
+           "presents=%u,%u refused=%u,%u)\n",
+           (unsigned)presents[0], (unsigned)presents[1], (unsigned)refused[0],
+           (unsigned)refused[1]);
+# endif
+    if (!check_admit_behind_time_test(tt))
+        return 0;
+    /* The instants check must have had refusals to hold, some of them with
+     * a Present wait between the two instants. */
+    CHECK(s_ab_ref_checked != 0u && s_ab_ref_split != 0u);
+    printf("Vita GL admit behind (time test): PASS (gate forced behind, "
+           "n st(p,f,x) ov wa ok bo tt rs:");
+    for (i = 0u; i < 4u; ++i)
+        printf(" %s %u %u,%u,%u %u %u %u %u %u %u;",
+               i == 0u ? "passing" : i == 1u ? "failing" :
+               i == 2u ? "failing over the bound" : "menu",
+               (unsigned)tt[i].gates, (unsigned)tt[i].pass,
+               (unsigned)tt[i].fail, (unsigned)tt[i].off,
+               (unsigned)tt[i].over, (unsigned)tt[i].would,
+               (unsigned)tt[i].ok, (unsigned)tt[i].bo, (unsigned)tt[i].tt,
+               (unsigned)tt[i].rs);
+    printf(" %u refusals handed gate + the measured last Render body / "
+           "cost, %u of them with a Present wait between the two)\n",
+           (unsigned)s_ab_ref_checked, (unsigned)s_ab_ref_split);
+    return 1;
+}
+#endif
+#endif
 #endif
 static int check_scenario(uint32_t render_us, uint32_t interpolation_enabled)
 {
@@ -3452,6 +4895,15 @@ int main(void)
 #if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
     if (!check_render_admission())
         return 1;
+# if defined(ORACLE_GL_WORKER_CASES)
+    if (!check_worker_cases())
+        return 1;
+#  if (defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) || \
+    defined(ORACLE_GL_ADMIT_BEHIND_TWIN)
+    if (!check_admit_behind_cases())
+        return 1;
+#  endif
+# endif
 #endif
     if (!check_scenario(5000u, 1u) ||
             !check_scenario(10000u, 1u) ||

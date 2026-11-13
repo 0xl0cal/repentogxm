@@ -17,7 +17,7 @@ ISAAC_VITA_LUA_INTEGER2STR negative once stopped at
    passes the whole knob block;
 4. does 2 and 3 over four bases: recipe A's Lua levers, the same plus S8
    (ISAAC_VITA_LUA_BINDING_REPLAY + _VERIFY ON), plus the lua-gc lever GC_ON
-   (GC_FINALIZER_PACE ON with SWEEP_COST 32), and plus both.
+   (GC_FINALIZER_PACE ON with its allocation latch), and plus both.
 
 The base is MODELLED by default: the Lua keys of the int2j device build's
 init cache (plus the four runtime keys S8 requires) and the Lua keys
@@ -75,12 +75,19 @@ RECIPE_A_LUA = [
 # The S8 verify build of 2026-10-26
 S8_VERIFY = [("ISAAC_VITA_LUA_BINDING_REPLAY", "ON"),
              ("ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY", "ON")]
-# Recipe A's GC_ON group, the lua-gc lever: with it in the
-# base, PACE=OFF alone trips "GC_FINALIZER_MAX/_COST and GC_SWEEP_COST take
-# effect only with PACE=ON" (CMakeLists.txt:480) before INTEGER2STR's FATAL
+# The lua-gc lever as the r5 pacer takes it (r60-b1-lua-20261111 build
+# PACE_ON).  int-final-20261025 build GC_ON (:98: SWEEP_COST 32, CLAMP_KB
+# 40) no longer configures: r5 retired ISAAC_VITA_LUA_GC_SWEEP_COST and
+# refuses any value but 5 (gc_on_retired_test below).  With the lever in the
+# base, PACE=OFF alone trips "..._ALLOC_LATCH_BYTES takes effect only with
+# ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON" before INTEGER2STR's FATAL, hence the
+# budget in the i2s-lua key list.
 GC_ON = [("ISAAC_VITA_LUA_GC_FINALIZER_PACE", "ON"),
-         ("ISAAC_VITA_LUA_GC_SWEEP_COST", "32"),
-         ("ISAAC_VITA_LUA_GCSTEP_CLAMP_KB", "40")]
+         ("ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES", "65536")]
+GC_ON_RETIRED = [("ISAAC_VITA_LUA_GC_FINALIZER_PACE", "ON"),
+                 ("ISAAC_VITA_LUA_GC_SWEEP_COST", "32"),
+                 ("ISAAC_VITA_LUA_GCSTEP_CLAMP_KB", "40")]
+MSG_RETIRED = "ISAAC_VITA_LUA_GC_SWEEP_COST is retired"
 
 MSG_LGCD = "ISAAC_VITA_LUA_GETCLASS_DIRECT requires ISAAC_VITA_LUA_NATIVE_GETCLASS=ON"
 MSG_I2S = "ISAAC_VITA_LUA_INTEGER2STR requires ISAAC_VITA_LUA=ON"
@@ -105,6 +112,7 @@ FIXED = {
         "ISAAC_VITA_LUA_CORE_ARM=OFF", "ISAAC_VITA_LUA_COST_PROFILE=OFF",
         "ISAAC_VITA_LUA_GC_FINALIZER_PACE=OFF", "ISAAC_VITA_LUA_GC_FINALIZER_MAX=8",
         "ISAAC_VITA_LUA_GC_FINALIZER_COST=512", "ISAAC_VITA_LUA_GC_SWEEP_COST=5",
+        "ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES=0",
         "ISAAC_VITA_LUA_NATIVE_GETCLASS=OFF", "ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY=OFF",
         "ISAAC_VITA_LUA_BINDING_REPLAY=OFF", "ISAAC_VITA_LUA_BINDING_REPLAY_VERIFY=OFF"]),
 }
@@ -222,6 +230,16 @@ def main() -> int:
                         f"[{base}] {neg} control ({flip}) does not pass: {first_error(out)}")
             print(f"[{base}] {original}; fixed negatives stop at :{line_i2s}/:{line_lgcd} "
                   f"with their own messages; both controls pass the block")
+        # 5. the frozen recipe's GC_ON no longer configures (r5 retired
+        # SWEEP_COST); GC_HOLD, which every device recipe carries, does
+        # (it is in the base above)
+        name, (init, extra) = next(iter(bases.items()))
+        rc, out = probe(work / "p", init,
+                        [f"{k}={v}" for k, v in GC_ON_RETIRED], args.path_map)
+        err = first_error(out)
+        require(rc != 0 and err is not None and MSG_RETIRED in err[2],
+                f"int-final GC_ON (SWEEP_COST 32) was not refused as retired: {err}")
+        print(f"[{name}+int-final GC_ON] refused at :{err[1]}: {MSG_RETIRED}")
     print("cmake knob probe + Lua tranche-2 FATAL negatives: PASS")
     return 0
 

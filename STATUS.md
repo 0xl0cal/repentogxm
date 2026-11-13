@@ -25,26 +25,26 @@ build of `opt-N`).
 ## Current build
 
 ```text
-build id:  rel:v0.1.1-alpha-rc3
-source:    the v0.1.1-alpha snapshot, configured from release/v0.1.1-alpha.cmake
-           in a fresh build directory
-eboot.bin: 13,360,635 bytes
-sha256:    87802d3fd987fc680472584b065a95fa4cc5b1953d54e611c7a4229fcb9e4886
-VPK:       17,529,342 bytes
-sha256:    3a1d6399d47938c591d63c4bed1ec296d46d6455944300720861605fbabeb927
-           (members identical to v0.1.0-alpha except eboot.bin)
-sessions:  2026-09-07: rc3 (rc2 plus the file-handle recovery) 4.9 min:
-           Continue into a Utero run, four rooms, saves written, no fault,
-           every native seam at fallbacks=0, no handle loss (enodev=0);
-           earlier the same day at the main menu with music, PS button to
-           the home screen and back: both music streams recovered their
-           handles, no fault. rc2 about 2.5 min of play and
-           rc1 (quad fast path for batched quads only) 4.5 min including a
-           save in a dense room: no fault record, every native seam at
-           fallbacks=0, picture correct
+build id:  rel:v0.2.0-alpha-rc1
+source:    the v0.2.0-alpha snapshot, configured from release/v0.2.0-alpha.cmake
+           (-DISAAC_VITA_GUEST_LINK_ID=rel:v0.2.0-alpha-rc1) in a fresh build
+           directory
+eboot.bin: 11,948,474 bytes
+sha256:    ce218f355fc910b4cd03e4241f0fcc68ee8789b2ff2ffc1255b5539dfaa10ee1
+VPK:       36,485,239 bytes (about 20 MB of it are the six trophy packs)
+sha256:    b35cc22b99095783b7b984db01530183c122d3058feda708b3ebbd35de2e6418
+sessions:  2026-11-13: boot smoke, 90 s to the title screen with music, every
+           speed-up banner present, no fault. The same build with only
+           ISAAC_VITA_LAUNCH_ARGS_FILE=ON added (every other object identical
+           but the build id) played the seeded bench through all eight phases
+           (Downpour with water, a floor change, Basement I): no fault, no Lua
+           error, game updates per phase within 0.15 per second of the
+           measured development build. FPS numbers come from that
+           development build (README); the release build carries no
+           measurement code.
 ```
 
-The complete option set is `release/v0.1.1-alpha.cmake` (option names are
+The complete option set is `release/v0.2.0-alpha.cmake` (option names are
 defined in `recomp/vita/CMakeLists.txt`). In groups:
 
 - Display 960x544 (`ISAAC_VITA_DISPLAY_RASTER=960`). The world is drawn on the
@@ -113,6 +113,25 @@ window with 120 presents prints "60 FPS" even when frames took 30-70 ms.
 budget); p95 the 95th percentile.
 
 ## Measured performance
+
+v0.2.0-alpha (2026-11-13): the development build with the same speed-ups as
+the release plus the measurement code, two seeded bench runs (EID loaded, the
+same rooms every run). FPS is presented frames per second over the whole
+phase, not the 120-frame windows above; game updates 29.1-29.8 per second in
+every phase but the floor transition (24.7 while loading).
+
+| bench phase | FPS (two runs) |
+|---|---|
+| Downpour, quiet room | 59.6 |
+| Downpour, fight | 57.0 |
+| Downpour, room with a big spawn | 49.0-52.3 |
+| floor transition, including the loads | 40.3-40.5 |
+| Downpour, another quiet room | 59.6 |
+| Basement I, quiet room | 59.6-59.7 |
+| Basement I, fight | 58.9 |
+| Basement I, room with a big spawn | 56.7-58.4 |
+
+The rest of this section is v0.1.1-alpha.
 
 Twins of the release source, EID loaded, game at 29.3-30.0 updates per second.
 The rc1 twin had the quad fast path for batched quads only; the rc2 twin
@@ -194,7 +213,8 @@ A door transition runs the room state reset (`00520160`, 73 ms per call,
     standby (power button) with a run open. The
     Manager's FTP has no authentication; any LAN device can modify
     `ux0:/data/isaacr001` while it runs. No remapping exists.
-11. Chinese language crashes on load (issue #4; v0.1.0 and v0.1.1-alpha).
+11. Chinese language crashes on load (issue #4; v0.1.0 and v0.1.1-alpha;
+    fixed in v0.2.0-alpha).
     The Chinese font atlases in `repentance_zh.a` decode to 16 MiB
     (`TeamMeatFontExtended12/16bold`, 2048x2048 RGBA) and 32 MiB
     (`UpheavalExtended_1`, 4096x2048); the shipped transient texel scratch
@@ -202,12 +222,12 @@ A door transition runs the room state reset (`00520160`, 73 ms per call,
     request either, and the font renderer dereferences the NULL page. The fix
     is in the tree behind `ISAAC_VITA_TEXEL_SCRATCH_32M` (a 33,558,528-byte
     scratch reserved before vitaGL, which shrinks the vitaGL RAM pool by the
-    same amount) and is not in the released build; a second, unconditional
+    same amount) and is in v0.2.0-alpha; a second, unconditional
     fix keeps guest `malloc(0)` alive when newlib is exhausted, which stopped
     the follow-up `bad_alloc` seen on a cold start with Chinese saved.
 12. The Daily challenge needs Steam. On the port the paper appears and nothing
     follows (reported in GitHub issue 5). Not fixable without a Steam client.
-13. Endings stop the game on v0.1.1-alpha (found 2026-09-09 jumping into the
+13. Endings stop the game on v0.1.1-alpha (fixed in v0.2.0-alpha; found 2026-09-09 jumping into the
     chest after Ultra Greed on the test device): every cutscene with a video
     part opens its `.ogv` through libtheora, whose CPU-feature probe toggles
     EFLAGS.ID with `pushfd`/`popfd`, and `popfd` was the one instruction the
@@ -617,5 +637,6 @@ Most options are off by default; the release configuration turns them on.
 | 2026-09-07 | rc2 twin | quad fast path for every quad | 100 % of quads handled; rooms 55-59 FPS at 9.9-10.3 ms; one `ArchivedFile` crash after a PS-button interception |
 | 2026-09-07 | rel:v0.1.1-alpha-rc2 | rc1 plus the complete quad fast path, configured from release/v0.1.1-alpha.cmake | 2.5 min session, no fault, fallbacks=0 |
 | 2026-09-07 | rel:v0.1.1-alpha-rc3 | rc2 plus recovery of file handles invalidated across an app suspend | PS button at the menu and back: 2 handles recovered, no fault; 4.9 min Utero run (Continue, four rooms, saves), no fault, fallbacks=0 |
+| 2026-11-13 | rel:v0.2.0-alpha-rc1 | v0.2.0-alpha: GL thread, admission behind the frame, FBO deferred attach, Lua GC pacing, BulletAtlas preload, texel scratch, release recipe release/v0.2.0-alpha.cmake | boot smoke; seeded bench (all eight phases) on the same build plus launch arguments: no fault, updates per phase as on the measured build |
 
 The order of work is in [PLAN.md](PLAN.md).

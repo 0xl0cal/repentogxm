@@ -581,6 +581,23 @@ def production_flavours(cc: list[str], work: Path) -> None:
                 os.environ.copy())
             print(f"production flavour reserve_mb={reserve}{' fight' if fight else ''} "
                   f"({Path(cc[0]).name}, -Wall -Wextra -Wtype-limits -Werror): PASS")
+    # ISAAC_VITA_IMAGE_PRELOAD (host_vita_image_retain.c) borrows this unit's
+    # Level::Init seam and headroom reading: ON compiles, OFF leaves no token.
+    base = [*cc, "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wtype-limits",
+            "-DGUEST_IMAGE_BASE=0x98000000u", "-DGUEST_STACK_REQUIRED=1",
+            "-DISAAC_VITA_SFX_FLOOR_PRELOAD=1", "-DISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB=8",
+            '-DISAAC_VITA_SFX_FLOOR_PRELOAD_BUILD_ID="sfxp:test"', "-DISAAC_VITA_SFX_FIGHT_PRELOAD=1",
+            "-I", str(stubs), "-I", str(RUNTIME), "-I", str(VITA), str(MODULE)]
+    run([*base, "-fsyntax-only", "-DISAAC_VITA_IMAGE_PRELOAD=1"], os.environ.copy())
+    off = run([*base, "-E", "-P"], os.environ.copy())
+    on = run([*base, "-E", "-P", "-DISAAC_VITA_IMAGE_PRELOAD=1"], os.environ.copy())
+    require("isaac_vita_image_preload" not in off and "sfxp_headroom" in off,
+            "IMAGE_PRELOAD OFF leaves its tokens in the SFX floor preload unit")
+    require(on.count("isaac_vita_image_preload_level_init") == 2 and
+            on.count("isaac_vita_image_preload_heap_headroom") == 2,
+            "IMAGE_PRELOAD ON: the seam call / headroom export are not in the unit")
+    print("production flavour image_preload=1 compiles (-Werror); OFF leaves no "
+          "isaac_vita_image_preload token in the preprocessed unit: PASS")
     # The raw-allocator poison header only accepts the gated Vita target
     # (arm_cross force-includes it); here the identifiers are checked as text.
     code = re.sub(r"/\*.*?\*/|//[^\n]*", " ", MODULE.read_text(encoding="utf-8"),
@@ -692,8 +709,15 @@ def verify_build_gate() -> None:
                    "${ISAAC_VITA_SFX_FLOOR_PRELOAD_RESERVE_MB}"):
         require(needle in body, f"knob block lacks {needle}")
     # 3 = the source list, the floor defines and the fight define (the fight
-    # block nests inside this one; checked below)
-    require(cmake.count('"${ISAAC_RUNTIME}/host_vita_sfx_floor_preload.c"') == 3 and
+    # block nests inside this one; checked below). The 4th mention in the
+    # file is ISAAC_VITA_IMAGE_PRELOAD's one compile definition on the unit,
+    # inside its own if() (which is FATAL unless this knob is ON).
+    image = re.search(r"\n      if\(ISAAC_VITA_IMAGE_PRELOAD\)\n(.*?)\n      else\(\)\n", cmake, re.S)
+    require(image is not None and
+            image.group(1).count('"${ISAAC_RUNTIME}/host_vita_sfx_floor_preload.c"\n'
+                                 '          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_IMAGE_PRELOAD=1)') == 1,
+            "ISAAC_VITA_IMAGE_PRELOAD does not define itself on the floor unit exactly once")
+    require(cmake.count('"${ISAAC_RUNTIME}/host_vita_sfx_floor_preload.c"') == 4 and
             body.count('"${ISAAC_RUNTIME}/host_vita_sfx_floor_preload.c"') == 3 and
             cmake.count("--wrap=sub_00311e60") == 2 and
             body.count("--wrap=sub_00311e60") == 1,

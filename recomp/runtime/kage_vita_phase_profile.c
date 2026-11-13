@@ -226,6 +226,13 @@ int sceKernelGetThreadId(void);
 #else
 # define KVPP_PRINTF sceClibPrintf
 #endif
+#if defined(ISAAC_VITA_GXM_RT_CREATE_CENSUS)
+/* ph120.gr: every sceGxmCreateRenderTarget / sceGxmDestroyRenderTarget call
+ * of the process, counted and timed by the two --wrap wrappers this include
+ * defines here (kage_vita_gxm_rt_census.h has the record and the reason). */
+# define KAGE_VITA_GXM_RT_CENSUS_WRAPS 1
+# include "kage_vita_gxm_rt_census.h"
+#endif
 #if defined(ISAAC_VITA_LASER_HALO_PROFILE) && ISAAC_VITA_LASER_HALO_PROFILE
 # include "../vita/vitagl-stock-reference/isaac_laser_halo_profile.h"
 # include <stdio.h>
@@ -716,6 +723,11 @@ void kage_vita_phase_profile_oracle_room_seed(uint32_t value)
     s_room_log_sat = 0u;
 }
 #endif
+#endif
+
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+/* ph120.uh / ph120.uhs: per-update attribution, see the header. */
+# include "kage_vita_update_hitch_record.h"
 #endif
 
 #if defined(ISAAC_VITA_FRAME_SPIKE_PROFILE)
@@ -2611,6 +2623,142 @@ static void kage_vita_profile_log_render_wake(
         w->ap_samples, w->ap_us, w->copied_bytes, w->mb_queries,
         w->clock_us, w->render_skips);
 }
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+/* ph120.aw (after rw, same loop-head take): GL admit wait at the interpolated
+ * gate (R60-DRYADMIT-SPEC-20261028.md).  n = gates that found the render thread
+ * behind; ok = waited, then rendered; to = waited to latest, closure still
+ * running, refused; nw = no window (no live floor, or the stock time test
+ * already fails), refused; bo = refused inside a back-off; tt = closure done,
+ * then refused by the tick-due re-check, the stock time test or a clock
+ * anomaly; us(sum,max) = waited us; lt(c,us) = Game::Update starts >= 1 us
+ * past the floor on the full tick right after an ok whose next loop head did
+ * not sleep; hl(c,us) = loop heads that did not sleep after a Present held
+ * on an ok's closure, by how far past their due time (lt and hl each arm a
+ * 30-phase back-off); ov = the largest wake past a timed-out wait's
+ * deadline; fit(e,a) = refusals with a window, checked at the next Present,
+ * of which the closure had finished by latest; miss(us,max) = how late the
+ * others were; hd(n,us) = Present holds on an ok's closure.  OBSERVE never
+ * waits (ok = to = bo = tt = lt = hl = ov = hd = us = 0).  Both modes: rs
+ * (ph120.rw) = n - ok - tt; fit e <= n - ok - tt - nw (+1 for an arm
+ * carried across the window edge).  Review fix pass: hl, ov and hd added,
+ * 380 B at all-ones, under the 384-byte logger ceiling. */
+static void kage_vita_profile_log_gl_admit_wait(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const KageVitaFullspeedGlAdmitWaitSnapshot *s, const uint32_t fit[6])
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.aw bid=%.32s win=%u loops=%u n=%u ok=%u to=%u "
+        "nw=%u bo=%u tt=%u us(sum,max)=%u,%u lt(c,us)=%u,%u hl(c,us)=%u,%u "
+        "ov=%u fit(e,a)=%u,%u miss(us,max)=%u,%u hd(n,us)=%u,%u\n",
+        build_id, window, last_outer_loop, s->gates, s->admitted, s->timeouts,
+        s->no_window, s->backoff, s->time_test, s->wait_us, s->wait_max_us,
+        s->late, s->late_us, s->hold_late, s->hold_late_us,
+        s->timeout_over_max_us, fit[0], fit[1], fit[2], fit[3], fit[4],
+        fit[5]);
+}
+static KageVitaFullspeedGlAdmitWaitSnapshot s_gl_admit_wait_window;
+static uint32_t s_gl_admit_fit_window[6];
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+/* ph120.ab + ph120.abp (after rw, same loop-head take): GL admit behind at
+ * the interpolated gate (R60-FABLE-PLAN.md lane B).
+ * ab: n = gates that found the render thread behind; st(p,f,x) = the stock
+ * time test at the stock last-Render cost there: live and passing, live and
+ * failing, not live (stock admits); ov = outstanding ring bytes over the
+ * bound; wa = within the bound and st not f (what ON renders outside a
+ * back-off); ok = rendered while behind; bo = within the bound, refused
+ * inside a back-off; tt = within the bound, refused by the stock time test;
+ * ob(50,max) = outstanding bytes at the gate, lower median of the first 64
+ * gates and the maximum of all; hl(c,us) = loop heads that did not sleep
+ * after a Present hold on a behind-admitted frame, by how far past their due
+ * time (each arms the 30-phase back-off); hd(n,us) = Present holds on or
+ * right after a behind-admitted frame.
+ * abp: refusals checked at the next Present: pm(c,ok,us,max) = checked, the
+ * closure was done by the refused frame's predicted Present, hold of the
+ * others; wp = the same over the wa frames; phl = of pm, the hold would have
+ * carried the Render return to or past the next loop head's due time.
+ * OBSERVE renders nothing extra (ok = bo = tt = hl = hd = 0).  Both modes:
+ * rs (ph120.rw) = n - ok; n = ov + wa + (within the bound and st f).
+ * ab 311 B, abp 226 B at all-ones, under the 384-byte logger ceiling. */
+static uint32_t kage_vita_profile_gl_admit_behind_median(
+    const KageVitaFullspeedGlAdmitBehindSnapshot *s)
+{
+    uint32_t sorted[KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES];
+    uint32_t count = s->out_count < KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES ?
+        s->out_count : KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES;
+    uint32_t i, j;
+
+    if (!count)
+        return 0u;
+    for (i = 0u; i < count; ++i) {
+        uint32_t value = s->out[i];
+
+        for (j = i; j > 0u && sorted[j - 1u] > value; --j)
+            sorted[j] = sorted[j - 1u];
+        sorted[j] = value;
+    }
+    return sorted[(count - 1u) / 2u];
+}
+static void kage_vita_profile_log_gl_admit_behind(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    const KageVitaFullspeedGlAdmitBehindSnapshot *s,
+    const uint32_t be[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS])
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.ab bid=%.32s win=%u loops=%u n=%u st(p,f,x)=%u,%u,%u "
+        "ov=%u wa=%u ok=%u bo=%u tt=%u ob(50,max)=%u,%u hl(c,us)=%u,%u "
+        "hd(n,us)=%u,%u\n",
+        build_id, window, last_outer_loop, s->gates, s->test_pass,
+        s->test_fail, s->test_off, s->over, s->would, s->admitted, s->backoff,
+        s->time_test, kage_vita_profile_gl_admit_behind_median(s), s->out_max,
+        s->hold_late, s->hold_late_us, be[9], be[10]);
+    KVPP_PRINTF(
+        "[kage-vita] ph120.abp bid=%.32s win=%u loops=%u "
+        "pm(c,ok,us,max)=%u,%u,%u,%u wp(c,ok,us,max)=%u,%u,%u,%u phl=%u\n",
+        build_id, window, last_outer_loop, be[0], be[1], be[2], be[3], be[4],
+        be[5], be[6], be[7], be[8]);
+}
+static KageVitaFullspeedGlAdmitBehindSnapshot s_gl_admit_behind_window;
+static uint32_t s_gl_admit_behind_backend_window[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS];
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+/* ph120.dp (after rw / aw / ab, same loop-head take): RENDER60 lane C, the
+ * GL recorder draw packet (gl_record_backend.h ISAAC_GL_DRAW_PACKET_*).
+ * mode = the recorder's compiled mode (VERIFY or ON); d = glDrawElements
+ * records requested; f = of them carried inside a packet; pk = packet
+ * records published; p1 = staged runs of exactly one call (ON publishes
+ * each as its own record, VERIFY as a one-call packet, also in pk);
+ * sub = calls staged; B = staged bytes; mx = most bytes staged at one
+ * publish; fr(r,c,s,f) = publishes ahead of another record, a closure, a
+ * drain / outstanding query / stop, or a full buffer (or a draw too large
+ * to fuse).  Render thread,
+ * VERIFY only: v(p,s) = packets compared and the separate records they were
+ * compared with; mm = packets whose bytes differed; late = a record that
+ * overtook staged calls; tot = mm + late since process start.  Records the
+ * ring carried for the draw path per draw = (pk + p1 + d - f) / d in ON.
+ * 328 B at all-ones with mode=VERIFY, under the 384-byte logger ceiling. */
+static void kage_vita_profile_log_draw_packet(
+    const char *build_id, uint32_t window, uint32_t last_outer_loop,
+    int mode, const uint32_t w[ISAAC_GL_DRAW_PACKET_WORDS])
+{
+    KVPP_PRINTF(
+        "[kage-vita] ph120.dp bid=%.32s win=%u loops=%u mode=%s d=%u f=%u "
+        "pk=%u p1=%u sub=%u B=%u mx=%u fr(r,c,s,f)=%u,%u,%u,%u v(p,s)=%u,%u "
+        "mm=%u late=%u tot=%u\n",
+        build_id, window, last_outer_loop,
+        mode == 2 ? "ON" : mode == 1 ? "VERIFY" : "BAD",
+        w[ISAAC_GL_DRAW_PACKET_DRAWS], w[ISAAC_GL_DRAW_PACKET_FUSED],
+        w[ISAAC_GL_DRAW_PACKET_PACKETS], w[ISAAC_GL_DRAW_PACKET_SINGLES],
+        w[ISAAC_GL_DRAW_PACKET_SUBS], w[ISAAC_GL_DRAW_PACKET_BYTES],
+        w[ISAAC_GL_DRAW_PACKET_MAX], w[ISAAC_GL_DRAW_PACKET_FLUSH_RECORD],
+        w[ISAAC_GL_DRAW_PACKET_FLUSH_CLOSURE],
+        w[ISAAC_GL_DRAW_PACKET_FLUSH_SYNC], w[ISAAC_GL_DRAW_PACKET_FLUSH_FULL],
+        w[ISAAC_GL_DRAW_PACKET_VERIFIED], w[ISAAC_GL_DRAW_PACKET_VERIFIED_SUBS],
+        w[ISAAC_GL_DRAW_PACKET_MISMATCH], w[ISAAC_GL_DRAW_PACKET_LATE],
+        w[ISAAC_GL_DRAW_PACKET_TOTAL_BAD]);
+}
+static uint32_t s_draw_packet_window[ISAAC_GL_DRAW_PACKET_WORDS];
+# endif
 static IsaacGlRecordWorkerWindow s_render_thread_window;
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
 #  include <stdio.h>
@@ -3579,12 +3727,102 @@ static void kage_vita_profile_report(
         ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
         s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
         last_outer_loop, &s_render_thread_window);
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    kage_vita_profile_log_gl_admit_wait(
+        ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+        s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+        last_outer_loop, &s_gl_admit_wait_window, s_gl_admit_fit_window);
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    kage_vita_profile_log_gl_admit_behind(
+        ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+        s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+        last_outer_loop, &s_gl_admit_behind_window,
+        s_gl_admit_behind_backend_window);
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    kage_vita_profile_log_draw_packet(
+        ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+        s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+        last_outer_loop, isaac_gl_record_draw_packet_mode(),
+        s_draw_packet_window);
+# endif
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     kage_vita_profile_log_opcode_census(
         ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
         s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
         last_outer_loop, isaac_gl_record_opcode_census());
 # endif
+#endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* ph120.da (ISAAC_VITA_FBO_DEFERRED_ATTACH), after the render-thread
+     * records: attach(d,x,s) = tracked colour attaches held back, of those
+     * superseded by a later attach of the same framebuffer before any
+     * consumer (never forwarded), and glCheckFramebufferStatus calls
+     * answered from the pending attach; flush(dr,cl,ow,rd,pr,tx,ot) =
+     * pending attaches forwarded before a draw, a native clear, an owed
+     * clear replay, a glReadPixels vitaGL serves, a present, a texture
+     * re-specify/sub-image/delete, and anything else (other attach shape or
+     * framebuffer, renderbuffer attach, framebuffer delete, glGetIntegerv,
+     * READ_FRAMEBUFFER status, install/uninstall).  d == x + the flush sum +
+     * at most one attach still pending at the take (pr forwards it at every
+     * present, so the residue is 0 at a loop head).  Native attaches per
+     * window = guest attaches - x.  The counters belong to the thread that
+     * runs the typed backend: taken there, through the recorder's
+     * synchronous closure when the render worker exists. */
+    {
+        IsaacVitaFboDeferredAttachCounters defer;
+
+        memset(&defer, 0, sizeof defer);
+# if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+        if (isaac_gl_record_worker_active())
+            isaac_gl_record_worker_call(
+                gl_vita_backend_fbo_deferred_attach_take, &defer);
+        else
+# endif
+            gl_vita_backend_fbo_deferred_attach_take(&defer);
+        KVPP_PRINTF(
+            "[kage-vita] ph120.da bid=%.32s win=%u loops=%u "
+            "attach(d,x,s)=%u,%u,%u flush(dr,cl,ow,rd,pr,tx,ot)="
+            "%u,%u,%u,%u,%u,%u,%u\n",
+            ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+            s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+            last_outer_loop,
+            defer.deferred, defer.dropped, defer.status_local,
+            defer.flushed[ISAAC_VITA_FBO_DEFER_FLUSH_DRAW],
+            defer.flushed[ISAAC_VITA_FBO_DEFER_FLUSH_CLEAR],
+            defer.flushed[ISAAC_VITA_FBO_DEFER_FLUSH_OWED],
+            defer.flushed[ISAAC_VITA_FBO_DEFER_FLUSH_READ],
+            defer.flushed[ISAAC_VITA_FBO_DEFER_FLUSH_PRESENT],
+            defer.flushed[ISAAC_VITA_FBO_DEFER_FLUSH_TEXTURE],
+            defer.flushed[ISAAC_VITA_FBO_DEFER_FLUSH_OTHER]);
+    }
+#endif
+#if defined(ISAAC_VITA_GXM_RT_CREATE_CENSUS)
+    /* ph120.gr (ISAAC_VITA_GXM_RT_CREATE_CENSUS), after ph120.da: the
+     * window's render-target creates and destroys as GXM saw them.  The
+     * counters are atomics written by the calling thread (the GL render
+     * thread when it exists), so no render-thread take is needed.  The
+     * receipt with the totals since process start goes out once, in front
+     * of the first record. */
+    {
+        static int receipt_printed;
+        KageVitaGxmRtCensus census;
+
+        if (!receipt_printed) {
+            uint32_t seen[3];
+
+            receipt_printed = 1;
+            kage_vita_gxm_rt_census_seen(seen);
+            KVPP_PRINTF(KAGE_VITA_GXM_RT_CENSUS_RECEIPT_FORMAT,
+                        seen[0], seen[1], seen[2]);
+        }
+        kage_vita_gxm_rt_census_take(&census);
+        KVPP_PRINTF(KAGE_VITA_GXM_RT_CENSUS_FORMAT,
+                    ISAAC_VITA_PHASE_PROFILE_BUILD_ID,
+                    s_completed_loops / KAGE_VITA_PHASE_PROFILE_WINDOW,
+                    last_outer_loop, KAGE_VITA_GXM_RT_CENSUS_ARGS(&census));
+    }
 #endif
 #if defined(ISAAC_VITA_LASER_HALO_PROFILE) && ISAAC_VITA_LASER_HALO_PROFILE
     /* One counter snapshot at the outer window boundary, never at the
@@ -3960,6 +4198,38 @@ void kage_vita_phase_profile_oracle_emit_max_records(void)
             max_build_id, UINT32_MAX, UINT32_MAX, &render_thread);
         kage_vita_profile_log_render_wake(
             max_build_id, UINT32_MAX, UINT32_MAX, &render_thread);
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+        {
+            KageVitaFullspeedGlAdmitWaitSnapshot admit_wait;
+            uint32_t fit[6];
+
+            memset(&admit_wait, 0xff, sizeof admit_wait);
+            memset(fit, 0xff, sizeof fit);
+            kage_vita_profile_log_gl_admit_wait(
+                max_build_id, UINT32_MAX, UINT32_MAX, &admit_wait, fit);
+        }
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+        {
+            KageVitaFullspeedGlAdmitBehindSnapshot admit_behind;
+            uint32_t be[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS];
+
+            memset(&admit_behind, 0xff, sizeof admit_behind);
+            memset(be, 0xff, sizeof be);
+            kage_vita_profile_log_gl_admit_behind(
+                max_build_id, UINT32_MAX, UINT32_MAX, &admit_behind, be);
+        }
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+        {
+            uint32_t dp[ISAAC_GL_DRAW_PACKET_WORDS];
+
+            memset(dp, 0xff, sizeof dp);
+            /* mode 1: VERIFY is the longer spelling */
+            kage_vita_profile_log_draw_packet(
+                max_build_id, UINT32_MAX, UINT32_MAX, 1, dp);
+        }
+# endif
     }
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     {
@@ -4026,6 +4296,36 @@ void kage_vita_phase_profile_note_loop_head(uint32_t outer_loop_count)
         isaac_gl_record_worker_take(NULL);
     else if ((s_completed_loops + 1u) % KAGE_VITA_PHASE_PROFILE_WINDOW == 0u)
         isaac_gl_record_worker_take(&s_render_thread_window);
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    /* ph120.dp: the take above closed the recorder's draw-packet window
+     * (both halves); copy it at the same edge as rt/rw.  Same condition as
+     * the take's else-if arm: nothing between them changes it. */
+    if (s_running &&
+        (s_completed_loops + 1u) % KAGE_VITA_PHASE_PROFILE_WINDOW == 0u)
+        isaac_gl_record_draw_packet_window(s_draw_packet_window);
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    /* ph120.aw: taken at the same edge as rt/rw, so rw rs == n - ok - tt
+     * holds per window. */
+    if (!s_running) {
+        kage_vita_fullspeed_scheduler_gl_admit_wait_take(NULL);
+        kage_vita_backend_gl_admit_fit_take(NULL);
+    } else if ((s_completed_loops + 1u) % KAGE_VITA_PHASE_PROFILE_WINDOW == 0u) {
+        kage_vita_fullspeed_scheduler_gl_admit_wait_take(&s_gl_admit_wait_window);
+        kage_vita_backend_gl_admit_fit_take(s_gl_admit_fit_window);
+    }
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    /* ph120.ab: taken at the same edge as rt/rw, so rw rs == n - ok holds
+     * per window. */
+    if (!s_running) {
+        kage_vita_fullspeed_scheduler_gl_admit_behind_take(NULL);
+        kage_vita_backend_gl_admit_behind_take(NULL);
+    } else if ((s_completed_loops + 1u) % KAGE_VITA_PHASE_PROFILE_WINDOW == 0u) {
+        kage_vita_fullspeed_scheduler_gl_admit_behind_take(&s_gl_admit_behind_window);
+        kage_vita_backend_gl_admit_behind_take(s_gl_admit_behind_backend_window);
+    }
+# endif
 #endif
 
     if (!s_running) {

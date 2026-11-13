@@ -55,6 +55,12 @@ int isaac_gl_record_spsc_consume_one(IsaacGlRecordRing *ring);
 /* Producer: wait until every record ending at or before `position` ran. */
 void isaac_gl_record_spsc_wait_done(IsaacGlRecordRing *ring, uint32_t position);
 int isaac_gl_record_spsc_reached(IsaacGlRecordRing *ring, uint32_t position);
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+/* Producer, GL admit wait: one wait_done step with an OS timeout of at most
+ * timeout_us; 1 = position reached.  Callers loop on their own deadline. */
+int isaac_gl_record_spsc_wait_done_for(IsaacGlRecordRing *ring, uint32_t position,
+                                       uint32_t timeout_us);
+#endif
 /* Producer: make sure the consumer runs everything published so far
  * (PRESENT; wait_done and a full ring kick by themselves). */
 void isaac_gl_record_spsc_kick(IsaacGlRecordRing *ring);

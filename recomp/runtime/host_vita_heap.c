@@ -618,6 +618,221 @@ typedef struct vita_heap_telemetry_event {
 } vita_heap_telemetry_event;
 #endif
 
+/* ISAAC_VITA_HEAP_IMPORT_LEAN2: exact cuts of the guest malloc/free import
+ * wrapper cost on top of ISAAC_VITA_HEAP_LEAN_IMPORT.  Every route, every
+ * newlib call (same order, same arguments), every returned pointer and every
+ * fault is unchanged; only work whose result is already known is skipped.
+ * CMake offers it only with the overflow mspace and LEAN_IMPORT; it also
+ * compiles without the overflow mspace (growing ledger) for the host
+ * prefilter oracle, and VITA_HEAP_IMPORT_TERMINAL below must exist in every
+ * configuration.  Each cut compiles only where its premise holds:
+ *   SIDECARS  removal no longer moves/clears floor-lifetime sidecar tokens.
+ *             Lean never inserts a token, and the one remaining writer (the
+ *             slab-move retag) is skipped too, so the sidecars stay all zero
+ *             and every skipped write would have stored zero over zero.  The
+ *             floor-lifetime totals are measurement-only and already invalid
+ *             under lean; only their rollback-path bookkeeping can differ.
+ *   PREFETCH  the free import prefetches the pointer's ledger home slot
+ *             before its prefilter/slab/observer work (a hint: no state).
+ *   TERMINAL  the import's own terminal checks load the latch relaxed; no
+ *             unlocked reader consumes data published with it (see above),
+ *             so the acquire barrier orders nothing they read.
+ *   OWNER     malloc skips the ANM2/texel scratch calls whose owner cannot
+ *             match: both answer NOT_HANDLED with no side effect but
+ *             clearing a decision the import then never reads.
+ *   RESERVE   malloc's ledger insert reuses the reserve made under the same
+ *             lock hold before newlib (nothing in between touches the
+ *             ledger), instead of re-deciding it.
+ *   SLABINL   the free import answers the room-slab fast reject inline (the
+ *             same predicate the slab route uses first).
+ * ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY keeps the skipped work as a check
+ * (owner calls still run, reserve re-decided, sidecar clusters inspected,
+ * published prefetch geometry and the prefetched home-slot address compared
+ * under the lock) and counts every disagreement: boot banner plus
+ * "guest heap lean2 verify:" lines. */
+#define VITA_HEAP_LEAN2 0
+#define VITA_HEAP_LEAN2_VERIFY 0
+#define VITA_HEAP_LEAN2_SIDECARS 0
+#define VITA_HEAP_LEAN2_PREFETCH 0
+#define VITA_HEAP_LEAN2_TERMINAL 0
+#define VITA_HEAP_LEAN2_OWNER_ANM2 0
+#define VITA_HEAP_LEAN2_OWNER_TEXEL 0
+#define VITA_HEAP_LEAN2_RESERVE 0
+#define VITA_HEAP_LEAN2_SLABINL 0
+#if defined(ISAAC_VITA_HEAP_IMPORT_LEAN2) && ISAAC_VITA_HEAP_IMPORT_LEAN2
+#undef VITA_HEAP_LEAN2
+#define VITA_HEAP_LEAN2 1
+#if defined(ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY) && \
+    ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY
+#undef VITA_HEAP_LEAN2_VERIFY
+#define VITA_HEAP_LEAN2_VERIFY 1
+#endif
+#if defined(ISAAC_VITA_HEAP_RANGE_LEASE) && \
+    defined(ISAAC_VITA_HEAP_LEDGER_BACKSHIFT) && \
+    defined(ISAAC_VITA_HEAP_LEAN_IMPORT)
+#undef VITA_HEAP_LEAN2_SIDECARS
+#define VITA_HEAP_LEAN2_SIDECARS 1
+#endif
+#undef VITA_HEAP_LEAN2_PREFETCH
+#define VITA_HEAP_LEAN2_PREFETCH 1
+#if defined(ISAAC_VITA_HEAP_OVERFLOW_MSPACE) && \
+    defined(ISAAC_VITA_HEAP_TERMINAL_FASTPATH) && \
+    ISAAC_VITA_HEAP_TERMINAL_FASTPATH
+#undef VITA_HEAP_LEAN2_TERMINAL
+#define VITA_HEAP_LEAN2_TERMINAL 1
+#endif
+#ifdef ISAAC_VITA_ANM2_SCRATCH
+#undef VITA_HEAP_LEAN2_OWNER_ANM2
+#define VITA_HEAP_LEAN2_OWNER_ANM2 1
+#endif
+#ifdef ISAAC_VITA_TEXEL_SCRATCH
+#undef VITA_HEAP_LEAN2_OWNER_TEXEL
+#define VITA_HEAP_LEAN2_OWNER_TEXEL 1
+#endif
+#ifdef ISAAC_VITA_HEAP_RANGE_LEASE
+#undef VITA_HEAP_LEAN2_RESERVE
+#define VITA_HEAP_LEAN2_RESERVE 1
+#endif
+#if defined(ISAAC_VITA_ROOM_ENTRY_SLAB) && \
+    defined(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH) && \
+    ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH
+#undef VITA_HEAP_LEAN2_SLABINL
+#define VITA_HEAP_LEAN2_SLABINL 1
+#endif
+#elif defined(ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY) && \
+    ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY
+#error ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY requires ISAAC_VITA_HEAP_IMPORT_LEAN2
+#endif
+
+/* The import's terminal observer.  OFF: the exported acquire accessor. */
+#if VITA_HEAP_LEAN2_TERMINAL
+#define VITA_HEAP_IMPORT_TERMINAL() \
+    atomic_load_explicit(&s_heap_terminal, memory_order_relaxed)
+#else
+#define VITA_HEAP_IMPORT_TERMINAL() isaac_vita_guest_heap_terminal()
+#endif
+
+#if VITA_HEAP_LEAN2
+void isaac_vita_log(const char *format, ...);
+#define VITA_HEAP_LEAN2_STR_(x) #x
+#define VITA_HEAP_LEAN2_STR(x) VITA_HEAP_LEAN2_STR_(x)
+#if VITA_HEAP_LEAN2_VERIFY
+#define VITA_HEAP_LEAN2_MODE "VERIFY"
+#else
+#define VITA_HEAP_LEAN2_MODE "ON"
+#endif
+#define VITA_HEAP_LEAN2_BANNER \
+    "guest heap lean2 import: mode=" VITA_HEAP_LEAN2_MODE \
+    " sidecars=" VITA_HEAP_LEAN2_STR(VITA_HEAP_LEAN2_SIDECARS) \
+    " prefetch=" VITA_HEAP_LEAN2_STR(VITA_HEAP_LEAN2_PREFETCH) \
+    " terminal=" VITA_HEAP_LEAN2_STR(VITA_HEAP_LEAN2_TERMINAL) \
+    " owner=" VITA_HEAP_LEAN2_STR(VITA_HEAP_LEAN2_OWNER_ANM2) \
+    "/" VITA_HEAP_LEAN2_STR(VITA_HEAP_LEAN2_OWNER_TEXEL) \
+    " reserve=" VITA_HEAP_LEAN2_STR(VITA_HEAP_LEAN2_RESERVE) \
+    " slabinl=" VITA_HEAP_LEAN2_STR(VITA_HEAP_LEAN2_SLABINL)
+#if VITA_HEAP_LEAN2_OWNER_ANM2
+/* Exactly the owners of host_vita_anm2_scratch.c s_sites[] (built from the
+ * same header constants); any other owner gets NOT_HANDLED there. */
+_Static_assert(ISAAC_VITA_ANM2_SEGMENT_COUNT == 6U,
+               "lean2 ANM2 owner switch must list every scratch site");
+static inline int vita_heap_lean2_anm2_owner(uint32_t owner_return_rva)
+{
+    switch (owner_return_rva) {
+    case ISAAC_VITA_ANM2_OWNER_RETURN_0:
+    case ISAAC_VITA_ANM2_OWNER_RETURN_1:
+    case ISAAC_VITA_ANM2_OWNER_RETURN_2:
+    case ISAAC_VITA_ANM2_OWNER_RETURN_3:
+    case ISAAC_VITA_ANM2_OWNER_RETURN_4:
+    case ISAAC_VITA_ANM2_OWNER_RETURN_5:
+        return 1;
+    default:
+        return 0;
+    }
+}
+#endif
+#if VITA_HEAP_LEAN2_OWNER_TEXEL
+/* isaac_vita_texel_scratch_malloc handles only its transient loaders, all
+ * nonzero; the owner walk below answers 0 for every non-loader stack. */
+_Static_assert(KAGE_VITA_TEXEL_PNG_LOADER_RETURN != 0U &&
+                   KAGE_VITA_TEXEL_LOADER_RETURN_4 != 0U &&
+                   KAGE_VITA_TEXEL_LOADER_RETURN_5 != 0U,
+               "lean2 texel owner gate needs nonzero transient owners");
+#endif
+#if VITA_HEAP_LEAN2_VERIFY
+enum {
+    VITA_HEAP_LEAN2_V_SIDECARS,  /* removal clusters with a nonzero token */
+    VITA_HEAP_LEAN2_V_OWNER,     /* skipped owner call that would act */
+    VITA_HEAP_LEAN2_V_RESERVE,   /* insert that would still need reserve */
+    VITA_HEAP_LEAN2_V_PREFETCH,  /* geometry or home-slot address != ledger */
+    VITA_HEAP_LEAN2_V_KINDS
+};
+static const char *const s_lean2_verify_name[VITA_HEAP_LEAN2_V_KINDS] = {
+    "sidecars", "owner", "reserve", "prefetch"
+};
+static atomic_uint s_lean2_verify_checks[VITA_HEAP_LEAN2_V_KINDS];
+static atomic_uint s_lean2_verify_bad[VITA_HEAP_LEAN2_V_KINDS];
+static atomic_uint s_lean2_verify_first_detail[VITA_HEAP_LEAN2_V_KINDS];
+static atomic_uint s_lean2_verify_pending; /* kinds with an unlogged first */
+static atomic_uint s_lean2_verify_calls;
+
+/* Called with or without s_ledger_lock held, so it never formats: the first
+ * mismatch of each kind is parked and logged by the next import entry. */
+static void vita_heap_lean2_verify_note(
+    unsigned kind, int ok, uint32_t detail)
+{
+    atomic_fetch_add_explicit(&s_lean2_verify_checks[kind], 1U,
+                              memory_order_relaxed);
+    if (!ok &&
+        atomic_fetch_add_explicit(&s_lean2_verify_bad[kind], 1U,
+                                  memory_order_relaxed) == 0U) {
+        atomic_store_explicit(&s_lean2_verify_first_detail[kind], detail,
+                              memory_order_relaxed);
+        atomic_fetch_or_explicit(&s_lean2_verify_pending, 1U << kind,
+                                 memory_order_release);
+    }
+}
+
+/* Import entry (never under the heap lock): log parked first mismatches,
+ * then one summary line per 65536 import calls (free + malloc). */
+static void vita_heap_lean2_verify_tick(void)
+{
+    unsigned calls;
+
+    if (atomic_load_explicit(&s_lean2_verify_pending,
+                             memory_order_relaxed)) {
+        unsigned pending = atomic_exchange_explicit(
+            &s_lean2_verify_pending, 0U, memory_order_acquire);
+        unsigned kind;
+
+        for (kind = 0U; kind < VITA_HEAP_LEAN2_V_KINDS; ++kind) {
+            if (pending & (1U << kind))
+                isaac_vita_log("guest heap lean2 verify: FIRST MISMATCH "
+                               "kind=%s detail=0x%08x",
+                               s_lean2_verify_name[kind],
+                               atomic_load_explicit(
+                                   &s_lean2_verify_first_detail[kind],
+                                   memory_order_relaxed));
+        }
+    }
+    calls = atomic_fetch_add_explicit(
+        &s_lean2_verify_calls, 1U, memory_order_relaxed) + 1U;
+    if ((calls & 0xffffU) != 0U)
+        return;
+    isaac_vita_log("guest heap lean2 verify: calls=%u bad/checks "
+                   "sidecars=%u/%u owner=%u/%u reserve=%u/%u prefetch=%u/%u",
+                   calls,
+                   atomic_load(&s_lean2_verify_bad[0]),
+                   atomic_load(&s_lean2_verify_checks[0]),
+                   atomic_load(&s_lean2_verify_bad[1]),
+                   atomic_load(&s_lean2_verify_checks[1]),
+                   atomic_load(&s_lean2_verify_bad[2]),
+                   atomic_load(&s_lean2_verify_checks[2]),
+                   atomic_load(&s_lean2_verify_bad[3]),
+                   atomic_load(&s_lean2_verify_checks[3]));
+}
+#endif
+#endif
+
 #ifdef ISAAC_VITA_ROOM_ENTRY_SLAB
 static void vita_heap_room_slab_unlock(
     isaac_vita_room_entry_slab_result slab_result,
@@ -1125,9 +1340,11 @@ static int vita_heap_floor_lifetime_retag_locked(
         return 1;
     vita_heap_floor_lifetime_account_remove_locked(
         requested_size, old_token);
+#if !VITA_HEAP_LEAN2_SIDECARS
     vita_heap_floor_lifetime_slot_store(
         slot, replacement_token,
         s_ledger_floor_phase, s_ledger_floor_current);
+#endif
     vita_heap_floor_lifetime_account_add_locked(
         requested_size, replacement_token);
     return 1;
@@ -1346,6 +1563,73 @@ static size_t vita_heap_hash(uintptr_t key)
     return (size_t)key;
 }
 
+#if VITA_HEAP_LEAN2_PREFETCH
+/* Ledger geometry for the free import's unlocked prefetch, republished under
+ * s_ledger_lock wherever s_ledger/s_ledger_capacity change.  Relaxed: a stale
+ * or torn pair only prefetches a wrong line (a hint never faults). */
+static atomic_uintptr_t s_lean2_ledger_base;
+static atomic_uintptr_t s_lean2_ledger_mask;
+
+static void vita_heap_lean2_publish_ledger_locked(void)
+{
+    atomic_store_explicit(&s_lean2_ledger_base,
+                          (uintptr_t)(void *)s_ledger, memory_order_relaxed);
+    atomic_store_explicit(&s_lean2_ledger_mask,
+                          s_ledger_capacity ?
+                              (uintptr_t)(s_ledger_capacity - 1U) : 0U,
+                          memory_order_relaxed);
+}
+
+/* The address the free import prefetches for a ledger key: its home slot
+ * under the published geometry.  One definition for the prefetch and for its
+ * VERIFY check, which compares it with the slot find_slot probes first. */
+static inline uintptr_t vita_heap_lean2_prefetch_addr(
+    uintptr_t base, uintptr_t mask, uintptr_t key)
+{
+    return base + (vita_heap_hash(key) & mask) * sizeof *s_ledger;
+}
+
+static inline void vita_heap_lean2_prefetch_home(uint32_t pointer)
+{
+    uintptr_t base = atomic_load_explicit(&s_lean2_ledger_base,
+                                          memory_order_relaxed);
+    uintptr_t mask = atomic_load_explicit(&s_lean2_ledger_mask,
+                                          memory_order_relaxed);
+
+    if (base && (uintptr_t)pointer > VITA_HEAP_LEDGER_TOMBSTONE)
+        __builtin_prefetch((const void *)vita_heap_lean2_prefetch_addr(
+            base, mask, (uintptr_t)pointer));
+}
+
+#if VITA_HEAP_LEAN2_VERIFY
+/* Under s_ledger_lock, on every free: the published geometry is the ledger's
+ * (detail = capacity), and for a key the prefetch would act on, the address
+ * it computes is &s_ledger[hash(key) & (capacity - 1)], the home slot of
+ * vita_heap_find_slot (detail = the key).  A prefetch is a hint, so a wrong
+ * address (dropped hash, wrong element size) is invisible to every exactness
+ * gate; this check is what sees it. */
+static void vita_heap_lean2_verify_prefetch_locked(uintptr_t key)
+{
+    uintptr_t mask = s_ledger_capacity ?
+        (uintptr_t)(s_ledger_capacity - 1U) : 0U;
+    uintptr_t base = atomic_load_explicit(&s_lean2_ledger_base,
+                                          memory_order_relaxed);
+    uintptr_t published_mask = atomic_load_explicit(&s_lean2_ledger_mask,
+                                                    memory_order_relaxed);
+    int ok = base == (uintptr_t)(void *)s_ledger && published_mask == mask;
+    uint32_t detail = (uint32_t)s_ledger_capacity;
+
+    if (ok && base && s_ledger_capacity &&
+        key > VITA_HEAP_LEDGER_TOMBSTONE) {
+        ok = vita_heap_lean2_prefetch_addr(base, published_mask, key) ==
+             (uintptr_t)(void *)&s_ledger[vita_heap_hash(key) & mask];
+        detail = (uint32_t)key;
+    }
+    vita_heap_lean2_verify_note(VITA_HEAP_LEAN2_V_PREFETCH, ok, detail);
+}
+#endif
+#endif
+
 /* Return the one replacement capacity reserve would need now.  Zero means no
  * replacement; a false return means growth is required but not representable.
  * Diagnostics and tests use this same decision so their byte report cannot
@@ -1515,6 +1799,9 @@ static int vita_heap_ledger_rehash(size_t new_capacity)
     s_ledger = replacement;
     s_ledger_capacity = new_capacity;
     s_ledger_tombstones = 0U;
+#if VITA_HEAP_LEAN2_PREFETCH
+    vita_heap_lean2_publish_ledger_locked();
+#endif
     return 1;
 }
 
@@ -1743,6 +2030,9 @@ static int vita_heap_ledger_rehash(size_t new_capacity)
     s_ledger_floor_current = replacement_current;
     s_ledger_capacity = new_capacity;
     s_ledger_tombstones = 0U;
+#if VITA_HEAP_LEAN2_PREFETCH
+    vita_heap_lean2_publish_ledger_locked();
+#endif
     return 1;
 }
 
@@ -1783,6 +2073,49 @@ static int vita_heap_ledger_insert(uintptr_t key, size_t requested_size)
         slot, requested_size, floor_token);
     return 1;
 }
+
+#if VITA_HEAP_LEAN2_RESERVE
+/* vita_heap_ledger_insert for the malloc router only: the router reserved
+ * one live entry under this same lock hold, before newlib, and nothing in
+ * between changes s_ledger_count/s_ledger_capacity, so reserve(1) here is
+ * the true no-op it would be (target 0, success).  Body otherwise copied
+ * from vita_heap_ledger_insert above. */
+static int vita_heap_ledger_insert_reserved(
+    uintptr_t key, size_t requested_size)
+{
+    int found;
+    size_t slot;
+    uint32_t floor_token;
+
+#if VITA_HEAP_LEAN2_VERIFY
+    {
+        size_t target = 0U;
+        int ok = vita_heap_ledger_reserve_target(1U, &target);
+
+        vita_heap_lean2_verify_note(VITA_HEAP_LEAN2_V_RESERVE,
+                                    ok && !target, (uint32_t)key);
+        if (!ok || target)
+            return vita_heap_ledger_insert(key, requested_size);
+    }
+#endif
+    if (key <= VITA_HEAP_LEDGER_TOMBSTONE)
+        return 0;
+    slot = vita_heap_find_slot(s_ledger, s_ledger_capacity, key, &found);
+    if (found || slot == SIZE_MAX)
+        return 0;
+#ifndef ISAAC_VITA_HEAP_LEDGER_BACKSHIFT
+    if (s_ledger[slot].base == VITA_HEAP_LEDGER_TOMBSTONE)
+        --s_ledger_tombstones;
+#endif
+    s_ledger[slot].base = key;
+    s_ledger[slot].requested_size = requested_size;
+    ++s_ledger_count;
+    floor_token = vita_heap_floor_lifetime_new_token_locked();
+    vita_heap_floor_lifetime_slot_insert_locked(
+        slot, requested_size, floor_token);
+    return 1;
+}
+#endif
 
 static int vita_heap_ledger_lookup(uintptr_t key, size_t *slot_out)
 {
@@ -1857,6 +2190,37 @@ static void vita_heap_ledger_remove_commit_table(
 }
 #endif
 
+#if VITA_HEAP_LEAN2_SIDECARS
+/* Raw sidecar bytes of one slot are zero (phase byte and current bit). */
+static int vita_heap_lean2_sidecar_zero(size_t slot)
+{
+    return (!s_ledger_floor_phase || s_ledger_floor_phase[slot] == 0U) &&
+        !vita_heap_floor_current_bit_get(s_ledger_floor_current, slot);
+}
+
+#if VITA_HEAP_LEAN2_VERIFY
+/* Every slot the backshift commit can read or write (the removed slot and
+ * the run of occupied slots after it) carries no token. */
+static void vita_heap_lean2_verify_sidecars_locked(size_t slot)
+{
+    size_t mask = s_ledger_capacity - 1U;
+    size_t scan = slot;
+    size_t probes;
+    uint32_t nonzero = 0U;
+
+    for (probes = 0U; probes < s_ledger_capacity; ++probes) {
+        if (probes && s_ledger[scan].base == 0U)
+            break;
+        if (!vita_heap_lean2_sidecar_zero(scan))
+            ++nonzero;
+        scan = (scan + 1U) & mask;
+    }
+    vita_heap_lean2_verify_note(VITA_HEAP_LEAN2_V_SIDECARS, !nonzero,
+                                (uint32_t)slot);
+}
+#endif
+#endif
+
 static int vita_heap_ledger_remove_preflight(size_t slot)
 {
 #ifdef ISAAC_VITA_HEAP_LEDGER_BACKSHIFT
@@ -1875,9 +2239,19 @@ static void vita_heap_ledger_remove_slot_commit(size_t slot)
     (void)vita_heap_floor_lifetime_slot_remove_locked(
         slot, requested_size);
 #ifdef ISAAC_VITA_HEAP_LEDGER_BACKSHIFT
+#if VITA_HEAP_LEAN2_SIDECARS && !VITA_HEAP_LEAN2_VERIFY
+    /* Lean2: the sidecars are all zero, so moving tokens with the shifted
+     * entries and clearing the final hole stores zero over zero. */
+    vita_heap_ledger_remove_commit_table(
+        s_ledger, s_ledger_capacity, slot, NULL, NULL);
+#else
+#if VITA_HEAP_LEAN2_SIDECARS
+    vita_heap_lean2_verify_sidecars_locked(slot);
+#endif
     vita_heap_ledger_remove_commit_table(
         s_ledger, s_ledger_capacity, slot,
         s_ledger_floor_phase, s_ledger_floor_current);
+#endif
 #else
     s_ledger[slot].base = VITA_HEAP_LEDGER_TOMBSTONE;
     s_ledger[slot].requested_size = 0U;
@@ -2473,6 +2847,11 @@ int isaac_vita_guest_heap_init(uint32_t stack_floor, uint32_t stack_ceiling)
     isaac_vita_log("guest heap lean import: floor-lifetime sidecars off "
                    "(init=%d)", result);
 #endif
+#if VITA_HEAP_LEAN2
+    /* Receipt: the resolved lean2 cuts this heap object was built with,
+     * spelled into the format literal so the ELF's strings carry it too. */
+    isaac_vita_log(VITA_HEAP_LEAN2_BANNER " (init=%d)", result);
+#endif
     return result;
 }
 
@@ -2600,7 +2979,9 @@ static void *vita_heap_guest_malloc_with_reason(
 #endif
     VITA_HEAP_STAGE_END(M_NATIVE)
     VITA_HEAP_STAGE_BEGIN(M_LEDGER)
-#ifdef ISAAC_VITA_HEAP_RANGE_LEASE
+#if VITA_HEAP_LEAN2_RESERVE
+    if (result && !vita_heap_ledger_insert_reserved((uintptr_t)result, size)) {
+#elif defined(ISAAC_VITA_HEAP_RANGE_LEASE)
     if (result && !vita_heap_ledger_insert((uintptr_t)result, size)) {
 #else
     if (result && !vita_heap_ledger_insert((uintptr_t)result)) {
@@ -3214,6 +3595,9 @@ static int vita_heap_guest_free_impl(
     VITA_HEAP_STAGE_END(F_LOCK)
     VITA_HEAP_STAGE_BEGIN(F_LEDGER)
     VITA_HEAP_COST_BEGIN()
+#if VITA_HEAP_LEAN2_PREFETCH && VITA_HEAP_LEAN2_VERIFY
+    vita_heap_lean2_verify_prefetch_locked((uintptr_t)pointer);
+#endif
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     if (s_heap_init_state != VITA_HEAP_INIT_READY) {
         vita_heap_router_result_set(
@@ -3567,6 +3951,42 @@ int isaac_vita_guest_heap_terminal(void)
     return 0;
 #endif
 }
+
+#if VITA_HEAP_LEAN2
+int isaac_vita_guest_heap_lean2_stats_get(
+    isaac_vita_guest_heap_lean2_stats *stats_out)
+{
+    if (!stats_out)
+        return 0;
+    memset(stats_out, 0, sizeof *stats_out);
+    stats_out->verify = VITA_HEAP_LEAN2_VERIFY;
+#if VITA_HEAP_LEAN2_SIDECARS
+    {
+        size_t slot;
+
+        vita_heap_lock();
+        for (slot = 0U; slot < s_ledger_capacity; ++slot) {
+            if (!vita_heap_lean2_sidecar_zero(slot))
+                ++stats_out->sidecar_nonzero;
+        }
+        vita_heap_unlock();
+    }
+#endif
+#if VITA_HEAP_LEAN2_VERIFY
+    {
+        unsigned kind;
+
+        for (kind = 0U; kind < VITA_HEAP_LEAN2_V_KINDS; ++kind) {
+            stats_out->checks[kind] = atomic_load_explicit(
+                &s_lean2_verify_checks[kind], memory_order_relaxed);
+            stats_out->bad[kind] = atomic_load_explicit(
+                &s_lean2_verify_bad[kind], memory_order_relaxed);
+        }
+    }
+#endif
+    return 1;
+}
+#endif
 
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
 int isaac_vita_guest_heap_telemetry_snapshot_get(
@@ -5280,6 +5700,9 @@ int isaac_vita_guest_heap_test_storage_reset(void)
     s_ledger_count = 0U;
     s_ledger_tombstones = 0U;
     s_ledger_fixed_capacity = 0;
+#if VITA_HEAP_LEAN2_PREFETCH
+    vita_heap_lean2_publish_ledger_locked();
+#endif
 #if defined(ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH) && ISAAC_VITA_HEAP_SLAB_REJECT_FASTPATH
     /* Test-only reset is quiescent, as required by the existing reset API. */
     atomic_store_explicit(&s_slab_forbidden_native_end, 0U, memory_order_release);
@@ -5541,6 +5964,10 @@ int isaac_vita_guest_heap_test_init(
     result = vita_heap_initialize_locked(
         link_end, heap_bytes, stack_floor, stack_ceiling);
     vita_heap_unlock();
+#if VITA_HEAP_LEAN2
+    /* Same receipt as isaac_vita_guest_heap_init, so host oracles check it. */
+    isaac_vita_log(VITA_HEAP_LEAN2_BANNER " (init=%d)", result);
+#endif
     return result;
 }
 
@@ -5636,11 +6063,17 @@ static void vita_heap_free(CPU *__restrict c)
 {
     KAGE_VITA_DEEP_SCOPE(KVD_HEAP_FREE);
     uint32_t pointer = vita_heap_arg(c, 0U);
+#if VITA_HEAP_LEAN2_PREFETCH
+    vita_heap_lean2_prefetch_home(pointer);
+#endif
+#if VITA_HEAP_LEAN2_VERIFY
+    vita_heap_lean2_verify_tick();
+#endif
     VITA_HEAP_COUNT(FREE)
     VITA_HEAP_COUNT_IF(FREE_NULL, !pointer)
     VITA_HEAP_STAGE_BEGIN(F_PRE)
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
-    if (isaac_vita_guest_heap_terminal()) {
+    if (VITA_HEAP_IMPORT_TERMINAL()) {
         guest_fault(c, pointer, "guest heap overflow domain is corrupted");
         return;
     }
@@ -5714,6 +6147,21 @@ static void vita_heap_free(CPU *__restrict c)
 #endif
     VITA_HEAP_STAGE_END(F_PRE)
 #ifdef ISAAC_VITA_ROOM_ENTRY_SLAB
+#if VITA_HEAP_LEAN2_SLABINL
+    /* The slab route's own first test: a native-range (or NULL) pointer is
+     * NOT_OWNED with no state touched, so neither its return-address read
+     * nor its decision memset is needed; the terminal check stays. */
+    if (vita_heap_definitely_not_slab((const void *)(uintptr_t)pointer)) {
+        VITA_HEAP_STAGE_BEGIN(F_SLAB)
+        VITA_HEAP_COUNT(FREE_SLAB_FAST)
+        VITA_HEAP_STAGE_END(F_SLAB)
+        if (VITA_HEAP_IMPORT_TERMINAL()) {
+            guest_fault(c, pointer, "room-entry slab is corrupted");
+            return;
+        }
+    }
+    else
+#endif
     {
         isaac_vita_room_entry_slab_decision room;
         isaac_vita_room_entry_slab_result slab_result;
@@ -5724,7 +6172,7 @@ static void vita_heap_free(CPU *__restrict c)
             (void *)(uintptr_t)pointer, free_return_rva, &room);
         VITA_HEAP_STAGE_END(F_SLAB)
         if (slab_result == ISAAC_VITA_ROOM_ENTRY_SLAB_TERMINAL ||
-            isaac_vita_guest_heap_terminal()) {
+            VITA_HEAP_IMPORT_TERMINAL()) {
             guest_fault(c, pointer, "room-entry slab is corrupted");
             return;
         }
@@ -5746,7 +6194,7 @@ static void vita_heap_free(CPU *__restrict c)
             (void *)(uintptr_t)pointer, &router_result);
 
         if (router_result == VITA_HEAP_ROUTER_TERMINAL ||
-            isaac_vita_guest_heap_terminal()) {
+            VITA_HEAP_IMPORT_TERMINAL()) {
             guest_fault(c, pointer, "guest heap overflow domain is corrupted");
             return;
         }
@@ -5819,8 +6267,11 @@ static void vita_heap_malloc(CPU *__restrict c)
     defined(ISAAC_VITA_HEAP_OVERFLOW_MSPACE)
     size_t request = (size_t)vita_heap_arg(c, 0U);
 #endif
+#if VITA_HEAP_LEAN2_VERIFY
+    vita_heap_lean2_verify_tick();
+#endif
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
-    if (isaac_vita_guest_heap_terminal()) {
+    if (VITA_HEAP_IMPORT_TERMINAL()) {
         guest_fault(c, (uint32_t)request,
                     "guest heap overflow domain is corrupted");
         return;
@@ -5832,13 +6283,31 @@ static void vita_heap_malloc(CPU *__restrict c)
     uint32_t owner_return_rva;
 #endif
 #ifdef ISAAC_VITA_ANM2_SCRATCH
+#if VITA_HEAP_LEAN2_OWNER_ANM2 && !VITA_HEAP_LEAN2_VERIFY
+    /* The block's own first read, done once here (same single stack access
+     * as OFF); a non-owner gets NOT_HANDLED there with no side effect. */
+    const uint32_t lean2_anm2_owner = vita_heap_arg(c, 2U);
+
+    if (vita_heap_lean2_anm2_owner(lean2_anm2_owner))
+#endif
     {
         isaac_vita_anm2_scratch_decision scratch;
+#if VITA_HEAP_LEAN2_OWNER_ANM2 && !VITA_HEAP_LEAN2_VERIFY
+        uint32_t owner_return_rva = lean2_anm2_owner;
+#else
         uint32_t owner_return_rva = vita_heap_arg(c, 2U);
+#endif
         int scratch_result = isaac_vita_anm2_scratch_malloc(
             owner_return_rva, request, c->stack_floor, c->stack_ceiling,
             &scratch);
 
+#if VITA_HEAP_LEAN2_OWNER_ANM2 && VITA_HEAP_LEAN2_VERIFY
+        vita_heap_lean2_verify_note(
+            VITA_HEAP_LEAN2_V_OWNER,
+            vita_heap_lean2_anm2_owner(owner_return_rva) ||
+                scratch_result == ISAAC_VITA_ANM2_SCRATCH_NOT_HANDLED,
+            owner_return_rva);
+#endif
         if (scratch_result == ISAAC_VITA_ANM2_SCRATCH_REJECTED) {
             guest_fault(c, scratch.fault_value, scratch.fault);
             return;
@@ -5867,12 +6336,23 @@ static void vita_heap_malloc(CPU *__restrict c)
         c, &owner_chain_depth);
 #endif
 #ifdef ISAAC_VITA_TEXEL_SCRATCH
+#if VITA_HEAP_LEAN2_OWNER_TEXEL && !VITA_HEAP_LEAN2_VERIFY
+    /* Owner 0 (not a texel loader stack) is never transient. */
+    if (owner_return_rva)
+#endif
     {
         isaac_vita_texel_scratch_decision scratch;
         int scratch_result = isaac_vita_texel_scratch_malloc(
             owner_return_rva, request, c->stack_floor, c->stack_ceiling,
             &scratch);
 
+#if VITA_HEAP_LEAN2_OWNER_TEXEL && VITA_HEAP_LEAN2_VERIFY
+        vita_heap_lean2_verify_note(
+            VITA_HEAP_LEAN2_V_OWNER,
+            owner_return_rva != 0U ||
+                scratch_result == ISAAC_VITA_TEXEL_SCRATCH_NOT_HANDLED,
+            owner_return_rva);
+#endif
         if (scratch_result == ISAAC_VITA_TEXEL_SCRATCH_REJECTED) {
             guest_fault(c, scratch.fault_value, scratch.fault);
             return;
@@ -5940,7 +6420,7 @@ static void vita_heap_malloc(CPU *__restrict c)
 #endif
 
     if (router_result == VITA_HEAP_ROUTER_TERMINAL ||
-        isaac_vita_guest_heap_terminal()) {
+        VITA_HEAP_IMPORT_TERMINAL()) {
         guest_fault(c, (uint32_t)request,
                     "guest heap overflow domain is corrupted");
         return;

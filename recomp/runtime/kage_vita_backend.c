@@ -828,6 +828,18 @@ static int kvb_worker_ensure(void)
         ISAAC_GL_RECORD_WORKER_MODE_NAME, (unsigned)self, (unsigned)before,
         (unsigned)after, (unsigned)rc, (unsigned)render, (unsigned)render_mask,
         sceKernelGetThreadStackFreeSize(render));
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    isaac_vita_log("KAGE VITA GL ADMIT WAIT: mode=%s bound=time-test slice_us=2000 backoff=30 record=ph120.aw",
+                   ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2 ? "on" : "observe");
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    /* bytes: the value the scheduler's gate compares with, read back from
+     * that translation unit, not the option text. */
+    isaac_vita_log("KAGE VITA GL ADMIT BEHIND: mode=%s bytes=%u backoff=%u record=ph120.ab",
+                   ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2 ? "on" : "observe",
+                   (unsigned)kage_vita_fullspeed_scheduler_gl_admit_behind_bytes(),
+                   (unsigned)KAGE_VITA_GL_ADMIT_BEHIND_BACKOFF);
+#endif
 #if defined(ISAAC_GL_RECORD_ADMISSION_RECEIPT)
     {
         /* --wrap redirects this TU's reference too: equal iff the wrap is
@@ -916,6 +928,287 @@ int kage_vita_backend_render_admit(void)
     return 0;
 }
 #endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+# if !defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) || !ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+#  error "GL admit wait needs GL render admission"
+# endif
+/* GL admit wait (R60-DRYADMIT-SPEC-20261028.md).  Game thread only, except
+ * s_admit_done_us: the present closure writes it on the render thread before
+ * its record's done_pos is published (release, gl_record_ring.c:249) and the
+ * game thread reads it only after worker_wait saw that done_pos (acquire,
+ * gl_record_ring.c:257). */
+static uint64_t s_admit_done_us;
+static uint32_t s_admit_fit_armed, s_admit_fit_position;
+static uint64_t s_admit_fit_latest_us;
+/* e, a, miss_us, miss_max_us; hd n, hd us (ON: Present holds on a closure
+ * that was admitted after a wait). */
+static uint32_t s_admit_fit[6];
+# if ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+/* Review round 2 finding 1: the scheduler arms s_admit_waited_arm when it
+ * admits a frame after a wait; that frame's Present records its closure's
+ * position; the next Present that finds this closure still running holds the
+ * game thread, and the hold (us, at least 1) waits in s_admit_hold_us for the
+ * scheduler's next loop head (kage_vita_backend_admit_hold_take). */
+static uint32_t s_admit_waited_arm, s_admit_waited_position, s_admit_hold_us;
+# endif
+
+/* The stock admission predicate, without its rs count. */
+int kage_vita_backend_render_behind(void)
+{
+    return isaac_gl_record_worker_behind(s_present_position);
+}
+
+/* The gate declined while behind: ph120.rw rs as kage_vita_backend_render_admit;
+ * latest_us != 0 arms the fit check at the next Present. */
+void kage_vita_backend_render_refused(uint64_t latest_us)
+{
+    isaac_gl_record_worker_note_render_skip();
+    if (latest_us) {
+        s_admit_fit_armed = 1u;
+        s_admit_fit_position = s_present_position;
+        s_admit_fit_latest_us = latest_us;
+    }
+}
+
+# if ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+int kage_vita_backend_render_wait_until(uint64_t deadline_us)
+{
+    return isaac_gl_record_worker_wait_until(s_present_position, deadline_us);
+}
+
+void kage_vita_backend_render_admitted_after_wait(void)
+{
+    s_admit_waited_arm = 1u;
+}
+
+uint32_t kage_vita_backend_admit_hold_take(void)
+{
+    uint32_t hold_us = s_admit_hold_us;
+
+    s_admit_hold_us = 0u;
+    return hold_us;
+}
+
+/* hd(n,us): Present, around the stock worker_wait (which stays one unguarded
+ * line, so OFF is the stock text): is this Present about to wait for a
+ * closure admitted after a wait, and for how long did it. */
+static uint32_t s_admit_hold_armed;
+static uint64_t s_admit_hold_at;
+
+static void kvb_admit_hold_begin(void)
+{
+    s_admit_hold_armed = s_admit_waited_position != 0u &&
+        s_admit_waited_position == s_present_position &&
+        isaac_gl_record_worker_behind(s_present_position);
+    s_admit_hold_at = s_admit_hold_armed ? sceKernelGetProcessTimeWide() : 0u;
+    s_admit_waited_position = 0u;
+}
+
+static void kvb_admit_hold_end(void)
+{
+    uint64_t now, hold, sum;
+
+    if (!s_admit_hold_armed)
+        return;
+    s_admit_hold_armed = 0u;
+    now = sceKernelGetProcessTimeWide();
+    hold = now > s_admit_hold_at ? now - s_admit_hold_at : 0u;
+    s_admit_hold_us = hold == 0u ? 1u :
+        hold > UINT32_MAX ? UINT32_MAX : (uint32_t)hold;
+    if (s_admit_fit[4] != UINT32_MAX)
+        ++s_admit_fit[4];
+    sum = (uint64_t)s_admit_fit[5] + s_admit_hold_us;
+    s_admit_fit[5] = sum > UINT32_MAX ? UINT32_MAX : (uint32_t)sum;
+}
+# endif
+
+void kage_vita_backend_gl_admit_fit_take(uint32_t out[6])
+{
+    if (out)
+        memcpy(out, s_admit_fit, sizeof s_admit_fit);
+    memset(s_admit_fit, 0, sizeof s_admit_fit);
+}
+
+/* Present, after worker_wait(s_present_position): that closure has run, so
+ * s_admit_done_us is its completion stamp. */
+static void kvb_admit_fit_check(void)
+{
+    uint64_t miss, sum;
+    if (!s_admit_fit_armed)
+        return;
+    s_admit_fit_armed = 0u;
+    if (!s_present_position || s_admit_fit_position != s_present_position)
+        return;
+    ++s_admit_fit[0];
+    if (s_admit_done_us <= s_admit_fit_latest_us) {
+        ++s_admit_fit[1];
+        return;
+    }
+    miss = s_admit_done_us - s_admit_fit_latest_us;
+    sum = (uint64_t)s_admit_fit[2] + miss;     /* saturating, as the scheduler's add_u32 */
+    s_admit_fit[2] = sum > UINT32_MAX ? UINT32_MAX : (uint32_t)sum;
+    if (miss > s_admit_fit[3])
+        s_admit_fit[3] = miss > UINT32_MAX ? UINT32_MAX : (uint32_t)miss;
+}
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+# if !defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) || !ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+#  error "GL admit behind needs GL render admission"
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+#  error "GL admit behind and GL admit wait each own the behind arm of the gate: build one"
+# endif
+/* GL admit behind (R60-FABLE-PLAN.md lane B).  Game thread only, except
+ * s_ab_done_us: the present closure writes it on the render thread before
+ * its record's done_pos is published and the game thread reads it only
+ * after worker_wait saw that done_pos (the admit wait's s_admit_done_us
+ * contract, above). */
+static uint64_t s_ab_done_us;
+static uint32_t s_ab_check_armed, s_ab_check_position, s_ab_check_would;
+static uint64_t s_ab_check_present_us, s_ab_check_return_us, s_ab_check_head_us;
+/* pm(c,ok,us,max) 0..3, wp(c,ok,us,max) 4..7, phl 8, hd(n,us) 9..10. */
+static uint32_t s_ab[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS];
+
+static void kvb_ab_add(uint32_t *counter, uint64_t value)
+{
+    uint64_t sum = (uint64_t)*counter + value; /* saturating, as the scheduler's add_u32 */
+
+    *counter = value > UINT32_MAX || sum > UINT32_MAX ? UINT32_MAX : (uint32_t)sum;
+}
+
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+/* The scheduler arms s_ab_admit_arm when it renders a frame while behind.
+ * That frame's own Present waits for the closure it was behind; the Present
+ * after it waits for that frame's closure (s_ab_chain_position).  Either
+ * wait is a hold (us, at least 1) left in s_ab_hold_us for the scheduler's
+ * next loop head. */
+static uint32_t s_ab_admit_arm, s_ab_chain_position, s_ab_hold_us;
+static uint32_t s_ab_hold_armed;
+static uint64_t s_ab_hold_at;
+# endif
+
+int kage_vita_backend_admit_behind_gate(uint32_t *outstanding)
+{
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    /* An arm still set here belongs to an admitted Render that never
+     * reached Present (the gate runs once per loop, before the admission
+     * that sets it): drop it, so a later, unrelated Present is not taken
+     * for that frame's. */
+    s_ab_admit_arm = 0u;
+# endif
+    if (!isaac_gl_record_worker_behind(s_present_position))
+        return 0;
+    *outstanding = isaac_gl_record_worker_outstanding();
+    return 1;
+}
+
+void kage_vita_backend_admit_behind_refused(
+    uint64_t present_us, uint64_t return_us, uint64_t head_due_us,
+    uint32_t would_admit)
+{
+    isaac_gl_record_worker_note_render_skip();
+    /* Two refusals against one closure (a skipped full Render between
+     * them): the later one is the one checked. */
+    s_ab_check_armed = 1u;
+    s_ab_check_position = s_present_position;
+    s_ab_check_present_us = present_us;
+    s_ab_check_return_us = return_us;
+    s_ab_check_head_us = head_due_us;
+    s_ab_check_would = would_admit;
+}
+
+/* Present, after worker_wait(s_present_position): that closure has run, so
+ * s_ab_done_us is its completion stamp.  Had the refused frame rendered, its
+ * Present (predicted at gate + last Render body) would have held until then:
+ * pm counts the refusals checked, those whose closure was done by that
+ * Present (ok), and the hold of the others (us, max); wp the same over the
+ * frames ON would have rendered; phl those of pm whose hold would have
+ * carried the Render return to or past the next loop head's due time, i.e.
+ * the hold + late head that arms the ON back-off. */
+static void kvb_admit_behind_check(void)
+{
+    uint64_t miss;
+
+    if (!s_ab_check_armed)
+        return;
+    s_ab_check_armed = 0u;
+    if (!s_present_position || s_ab_check_position != s_present_position)
+        return;
+    miss = s_ab_done_us > s_ab_check_present_us ?
+        s_ab_done_us - s_ab_check_present_us : 0u;
+    kvb_ab_add(&s_ab[0], 1u);
+    if (s_ab_check_would)
+        kvb_ab_add(&s_ab[4], 1u);
+    if (!miss) {
+        kvb_ab_add(&s_ab[1], 1u);
+        if (s_ab_check_would)
+            kvb_ab_add(&s_ab[5], 1u);
+        return;
+    }
+    kvb_ab_add(&s_ab[2], miss);
+    if (miss > s_ab[3])
+        s_ab[3] = miss > UINT32_MAX ? UINT32_MAX : (uint32_t)miss;
+    if (s_ab_check_would) {
+        kvb_ab_add(&s_ab[6], miss);
+        if (miss > s_ab[7])
+            s_ab[7] = miss > UINT32_MAX ? UINT32_MAX : (uint32_t)miss;
+    }
+    if (s_ab_check_return_us <= UINT64_MAX - miss &&
+            s_ab_check_return_us + miss >= s_ab_check_head_us)
+        kvb_ab_add(&s_ab[8], 1u);
+}
+
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+void kage_vita_backend_admit_behind_admitted(void)
+{
+    s_ab_admit_arm = 1u;
+}
+
+uint32_t kage_vita_backend_admit_behind_hold_take(void)
+{
+    uint32_t hold_us = s_ab_hold_us;
+
+    s_ab_hold_us = 0u;
+    return hold_us;
+}
+
+/* Around the stock worker_wait, which stays one unguarded line. */
+static void kvb_admit_behind_hold_begin(void)
+{
+    s_ab_hold_armed =
+        (s_ab_admit_arm ||
+         (s_ab_chain_position != 0u &&
+          s_ab_chain_position == s_present_position)) &&
+        isaac_gl_record_worker_behind(s_present_position);
+    s_ab_hold_at = s_ab_hold_armed ? sceKernelGetProcessTimeWide() : 0u;
+    s_ab_chain_position = 0u;
+}
+
+static void kvb_admit_behind_hold_end(void)
+{
+    uint64_t now, hold;
+
+    if (!s_ab_hold_armed)
+        return;
+    s_ab_hold_armed = 0u;
+    now = sceKernelGetProcessTimeWide();
+    hold = now > s_ab_hold_at ? now - s_ab_hold_at : 0u;
+    if (!hold)
+        hold = 1u;
+    kvb_ab_add(&s_ab_hold_us, hold);
+    kvb_ab_add(&s_ab[9], 1u);
+    kvb_ab_add(&s_ab[10], hold);
+}
+# endif
+
+void kage_vita_backend_gl_admit_behind_take(
+    uint32_t out[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS])
+{
+    if (out)
+        memcpy(out, s_ab, sizeof s_ab);
+    memset(s_ab, 0, sizeof s_ab);
+}
+#endif
 
 static void kvb_present_closure(void *unused)
 {
@@ -924,6 +1217,9 @@ static void kvb_present_closure(void *unused)
     gl_vita_backend_attrib_sync();
 #if defined(ISAAC_VITA_VITAGL_SHADER_CACHE)
     gl_vita_backend_shader_cache_report();
+#endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    gl_vita_backend_fbo_deferred_attach_present();
 #endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     gl_vita_backend_fbo_present();
@@ -944,6 +1240,16 @@ static void kvb_present_closure(void *unused)
 #endif
 #if defined(ISAAC_VITA_GL_OWNER_CHECK) && ISAAC_VITA_GL_OWNER_CHECK
     isaac_gl_owner_report();
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    /* ph120.aw fit check: the scheduler's clock (isaac_vita_get_process_time,
+     * platform.c), published with this record's done_pos. */
+    s_admit_done_us = sceKernelGetProcessTimeWide();
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    /* ph120.abp closure check: the scheduler's clock, published with this
+     * record's done_pos. */
+    s_ab_done_us = sceKernelGetProcessTimeWide();
 #endif
 }
 #endif
@@ -987,8 +1293,38 @@ int kage_vita_backend_present(void)
 #if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
     KAGE_VITA_GPU_FRAME_PROFILE_PRESENT_ENTER();
 #endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+    kvb_admit_hold_begin();
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    kvb_admit_behind_hold_begin();
+#endif
     isaac_gl_record_worker_wait(s_present_position);
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    kvb_admit_behind_hold_end();
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    kvb_admit_behind_check();
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+    kvb_admit_hold_end();
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    kvb_admit_fit_check();
+#endif
     s_present_position = isaac_gl_record_worker_post(kvb_present_closure, NULL);
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND == 2
+    if (s_ab_admit_arm) {
+        s_ab_admit_arm = 0u;
+        s_ab_chain_position = s_present_position;
+    }
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+    if (s_admit_waited_arm) {
+        s_admit_waited_arm = 0u;
+        s_admit_waited_position = s_present_position;
+    }
+#endif
 #if defined(ISAAC_VITA_GPU_FRAME_PROFILE)
     KAGE_VITA_GPU_FRAME_PROFILE_PRESENT_RETURN();
 #endif
@@ -1019,6 +1355,9 @@ int kage_vita_backend_present(void)
 #if defined(ISAAC_VITA_FIRST_FRAME_PROBE)
     gl_vita_backend_first_frame_before_present(s_present_count);
     gl_vita_backend_first_frame_queue_begin(s_present_count);
+#endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    gl_vita_backend_fbo_deferred_attach_present();
 #endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     gl_vita_backend_fbo_present();

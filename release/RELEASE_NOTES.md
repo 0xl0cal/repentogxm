@@ -6,7 +6,16 @@ come from your own PC copy. What runs on real hardware, how fast, and what is
 broken is recorded in [../STATUS.md](../STATUS.md); the priorities are in
 [../PLAN.md](../PLAN.md).
 
-## Unreleased
+## v0.2.0-alpha (2026-11-13)
+
+v0.1.2 was prepared but never published, so this section covers everything
+since v0.1.1-alpha. In short: fights run at 57-59 FPS instead of about
+28-36 (rooms with a big spawn 49-58, floor transitions about 40 while
+loading), ending cutscenes play, Chinese text works, water and floor tints
+are back, entering a room with a big spawn no longer freezes, and the port
+has a settings page, a reworked Manager UI and trophies. The exact option
+set is [v0.2.0-alpha.cmake](v0.2.0-alpha.cmake). The technical list
+follows, newest work last.
 
 - Manager pages other than HOME showed only the lower part of the screen
   on the device (issue #1 photos: no header, panel from about row 156,

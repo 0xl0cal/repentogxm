@@ -938,6 +938,11 @@ void isaac_vita_hascoll_native_take(IsaacVitaHasCollCounters *out)
  * quiesce (reset). */
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
 # include "gl_record_backend.h"
+# if (defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT) || \
+     (defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND)
+#  include "kage_vita_backend.h"
+#  include "kage_vita_fullspeed_scheduler.h"
+# endif
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
 /* ISAAC_VITA_GL_RECORD_OPCODE_CENSUS: ph120.ro + ph120.rop after rw.  The
  * stand-in census has seven active slots (0 and 78 included: an out-of-range
@@ -948,7 +953,12 @@ void isaac_vita_hascoll_native_take(IsaacVitaHasCollCounters *out)
  * ISAAC_VITA_KAGE_BIND_PACKET: 82 slots with opcode 81, ro + 28 records,
  * the last holding slot 81). */
 #  define ORACLE_CENSUS_RECORDS 4U
-#  if defined(ISAAC_VITA_KAGE_BIND_PACKET)
+#  if defined(ISAAC_VITA_GL_DRAW_PACKET)
+/* RENDER60 lane C: 83 slots with opcode 82, ro + 28 records, the last
+ * holding slots 81 and 82. */
+#   define ORACLE_MAX_CENSUS_PARTS 28u
+#   define ORACLE_MAX_CENSUS_OPS "ops=83 lines=28 "
+#  elif defined(ISAAC_VITA_KAGE_BIND_PACKET)
 #   define ORACLE_MAX_CENSUS_PARTS 28u
 #   define ORACLE_MAX_CENSUS_OPS "ops=82 lines=28 "
 #  elif defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
@@ -974,7 +984,116 @@ const IsaacGlRecordOpcodeCensus *isaac_gl_record_opcode_census(void)
 # else
 #  define ORACLE_CENSUS_RECORDS 0U
 # endif
-# define ORACLE_RENDER_THREAD_RECORDS (2U + ORACLE_CENSUS_RECORDS) /* rt, rw (, ro, rop) */
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+/* ph120.aw after rw (R60-DRYADMIT-SPEC-20261028.md); all-ones: 21 ten-digit
+ * numbers behind the 32-byte build id (review fix pass: + hl, ov, hd). */
+#  define ORACLE_GL_ADMIT_WAIT_RECORDS 1U
+#  define ORACLE_MAX_GL_ADMIT_WAIT_LENGTH 380u
+static uint32_t s_admit_wait_takes, s_admit_wait_discards;
+static uint32_t s_admit_fit_takes, s_admit_fit_discards;
+/* Fields 100*take + 1 + i in record order: n..ov (13 words) from the
+ * scheduler, fit/miss/hd (fields 14..19) from the backend. */
+void kage_vita_fullspeed_scheduler_gl_admit_wait_take(
+    KageVitaFullspeedGlAdmitWaitSnapshot *snapshot)
+{
+    ++s_admit_wait_takes;
+    if (snapshot) {
+        uint32_t words[sizeof *snapshot / sizeof(uint32_t)], i;
+        for (i = 0u; i < sizeof words / sizeof words[0]; ++i)
+            words[i] = 100u * s_admit_wait_takes + 1u + i;
+        memcpy(snapshot, words, sizeof *snapshot);
+    } else {
+        ++s_admit_wait_discards;
+    }
+}
+void kage_vita_backend_gl_admit_fit_take(uint32_t out[6])
+{
+    ++s_admit_fit_takes;
+    if (out) {
+        uint32_t i;
+        for (i = 0u; i < 6u; ++i)
+            out[i] = 100u * s_admit_fit_takes + 14u + i;
+    } else {
+        ++s_admit_fit_discards;
+    }
+}
+# else
+#  define ORACLE_GL_ADMIT_WAIT_RECORDS 0U
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+/* ph120.ab + ph120.abp after rw (R60-FABLE-PLAN.md lane B); all-ones: ab
+ * 17 ten-digit numbers, abp 11, behind the 32-byte build id. */
+#  define ORACLE_GL_ADMIT_BEHIND_RECORDS 2U
+#  define ORACLE_MAX_GL_ADMIT_BEHIND_LENGTH 311u
+#  define ORACLE_MAX_GL_ADMIT_BEHIND_PRESENT_LENGTH 226u
+static uint32_t s_admit_behind_takes, s_admit_behind_discards;
+static uint32_t s_admit_behind_backend_takes, s_admit_behind_backend_discards;
+/* Scheduler words 100*take + 1 + i in declaration order (gates..out_max, 12
+ * words); the outstanding-byte samples are out of order so the record has to
+ * sort them: take 2 stores five (1000*take + 5,1,4,2,3: lower median +3),
+ * take 3 reports 70 gates over the 64 stored (descending 1000*take + 63..0:
+ * lower median of an even count is the 32nd, +31).  Backend words
+ * 100*take + 14 + i (pm 4, wp 4, phl, hd 2). */
+void kage_vita_fullspeed_scheduler_gl_admit_behind_take(
+    KageVitaFullspeedGlAdmitBehindSnapshot *snapshot)
+{
+    ++s_admit_behind_takes;
+    if (snapshot) {
+        static const uint32_t five[5] = { 5u, 1u, 4u, 2u, 3u };
+        uint32_t words[12], i;
+        _Static_assert(offsetof(KageVitaFullspeedGlAdmitBehindSnapshot,
+                                out_count) == sizeof words,
+                       "twelve counters before the samples");
+        memset(snapshot, 0, sizeof *snapshot);
+        for (i = 0u; i < 12u; ++i)
+            words[i] = 100u * s_admit_behind_takes + 1u + i;
+        memcpy(snapshot, words, sizeof words);
+        if (s_admit_behind_takes == 2u) {
+            snapshot->out_count = 5u;
+            for (i = 0u; i < 5u; ++i)
+                snapshot->out[i] = 1000u * s_admit_behind_takes + five[i];
+        } else {
+            snapshot->out_count = KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES + 6u;
+            for (i = 0u; i < KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES; ++i)
+                snapshot->out[i] = 1000u * s_admit_behind_takes +
+                    (KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES - 1u - i);
+        }
+    } else {
+        ++s_admit_behind_discards;
+    }
+}
+void kage_vita_backend_gl_admit_behind_take(
+    uint32_t out[KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS])
+{
+    ++s_admit_behind_backend_takes;
+    if (out) {
+        uint32_t i;
+        for (i = 0u; i < KAGE_VITA_BACKEND_ADMIT_BEHIND_WORDS; ++i)
+            out[i] = 100u * s_admit_behind_backend_takes + 14u + i;
+    } else {
+        ++s_admit_behind_backend_discards;
+    }
+}
+# else
+#  define ORACLE_GL_ADMIT_BEHIND_RECORDS 0U
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+/* ph120.dp after rw (, aw) (, ab, abp), RENDER60 lane C; all-ones: 18
+ * ten-digit numbers and mode=VERIFY behind the 32-byte build id. */
+#  define ORACLE_DRAW_PACKET_RECORDS 1U
+#  define ORACLE_MAX_DRAW_PACKET_LENGTH 328u
+#  if ISAAC_VITA_GL_DRAW_PACKET == 2
+#   define ORACLE_DRAW_PACKET_MODE "ON"
+#  else
+#   define ORACLE_DRAW_PACKET_MODE "VERIFY"
+#  endif
+# else
+#  define ORACLE_DRAW_PACKET_RECORDS 0U
+# endif
+# define ORACLE_RENDER_THREAD_RECORDS \
+    (2U + ORACLE_GL_ADMIT_WAIT_RECORDS + ORACLE_GL_ADMIT_BEHIND_RECORDS + \
+     ORACLE_DRAW_PACKET_RECORDS + \
+     ORACLE_CENSUS_RECORDS) /* rt, rw (, aw) (, ab, abp) (, dp) (, ro, rop) */
 /* All-ones fields: 20 ten-digit numbers behind the 32-byte build id. */
 # define ORACLE_MAX_RENDER_THREAD_LENGTH 356u
 /* ph120.rw all-ones: 14 ten-digit numbers. */
@@ -1011,6 +1130,22 @@ void isaac_gl_record_worker_quiesce(void)
 {
     ++s_render_thread_quiesces;
 }
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+/* Stand-in for the recorder's draw-packet window: read right after the
+ * window's take, words 100*take + 40 + i in index order. */
+static uint32_t s_draw_packet_reads;
+int isaac_gl_record_draw_packet_mode(void)
+{
+    return ISAAC_VITA_GL_DRAW_PACKET;
+}
+void isaac_gl_record_draw_packet_window(uint32_t out[ISAAC_GL_DRAW_PACKET_WORDS])
+{
+    uint32_t i;
+    ++s_draw_packet_reads;
+    for (i = 0u; i < ISAAC_GL_DRAW_PACKET_WORDS; ++i)
+        out[i] = 100u * s_render_thread_takes + 40u + i;
+}
+# endif
 #else
 # define ORACLE_RENDER_THREAD_RECORDS 0U
 #endif
@@ -1950,6 +2085,15 @@ int main(int argc, char **argv)
 #endif
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
     size_t max_render_thread_length, max_render_wake_length;
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    size_t max_gl_admit_wait_length;
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    size_t max_gl_admit_behind_length, max_gl_admit_behind_present_length;
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    size_t max_draw_packet_length;
+# endif
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     size_t max_census_length, max_census_part_length = 0u;
     unsigned census_part;
@@ -2376,6 +2520,40 @@ int main(int argc, char **argv)
                  "ph120.rw bid=phase:oracle win=1 loops=120 wk=219 "
                  "sl(n,t)=220,221 mb(n,s,us)=222,223,224 ap(s,us)=225,226 "
                  "cb=227 mq=228 ck=229 rs=230\n") != NULL);
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    /* ph120.aw right after rw, taken at the same loop-head edge. */
+    CHECK(s_admit_wait_takes == 2u && s_admit_wait_discards == 1u &&
+          s_admit_fit_takes == 2u && s_admit_fit_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.aw bid=phase:oracle win=1 loops=120 n=201 ok=202 to=203 "
+                 "nw=204 bo=205 tt=206 us(sum,max)=207,208 lt(c,us)=209,210 "
+                 "hl(c,us)=211,212 ov=213 fit(e,a)=214,215 miss(us,max)=216,217 "
+                 "hd(n,us)=218,219\n") != NULL);
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    /* ph120.ab + ph120.abp right after rw, taken at the same loop-head
+     * edge; ob 50 is the lower median of five unsorted samples. */
+    CHECK(s_admit_behind_takes == 2u && s_admit_behind_discards == 1u &&
+          s_admit_behind_backend_takes == 2u &&
+          s_admit_behind_backend_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.ab bid=phase:oracle win=1 loops=120 n=201 "
+                 "st(p,f,x)=202,203,204 ov=205 wa=206 ok=207 bo=208 tt=209 "
+                 "ob(50,max)=2003,212 hl(c,us)=210,211 hd(n,us)=223,224\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.abp bid=phase:oracle win=1 loops=120 "
+                 "pm(c,ok,us,max)=214,215,216,217 "
+                 "wp(c,ok,us,max)=218,219,220,221 phl=222\n") != NULL);
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    /* ph120.dp after rw (, aw, ab): the window read right after its take. */
+    CHECK(s_draw_packet_reads == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.dp bid=phase:oracle win=1 loops=120 mode="
+                 ORACLE_DRAW_PACKET_MODE " d=240 f=241 pk=242 p1=243 sub=244 "
+                 "B=245 mx=246 fr(r,c,s,f)=247,248,249,250 v(p,s)=251,252 "
+                 "mm=253 late=254 tot=255\n") != NULL);
+# endif
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     CHECK(strstr(log_line(next_line++),
                  "ph120.ro bid=phase:oracle win=1 loops=120 ops=7 lines=3 "
@@ -3082,6 +3260,37 @@ int main(int argc, char **argv)
                  "ph120.rw bid=phase:oracle win=2 loops=240 wk=319 "
                  "sl(n,t)=320,321 mb(n,s,us)=322,323,324 ap(s,us)=325,326 "
                  "cb=327 mq=328 ck=329 rs=330\n") != NULL);
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    CHECK(s_admit_wait_takes == 3u && s_admit_wait_discards == 1u &&
+          s_admit_fit_takes == 3u && s_admit_fit_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.aw bid=phase:oracle win=2 loops=240 n=301 ok=302 to=303 "
+                 "nw=304 bo=305 tt=306 us(sum,max)=307,308 lt(c,us)=309,310 "
+                 "hl(c,us)=311,312 ov=313 fit(e,a)=314,315 miss(us,max)=316,317 "
+                 "hd(n,us)=318,319\n") != NULL);
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    /* 70 gates, 64 samples stored: the lower median of the stored 64. */
+    CHECK(s_admit_behind_takes == 3u && s_admit_behind_discards == 1u &&
+          s_admit_behind_backend_takes == 3u &&
+          s_admit_behind_backend_discards == 1u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.ab bid=phase:oracle win=2 loops=240 n=301 "
+                 "st(p,f,x)=302,303,304 ov=305 wa=306 ok=307 bo=308 tt=309 "
+                 "ob(50,max)=3031,312 hl(c,us)=310,311 hd(n,us)=323,324\n") != NULL);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.abp bid=phase:oracle win=2 loops=240 "
+                 "pm(c,ok,us,max)=314,315,316,317 "
+                 "wp(c,ok,us,max)=318,319,320,321 phl=322\n") != NULL);
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    CHECK(s_draw_packet_reads == 2u);
+    CHECK(strstr(log_line(next_line++),
+                 "ph120.dp bid=phase:oracle win=2 loops=240 mode="
+                 ORACLE_DRAW_PACKET_MODE " d=340 f=341 pk=342 p1=343 sub=344 "
+                 "B=345 mx=346 fr(r,c,s,f)=347,348,349,350 v(p,s)=351,352 "
+                 "mm=353 late=354 tot=355\n") != NULL);
+# endif
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     CHECK(strstr(log_line(next_line++),
                  "ph120.ro bid=phase:oracle win=2 loops=240 ops=7 lines=3 "
@@ -3644,6 +3853,32 @@ int main(int argc, char **argv)
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
     max_render_thread_length = log_line_length(log_line(next_line++));
     max_render_wake_length = log_line_length(log_line(next_line++));
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    CHECK(strstr(log_line(next_line), "ph120.aw bid=12345678901234567890123456789012 "
+                 "win=4294967295 loops=4294967295 n=4294967295 ") != NULL &&
+          strstr(log_line(next_line), " ov=4294967295 fit(e,a)=") != NULL &&
+          strstr(log_line(next_line), " hd(n,us)=4294967295,4294967295\n") != NULL);
+    max_gl_admit_wait_length = log_line_length(log_line(next_line++));
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    CHECK(strstr(log_line(next_line), "ph120.ab bid=12345678901234567890123456789012 "
+                 "win=4294967295 loops=4294967295 n=4294967295 "
+                 "st(p,f,x)=4294967295,4294967295,4294967295 ") != NULL &&
+          strstr(log_line(next_line), " ob(50,max)=4294967295,4294967295 ") != NULL &&
+          strstr(log_line(next_line), " hd(n,us)=4294967295,4294967295\n") != NULL);
+    max_gl_admit_behind_length = log_line_length(log_line(next_line++));
+    CHECK(strstr(log_line(next_line), "ph120.abp bid=12345678901234567890123456789012 "
+                 "win=4294967295 loops=4294967295 pm(c,ok,us,max)=4294967295,") != NULL &&
+          strstr(log_line(next_line), " phl=4294967295\n") != NULL);
+    max_gl_admit_behind_present_length = log_line_length(log_line(next_line++));
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    CHECK(strstr(log_line(next_line), "ph120.dp bid=12345678901234567890123456789012 "
+                 "win=4294967295 loops=4294967295 mode=VERIFY d=4294967295 ") != NULL &&
+          strstr(log_line(next_line), " fr(r,c,s,f)=4294967295,4294967295,4294967295,4294967295 ") != NULL &&
+          strstr(log_line(next_line), " tot=4294967295\n") != NULL);
+    max_draw_packet_length = log_line_length(log_line(next_line++));
+# endif
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     CHECK(strstr(log_line(next_line), "ph120.ro bid=12345678901234567890123456789012 "
                  "win=4294967295 loops=4294967295 " ORACLE_MAX_CENSUS_OPS) != NULL);
@@ -3654,7 +3889,12 @@ int main(int argc, char **argv)
         CHECK(part != NULL && strncmp(part, "[kage-vita] ph120.rop bid=", 26u) == 0);
         if (length > max_census_part_length) max_census_part_length = length;
     }
-#  if defined(ISAAC_VITA_KAGE_BIND_PACKET)
+#  if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    CHECK(strstr(log_line(next_line - 2u), " part=26 op=78:4294967295,") != NULL &&
+          strstr(log_line(next_line - 2u), ";80:4294967295,") != NULL);
+    CHECK(strstr(log_line(next_line - 1u), " part=27 op=81:4294967295,") != NULL &&
+          strstr(log_line(next_line - 1u), ";82:4294967295,") != NULL);
+#  elif defined(ISAAC_VITA_KAGE_BIND_PACKET)
     CHECK(strstr(log_line(next_line - 2u), " part=26 op=78:4294967295,") != NULL &&
           strstr(log_line(next_line - 2u), ";80:4294967295,") != NULL);
     CHECK(strstr(log_line(next_line - 1u), " part=27 op=81:4294967295,") != NULL &&
@@ -3852,6 +4092,28 @@ int main(int argc, char **argv)
           max_render_thread_length < 384u);
     CHECK(max_render_wake_length == ORACLE_MAX_RENDER_WAKE_LENGTH &&
           max_render_wake_length < 384u);
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    CHECK(max_gl_admit_wait_length == ORACLE_MAX_GL_ADMIT_WAIT_LENGTH &&
+          max_gl_admit_wait_length < 384u);
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    if (max_gl_admit_behind_length != ORACLE_MAX_GL_ADMIT_BEHIND_LENGTH ||
+        max_gl_admit_behind_present_length !=
+            ORACLE_MAX_GL_ADMIT_BEHIND_PRESENT_LENGTH)
+        fprintf(stderr, "ph120.ab max %zu, ph120.abp max %zu\n",
+                max_gl_admit_behind_length, max_gl_admit_behind_present_length);
+    CHECK(max_gl_admit_behind_length == ORACLE_MAX_GL_ADMIT_BEHIND_LENGTH &&
+          max_gl_admit_behind_length < 384u);
+    CHECK(max_gl_admit_behind_present_length ==
+              ORACLE_MAX_GL_ADMIT_BEHIND_PRESENT_LENGTH &&
+          max_gl_admit_behind_present_length < 384u);
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    if (max_draw_packet_length != ORACLE_MAX_DRAW_PACKET_LENGTH)
+        fprintf(stderr, "ph120.dp max %zu\n", max_draw_packet_length);
+    CHECK(max_draw_packet_length == ORACLE_MAX_DRAW_PACKET_LENGTH &&
+          max_draw_packet_length < 384u);
+# endif
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     CHECK(max_census_length == ORACLE_MAX_CENSUS_LENGTH &&
           max_census_length < 384u);
@@ -4063,6 +4325,19 @@ int main(int argc, char **argv)
 #endif
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
     printf("; rt=%zu; rw=%zu", max_render_thread_length, max_render_wake_length);
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+    /* Suffix only under the admit-wait define (frozen PASS strings elsewhere). */
+    printf("; aw=%zu", max_gl_admit_wait_length);
+# endif
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+    /* Suffix only under the admit-behind define. */
+    printf("; ab=%zu; abp=%zu", max_gl_admit_behind_length,
+           max_gl_admit_behind_present_length);
+# endif
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    /* Suffix only under the draw-packet define. */
+    printf("; dp=%zu", max_draw_packet_length);
+# endif
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     /* Suffix only under the census define (frozen PASS strings elsewhere). */
     printf("; ro=%zu; rop=%zu", max_census_length, max_census_part_length);

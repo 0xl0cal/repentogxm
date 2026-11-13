@@ -325,7 +325,7 @@ def cmake_contract() -> None:
         "production APP_NAME changed",
     )
     check(
-        'set(ISAAC_APP_VERSION "01.01")' in text,
+        'set(ISAAC_APP_VERSION "02.00")' in text,
         "production APP_VERSION changed",
     )
     check(

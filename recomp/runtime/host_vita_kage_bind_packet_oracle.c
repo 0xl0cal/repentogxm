@@ -1081,10 +1081,16 @@ static int run_chain(const bind_case *k, guest_fn body, step_result *out)
         r->records = window.records - 1u;
         r->syncs = window.syncs;
 #if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
-        /* REC_KAGE_BIND_PACKET is the last census slot (static assert in
-         * gl_record_backend.c). */
+        /* REC_KAGE_BIND_PACKET's slot: the last one (static assert in
+         * gl_record_backend.c), unless RENDER60 lane C appends
+         * REC_DRAW_PACKET behind it and names this slot (gl_record_backend.h). */
+# if defined(ISAAC_GL_RECORD_KAGE_BIND_PACKET_OPCODE)
+        r->packet_replays = isaac_gl_record_opcode_census()->op[
+            ISAAC_GL_RECORD_KAGE_BIND_PACKET_OPCODE].n;
+# else
         r->packet_replays = isaac_gl_record_opcode_census()->op[
             ISAAC_GL_RECORD_CENSUS_OPS - 1u].n;
+# endif
 #else
         r->packet_replays = 0u;
 #endif

@@ -642,6 +642,10 @@ static uint32_t s_readback_texels[4][8];
 static unsigned s_readback_accessor_calls;
 static unsigned s_readback_accessor_finishes;
 static GLuint s_readback_accessor_binding;
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+/* 1: vglGetTexDataPointer answers NULL, a view the census cannot walk. */
+static int s_readback_no_data;
+# endif
 
 SceGxmTexture *vglGetGxmTexture(GLenum target)
 {
@@ -655,6 +659,10 @@ SceGxmTexture *vglGetGxmTexture(GLenum target)
 void *vglGetTexDataPointer(GLenum target)
 {
     (void)target;
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    if (s_readback_no_data)
+        return NULL;
+# endif
     return s_readback_texels;
 }
 
@@ -703,6 +711,13 @@ static char s_readback_logs[ORACLE_READBACK_LOG_CAPACITY][256];
 #  if defined(ISAAC_VITA_DISPLAY_CENTER_Y)
 #   define ORACLE_DISPLAY_CENTER_Y_FILTERED 1
 #  endif
+#  if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+/* The census mode banner (once per process, at the first install, whichever
+ * test installs first) is kept apart from the readback log slots so the
+ * readback test's slot numbers do not depend on test order. */
+static unsigned s_census_banner_calls;
+static char s_census_banner[256];
+#  endif
 
 void isaac_vita_log(const char *format, ...)
 {
@@ -716,6 +731,18 @@ void isaac_vita_log(const char *format, ...)
         return;
     }
     va_end(arguments);
+#  endif
+#  if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    if (strncmp(format, "KAGE VITA FBO READBACK CENSUS:",
+                strlen("KAGE VITA FBO READBACK CENSUS:")) == 0) {
+        ++s_census_banner_calls;
+        va_start(arguments, format);
+        (void)vsnprintf(s_census_banner, sizeof s_census_banner, format,
+                        arguments);
+        va_end(arguments);
+        s_census_banner[sizeof s_census_banner - 1u] = '\0';
+        return;
+    }
 #  endif
     ++s_readback_log_calls;
     if (slot >= ORACLE_READBACK_LOG_CAPACITY)
@@ -3116,10 +3143,25 @@ static int oracle_test_fbo_readback_sync(CPU *cpu, uint32_t stack_top)
         "[kage-vita] fbo-readback-tex: tex=5 fmt=0c000000 type=60000000 "
         "8x4 stride=32 data="));
     CHECK(strstr(s_readback_logs[1], " last_fb=0 writes=0 age=0") != NULL);
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP) && \
+    ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 2
+    /* ON: no census fields at all, the two texels stay. */
+    CHECK(strcmp(s_readback_logs[2],
+                 "[kage-vita] fbo-readback-mem: census=skip at=78563412 "
+                 "flip=deadbeef") == 0);
+# elif defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    /* OBSERVE: the stock census, then the walk between two stub clock
+     * reads (5 us per call). */
+    CHECK(strcmp(s_readback_logs[2],
+                 "[kage-vita] fbo-readback-mem: census=1 nonzero=3/32 "
+                 "rows=3/4 first=0,0 last_row=3 at=78563412 "
+                 "flip=deadbeef census_us=5") == 0);
+# else
     CHECK(strcmp(s_readback_logs[2],
                  "[kage-vita] fbo-readback-mem: census=1 nonzero=3/32 "
                  "rows=3/4 first=0,0 last_row=3 at=78563412 "
                  "flip=deadbeef") == 0);
+# endif
     CHECK(strcmp(s_readback_logs[3],
                  "[kage-vita] fbo-readback: fb=7 tex=5 at=0,0 1x1 "
                  "sync=1 wait_us=5 rgba=12345678 copy=1") == 0);
@@ -3137,10 +3179,51 @@ static int oracle_test_fbo_readback_sync(CPU *cpu, uint32_t stack_top)
     CHECK(strcmp(s_readback_logs[18],
                  "[kage-vita] fbo-readback: fb=7 tex=5 at=0,0 1x1 "
                  "sync=1 wait_us=5 rgba=12345678 copy=1") == 0);
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP) && \
+    ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 2
+    /* All eight detail lines skipped their census (each had a census-able
+     * 8x4 view); the read-side counts are those of OFF. */
+    CHECK(strcmp(s_readback_logs[24],
+                 "KAGE VITA FBO READBACK: reads=12 display=1 finishes=5 "
+                 "unknown=2 settled=7 skipped=0 copied=8 wait_us=25 "
+                 "max_us=5 census=skip walks=0 census_skips=8 census_us=0 "
+                 "census_max_us=0") == 0);
+    for (unsigned line = 2u; line < 24u; line += 3u)
+        CHECK(strncmp(s_readback_logs[line],
+                      "[kage-vita] fbo-readback-mem: census=skip ",
+                      strlen("[kage-vita] fbo-readback-mem: census=skip ")) == 0);
+# elif defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    /* Eight timed walks of 5 us each; the finish brackets are unchanged. */
+    CHECK(strcmp(s_readback_logs[24],
+                 "KAGE VITA FBO READBACK: reads=12 display=1 finishes=5 "
+                 "unknown=2 settled=7 skipped=0 copied=8 wait_us=25 "
+                 "max_us=5 census=observe walks=8 census_skips=0 "
+                 "census_us=40 census_max_us=5") == 0);
+    for (unsigned line = 2u; line < 24u; line += 3u)
+        CHECK(strstr(s_readback_logs[line], " census_us=5") != NULL);
+# else
     CHECK(strcmp(s_readback_logs[24],
                  "KAGE VITA FBO READBACK: reads=12 display=1 finishes=5 "
                  "unknown=2 settled=7 skipped=0 copied=8 wait_us=25 "
                  "max_us=5") == 0);
+# endif
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    /* One banner per process, whatever the number of installs. */
+    {
+#  if ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 2
+        static const char banner[] =
+            "KAGE VITA FBO READBACK CENSUS: mode=skip detail_lines=8 "
+            "receipt=fbo-readback-mem";
+#  else
+        static const char banner[] =
+            "KAGE VITA FBO READBACK CENSUS: mode=observe detail_lines=8 "
+            "receipt=fbo-readback-mem";
+#  endif
+
+        CHECK(s_census_banner_calls == 1u);
+        CHECK(strcmp(s_census_banner, banner) == 0);
+    }
+# endif
     /* A fresh install starts from zero: its uninstall logs nothing. */
     CHECK(gl_vita_backend_install());
     gl_vita_backend_uninstall();
@@ -3148,6 +3231,51 @@ static int oracle_test_fbo_readback_sync(CPU *cpu, uint32_t stack_top)
     CHECK(gl_vita_backend_install());
     return 0;
 }
+
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+/* A detail line whose view the census cannot walk (no data pointer here; an
+ * edge over GL_VITA_READBACK_CENSUS_MAX_EDGE or a short stride take the same
+ * branch) prints census=0 in both modes, as stock does, and counts neither a
+ * walk nor a skip: census=skip lines and the receipt's census_skips agree. */
+static int oracle_test_fbo_readback_census_unwalkable(
+    CPU *cpu, uint32_t stack_top)
+{
+    gl_vita_backend_uninstall();
+    CHECK(gl_vita_backend_install());
+    s_readback_log_calls = 0u;
+    s_readback_no_data = 1;
+    CHECK(oracle_bind_framebuffer(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 7u));
+    CHECK(oracle_fbo_attach(cpu, stack_top, ORACLE_GL_FRAMEBUFFER, 5u));
+    CHECK(oracle_fbo_read_pixels(cpu, stack_top));
+    s_readback_no_data = 0;
+    gl_vita_backend_uninstall();
+    /* fbo-readback:, -tex, -mem, then the receipt. */
+    CHECK(s_readback_log_calls == 4u);
+    CHECK(oracle_readback_log_starts(0u, "[kage-vita] fbo-readback: fb=7 tex=5 "));
+    CHECK(oracle_readback_log_starts(1u,
+        "[kage-vita] fbo-readback-tex: tex=5 fmt=0c000000 type=60000000 "
+        "8x4 stride=32 data=00000000 "));
+#  if ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 2
+    CHECK(strcmp(s_readback_logs[2],
+                 "[kage-vita] fbo-readback-mem: census=0 at=00000000 "
+                 "flip=00000000") == 0);
+    CHECK(strstr(s_readback_logs[3],
+                 " census=skip walks=0 census_skips=0 census_us=0 "
+                 "census_max_us=0") != NULL);
+#  else
+    CHECK(strcmp(s_readback_logs[2],
+                 "[kage-vita] fbo-readback-mem: census=0 nonzero=0/32 "
+                 "rows=0/4 first=0,0 last_row=0 at=00000000 flip=00000000 "
+                 "census_us=0") == 0);
+    CHECK(strstr(s_readback_logs[3],
+                 " census=observe walks=0 census_skips=0 census_us=0 "
+                 "census_max_us=0") != NULL);
+#  endif
+    CHECK(oracle_readback_log_starts(3u, "KAGE VITA FBO READBACK: reads=1 "));
+    CHECK(gl_vita_backend_install());
+    return 0;
+}
+# endif
 #endif
 
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION) && \
@@ -5728,6 +5856,9 @@ int main(void)
 #endif
 #if defined(ISAAC_VITA_FBO_READBACK_FIX)
     CHECK(oracle_test_fbo_readback_sync(&cpu, stack_top) == 0);
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    CHECK(oracle_test_fbo_readback_census_unwalkable(&cpu, stack_top) == 0);
+# endif
 #endif
 #if defined(ISAAC_VITA_GL_FILL_CENSUS)
     CHECK(oracle_test_fill_census(&cpu, stack_top) == 0);

@@ -48,6 +48,17 @@ void isaac_gl_record_rbo_gen(int32_t count, uint32_t names);
 #else
 # define ISAAC_GL_RECORD_OPCODE_SLOTS 79u
 #endif
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+/* RENDER60 lane C (ISAAC_VITA_GL_DRAW_PACKET, which requires W-pkt and S4,
+ * CMake checks) appends REC_DRAW_PACKET = 82 after REC_KAGE_BIND_PACKET;
+ * gl_record_backend.c static-asserts it. */
+# undef ISAAC_GL_RECORD_OPCODE_SLOTS
+# define ISAAC_GL_RECORD_OPCODE_SLOTS 83u
+/* The bind packet's slot is then no longer the last one: census readers
+ * index it by this (REC_KAGE_BIND_PACKET = REC_WORKER_CALL + 3, also
+ * static-asserted in gl_record_backend.c). */
+# define ISAAC_GL_RECORD_KAGE_BIND_PACKET_OPCODE 81u
+#endif
 
 #if defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
 /* RENDER60 S4: one ring record per Shader::EnableAttribs/DisableAttribs
@@ -139,6 +150,18 @@ typedef struct IsaacGlRecordWorkerWindow {
 } IsaacGlRecordWorkerWindow;
 int isaac_gl_record_worker_behind(uint32_t position);
 void isaac_gl_record_worker_note_render_skip(void);
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+/* Producer, GL admit wait: 1 once the record ending at position has run
+ * (or nothing to wait for), 0 when the record clock reached deadline_us
+ * first (Vita: sceKernelGetProcessTimeWide µs).  Bounded sleeps only. */
+int isaac_gl_record_worker_wait_until(uint32_t position, uint64_t deadline_us);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+/* Producer, GL admit behind (R60-FABLE-PLAN.md lane B): ring bytes appended
+ * and not yet consumed, 0 without a render thread or on it.  Read-only, never
+ * waits; a snapshot the consumer may already have moved past. */
+uint32_t isaac_gl_record_worker_outstanding(void);
+#endif
 #if defined(__vita__)
 /* Every sceKernelFreeMemBlock wrapper calls this before the real free. */
 void isaac_gl_record_memblock_freeing(void);
@@ -217,6 +240,52 @@ void isaac_gl_record_bind_packet_uniform_matrix4fv(uint32_t rva,
     guest_gl_addr value, const uint32_t matrix[16]);
 void isaac_gl_record_bind_packet_flush(void);
 void isaac_gl_record_bind_packet_stats(uint32_t out[5]);
+#endif
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+/* RENDER60 lane C (ISAAC_VITA_GL_DRAW_PACKET = 1 VERIFY, 2 ON; OFF leaves
+ * the macro undefined).  The game thread stages the per-draw state records
+ * (glBlendFuncSeparate, REC_ATTRIBS_ENABLE/_DISABLE, REC_KAGE_BIND_PACKET)
+ * and publishes them with the next draw as ONE ring record
+ * (REC_DRAW_PACKET), or alone in front of any other record, closure, drain
+ * or outstanding-bytes query.  The render thread runs each staged call
+ * through record_dispatch with its own return RVA, in staging order.
+ * VERIFY also publishes every call as its own record (those run), and the
+ * render thread checks that each packet carries exactly the bytes of the
+ * separate records it replayed since the previous packet.
+ *
+ * window: the counts of the window the last isaac_gl_record_worker_take(out)
+ * closed, game thread, after that take; indices below. */
+enum {
+    ISAAC_GL_DRAW_PACKET_DRAWS,      /* glDrawElements records requested */
+    ISAAC_GL_DRAW_PACKET_FUSED,      /* of them carried inside a packet */
+    ISAAC_GL_DRAW_PACKET_PACKETS,    /* REC_DRAW_PACKET records published */
+    ISAAC_GL_DRAW_PACKET_SINGLES,    /* staged runs of exactly one call: ON
+                                      * publishes each as its own record,
+                                      * VERIFY as a one-call packet (so they
+                                      * are in PACKETS too) */
+    ISAAC_GL_DRAW_PACKET_SUBS,       /* calls staged */
+    ISAAC_GL_DRAW_PACKET_BYTES,      /* staged bytes (sub headers included) */
+    ISAAC_GL_DRAW_PACKET_MAX,        /* most bytes staged at one publish */
+    ISAAC_GL_DRAW_PACKET_FLUSH_RECORD,  /* published ahead of another record */
+    ISAAC_GL_DRAW_PACKET_FLUSH_CLOSURE, /* ahead of a closure */
+    ISAAC_GL_DRAW_PACKET_FLUSH_SYNC,    /* drain / outstanding / stop */
+    ISAAC_GL_DRAW_PACKET_FLUSH_FULL,    /* staging buffer full, or a draw whose
+                                         * client copies are too large to fuse */
+    ISAAC_GL_DRAW_PACKET_VERIFIED,   /* VERIFY, render thread: packets compared */
+    ISAAC_GL_DRAW_PACKET_VERIFIED_SUBS, /* records they were compared with */
+    ISAAC_GL_DRAW_PACKET_MISMATCH,   /* packets whose bytes differ */
+    ISAAC_GL_DRAW_PACKET_LATE,       /* another record replayed before the packet */
+    ISAAC_GL_DRAW_PACKET_TOTAL_BAD,  /* mismatch + late since process start */
+    ISAAC_GL_DRAW_PACKET_WORDS
+};
+int isaac_gl_record_draw_packet_mode(void);   /* 1 VERIFY, 2 ON */
+# if (defined(ISAAC_GL_VITA_BACKEND_ORACLE) || defined(ORACLE_ATTRIB_RECORDER)) && \
+     defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+/* Oracles: REC_DRAW_PACKET records that started right behind a ring wrap
+ * marker since process start. */
+uint32_t isaac_gl_record_oracle_draw_packets_after_wrap(void);
+# endif
+void isaac_gl_record_draw_packet_window(uint32_t out[ISAAC_GL_DRAW_PACKET_WORDS]);
 #endif
 
 #if defined(ISAAC_GL_VITA_BACKEND_ORACLE)

@@ -171,6 +171,17 @@ RE_ARGS = re.compile(r"ISAAC VITA LAUNCH ARGS: (.*)$")
 # The scheduler banner names the S5 floor-debt mode: the R1/R8 gates below
 # read the residual of the build's own mode.
 RE_CAD = re.compile(r"KAGE VITA CADENCE30: bid=(\S*) .*?\bfloor-debt=(observe|on) cap=(\d+)us")
+# The GL admit wait mode (ISAAC_VITA_GL_THREAD_ADMIT_WAIT, recomp/vita/README.md) comes from the same
+# bid-checked scheduler banner (kage_vita_fullspeed_scheduler.c, " gl-admit-wait=on backoff=30" /
+# " gl-admit-wait=observe"): the backend receipt below carries no build id, so a stale log tail could
+# name the mode of another build.  The receipt is kept as aw_receipt and reported only when it disagrees.
+RE_CAD_AW = re.compile(r"KAGE VITA CADENCE30: bid=(\S*) .*?\bgl-admit-wait=(observe|on)\b")
+RE_AW_MODE = re.compile(r"KAGE VITA GL ADMIT WAIT: mode=(\w+)")
+# GL admit behind (ISAAC_VITA_GL_THREAD_ADMIT_BEHIND): the mode and the bound from the same bid-checked
+# banner (" gl-admit-behind=on bytes=65536 backoff=30" / " gl-admit-behind=observe bytes=65536
+# backoff=30"); the bid-less backend receipt is kept and reported only when it disagrees.
+RE_CAD_AB = re.compile(r"KAGE VITA CADENCE30: bid=(\S*) .*?\bgl-admit-behind=(observe|on) bytes=(\d+)\b")
+RE_AB_MODE = re.compile(r"KAGE VITA GL ADMIT BEHIND: mode=(\w+) bytes=(\d+)")
 RE_SLOTEV = re.compile(r"ISAAC VITA LAUNCH SAVE SLOT: event=(\w+) slot=(\d+) was=0x([0-9a-f]+) "
                        r"manager=0x([0-9a-f]+) (waited|restored)=(\d+) trigger=(.*)$")
 RE_MODSAVE = re.compile(r"/data/[^/]+/save\d\.dat$")
@@ -200,6 +211,11 @@ RE_LUA_MEM = re.compile(r"Lua mem usage: (\d+) KB and (\d+) bytes")
 # tail holds spaces, path= may hold spaces), xinput transitions, the Lua cost profiler's windows.
 RE_LF_RETRY = re.compile(r"KAGE VITA LUA LOADFILE RETRY: (.*?) path=(.*) why=(.*)$")
 RE_LF_STATS = re.compile(r"KAGE VITA LUA LOADFILE STATS: (.*)$")
+# ISAAC_VITA_IMAGE_PRELOAD (+ _PIN) receipts, host_vita_image_retain.c: the kind is the
+# first token ('armed', 'totals', 'level=<n>', 'image', 'hit', 'miss', 'evicted-unused'; PIN also
+# 'present', 'lost').  Keys are printable, values carry no spaces (names are [A-Za-z0-9_./-]).
+RE_IRP = re.compile(r"KAGE VITA IMAGE PRELOAD( PIN)?: (\S+)(.*)$")
+IRP_PIN_LINES_KEEP = 24  # present / miss / lost lines kept for the report (the module prints <= 64)
 RE_XINPUT = re.compile(r"xinput snapshot seq=(\d+) buttons=([0-9a-fA-F]+)->([0-9a-fA-F]+)\b")
 RE_LUA_COST = re.compile(r"\[isaac-lua\] cost win=(\d+) .*?\blost=(\d+)\b")
 # Sampler list records (kage_vita_guest_sampler.c): ph120.hot/hotc/hoti/hotr/hotu "phase=P
@@ -277,19 +293,83 @@ def _n(v) -> int:
     return int(v) if isinstance(v, str) and v.isdigit() else 0
 
 
+def parse_irp(irp: dict, pin: bool, head: str, rest: str, ts) -> None:
+    """One 'KAGE VITA IMAGE PRELOAD[ PIN]:' line into parse_native's n["irp"]."""
+    if head.startswith("level="):
+        kind, rest = "level", head + rest
+    else:
+        kind = head
+    f = dict(kv(rest), _ts=ts)
+    if pin:
+        if kind == "armed":
+            irp["pin_armed"] = f
+        elif kind == "level":
+            irp["pin_levels"].append(f)
+        elif kind == "totals":
+            irp["pin_totals"].append(f)
+        elif kind in ("present", "miss", "lost"):
+            irp["pin_lines_n"] += 1
+            if len(irp["pin_lines"]) < IRP_PIN_LINES_KEEP:
+                irp["pin_lines"].append(f"{kind}{rest}".strip())
+        return
+    if kind == "armed":
+        irp["armed"] = f
+    elif kind == "level":
+        irp["levels"].append(f)
+    elif kind == "totals":
+        irp["totals"].append(f)
+    elif kind == "image":
+        irp["images"].append(f)
+    elif kind == "hit":
+        irp["hit"] += 1
+    elif kind == "miss":
+        irp["miss"] += 1
+    elif kind == "evicted-unused":
+        irp["evicted_unused"] += 1
+
+
+def irp_summary(irp: dict) -> dict | None:
+    """The preload (+ pin) receipts of a run for the analyze JSON; None when the build has no preload."""
+    if irp["armed"] is None and not irp["levels"] and not irp["totals"]:
+        return None
+
+    def last(rows: list) -> dict | None:
+        # the totals are cumulative since the arm: the last report of the boot is the run's
+        # (periodic every 64 offers, loading-complete, teardown -- whichever came last)
+        return {k: v for k, v in rows[-1].items() if not k.startswith("_")} if rows else None
+
+    def strip(rows: list) -> list:
+        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+
+    return {"armed": last([irp["armed"]] if irp["armed"] else []),
+            "pin_armed": last([irp["pin_armed"]] if irp["pin_armed"] else []),
+            "levels": strip(irp["levels"]), "pin_levels": strip(irp["pin_levels"]),
+            "images": strip(irp["images"]), "totals": last(irp["totals"]),
+            "pin_totals": last(irp["pin_totals"]),
+            "hit_lines": irp["hit"], "miss_lines": irp["miss"],
+            "evicted_unused_lines": irp["evicted_unused"],
+            "pin_lines": list(irp["pin_lines"]), "pin_lines_n": irp["pin_lines_n"]}
+
+
 def parse_native(text: str) -> dict:
     """Boot receipts plus ph120 windows (win -> {record: kv}) and roomlog markers."""
     n = {"build": None, "args": None, "slot_events": [], "last_ts": 0.0, "enodev": [],
          "stops": [], "wins": {}, "rooms": {}, "rl_drop": 0, "bytes": len(text.encode("utf-8", "replace")),
-         "lines": 0, "fd_mode": None, "fd_cap": None, "tops": {}, "fe_stale": 0,
+         "lines": 0, "fd_mode": None, "fd_cap": None, "tops": {}, "fe_stale": 0, "aw_mode": None,
+         "aw_receipt": None, "ab_mode": None, "ab_bytes": None, "ab_receipt": None,
          # bench validity gate
-         "lf_retry": [], "lf_stats": [], "intercepts": [], "cost_lost": []}
+         "lf_retry": [], "lf_stats": [], "intercepts": [], "cost_lost": [],
+         # image preload (+ pin) receipts of the first build's boot(s); see parse_irp
+         "irp": {"armed": None, "pin_armed": None, "levels": [], "pin_levels": [], "totals": [],
+                 "pin_totals": [], "images": [], "hit": 0, "miss": 0, "evicted_unused": 0,
+                 "pin_lines": [], "pin_lines_n": 0}}
     lines = text.splitlines()
     n["lines"] = len(lines)
     for line in lines:
         m = RE_BUILD.search(line)
         if m and n["build"] is None:
             n["build"] = m.group(1)
+    cur_build = None  # the build of the boot the current line belongs to (the receipts carry no bid)
     bid32 = n["build"][:32] if n["build"] else None
     group_seen: dict = {}  # (win, rec, phase) -> (header, item names) of the current instance
     untimed: list = []  # intercepts waiting for the next timestamped line
@@ -346,10 +426,24 @@ def parse_native(text: str) -> dict:
             if "win" in f:
                 n["wins"].setdefault(int(f["win"]), {})[rec] = f
             continue
+        m = RE_CAD_AW.search(line)
+        if m and (bid32 is None or m.group(1) == bid32):
+            n["aw_mode"] = m.group(2)
+        m = RE_CAD_AB.search(line)
+        if m and (bid32 is None or m.group(1) == bid32):
+            n["ab_mode"], n["ab_bytes"] = m.group(2), int(m.group(3))
+        m = RE_AB_MODE.search(line)
+        if m:
+            n["ab_receipt"] = f"{m.group(1)}/{m.group(2)}"
+            continue
         m = RE_CAD.search(line)
         if m:
             if bid32 is None or m.group(1) == bid32:
                 n["fd_mode"], n["fd_cap"] = m.group(2), int(m.group(3))
+            continue
+        m = RE_AW_MODE.search(line)
+        if m:
+            n["aw_receipt"] = m.group(1)
             continue
         m = RE_ARGS.search(line)
         if m and n["args"] is None:
@@ -369,6 +463,14 @@ def parse_native(text: str) -> dict:
         m = RE_LF_STATS.search(line)
         if m:
             n["lf_stats"].append(dict(kv(m.group(1)), _ts=ts))
+            continue
+        m = RE_BUILD.search(line)
+        if m:
+            cur_build = m.group(1)
+        m = RE_IRP.search(line)
+        if m:
+            if cur_build is None or cur_build == n["build"]:
+                parse_irp(n["irp"], bool(m.group(1)), m.group(2), m.group(3), ts)
             continue
         m = RE_XINPUT.search(line)
         if m:
@@ -807,6 +909,130 @@ def phase_row(name: str, w: dict, sel: list, span_us: int, at: dict, wins_all: l
                 mq_share=med([rv(rw, "mq") / max(rv(rw, "mb", 0), 1) for _, rw, _ in RW]),
                 prod_us=med([prod_us(rw, rt) for _, rw, rt in RW]),
                 refused=sum(rv(rw, "rs") for _, rw, _ in RW),
+            )
+        # GL admit wait (ph120.aw, ISAAC_VITA_GL_THREAD_ADMIT_WAIT=OBSERVE|ON):
+        # sums over the phase's windows, and the windows
+        # breaking a per-window identity: I1 rw.rs = n - ok - tt, I2 n >= ok + to + nw + bo + tt,
+        # I3 fit.e <= n - ok - tt - nw + 1 (one arm carried across the window edge).
+        AW = [(x, w[x]["ph120.aw"]) for x, _ in RT if "ph120.aw" in w[x]]
+        if AW:
+            def aw_bad(x, a):
+                n, ok, tt, nw = rv(a, "n"), rv(a, "ok"), rv(a, "tt"), rv(a, "nw")
+                rw = w[x].get("ph120.rw")
+                i1 = rw is None or "rs" not in rw or rv(rw, "rs") == n - ok - tt
+                i2 = n >= ok + rv(a, "to") + nw + rv(a, "bo") + tt
+                i3 = rv(a, "fit", 0) <= n - ok - tt - nw + 1
+                return not (i1 and i2 and i3)
+            row.update(
+                aw_windows=len(AW),
+                **{f"aw_{k}": sum(rv(a, k) for _, a in AW) for k in ("n", "ok", "to", "nw", "bo", "tt")},
+                aw_lt=sum(rv(a, "lt", 0) for _, a in AW),
+                fit_e=sum(rv(a, "fit", 0) for _, a in AW), fit_a=sum(rv(a, "fit", 1) for _, a in AW),
+                aw_ms=sum(rv(a, "us", 0) for _, a in AW) / 1e3,
+                aw_max=max(rv(a, "us", 1) for _, a in AW) / 1e3,
+                aw_lt_ms=sum(rv(a, "lt", 1) for _, a in AW) / 1e3,
+                miss_ms=sum(rv(a, "miss", 0) for _, a in AW) / 1e3,
+                # hl(c,us) = loop heads late after a Present held on an ok's closure,
+                # ov = worst wake past a timed-out wait's deadline (us), hd(n,us) = those holds
+                aw_hl=sum(rv(a, "hl", 0) for _, a in AW),
+                aw_hl_ms=sum(rv(a, "hl", 1) for _, a in AW) / 1e3,
+                aw_ov=max(rv(a, "ov", 0) for _, a in AW) / 1e3,
+                aw_hd=sum(rv(a, "hd", 0) for _, a in AW),
+                aw_hd_ms=sum(rv(a, "hd", 1) for _, a in AW) / 1e3,
+                aw_bad=sum(1 for x, a in AW if aw_bad(x, a)),
+                aw_missing=sum(1 for x, _ in RT if "ph120.rw" in w[x] and "ph120.aw" not in w[x]),
+            )
+        # GL admit behind (ph120.ab + ph120.abp, ISAAC_VITA_GL_THREAD_ADMIT_BEHIND=OBSERVE|ON):
+        # sums over the phase's windows, and the windows breaking a
+        # per-window identity: J1 n = st p + f + x, J2 rw.rs = n - ok, J3 ov + wa <= n and
+        # ok <= wa, J4 (with abp) pm ok <= pm c <= n - ok + 1 (one refusal carried across the
+        # window edge), wp c <= pm c, wp ok <= wp c, phl <= pm c.
+        AB = [(x, w[x]["ph120.ab"], f) for x, f in RT if "ph120.ab" in w[x]]
+        if AB:
+            def ab_bad(x, a):
+                n, ok = rv(a, "n"), rv(a, "ok")
+                rw, p = w[x].get("ph120.rw"), w[x].get("ph120.abp")
+                j1 = n == rv(a, "st", 0) + rv(a, "st", 1) + rv(a, "st", 2)
+                j2 = rw is None or "rs" not in rw or rv(rw, "rs") == n - ok
+                j3 = rv(a, "ov") + rv(a, "wa") <= n and ok <= rv(a, "wa")
+                j4 = p is None or (rv(p, "pm", 1) <= rv(p, "pm", 0) <= n - ok + 1
+                                   and rv(p, "wp", 0) <= rv(p, "pm", 0)
+                                   and rv(p, "wp", 1) <= rv(p, "wp", 0)
+                                   and rv(p, "phl") <= rv(p, "pm", 0))
+                return not (j1 and j2 and j3 and j4)
+            ABP = [w[x]["ph120.abp"] for x, _, _ in AB if "ph120.abp" in w[x]]
+            ab_n = sum(rv(a, "n") for _, a, _ in AB)
+            pm_c, wp_c = sum(rv(p, "pm", 0) for p in ABP), sum(rv(p, "wp", 0) for p in ABP)
+            row.update(
+                ab_windows=len(AB), ab_n=ab_n,
+                ab_stp=sum(rv(a, "st", 0) for _, a, _ in AB),
+                ab_stf=sum(rv(a, "st", 1) for _, a, _ in AB),
+                ab_stx=sum(rv(a, "st", 2) for _, a, _ in AB),
+                **{f"ab_{k}": sum(rv(a, k) for _, a, _ in AB) for k in ("ov", "wa", "ok", "bo", "tt")},
+                # the share of behind gates the stock time test would pass (p + x), and the share
+                # ON renders outside a back-off (wa): the device rule's two numerators
+                ab_pass=(sum(rv(a, "st", 0) + rv(a, "st", 2) for _, a, _ in AB) / ab_n) if ab_n else None,
+                ab_wa_share=(sum(rv(a, "wa") for _, a, _ in AB) / ab_n) if ab_n else None,
+                ab_ob50=med([rv(a, "ob", 0) for _, a, _ in AB if rv(a, "n")]),
+                ab_obmax=max(rv(a, "ob", 1) for _, a, _ in AB),
+                ab_hl=sum(rv(a, "hl", 0) for _, a, _ in AB),
+                ab_hl_ms=sum(rv(a, "hl", 1) for _, a, _ in AB) / 1e3,
+                ab_hd=sum(rv(a, "hd", 0) for _, a, _ in AB),
+                ab_hd_ms=sum(rv(a, "hd", 1) for _, a, _ in AB) / 1e3,
+                # the render thread's own sync blocks over the same windows (ph120.rt s(n,w,us))
+                ab_s_w=sum(rv(f, "s", 1) for _, _, f in AB),
+                ab_s_ms=sum(rv(f, "s", 2) for _, _, f in AB) / 1e3,
+                pm_c=pm_c, pm_ok=sum(rv(p, "pm", 1) for p in ABP),
+                pm_ms=sum(rv(p, "pm", 2) for p in ABP) / 1e3,
+                pm_max=max([rv(p, "pm", 3) for p in ABP], default=0) / 1e3,
+                wp_c=wp_c, wp_ok=sum(rv(p, "wp", 1) for p in ABP),
+                wp_ms=sum(rv(p, "wp", 2) for p in ABP) / 1e3,
+                wp_max=max([rv(p, "wp", 3) for p in ABP], default=0) / 1e3,
+                ab_phl=sum(rv(p, "phl") for p in ABP),
+                ab_bad=sum(1 for x, a, _ in AB if ab_bad(x, a)),
+                ab_missing=sum(1 for x, _ in RT if "ph120.rw" in w[x]
+                               and ("ph120.ab" not in w[x] or "ph120.abp" not in w[x])),
+            )
+        # GL draw packet (ph120.dp, ISAAC_VITA_GL_DRAW_PACKET=VERIFY|ON, recomp/vita/README.md):
+        # sums over the phase's windows.  dp_path_pd = ring records
+        # for the draws and their staged state calls, per draw: (pk + p1 + d - f) / d (ON: the
+        # lever's "records per draw" gate, <= 2; VERIFY also publishes every call as its own
+        # record, so there it is not the lever's number); dp_rec_pd = every ring record per draw
+        # (ph120.rt r / d over the same windows); dp_sub_pd = calls staged per draw; dp_bad =
+        # windows with mm or late > 0 (VERIFY: a packet differed from the separate records, or a
+        # record overtook staged calls); dp_tot = the largest tot (mm + late since boot).
+        # VERIFY coverage: dp_cov = windows with |v(p) - pk| > 1.
+        # The producer copies its counts (record_dp_take_produce) before the take's own
+        # closure flush, which the render thread verifies before it copies its half
+        # (record_dp_take_replay), so that one packet is in this window's v(p) and the next
+        # window's pk: at most 1 apart per window.  dp_vsx = windows with mm = late = 0 where
+        # v(s) != sub + f: every staged call (sub) and every fused draw (f) is one compared
+        # record, and the take moves no staged call across windows (the same flush), so the
+        # two are equal per window; a WARN, not a FAIL, because mm already proves the bytes.
+        DP = [(x, w[x]["ph120.dp"], f) for x, f in RT if "ph120.dp" in w[x]]
+        DPV = [p for _, p, _ in DP if p.get("mode") == "VERIFY"]
+        if DP:
+            dp = {k: sum(rv(p, k) for _, p, _ in DP)
+                  for k in ("d", "f", "pk", "p1", "sub", "B", "mm", "late")}
+            dd = dp["d"]
+            row.update(
+                dp_windows=len(DP),
+                dp_mode=",".join(sorted({p.get("mode", "?") for _, p, _ in DP})),
+                **{f"dp_{k}": v for k, v in dp.items()},
+                dp_mx=max(rv(p, "mx") for _, p, _ in DP),
+                **{f"dp_fr_{k}": sum(rv(p, "fr", i) for _, p, _ in DP) for i, k in enumerate("rcsf")},
+                dp_vp=sum(rv(p, "v", 0) for _, p, _ in DP),
+                dp_vs=sum(rv(p, "v", 1) for _, p, _ in DP),
+                dp_tot=max(rv(p, "tot") for _, p, _ in DP),
+                dp_path_pd=(dp["pk"] + dp["p1"] + dd - dp["f"]) / dd if dd else None,
+                dp_rec_pd=sum(rv(f, "r") for _, _, f in DP) / dd if dd else None,
+                dp_sub_pd=dp["sub"] / dd if dd else None,
+                dp_bad=sum(1 for _, p, _ in DP if rv(p, "mm") or rv(p, "late")),
+                dp_verify_windows=len(DPV),
+                dp_cov=sum(1 for p in DPV if abs(rv(p, "v", 0) - rv(p, "pk")) > 1),
+                dp_vsx=sum(1 for p in DPV if not rv(p, "mm") and not rv(p, "late")
+                           and rv(p, "v", 1) != rv(p, "sub") + rv(p, "f")),
+                dp_missing=sum(1 for x, _ in RT if "ph120.rw" in w[x] and "ph120.dp" not in w[x]),
             )
     census = census_phase(w, sel, opcode_names())
     if census is not None:
@@ -1861,6 +2087,72 @@ def diagnose(native_text: str, game_text: str, nonce: str | None = None,
                 # R1.6b: ph120.w emit over every phase window of the run
                 emits += [ints(nat["wins"][x]["ph120.w"].get("emit"))[0] for x in sel
                           if nat["wins"][x].get("ph120.w", {}).get("emit")]
+            # GL admit behind: the bid-checked banner says the knob
+            # is OBSERVE or ON, so every phase window with a ph120.rt and a ph120.rw owes a
+            # ph120.ab and a ph120.abp.  A run without them measured nothing and would read as
+            # "no behind gates" (the device rule's ab_pass / ab_phl would be empty, not bad), so
+            # it is not a BENCH OK.  A broken identity (ab_bad) is a warning: the columns say where.
+            if nat["ab_mode"]:
+                w = nat["wins"]
+                owed = {name: [x for x in sel if "ph120.rt" in w[x] and "ph120.rw" in w[x]]
+                        for name, sel, _ in pw}
+                lost = {name: sum(1 for x in xs if "ph120.ab" not in w[x] or "ph120.abp" not in w[x])
+                        for name, xs in owed.items()}
+                if not any(owed.values()):
+                    add("FAIL", "AB_RECORD_MISSING", f"gl-admit-behind {nat['ab_mode']} in the banner "
+                        "and no phase window has a ph120.rw: nothing was measured")
+                elif any(lost.values()):
+                    add("FAIL", "AB_RECORD_MISSING", f"gl-admit-behind {nat['ab_mode']} in the banner, "
+                        "but windows with ph120.rw have no ph120.ab or no ph120.abp: " + ", ".join(
+                            f"{name.split()[0]} {n} of {len(owed[name])}" for name, n in lost.items() if n))
+                broken = [(r["phase"].split()[0], r["ab_bad"]) for r in rows if r.get("ab_bad")]
+                if broken:
+                    add("WARN", "AB_IDENTITY", "ph120.ab / ph120.abp windows breaking a per-window "
+                        "identity (ab_bad): " + ", ".join(f"{p} {n}" for p, n in broken))
+            # GL draw packet: a build that prints ph120.dp in one phase window
+            # owes it in every window with a ph120.rw; VERIFY is the draw packet's correctness gate, so a
+            # differing packet (mm) or an overtaking record (late) is not a BENCH OK.
+            if any(r.get("dp_windows") for r in rows):
+                lost = [(r["phase"].split()[0], r["dp_missing"]) for r in rows if r.get("dp_missing")]
+                if lost:
+                    add("FAIL", "DP_RECORD_MISSING", "ph120.dp in the run, but windows with ph120.rw "
+                        "have none: " + ", ".join(f"{p} {n}" for p, n in lost))
+                bad = [(r["phase"].split()[0], r["dp_bad"], r["dp_mm"], r["dp_late"])
+                       for r in rows if r.get("dp_bad")]
+                # tot (mm + late since boot, never reset) over EVERY ph120.dp of the run, so a
+                # mismatch between phase windows (a floor transition, the menu, after the last
+                # phase) is not a BENCH OK either
+                run_tot = max((ints(f["ph120.dp"].get("tot"))[:1] or [0])[0]
+                              for f in nat["wins"].values() if "ph120.dp" in f)
+                if bad or run_tot:
+                    add("FAIL", "DP_VERIFY", "draw packet VERIFY: " + "; ".join(
+                        (["windows with mm or late > 0: " + ", ".join(
+                            f"{p} {n} (mm {m}, late {lt})" for p, n, m, lt in bad)] if bad else []) +
+                        ([f"tot (mm + late since boot) = {run_tot} at the run's last ph120.dp"]
+                         if run_tot else [])))
+                # a VERIFY build that compared nothing proves nothing
+                empty = [r["phase"].split()[0] for r in rows if r.get("dp_verify_windows")
+                         and r.get("dp_d", 0) > 0 and not r.get("dp_vp")]
+                if empty:
+                    add("FAIL", "DP_VERIFY_EMPTY", "draw packet VERIFY phases with draws and no packet "
+                        "compared (v(p) = 0): " + ", ".join(empty))
+                cov = [(r["phase"].split()[0], r["dp_cov"], r["dp_verify_windows"])
+                       for r in rows if r.get("dp_cov")]
+                if cov:
+                    add("FAIL", "DP_VERIFY_COVERAGE", "draw packet VERIFY windows where the packets "
+                        "compared (v(p)) and published (pk) differ by more than the take's one: " +
+                        ", ".join(f"{p} {n} of {nw}" for p, n, nw in cov))
+                vsx = [(r["phase"].split()[0], r["dp_vsx"], r["dp_verify_windows"])
+                       for r in rows if r.get("dp_vsx")]
+                if vsx:
+                    add("WARN", "DP_VERIFY_SUBS", "draw packet VERIFY windows (mm = late = 0) where the "
+                        "records compared (v(s)) are not sub + f: " +
+                        ", ".join(f"{p} {n} of {nw}" for p, n, nw in vsx))
+                fat = [(r["phase"].split()[0], r["dp_path_pd"]) for r in rows
+                       if "ON" in r.get("dp_mode", "").split(",") and (r.get("dp_path_pd") or 0) > 2]
+                if fat:
+                    add("WARN", "DP_RECORDS_PER_DRAW", "draw packet ON with more than 2 ring records "
+                        "per draw on the draw path: " + ", ".join(f"{p} {v:.2f}" for p, v in fat))
         except ValueError as exc:
             phase_err = str(exc)
             add("FAIL", "ROOM_ALIGN", phase_err)
@@ -1951,7 +2243,9 @@ def diagnose(native_text: str, game_text: str, nonce: str | None = None,
         if not name.startswith("NONCE"):
             marks_fields[name] = fields
     return {"verdict": verdict, "ok": not fails, "diagnostics": d, "phases": rows,
-            "fd_steady": steady, "fd_mode": nat["fd_mode"], "fd_cap": nat["fd_cap"],
+            "fd_steady": steady, "fd_mode": nat["fd_mode"], "fd_cap": nat["fd_cap"], "aw_mode": nat["aw_mode"],
+            "aw_receipt": nat["aw_receipt"],
+            "ab_mode": nat["ab_mode"], "ab_bytes": nat["ab_bytes"], "ab_receipt": nat["ab_receipt"],
             "fd_gates": floor_debt_gates(rows, steady, nat["fd_mode"], nat["fd_cap"]),
             "marks_fields": marks_fields, "emit50": med(emits) / 1e3 if emits else None,
             "emit_n": len(emits),
@@ -1967,7 +2261,8 @@ def diagnose(native_text: str, game_text: str, nonce: str | None = None,
             "eid_version": eid_version,
             "eid_heap": list(game["eid_heap"]) if game["eid_heap"] is not None else None,
             "lua_errors": [[code, f"log.txt:{no}: {text}"] for no, code, text in lua_errors],
-            "loadfile": loadfile, "intercepts": [x["line"] for x in nat["intercepts"]]}
+            "loadfile": loadfile, "intercepts": [x["line"] for x in nat["intercepts"]],
+            "image_preload": irp_summary(nat["irp"])}
 
 
 # The verdict names the failure that explains the others first.
@@ -2007,6 +2302,28 @@ FDGF_COLS = [("gfpos50", "{:7.1f}"), ("gfposw", "{:6.0f}"), ("gfmax50", "{:7.3f}
 RT_COLS = [("rt_busy_pct", "{:5.1f}"), ("fr50", "{:6.2f}"), ("fr95", "{:6.2f}"), ("frmax", "{:7.1f}"),
            ("sw_pf", "{:6.2f}"), ("held", "{:5.0f}"), ("sblk_pf", "{:6.2f}"), ("rec_pf", "{:6.0f}"),
            ("wk_pf", "{:5.2f}"), ("mq_share", "{:5.2f}"), ("prod_us", "{:6.2f}"), ("refused", "{:5.0f}")]
+# GL admit wait (ph120.aw, ISAAC_VITA_GL_THREAD_ADMIT_WAIT)
+AW_COLS = [("aw_n", "{:5.0f}"), ("aw_ok", "{:5.0f}"), ("aw_to", "{:5.0f}"), ("aw_nw", "{:5.0f}"),
+           ("aw_bo", "{:5.0f}"), ("aw_tt", "{:5.0f}"), ("aw_ms", "{:7.1f}"), ("aw_max", "{:6.2f}"),
+           ("aw_lt", "{:5.0f}"), ("aw_lt_ms", "{:8.2f}"), ("aw_hl", "{:5.0f}"), ("aw_hl_ms", "{:8.2f}"),
+           ("aw_ov", "{:5.2f}"), ("aw_hd", "{:5.0f}"), ("aw_hd_ms", "{:8.2f}"), ("fit_e", "{:5.0f}"),
+           ("fit_a", "{:5.0f}"), ("miss_ms", "{:7.1f}"), ("aw_bad", "{:6.0f}"), ("aw_missing", "{:10.0f}")]
+# GL admit behind (ph120.ab + ph120.abp, ISAAC_VITA_GL_THREAD_ADMIT_BEHIND)
+AB_COLS = [("ab_n", "{:5.0f}"), ("ab_stp", "{:6.0f}"), ("ab_stf", "{:6.0f}"), ("ab_stx", "{:6.0f}"),
+           ("ab_pass", "{:7.3f}"), ("ab_ov", "{:5.0f}"), ("ab_wa", "{:5.0f}"), ("ab_wa_share", "{:11.3f}"),
+           ("ab_ok", "{:5.0f}"), ("ab_bo", "{:5.0f}"), ("ab_tt", "{:5.0f}"), ("ab_ob50", "{:7.0f}"),
+           ("ab_obmax", "{:8.0f}"), ("ab_hl", "{:5.0f}"), ("ab_hl_ms", "{:8.2f}"), ("ab_hd", "{:5.0f}"),
+           ("ab_hd_ms", "{:8.2f}"), ("ab_s_w", "{:6.0f}"), ("ab_s_ms", "{:8.1f}")]
+ABP_COLS = [("pm_c", "{:5.0f}"), ("pm_ok", "{:5.0f}"), ("pm_ms", "{:7.1f}"), ("pm_max", "{:6.2f}"),
+            ("wp_c", "{:5.0f}"), ("wp_ok", "{:5.0f}"), ("wp_ms", "{:7.1f}"), ("wp_max", "{:6.2f}"),
+            ("ab_phl", "{:6.0f}"), ("ab_bad", "{:6.0f}"), ("ab_missing", "{:10.0f}")]
+# GL draw packet (ph120.dp, ISAAC_VITA_GL_DRAW_PACKET)
+DP_COLS = [("dp_d", "{:7.0f}"), ("dp_f", "{:7.0f}"), ("dp_pk", "{:7.0f}"), ("dp_p1", "{:6.0f}"),
+           ("dp_sub", "{:7.0f}"), ("dp_sub_pd", "{:9.2f}"), ("dp_path_pd", "{:10.3f}"),
+           ("dp_rec_pd", "{:9.2f}"), ("dp_mx", "{:5.0f}"), ("dp_fr_r", "{:7.0f}"), ("dp_fr_c", "{:7.0f}"),
+           ("dp_fr_s", "{:7.0f}"), ("dp_fr_f", "{:7.0f}"), ("dp_vp", "{:7.0f}"), ("dp_vs", "{:7.0f}"),
+           ("dp_mm", "{:5.0f}"), ("dp_late", "{:7.0f}"), ("dp_tot", "{:6.0f}"), ("dp_bad", "{:6.0f}"),
+           ("dp_cov", "{:6.0f}"), ("dp_vsx", "{:6.0f}"), ("dp_missing", "{:10.0f}")]
 MEAN_COLS = [("pps_mean", "{:8.2f}"), ("rps_mean", "{:8.2f}"), ("ups_mean", "{:8.3f}")]
 TL_COLS = [("tgt_pr", "{:6.1f}"), ("tl_n_pr", "{:7.1f}"), ("tl_h_pr", "{:7.1f}"), ("tl_hit_pct", "{:10.1f}"),
            ("tl_clk_pr", "{:9.1f}"), ("tl_x", "{:6.0f}"), ("tl_t", "{:6.0f}"), ("tl_d", "{:4.0f}"),
@@ -2021,6 +2338,51 @@ def table(rows: list, cols: list) -> list[str]:
     return out
 
 
+IRP_LEVEL_KEYS = ("loaded", "retained", "dropped", "present", "fail", "skipped", "bytes", "us", "hr_kb",
+                  "need_kb", "fault")
+IRP_PIN_LEVEL_KEYS = ("pins", "pinned_bytes", "share", "released", "pinned", "own", "exact", "alias", "held")
+IRP_TOTAL_KEYS = ("levels", "loaded", "retained", "dropped", "present", "fail", "hit", "miss",
+                  "evicted_unused", "skip", "breach", "bytes", "us", "why")
+IRP_PIN_TOTAL_KEYS = ("mode", "pinned", "refused", "used", "floor", "yield", "stale", "dropped", "skip", "cskip",
+                      "own", "exact", "alias", "held", "on_free", "lost", "twins", "pins", "pinned_bytes", "why")
+
+
+def irp_report(irp: dict | None) -> list[str]:
+    """The image preload (+ pin) block of the report; nothing when the build has no preload."""
+    if not irp:
+        return []
+
+    def pick(f: dict | None, keys: tuple) -> str:
+        return " ".join(f"{k}={f[k]}" for k in keys if f and k in f) if f else "-"
+
+    armed = irp.get("armed") or {}
+    pin_armed = irp.get("pin_armed")
+    out = ["", f"image preload (KAGE VITA IMAGE PRELOAD; list={armed.get('list', '?')} "
+               f"reserve_mb={armed.get('reserve_mb', '?')} max_kb={armed.get('max_kb', '?')}; pin "
+               f"{pin_armed.get('mode', '?') if pin_armed else 'not built'}; skipped = gates s,l,t,v,h,k; "
+               f"hr_kb before..after against need_kb):"]
+    pins = {p.get("level"): p for p in irp.get("pin_levels", [])}
+    for lv in irp.get("levels", []):
+        line = f"  level {lv.get('level', '?'):>3}: {pick(lv, IRP_LEVEL_KEYS)}"
+        if lv.get("level") in pins:
+            line += f" | pin {pick(pins[lv.get('level')], IRP_PIN_LEVEL_KEYS)}"
+        out.append(line)
+    for im in irp.get("images", []):
+        out.append(f"  decode: name={im.get('name', '?')} result={im.get('result', '?')} "
+                   f"bytes={im.get('bytes', '?')} dim={im.get('dim', '?')} flags={im.get('flags', '?')} "
+                   f"us={im.get('us', '?')} hr_kb={im.get('hr_kb', '?')} key={im.get('key', '?')}")
+    out.append(f"  totals: {pick(irp.get('totals'), IRP_TOTAL_KEYS)} "
+               f"(hit lines {irp.get('hit_lines', 0)}, miss lines {irp.get('miss_lines', 0)}, "
+               f"evicted-unused lines {irp.get('evicted_unused_lines', 0)})")
+    if pin_armed is not None or irp.get("pin_totals"):
+        out.append(f"  pin totals: {pick(irp.get('pin_totals'), IRP_PIN_TOTAL_KEYS)}")
+        lines = irp.get("pin_lines", [])
+        if lines:
+            out.append(f"  pin present/miss/lost lines ({len(lines)} of {irp.get('pin_lines_n', len(lines))}):")
+            out += [f"    {x}" for x in lines]
+    return out
+
+
 def report(res: dict) -> str:
     out = [res["verdict"], ""]
     for level, code, msg in res["diagnostics"]:
@@ -2028,7 +2390,15 @@ def report(res: dict) -> str:
     out.append("")
     out.append(f"build {res['build']}; native log {res['native_bytes']} B to {res['native_last_s']:.1f} s; "
                f"{res['windows']} ph120 windows; room markers native {res['room_markers']} / game "
-               f"{res['game_rooms']}; game starts {res['game_starts']}; markers {res['markers']}")
+               f"{res['game_rooms']}; game starts {res['game_starts']}; markers {res['markers']}"
+               + (f"; gl-admit-wait {res['aw_mode']}" if res.get("aw_mode") else "")
+               + (f"; GL ADMIT WAIT receipt mode={res['aw_receipt']} disagrees with the banner"
+                  if res.get("aw_receipt") and res.get("aw_receipt") != res.get("aw_mode") else "")
+               + (f"; gl-admit-behind {res['ab_mode']} bytes={res['ab_bytes']}" if res.get("ab_mode") else "")
+               + (f"; GL ADMIT BEHIND receipt mode/bytes={res['ab_receipt']} disagrees with the banner"
+                  if res.get("ab_receipt")
+                  and res.get("ab_receipt") != f"{res.get('ab_mode')}/{res.get('ab_bytes')}" else ""))
+    out += irp_report(res.get("image_preload"))
     rows = res["phases"]
     if rows:
         out.append("")
@@ -2075,6 +2445,70 @@ def report(res: dict) -> str:
                        "held = presents that waited for the previous one, wk_pf = producer wakes per "
                        "present, prod_us = producer us per record, refused = interpolated frames declined):")
             out += table(rows, RT_COLS)
+        if any(r.get("aw_n") is not None for r in rows):
+            out.append("")
+            out.append("GL admit wait per phase (ph120.aw, gl-admit-wait "
+                       f"{res.get('aw_mode') or 'unknown'}; n = interpolated gates that found the render "
+                       "thread behind; ok = waited, then rendered; to = waited to latest, closure still "
+                       "running, refused; nw = no window (no live floor, or the stock time test already "
+                       "fails), refused; bo = refused inside a back-off; tt = closure done, then refused by "
+                       "the tick-due re-check, the stock time test or a clock anomaly; aw_ms/aw_max = waited "
+                       "ms (sum, worst); aw_lt/aw_lt_ms = Game::Update starts past the floor on the full tick "
+                       "right after an ok whose loop head did not sleep; aw_hl/aw_hl_ms = loop heads that did "
+                       "not sleep after a Present held on an ok's closure, ms past their due time (lt and hl "
+                       "each arm a 30-phase back-off); aw_ov = worst wake past a timed-out wait's deadline, "
+                       "ms; aw_hd/aw_hd_ms = Present holds on an ok's closure; fit_e/fit_a = refusals with a "
+                       "window checked at the next Present / of them finished by latest; miss_ms = how late "
+                       "the others were; OBSERVE never waits (ok = to = bo = tt = lt = hl = hd = 0); the mode "
+                       "is the bid-checked CADENCE30 banner's; aw_bad = windows "
+                       "breaking rs = n - ok - tt, n >= ok+to+nw+bo+tt or fit_e <= n - ok - tt - nw + 1; "
+                       "aw_missing = windows with ph120.rw and no ph120.aw):")
+            out += table(rows, AW_COLS)
+        if any(r.get("ab_n") is not None for r in rows):
+            out.append("")
+            out.append("GL admit behind per phase (ph120.ab, gl-admit-behind "
+                       f"{res.get('ab_mode') or 'unknown'} bytes={res.get('ab_bytes') or 'unknown'}; "
+                       "n = interpolated gates that found the render thread behind; ab_stp/stf/stx = the "
+                       "stock time test there: passing, failing, not live (stock admits); ab_pass = "
+                       "(stp + stx) / n; ov = outstanding ring bytes over the bound; wa = within the bound "
+                       "and the time test not failing (what ON renders outside a back-off), ab_wa_share = "
+                       "wa / n; ok = rendered while behind; bo = within the bound, refused inside a "
+                       "back-off; tt = within the bound, refused by the stock time test; ab_ob50 = median "
+                       "of the windows' median outstanding bytes (first 64 gates each), ab_obmax = the "
+                       "largest reading; ab_hl/ab_hl_ms = loop heads that did not sleep after a Present "
+                       "hold on a behind-admitted frame, ms past their due time (each arms a 30-phase "
+                       "back-off); ab_hd/ab_hd_ms = Present holds on or right after a behind-admitted "
+                       "frame; ab_s_w/ab_s_ms = the render thread's sync waits over the same windows "
+                       "(ph120.rt s); OBSERVE renders nothing extra (ok = bo = tt = hl = hd = 0); the mode "
+                       "and the bound are the bid-checked CADENCE30 banner's):")
+            out += table(rows, AB_COLS)
+            out.append("")
+            out.append("GL admit behind, refusals checked at the next Present (ph120.abp; pm_c = checked, "
+                       "pm_ok = the closure was done by the refused frame's predicted Present, pm_ms/pm_max "
+                       "= the hold of the others, sum and worst, ms; wp_* = the same over the wa frames; "
+                       "ab_phl = of pm_c, the hold would have carried the Render return to or past the next "
+                       "loop head's due time; ab_bad = windows breaking n = stp + stf + stx, rs = n - ok, "
+                       "ov + wa <= n, ok <= wa, pm_ok <= pm_c <= n - ok + 1, wp_c <= pm_c, wp_ok <= wp_c or "
+                       "phl <= pm_c; ab_missing = windows with ph120.rw and no ph120.ab or ph120.abp):")
+            out += table(rows, ABP_COLS)
+        if any(r.get("dp_windows") for r in rows):
+            modes = sorted({m for r in rows for m in r.get("dp_mode", "").split(",") if m})
+            out.append("")
+            out.append(f"GL draw packet per phase (ph120.dp, mode {','.join(modes) or 'unknown'} as the "
+                       "recorder prints it; d = glDrawElements records requested, f = of them carried in a "
+                       "packet, pk = packet records, p1 = staged runs of exactly one call (ON publishes each "
+                       "as its own record, VERIFY as a one-call packet, also in pk), "
+                       "sub = state calls staged, sub_pd = per draw; path_pd = (pk + p1 + d - f) / d, the "
+                       "ring records of the draw path per draw (ON gate <= 2; VERIFY also publishes every "
+                       "call alone); rec_pd = every ring record per draw (ph120.rt r / d); mx = most bytes "
+                       "staged at one publish; fr_r/c/s/f = publishes ahead of another record, a closure, a "
+                       "drain/outstanding query/stop, a full buffer or a draw too large to fuse; VERIFY: vp/vs = "
+                       "packets compared and "
+                       "the records they were compared with, mm = packets that differed, late = records "
+                       "that overtook staged calls, tot = mm + late since boot, bad = windows with mm or "
+                       "late, cov = VERIFY windows with |vp - pk| > 1, vsx = VERIFY windows with mm = late = 0 "
+                       "and vs != sub + f; dp_missing = windows with ph120.rw and no ph120.dp):")
+            out += table(rows, DP_COLS)
         if any(r.get("census") for r in rows):
             out.append("")
             out.append("GL recorder opcode census per phase (ph120.ro/rop; per present: n records, B payload "

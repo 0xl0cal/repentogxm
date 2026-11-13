@@ -59,6 +59,9 @@ for mode in off on fxray texture texture-fxray fbo fbo720 time time-fbo720 \
     prod-elision prod-elision-drop prod-loc prod-loc-verify \
     prod-elision-loc-verify prod-fill prod-elision-drop-fill \
     readback prod-elision-drop-readback \
+    readback-census-observe readback-census-skip \
+    prod-elision-drop-readback-census-observe \
+    prod-elision-drop-readback-census-skip \
     depth-scene depth-carry prod-elision-drop-depth-scene \
     prod-elision-drop-depth-carry \
     center-y prod-elision-drop-readback-center-y \
@@ -114,9 +117,18 @@ do
     fi
     # readback / prod-elision-drop-readback: the offscreen readback sync
     # (issue #10) alone and on top of the shipped depth-drop elision.
+    # readback-census-*: ISAAC_VITA_FBO_READBACK_CENSUS_SKIP (lane TXR) on
+    # the readback fix, 1 = OBSERVE (census timed), 2 = ON (skipped), alone
+    # and on the production shape (prod-elision-drop-readback-census-*).
     if [ "$mode" = readback ] || [ "$mode" = prod-elision-drop-readback ] ||
             [ "$mode" = prod-elision-drop-readback-center-y ]; then
         readback_define=-DISAAC_VITA_FBO_READBACK_FIX=1
+    elif [ "$mode" = readback-census-observe ] ||
+            [ "$mode" = prod-elision-drop-readback-census-observe ]; then
+        readback_define="-DISAAC_VITA_FBO_READBACK_FIX=1 -DISAAC_VITA_FBO_READBACK_CENSUS_SKIP=1"
+    elif [ "$mode" = readback-census-skip ] ||
+            [ "$mode" = prod-elision-drop-readback-census-skip ]; then
+        readback_define="-DISAAC_VITA_FBO_READBACK_FIX=1 -DISAAC_VITA_FBO_READBACK_CENSUS_SKIP=2"
     else
         readback_define=
     fi
@@ -137,6 +149,8 @@ do
     if [ "$mode" = prod-elision-drop ] || [ "$mode" = prod-elision-drop-fill ] ||
             [ "$mode" = prod-elision-drop-readback ] ||
             [ "$mode" = prod-elision-drop-readback-center-y ] ||
+            [ "$mode" = prod-elision-drop-readback-census-observe ] ||
+            [ "$mode" = prod-elision-drop-readback-census-skip ] ||
             [ "$mode" = prod-elision-drop-depth-scene ] ||
             [ "$mode" = prod-elision-drop-depth-carry ] ||
             [ "$mode" = prod-elision-drop-depth-carry-center-y ]; then

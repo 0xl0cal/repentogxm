@@ -480,6 +480,13 @@ static int continue_overlay_begin(uint32_t kind_run, uint32_t stage,
         (stage & CONTINUE_OVERLAY_STAGE_MASK);
     continue_overlay_store(snapshot);
     vglSetDisplayCallback(continue_overlay_callback);
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    {
+        extern void gl_vita_backend_fbo_deferred_attach_present(void);
+
+        gl_vita_backend_fbo_deferred_attach_present();
+    }
+#endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     {
         /* Same scene-ending present as kage_vita_backend.c. */
@@ -506,6 +513,13 @@ static void continue_overlay_stage(uint32_t kind_run, uint32_t stage)
         (s_overlay_phase << CONTINUE_OVERLAY_PHASE_SHIFT) |
         (stage & CONTINUE_OVERLAY_STAGE_MASK);
     continue_overlay_store(snapshot);
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    {
+        extern void gl_vita_backend_fbo_deferred_attach_present(void);
+
+        gl_vita_backend_fbo_deferred_attach_present();
+    }
+#endif
     gl_vita_backend_attrib_sync();
     vglSwapBuffers(GL_FALSE);
     ++s_overlay_swaps;

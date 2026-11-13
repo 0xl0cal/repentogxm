@@ -84,6 +84,9 @@ $modes = @(
     'direct-plain', 'typed-direct', 'coalesce-direct', 'coalesce-direct-loc',
     'coalesce-direct-fill',
     'readback', 'prod-elision-drop-readback',
+    'readback-census-observe', 'readback-census-skip',
+    'prod-elision-drop-readback-census-observe',
+    'prod-elision-drop-readback-census-skip',
     'depth-scene', 'depth-carry',
     'prod-elision-drop-depth-scene', 'prod-elision-drop-depth-carry',
     'center-y', 'typed-center-y', 'prod-elision-drop-readback-center-y',
@@ -208,10 +211,17 @@ foreach ($mode in $modes) {
     # (GXM drain before a glReadPixels of a colour texture written since
     # the last drain, issue #10) alone and on top of the shipped
     # depth-drop elision.
+    # readback-census-*: ISAAC_VITA_FBO_READBACK_CENSUS_SKIP (lane TXR) on the
+    # readback fix: 1 = OBSERVE (the detail census timed), 2 = ON (skipped),
+    # alone and on the production shape (prod-elision-drop-readback-census-*).
     $readbackDefine = if (
             $mode -eq 'readback' -or $mode -eq 'prod-elision-drop-readback' -or
             $mode -eq 'prod-elision-drop-readback-center-y') {
         '/DISAAC_VITA_FBO_READBACK_FIX=1 '
+    } elseif ($mode -like '*readback-census-observe') {
+        '/DISAAC_VITA_FBO_READBACK_FIX=1 /DISAAC_VITA_FBO_READBACK_CENSUS_SKIP=1 '
+    } elseif ($mode -like '*readback-census-skip') {
+        '/DISAAC_VITA_FBO_READBACK_FIX=1 /DISAAC_VITA_FBO_READBACK_CENSUS_SKIP=2 '
     } else {
         ''
     }
@@ -222,6 +232,7 @@ foreach ($mode in $modes) {
             $mode -eq 'prod-elision-drop-fill' -or
             $mode -eq 'prod-elision-drop-readback' -or
             $mode -eq 'prod-elision-drop-readback-center-y' -or
+            $mode -like 'prod-elision-drop-readback-census-*' -or
             $mode -like 'prod-elision-drop-depth-*') {
         # Depth-drop sub-mode: colour clears native, owed depth clear dropped
         # at the owing FBO's colour re-attach (ph120.e a/d counters).
@@ -343,12 +354,21 @@ foreach ($mode in $modes) {
         # proof: the worker in ownership-proof mode (waits after every record).
         # census: the worker with ISAAC_VITA_GL_RECORD_OPCODE_CENSUS (same trace;
         # the scenario checks the census against the window and prints coverage).
-        foreach ($variant in @('direct', 'record', 'worker', 'proof', 'census')) {
+        # admitwait: the worker with ISAAC_VITA_GL_THREAD_ADMIT_WAIT=2 (same trace;
+        # the scenario also runs the bounded producer wait, H8 of
+        # R60-DRYADMIT-SPEC-20261028.md, and prints its 'admit wait:' line).
+        # admitbehind: the worker with ISAAC_VITA_GL_THREAD_ADMIT_BEHIND=2 (same
+        # trace; the scenario also checks isaac_gl_record_worker_outstanding
+        # across the storage wrap, R60-FABLE-PLAN.md lane B, and prints its
+        # 'admit behind:' line).
+        foreach ($variant in @('direct', 'record', 'worker', 'proof', 'census', 'admitwait', 'admitbehind')) {
             # ISAAC_GL_RECORD_MUTATION: oracle self-test define; the run MUST fail.
             $variantDefine = if ($variant -ne 'direct') {
                 '/DISAAC_VITA_GL_THREAD_RECORD=1 ' +
-                $(if ($variant -eq 'worker' -or $variant -eq 'proof' -or $variant -eq 'census') { '/DISAAC_VITA_GL_THREAD_WORKER=1 /DISAAC_GL_RECORD_WORKER_JITTER=1 ' } else { '' }) +
+                $(if ($variant -eq 'worker' -or $variant -eq 'proof' -or $variant -eq 'census' -or $variant -eq 'admitwait' -or $variant -eq 'admitbehind') { '/DISAAC_VITA_GL_THREAD_WORKER=1 /DISAAC_GL_RECORD_WORKER_JITTER=1 ' } else { '' }) +
                 $(if ($variant -eq 'census') { '/DISAAC_GL_RECORD_OPCODE_CENSUS=1 ' } else { '' }) +
+                $(if ($variant -eq 'admitwait') { '/DISAAC_VITA_GL_THREAD_RENDER_ADMISSION=1 /DISAAC_VITA_GL_THREAD_ADMIT_WAIT=2 ' } else { '' }) +
+                $(if ($variant -eq 'admitbehind') { '/DISAAC_VITA_GL_THREAD_RENDER_ADMISSION=1 /DISAAC_VITA_GL_THREAD_ADMIT_BEHIND=2 /DISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES=65536 ' } else { '' }) +
                 $(if ($variant -eq 'proof') { '/DISAAC_VITA_GL_THREAD_WORKER_PROOF=1 ' } else { '' }) +
                 $(if ($env:ISAAC_GL_RECORD_MUTATION) { '/D' + $env:ISAAC_GL_RECORD_MUTATION + '=1 ' } else { '' })
             } else { '' }

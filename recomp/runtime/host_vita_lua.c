@@ -30,7 +30,7 @@
  * target and the unwind routes below restore it.  Diagnostic only. */
 #include "kage_vita_guest_sampler.h"
 #endif
-#if defined(ISAAC_VITA_LUA_GCCOLLECT_CLAMP) || defined(ISAAC_VITA_LUA_GC_PROFILE)
+#if defined(ISAAC_VITA_LUA_GCCOLLECT_CLAMP) || defined(ISAAC_VITA_LUA_GC_PROFILE) || defined(ISAAC_VITA_LUA_GC_IDLE_STEP)
 /* Floor-transition GCCOLLECT clamp and per-window GC profile: the lua_gc
  * import routes through host_vita_lua_gc.c (see that file). */
 #include "host_vita_lua_gc.h"
@@ -2141,6 +2141,19 @@ static void vita_lua_newstate_aux_import(CPU *__restrict c)
                        (unsigned)(uintptr_t)lua_pushnil);
     }
 #endif
+#if defined(ISAAC_VITA_LUA_VM_COMPUTED_GOTO)
+    {
+        /* Only the derived lvm.c defines these (lua53_vm_computed_goto.py),
+         * so this line names the dispatch of the VM that was linked. */
+        void isaac_vita_log(const char *format, ...);
+        extern const char isaac_lua_vm_dispatch[];
+        extern const unsigned int isaac_lua_vm_dispatch_slots;
+        extern const unsigned int isaac_lua_vm_dispatch_opcodes;
+        isaac_vita_log("[isaac-lua] vm dispatch=%s slots=%u opcodes=%u",
+                       isaac_lua_vm_dispatch, isaac_lua_vm_dispatch_slots,
+                       isaac_lua_vm_dispatch_opcodes);
+    }
+#endif
 #if defined(ISAAC_VITA_LUA_INTEGER2STR_SELFTEST)
     {
         /* ISAAC_VITA_LUA_INTEGER2STR profile builds: one timed comparison of
@@ -2497,6 +2510,89 @@ static int vita_lua_gcstep_clamp(CPU *__restrict c, int what, int data)
 }
 #endif
 
+#if defined(ISAAC_VITA_LUA_GC_FINALIZER_PACE)
+/* ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON (CMake sets this definition with the
+ * knob only): the derived lgc.c (lua53_gc_finalizer_pace.py) paces __gc
+ * finalizers, and hands a Lua state back to the pristine 5.3.3 collector
+ * for good -- "latched" -- when a script calls collectgarbage or, with an
+ * allocation budget (--alloc-latch, lines 61/821/958), when the finalizers
+ * of one GC cycle allocate more than the budget.  Both are silent inside
+ * Lua and a latched state measures pristine, so they are logged here, after
+ * every lua_gc import (LuaEngine::Update makes one per frame):
+ *   once: the resolved knobs (pacer, budget, GCSTEP clamp);
+ *   with a budget: one "state" line whenever the calling state or its latch
+ *   changes (a latch with an unchanged count is the script latch), and one
+ *   "LATCHED" line per change of the process-wide count.  The count is the
+ *   process's, the latch is per state: state_latched says whether THIS
+ *   state is the latched one (0: the budget was passed in another state,
+ *   e.g. by the finalizers lua_close ran on the previous one).
+ * Without a budget the derivation has no accessor for the script latch, so
+ * only the first line is printed. */
+void isaac_vita_log(const char *format, ...);
+#if !defined(ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES)
+#define ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES 0
+#endif
+#if ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES > 0
+unsigned int isaac_lua_gc_alloc_latches(void);
+int isaac_lua_gc_state_latched(lua_State *L);
+#define VITA_LUA_GC_PACE_STATE_LINES 32U
+#endif
+
+static void vita_lua_gc_pace_receipt(lua_State *state)
+{
+    static int s_banner;
+
+    if (!s_banner) {
+        s_banner = 1;
+        isaac_vita_log("[isaac-lua] finalizer pace: on=1 "
+                       "alloc_latch_bytes=%d gcstep_clamp_kb=%d",
+                       (int)ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES,
+#if defined(ISAAC_VITA_LUA_GCSTEP_CLAMP_KB)
+                       (int)ISAAC_VITA_LUA_GCSTEP_CLAMP_KB
+#else
+                       0
+#endif
+                       );
+    }
+#if ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES > 0
+    {
+        static unsigned int s_seen;
+        static unsigned int s_lines;
+        static lua_State *s_state;
+        static int s_latched = -1;
+        unsigned int now = isaac_lua_gc_alloc_latches();
+        int latched = isaac_lua_gc_state_latched(state) != 0;
+
+        if (now != s_seen)
+            isaac_vita_log("[isaac-lua] finalizer alloc latch: LATCHED "
+                           "latches=%u budget=%d state=%08x "
+                           "state_latched=%d (1: this state runs the "
+                           "pristine 5.3.3 collector from here on; 0: the "
+                           "budget was passed in another state)",
+                           now,
+                           (int)ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES,
+                           (unsigned)(uintptr_t)state, latched);
+        if ((state != s_state || latched != s_latched) &&
+            s_lines < VITA_LUA_GC_PACE_STATE_LINES) {
+            ++s_lines;
+            isaac_vita_log("[isaac-lua] finalizer pace state: state=%08x "
+                           "latched=%d alloc_latches=%u line=%u/%u%s",
+                           (unsigned)(uintptr_t)state, latched, now,
+                           s_lines, VITA_LUA_GC_PACE_STATE_LINES,
+                           s_lines == VITA_LUA_GC_PACE_STATE_LINES
+                               ? " (last state line; LATCHED lines go on)"
+                               : "");
+        }
+        s_seen = now;
+        s_state = state;
+        s_latched = latched;
+    }
+#else
+    (void)state;
+#endif
+}
+#endif
+
 static void vita_lua_gc_import(CPU *__restrict c)
 {
     KAGE_VITA_DEEP_SCOPE(KVD_LUA_GC);
@@ -2514,6 +2610,9 @@ static void vita_lua_gc_import(CPU *__restrict c)
     c->eax = (uint32_t)isaac_vita_lua_gc_call(c, state, what, requested, data);
 #else
     c->eax = (uint32_t)lua_gc(state, what, data);
+#endif
+#if defined(ISAAC_VITA_LUA_GC_FINALIZER_PACE)
+    vita_lua_gc_pace_receipt(state);
 #endif
     VITA_LUA_END();
 }

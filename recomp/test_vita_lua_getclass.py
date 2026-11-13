@@ -22,7 +22,12 @@
    and with a constant luai_makeseed so two fresh states hash strings alike;
    the oracle compares Lua-state snapshots (string cache, GC debt, total
    bytes, live and dead stack slots) and GC transcripts on fresh states in a
-   deterministic arena (translated vs API path vs wrap);
+   deterministic arena (translated vs API path vs wrap); the position
+   transcripts force a collector step at each GC point of a call in turn
+   (the classic ones step only at the first), and the GC-point mutants of
+   the direct path -- one per luaC_checkGC site, the `__parent` hop push
+   and the class `__const` push among them -- must each
+   FAIL the direct oracle;
 4. CMake wiring of ISAAC_VITA_LUA_GETCLASS_DIRECT (default OFF, FATAL without
    NATIVE_GETCLASS, definition on host_vita_lua_getclass.c only);
 5. optional --arm-cc leg: eboot flags, -Werror, nm contract (both seams;
@@ -272,7 +277,8 @@ def run_capture(command: str, cwd: Path) -> str:
 
 
 def build_oracle(vcvars: Path, lua_source: Path, lua_sources: list[Path], build: Path,
-                 getclass_body: str, getexact_body: str) -> dict[str, Path]:
+                 getclass_body: str, getexact_body: str,
+                 oracle_source: Path | None = None) -> dict[str, Path]:
     generated = build / "lgc_oracle_generated.c"
     generated.write_text(
         "/* Extracted by recomp/test_vita_lua_getclass.py from the generated corpus "
@@ -307,8 +313,11 @@ def build_oracle(vcvars: Path, lua_source: Path, lua_sources: list[Path], build:
     for tag, extra in (("plain", []), ("verify", [verify]), ("direct", [direct]),
                        ("direct-verify", [direct, verify])):
         for source in ("host_vita_lua_getclass.c", "host_vita_lua_getclass_guest_oracle.c"):
+            path = RUNTIME / source
+            if oracle_source is not None and source.endswith("_guest_oracle.c"):
+                path = oracle_source
             steps.append(" ".join([*common, "/W4", "/WX", "/wd4310", *GUEST_DEFS, *SEAM_DEFS, *extra, "/c",
-                                   quote(RUNTIME / source), f"/Fo{quote(build / f'{tag}_{source[:-2]}.obj')}"]))
+                                   quote(path), f"/Fo{quote(build / f'{tag}_{source[:-2]}.obj')}"]))
         exe = build / f"lgc-guest-oracle-{tag}.exe"
         objects = [f"{p.stem}.obj" for p in lua_sources] + ["lgc_oracle_generated.obj", "host_vita_lua.obj",
                                                             f"{tag}_host_vita_lua_getclass.obj",
@@ -322,12 +331,15 @@ def build_oracle(vcvars: Path, lua_source: Path, lua_sources: list[Path], build:
     return variants
 
 
+POSITIONS_LINE = "  pos   : GC-point positions 1..3 each stepped in turn, position 4 never reached: PASS"
 ORACLE_LINES = {
     # the state comparisons run without VERIFY (its re-runs push twice)
-    "plain": ["  exact : 24 cases x 3 paths:", "  trans : wrap == wrap:", "  trans : translated == wrap by meaning"],
+    "plain": ["  exact : 24 cases x 3 paths:", "  trans : wrap == wrap:", "  trans : translated == wrap by meaning",
+              "  pos   : N=3 wrap-again == wrap", POSITIONS_LINE],
     "verify": [],
     "direct": ["  exact : 24 cases x 3 paths:", "  trans : direct == api:", "  trans : translated == api by meaning",
-               "memo coverage:"],
+               "  pos   : N=1 direct == api", "  pos   : N=2 direct == api", "  pos   : N=3 direct == api",
+               "  pos   : N=4 direct == api", POSITIONS_LINE, "memo coverage:"],
     "direct-verify": ["memo coverage:", "registry[tmp] = nil: memo hit reads nil"],
 }
 
@@ -339,6 +351,125 @@ def run_oracle(exe: Path, tag: str) -> None:
         require(line in out, f"{tag} oracle did not report {line!r}:\n{out}")
     print(f"host oracle [{tag}]:")
     print("  " + out.strip().replace("\n", "\n  "))
+
+
+# --- 3b. GC-point mutants of the direct path ---------------------------------------
+
+# Every luaC_checkGC of the direct path sits in lgc_pushstring; a mutant swaps
+# ONE call site for a push without the check.  (name, the call-site line as
+# written in host_vita_lua_getclass.c, which occurrence of it, what it is)
+GC_PUSH_HELPER = (
+    "static void lgc_pushstring (lua_State *L, const char *s) {\n"
+    "  TString *ts;\n"
+    "  ts = luaS_new(L, s);\n"
+    "  setsvalue2s(L, L->top, ts);\n"
+    "  api_incr_top(L);\n"
+    "  luaC_checkGC(L);\n"
+    "}\n")
+GC_MUTANTS = [
+    ("gc-const-probe", "        lgc_pushstring(L, LGC_STR_CONST);              /* GC point */\n", 0,
+     "getClass: the `__const` probe push (first GC point of every call)"),
+    ("gc-const-class", "                lgc_pushstring(L, LGC_STR_CONST);      /* GC point */\n", 0,
+     "getClass: the class `__const` push of a const object (second GC point)"),
+    ("gc-parent-hop", "        lgc_pushstring(L, LGC_STR_PARENT);             /* GC point */\n", 0,
+     "getClass: the `__parent` hop push (second or later GC point)"),
+    ("gc-exact-const", "            lgc_pushstring(L, LGC_STR_CONST);          /* GC point */\n", 0,
+     "getExact: the class `__const` push"),
+]
+# What the oracle must say when a mutant dies in the transcripts: the classic
+# ones catch a missing FIRST point, the position ones a later point.
+MUTANT_DEATHS = ("first GC point that differs", "probe configuration")
+# The oracle leg each mutant must die in.  A missing FIRST GC point is caught
+# by the legs that arm the debt before a call; a missing later point only by
+# the position transcripts -- every leg before them steps at the first point
+# of a call, which leaves the debt negative for the rest of it.
+MUTANT_LEGS = {
+    "gc-const-probe": "run_gc_stress",
+    "gc-const-class": "run_position_transcripts",
+    "gc-parent-hop": "run_position_transcripts",
+    "gc-exact-const": "run_transcripts",
+}
+
+
+def mutate_seam(text: str, call_line: str, occurrence: int) -> str:
+    require(text.count(GC_PUSH_HELPER) == 1, "lgc_pushstring changed: re-derive the GC-point mutants")
+    require(len(re.findall(r"luaC_(?:checkGC|condGC|step)\s*\([^)]*\)\s*;", text)) == 1,
+            "the direct path has a luaC_checkGC outside lgc_pushstring: add a mutant for it")
+    sites = [m.start() for m in re.finditer(re.escape(call_line), text)]
+    require(len(sites) == 1 and occurrence == 0, f"mutant call site not unique ({len(sites)}): {call_line!r}")
+    require(len(re.findall(r"\blgc_pushstring\(L, ", text)) == len(GC_MUTANTS),
+            "the direct path gained or lost an lgc_pushstring call: one mutant per GC point")
+    nogc = GC_PUSH_HELPER.replace("lgc_pushstring (", "lgc_pushstring_mutant_nogc (").replace(
+        "  luaC_checkGC(L);\n", "")
+    require(nogc != GC_PUSH_HELPER and "luaC_checkGC" not in nogc, "mutant helper derivation failed")
+    text = text.replace(GC_PUSH_HELPER, GC_PUSH_HELPER + "\n/* MUTANT */\n" + nogc)
+    mutated_call = call_line.replace("lgc_pushstring(", "lgc_pushstring_mutant_nogc(")
+    require(mutated_call != call_line, "mutant call derivation failed")
+    return text.replace(call_line, mutated_call)
+
+
+def run_mutants(vcvars: Path, lua_source: Path, lua_sources: list[Path], build: Path,
+                oracle_source: Path | None, expect_survivors: set[str]) -> None:
+    """Each mutant: the direct oracle (already built in `build`) relinked with a
+    mutated seam must exit non-zero in a transcript comparison.  With
+    --mutant-oracle-source the same mutants run against another revision of
+    the oracle source (evidence that an older oracle let some survive)."""
+    seam = (RUNTIME / "host_vita_lua_getclass.c").read_bytes().decode("utf-8")
+    require("\r\n" not in seam, "host_vita_lua_getclass.c has CRLF line ends")
+    includes = [f"/I{quote(lua_source / 'src')}", f"/I{quote(RUNTIME)}"]
+    common = ["cl", "/nologo", "/std:c11", "/O2", "/D_CRT_SECURE_NO_WARNINGS", *includes,
+              "/W4", "/WX", "/wd4310", *GUEST_DEFS, *SEAM_DEFS, "/DISAAC_VITA_LUA_GETCLASS_DIRECT=1"]
+    vc = f"call {quote(vcvars)} x86 >nul && "
+    oracle_object = "direct_host_vita_lua_getclass_guest_oracle.obj"
+    if oracle_source is not None:
+        oracle_object = "mutant_other_oracle.obj"
+        out = run_capture(vc + " ".join([*common, "/c", quote(oracle_source), f"/Fo{quote(build / oracle_object)}"]),
+                          build)
+        require("warning" not in out.lower(), f"MSVC warned on {oracle_source}:\n{out}")
+    survivors = set()
+    for name, call_line, occurrence, what in GC_MUTANTS:
+        source = build / f"mutant_{name}.c"
+        source.write_bytes(mutate_seam(seam, call_line, occurrence).encode("utf-8"))
+        obj = build / f"mutant_{name}.obj"
+        exe = build / f"lgc-guest-oracle-mutant-{name}.exe"
+        for stale in (obj, exe):
+            if stale.exists():
+                stale.unlink()
+        out = run_capture(vc + " ".join([*common, "/c", quote(source), f"/Fo{quote(obj)}"]), build)
+        require("warning" not in out.lower(), f"MSVC warned on mutant {name}:\n{out}")
+        objects = [f"{p.stem}.obj" for p in lua_sources] + ["lgc_oracle_generated.obj", "host_vita_lua.obj",
+                                                            obj.name, oracle_object]
+        run_capture(vc + " ".join(["link", "/nologo", "/LARGEADDRESSAWARE", f"/out:{quote(exe)}", *objects]), build)
+        require(exe.is_file(), f"mutant {name} did not link")
+        completed = subprocess.run([str(exe)], cwd=build, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT)
+        out = completed.stdout
+        passed = "native getclass guest oracle: PASS" in out
+        if completed.returncode == 0 or passed:
+            require(completed.returncode == 0 and passed, f"mutant {name}: exit code and PASS line disagree:\n{out}")
+            survivors.add(name)
+            print(f"mutant {name}: SURVIVED ({what})")
+            continue
+        # a CHECK that fails inside a leg prints its own line and the leg's line in main()
+        failed = [line.strip() for line in out.splitlines() if "native getclass guest oracle failed at" in line]
+        require(failed, f"mutant {name} died without the oracle's failure line "
+                        f"(exit {completed.returncode}):\n{out[-3000:]}")
+        leg = MUTANT_LEGS[name]
+        if oracle_source is None:
+            require(any(f"{leg}() == 0" in line for line in failed),
+                    f"mutant {name} must die in {leg}, it died elsewhere:\n" + "\n".join(failed))
+        evidence = [line.strip() for line in out.splitlines()
+                    if any(mark in line for mark in MUTANT_DEATHS)
+                    or (line.startswith("  pos   : ") and "want" in line)]
+        print(f"mutant {name}: killed ({what})\n    " + "\n    ".join([*failed, *evidence[:4]]))
+    require(survivors == expect_survivors,
+            f"GC-point mutants: survivors {sorted(survivors)}, expected {sorted(expect_survivors)}")
+    if expect_survivors:
+        print(f"GC-point mutants vs {oracle_source}: {len(GC_MUTANTS) - len(survivors)} killed, "
+              f"survivors as expected: {sorted(survivors)}")
+    else:
+        print(f"GC-point mutants: {len(GC_MUTANTS)}/{len(GC_MUTANTS)} killed "
+              "(one per luaC_checkGC call site of the direct path)")
 
 
 # --- 4. CMake wiring of ISAAC_VITA_LUA_GETCLASS_DIRECT -------------------------------
@@ -458,6 +589,12 @@ def main() -> int:
     parser.add_argument("--arm-cc")
     parser.add_argument("--keep", type=Path, help="work directory to keep (default: temp)")
     parser.add_argument("--skip-oracle", action="store_true")
+    parser.add_argument("--skip-mutants", action="store_true",
+                        help="do not build and run the GC-point mutants of the direct path")
+    parser.add_argument("--mutant-oracle-source", type=Path,
+                        help="also run the mutants against this revision of the oracle source ...")
+    parser.add_argument("--mutant-oracle-survivors", default="",
+                        help="... and require exactly these (comma separated) to survive it")
     parser.add_argument("--arm-only", action="store_true",
                         help="only the CMake wiring and the --arm-cc leg (no PE, corpus or host oracle); "
                              "the corpus pins hold only for the unmasked corpus, the ARM leg needs none")
@@ -492,6 +629,14 @@ def main() -> int:
             variants = build_oracle(vcvars, lua_source, lua_sources, work, getclass_body, getexact_body)
             for tag, exe in variants.items():
                 run_oracle(exe, tag)
+            if args.skip_mutants:
+                print("GC-point mutants: skipped (--skip-mutants)")
+            else:
+                run_mutants(vcvars, lua_source, lua_sources, work, None, set())
+                if args.mutant_oracle_source is not None:
+                    names = {n for n in args.mutant_oracle_survivors.split(",") if n}
+                    require(names <= {m[0] for m in GC_MUTANTS}, f"unknown mutant in {sorted(names)}")
+                    run_mutants(vcvars, lua_source, lua_sources, work, args.mutant_oracle_source.resolve(), names)
         else:
             print("host oracle: skipped (--skip-oracle)")
         if args.arm_cc:

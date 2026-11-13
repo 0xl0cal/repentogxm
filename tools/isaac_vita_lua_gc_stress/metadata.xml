@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+    <name>repentogxm Lua GC stress</name>
+    <directory>repentogxm_lua_gc_stress</directory>
+    <description>Test only: the LUA-GC.md stress leg. Creates about 300 finalizable LuaBridge userdata per game update for 10 minutes and logs [gcstress] heap and finalizer-backlog lines to log.txt.</description>
+    <version>1.0.0</version>
+    <visibility>Private</visibility>
+    <tag id="Lua"/>
+</metadata>

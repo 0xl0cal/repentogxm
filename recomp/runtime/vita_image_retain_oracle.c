@@ -44,6 +44,18 @@ static char s_last_receipt[1024];
 static char s_last_mem[1024];
 static unsigned s_log_calls, s_receipt_calls, s_mem_calls;
 static size_t s_max_log_len;
+static unsigned s_totals_seen;
+#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)
+#define PIN_KEEP 32U
+static char s_pin_log[PIN_KEEP][400];  /* "KAGE VITA IMAGE PRELOAD" lines since p_begin */
+static unsigned s_pin_n, s_pin_totals_seen;
+#endif
+#if defined(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE)
+#define BIG_KEEP 16U
+static char s_big[BIG_KEEP][1024];     /* the first BIG_KEEP trace lines since big_reset() */
+static unsigned s_big_n;               /* every trace line since big_reset() */
+static void big_reset(void) { s_big_n = 0U; memset(s_big, 0, sizeof s_big); }
+#endif
 void isaac_vita_log(const char *format, ...)
 {
     va_list ap;
@@ -57,10 +69,30 @@ void isaac_vita_log(const char *format, ...)
         memcpy(s_last_receipt, s_last_log, sizeof s_last_receipt);
         ++s_receipt_calls;
     }
+    if (strncmp(s_last_log, "KAGE VITA IMAGE PRELOAD: totals levels=4294967295 ", 50) == 0)
+        ++s_totals_seen;
+#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)
+    if (strncmp(s_last_log, "KAGE VITA IMAGE PRELOAD", 23) == 0) {
+        char *slot = s_pin_log[s_pin_n % PIN_KEEP];
+        memcpy(slot, s_last_log, sizeof s_pin_log[0] - 1U);
+        slot[sizeof s_pin_log[0] - 1U] = '\0';
+        ++s_pin_n;
+    }
+    if (strncmp(s_last_log, "KAGE VITA IMAGE PRELOAD PIN: totals mode=", 41) == 0 &&
+            strstr(s_last_log, " pinned=4294967295 refused=4294967295 ") != NULL)
+        ++s_pin_totals_seen;
+#endif
     if (strncmp(s_last_log, "KAGE VITA IMAGE RETAIN MEM: ", 28) == 0) {
         memcpy(s_last_mem, s_last_log, sizeof s_last_mem);
         ++s_mem_calls;
     }
+#if defined(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE)
+    if (strncmp(s_last_log, "KAGE VITA IMAGE RETAIN BIG", 26) == 0) {
+        if (s_big_n < BIG_KEEP)
+            memcpy(s_big[s_big_n], s_last_log, sizeof s_big[0]);
+        ++s_big_n;
+    }
+#endif
 }
 
 static unsigned s_fault_hit;
@@ -283,6 +315,9 @@ static uint32_t img_bytes(uint32_t img)
            ld32(img + ISAAC_IR_IMG_BPP);
 }
 
+#if !defined(IR_ORACLE_OLD_ABI)
+static void fv_reset(void);
+#endif
 static void manager_reset(void)
 {
     uint32_t i;
@@ -304,6 +339,9 @@ static void manager_reset(void)
     st32(va(ISAAC_IR_MANAGER_LOCK_RVA) + ISAAC_IR_MUTEX_CS, va(OFF_MGR_CS));
     st8(va(OFF_MGR_CS) + ISAAC_IR_CS_HELD, 0U);
     s_ctrl_n = s_img_n = s_name_n = 0U;
+#if !defined(IR_ORACLE_OLD_ABI)
+    fv_reset();
+#endif
     s_fault_hit = 0; s_fault_what[0] = 0;
     s_unknown_targets = 0;
     ev_reset();
@@ -399,6 +437,117 @@ static uint32_t manager_count(void)
     return n;
 }
 
+#if !defined(IR_ORACLE_OLD_ABI)
+#define IR_ORACLE_FLUSH 1
+/* ------------------------------------------------ fake batch renderer ----- */
+/* The three vectors ImageManager::Unregister scrubs before it erases the
+ * bucket entry (PE 0x56d280 DIRTY, 0x56d2c1 TOUCHED, 0x56d2f6 PAIRS) and the
+ * last-pair Image global, at their frozen RVAs.  Storage lives in the arena.
+ * A "walker" models a flush/sweep loop of the game that is on the stack while
+ * a release runs: the OFF build shrinks these vectors under such a loop only
+ * for the Image being released, so any other shrink is a violation. */
+#define OFF_FV_DIRTY   0x00430000U
+#define OFF_FV_TOUCHED 0x00438000U
+#define OFF_FV_PAIRS   0x00440000U
+#define FV_DIRTY   ISAAC_IR_DIRTY_BEGIN_RVA, ISAAC_IR_DIRTY_END_RVA
+#define FV_TOUCHED ISAAC_IR_TOUCHED_BEGIN_RVA, ISAAC_IR_TOUCHED_END_RVA
+static unsigned s_walker_active;
+static uint32_t s_walker_image;
+static unsigned s_walker_violations;
+static unsigned s_vec_erases;         /* Unregister calls that shrank a vector */
+
+static void fv_reset(void)
+{
+    st32(va(ISAAC_IR_DIRTY_BEGIN_RVA), va(OFF_FV_DIRTY));
+    st32(va(ISAAC_IR_DIRTY_END_RVA), va(OFF_FV_DIRTY));
+    st32(va(ISAAC_IR_TOUCHED_BEGIN_RVA), va(OFF_FV_TOUCHED));
+    st32(va(ISAAC_IR_TOUCHED_END_RVA), va(OFF_FV_TOUCHED));
+    st32(va(ISAAC_IR_PAIRS_BEGIN_RVA), va(OFF_FV_PAIRS));
+    st32(va(ISAAC_IR_PAIRS_END_RVA), va(OFF_FV_PAIRS));
+    st32(va(ISAAC_IR_LAST_PAIR_IMAGE_RVA), 0U);
+    s_walker_active = 0; s_walker_image = 0U; s_walker_violations = 0; s_vec_erases = 0;
+}
+static void fv_push(uint32_t begin_rva, uint32_t end_rva, uint32_t image)
+{
+    uint32_t end = ld32(va(end_rva));
+    (void)begin_rva;
+    st32(end, image);
+    st32(va(end_rva), end + 4U);
+}
+static unsigned fv_count(uint32_t begin_rva, uint32_t end_rva, uint32_t image)
+{
+    uint32_t p = ld32(va(begin_rva)), end = ld32(va(end_rva));
+    unsigned n = 0;
+    for (; p < end; p += 4U)
+        if (ld32(p) == image) ++n;
+    return n;
+}
+/* Erase the first occurrence the way the PE does (memmove the tail down,
+ * `sub [end],4`).  Returns 1 when the vector shrank. */
+static int fv_erase(uint32_t begin_rva, uint32_t end_rva, uint32_t image)
+{
+    uint32_t p = ld32(va(begin_rva)), end = ld32(va(end_rva));
+    for (; p < end; p += 4U) {
+        if (ld32(p) == image) {
+            for (; p + 4U < end; p += 4U)
+                st32(p, ld32(p + 4U));
+            st32(va(end_rva), end - 4U);
+            return 1;
+        }
+    }
+    return 0;
+}
+/* A flush drew the Image (0x56d5cf): bit 0x10 + TOUCHED membership. */
+static void touched_add(uint32_t image)
+{
+    st32(image + ISAAC_IR_IMG_FLAGS, ld32(image + ISAAC_IR_IMG_FLAGS) | ISAAC_IR_IMG_FLAG_TOUCHED);
+    fv_push(FV_TOUCHED, image);
+}
+/* A quad was queued (0x5601f6): bit 0x04 + DIRTY membership. */
+static void dirty_add(uint32_t image)
+{
+    st32(image + ISAAC_IR_IMG_FLAGS, ld32(image + ISAAC_IR_IMG_FLAGS) | ISAAC_IR_IMG_FLAG_DIRTY);
+    fv_push(FV_DIRTY, image);
+}
+/* A {batch, Image} pair was appended (0x5608f6 also latches the Image). */
+static void pair_add(uint32_t batch, uint32_t image)
+{
+    uint32_t end = ld32(va(ISAAC_IR_PAIRS_END_RVA));
+    st32(end, batch);
+    st32(end + 4U, image);
+    st32(va(ISAAC_IR_PAIRS_END_RVA), end + 8U);
+    st32(va(ISAAC_IR_LAST_PAIR_IMAGE_RVA), image);
+}
+/* The game's idle sweep (0x561f81 / 0x564fec): bit off, entry erased. */
+__attribute__((unused)) static void fake_sweep(uint32_t image)
+{
+    st32(image + ISAAC_IR_IMG_FLAGS, ld32(image + ISAAC_IR_IMG_FLAGS) & ~ISAAC_IR_IMG_FLAG_TOUCHED);
+    (void)fv_erase(FV_TOUCHED, image);
+}
+/* Unregister's scrub of the three vectors for `image`. */
+static void unregister_flush_lists(uint32_t image)
+{
+    uint32_t p, q, end;
+    int shrunk = 0;
+    shrunk |= fv_erase(FV_DIRTY, image);
+    shrunk |= fv_erase(FV_TOUCHED, image);
+    p = q = ld32(va(ISAAC_IR_PAIRS_BEGIN_RVA));
+    end = ld32(va(ISAAC_IR_PAIRS_END_RVA));
+    for (; p < end; p += 8U) {
+        if (ld32(p + 4U) == image) { shrunk = 1; continue; }
+        st32(q, ld32(p)); st32(q + 4U, ld32(p + 4U));
+        q += 8U;
+    }
+    if (q < end)
+        st32(va(ISAAC_IR_PAIRS_END_RVA), q);
+    if (shrunk) {
+        ++s_vec_erases;
+        if (s_walker_active && image != s_walker_image)
+            ++s_walker_violations;
+    }
+}
+#endif
+
 /* Nested hook offers fired from inside a destroy (Image dtor releasing
  * sub-objects) and the esp-misbehaviour switch for the contract test. */
 static uint32_t s_nested_image, s_nested_ctrl;
@@ -493,6 +642,9 @@ static void do_unregister(CPU *c, uint32_t ret, uint32_t image)
     uint32_t begin, end, p;
     if (!mgr_enter(ret))
         return;                                          /* would spin forever */
+#if defined(IR_ORACLE_FLUSH)
+    unregister_flush_lists(image);                       /* 0x56d280..0x56d33x */
+#endif
     begin = ld32(bucket_hdr(b)); end = ld32(bucket_hdr(b) + 4U);
     for (p = begin; p < end; p += 8U) {
         if (ld32(p) == image) {
@@ -541,6 +693,101 @@ static void manager_grow(CPU *c, uint32_t b, uint32_t ret)
     mgr_leave(ret);
 }
 
+#if defined(ISAAC_VITA_IMAGE_PRELOAD)
+/* ------------------------------------------------- fake Load / Release ---- */
+/* What the preload replays: ImageManager::Load (sub_0056c7e0, `ret 0x10`,
+ * called as at 0x565fad), the control block's Release (vtable +0xc, 0x7af0,
+ * thiscall, plain ret, al = still referenced) and the observer through the
+ * hook global. */
+#define OFF_FAKE_RELEASE 0x00007af0U
+static uint32_t s_load_flags, s_load_pw, s_load_ph;
+static int s_load_fail, s_load_orphan, s_load_break_esp, s_release_break_esp, s_hook_break_esp;
+static unsigned s_load_calls, s_load_bad_args, s_release_calls, s_hook_calls;
+static uint32_t s_heap_hr;
+static int s_heap_terminal;
+static uint64_t s_irp_now;
+uint64_t isaac_irp_oracle_now_us(void) { s_irp_now += 1000U; return s_irp_now; }
+uint32_t isaac_vita_image_preload_heap_headroom(void) { return s_heap_hr; }
+int isaac_vita_guest_heap_terminal(void) { return s_heap_terminal; }
+
+static int guest_str_eq(uint32_t a, const char *b)
+{
+    uint32_t i;
+    if (a == 0U)
+        return 0;
+    for (i = 0; i < 0x20U; ++i) {
+        if (ld8(a + i) != (uint8_t)b[i]) return 0;
+        if (b[i] == '\0') return 1;
+    }
+    return 0;
+}
+
+static void fake_load(CPU *c)
+{
+    uint32_t ret = gpop(c), out = gpop(c), name = gpop(c), desc = gpop(c), flag = gpop(c);
+    uint32_t b, p, image = 0U, ctrl = 0U;
+    char key[0x20];
+    size_t n = 0;
+
+    ++s_load_calls;
+    if (ret != ISAAC_IR_LOAD_SITE_RVA || desc != va(ISAAC_IR_LOAD_VERTEX_DESC_RVA) ||
+            flag != 0U || ld32(out) != 0U || ld32(out + 4U) != 0U)
+        ++s_load_bad_args;
+    memcpy(key, "resources/", 10); n = 10;
+    while (n < sizeof key - 1U && ld8(name + (uint32_t)(n - 10U)) != 0U) {
+        key[n] = (char)ld8(name + (uint32_t)(n - 10U));
+        ++n;
+    }
+    key[n] = '\0';
+    if (!mgr_enter(ret))
+        return;
+    for (b = 0; b < 32U && image == 0U; ++b) {
+        for (p = ld32(bucket_hdr(b)); p < ld32(bucket_hdr(b) + 4U); p += 8U) {
+            if (guest_str_eq(ld32(ld32(p) + ISAAC_IR_IMG_NAME), key)) {
+                image = ld32(p); ctrl = ld32(p + 4U);
+                st16(ctrl + ISAAC_IR_CTRL_STRONG, (uint16_t)(ld16(ctrl + ISAAC_IR_CTRL_STRONG) + 1U));
+                break;
+            }
+        }
+    }
+    if (image == 0U && !s_load_fail) {
+        image = new_image(va(ISAAC_IR_VT_PNG_RVA), key, s_load_pw, s_load_ph, 4U, s_load_flags);
+        ctrl = new_ctrl(s_load_orphan ? 1U : 2U);        /* the manager's + `out` */
+        if (s_load_orphan)
+            st32(ctrl + 0x14U, image);                   /* `out` is the only owner */
+        else
+            manager_register(image, ctrl);
+        s_free_ram -= img_bytes(image);
+    }
+    mgr_leave(ret);
+    st32(out, image);
+    st32(out + 4U, ctrl);
+    c->eax = out;
+    if (s_load_break_esp)
+        c->esp -= 4U;                                    /* violate `ret 0x10` */
+}
+
+static void fake_release(CPU *c)
+{
+    uint32_t ret = gpop(c), ctrl = c->ecx;
+    uint16_t strong = ld16(ctrl + ISAAC_IR_CTRL_STRONG);
+
+    ++s_release_calls;
+    if (ret != ISAAC_IR_LOAD_RELEASE_SITE_RVA || strong == 0U)
+        ++s_load_bad_args;
+    --strong;
+    st16(ctrl + ISAAC_IR_CTRL_STRONG, strong);
+    if (strong == 0U) {
+        destroy_image(c, ld32(ctrl + 0x14U), ctrl);
+        c->eax = 0xabcdef00U;                            /* al = 0, garbage above */
+    } else {
+        c->eax = 0xabcdef01U;                            /* al = 1 */
+    }
+    if (s_release_break_esp)
+        c->esp -= 4U;                                    /* violate `ret` */
+}
+#endif
+
 /* The oracle's guest_call: dispatches the module's (and the reference
  * observer's) replays by target address and emulates the x86 callee
  * conventions (return word + argument cleanup). */
@@ -577,6 +824,22 @@ void guest_call(CPU *__restrict c, uint32_t target)
         do_unregister(c, ret, image);
         if (s_unreg_break_esp)
             c->esp -= 4U;                                /* violate `ret 4` */
+#if defined(ISAAC_VITA_IMAGE_PRELOAD)
+    } else if (target == va(ISAAC_IR_HOOK_RVA)) {        /* cdecl observer; it pops its own ret */
+        uint32_t pair = ld32(c->esp + 4U);
+        ++s_hook_calls;
+        ev(EV_OBSERVER, ld32(c->esp), ld32(pair), ld32(pair + 4U));
+        if (s_observer)
+            s_observer(c);
+        else
+            (void)gpop(c);
+        if (s_hook_break_esp)
+            c->esp += 4U;                                /* violate cdecl */
+    } else if (target == va(ISAAC_IR_LOAD_RVA)) {
+        fake_load(c);
+    } else if (target == va(OFF_FAKE_RELEASE)) {
+        fake_release(c);
+#endif
     } else {
         ++s_unknown_targets;
         ev(EV_BAD_TARGET, 0, target, 0);
@@ -1201,6 +1464,1132 @@ static void memory_hostile_scenarios(void)
     CHECK(strstr(s_last_mem, " why=loading-complete") != NULL);
     isaac_vita_image_retain_disarm();
 }
+
+#if defined(IR_ORACLE_FLUSH)
+/* ------------------------------------------ batch-flush flags (0x04/0x10) - */
+#if defined(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED)
+#define IRT(f) isaac_ir_oracle_touched(ISAAC_IRT_F_##f)
+#endif
+#if defined(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED) && ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED == 2
+#define IRT_ON 1
+#else
+#define IRT_ON 0
+#endif
+
+/* An Image a flush has drawn and nothing else references: flags 0x11, in the
+ * TOUCHED vector once, no pending pair. */
+static uint32_t mk_touched(const char *nm, uint32_t *ctrl_out)
+{
+    uint32_t image = mk(va(ISAAC_IR_VT_PNG_RVA), nm, 512, 512, 4, 1, ctrl_out);
+    st32(image + ISAAC_IR_IMG_FLAGS, 0x01U);
+    touched_add(image);
+    return image;
+}
+
+static void flush_scenarios(void)
+{
+    uint32_t a, ac, b, bc;
+    const uint32_t mib = 512U * 512U * 4U;
+
+    (void)mib;
+    /* F1. The H2 case: a sheet with flags 0x11 whose last sprite dies.
+     *     ON keeps it (and its TOUCHED entry); OFF / OBSERVE Unregister it,
+     *     which erases the entry -- OBSERVE counts what ON would keep. */
+    begin("touched-admit", 64, 0);
+    a = mk_touched("t1.png", &ac);
+    offer(a, ac);
+#if IRT_ON
+    CHECK(retained_events_only());
+    CHECK(manager_present(a) == 1 && ld16(ac + ISAAC_IR_CTRL_STRONG) == 1);
+    CHECK(fv_count(FV_TOUCHED, a) == 1 && ld32(a + ISAAC_IR_IMG_FLAGS) == 0x11U && s_vec_erases == 0);
+    CHECK(st()->retained_new == 1 && st()->ineligible == 0 && isaac_ir_oracle_retained_bytes() == mib);
+    CHECK(IRT(OFFERS) == 1 && IRT(ADMIT) == 1 && IRT(ADMIT_BYTES) == mib);
+    CHECK(IRT(DIRTY) == 0 && IRT(VEC) == 0 && IRT(PAIR) == 0);
+    /* the next user takes it from the manager and lets go again: a reuse */
+    load_hit(ac);
+    sprite_dies(a, ac);
+    CHECK(retained_events_only() && st()->reuse == 1 && IRT(ADMIT) == 2 && IRT(ADMIT_BYTES) == mib);
+    /* the game's own sweep drops the entry; a later eviction is an ordinary
+     * Unregister that finds nothing in the vector */
+    fake_sweep(a);
+    CHECK(fv_count(FV_TOUCHED, a) == 0 && ld32(a + ISAAC_IR_IMG_FLAGS) == 0x01U);
+    isaac_ir_oracle_set_budget(mib, 0U);
+    b = mk(va(ISAAC_IR_VT_PNG_RVA), "t1b.png", 512, 512, 4, 1, &bc);
+    offer(b, bc);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0 && manager_present(b) == 1);
+    CHECK(s_vec_erases == 0 && s_walker_violations == 0 && IRT(PINNED_SKIP) == 0);
+#else
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0 && ld32(a) == 0xdead0000U);
+    CHECK(fv_count(FV_TOUCHED, a) == 0 && s_vec_erases == 1);
+    CHECK(st()->retained_new == 0 && st()->ineligible == 1 && isaac_ir_oracle_live_records() == 0);
+# if defined(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED)
+    CHECK(IRT(OFFERS) == 1 && IRT(ADMIT) == 1 && IRT(ADMIT_BYTES) == mib);
+    CHECK(IRT(DIRTY) == 0 && IRT(VEC) == 0 && IRT(PAIR) == 0);
+# endif
+    (void)b; (void)bc;
+#endif
+
+    /* F2. T1: quads still queued (0x04) -- refused in every mode; Unregister
+     *     drops them from the DIRTY vector as the OFF build does. */
+    begin("touched-dirty-refused", 64, 0);
+    a = mk_touched("t2.png", &ac);
+    dirty_add(a);                                        /* flags 0x15 */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0 && st()->retained_new == 0);
+    CHECK(fv_count(FV_DIRTY, a) == 0 && fv_count(FV_TOUCHED, a) == 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "t2b.png", 512, 512, 4, 1, &ac);
+    st32(a + ISAAC_IR_IMG_FLAGS, 0x01U);
+    dirty_add(a);                                        /* flags 0x05 */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0 && st()->ineligible == 2);
+#if defined(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED)
+    CHECK(IRT(OFFERS) == 2 && IRT(DIRTY) == 2 && IRT(ADMIT) == 0 && IRT(ADMIT_BYTES) == 0);
+#endif
+
+    /* F3. T2: the flags and the vectors must agree. */
+    begin("touched-vector-mismatch", 64, 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "t3a.png", 512, 512, 4, 1, &ac);
+    st32(a + ISAAC_IR_IMG_FLAGS, 0x11U);                 /* bit without an entry */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0);
+    a = mk_touched("t3b.png", &ac);
+    fv_push(FV_TOUCHED, a);                              /* two entries */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0);
+    (void)fv_erase(FV_TOUCHED, a);
+    a = mk_touched("t3c.png", &ac);
+    fv_push(FV_DIRTY, a);                                /* DIRTY entry without the bit */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0);
+    a = mk_touched("t3d.png", &ac);
+    st32(va(ISAAC_IR_TOUCHED_END_RVA), ld32(va(ISAAC_IR_TOUCHED_BEGIN_RVA)) - 4U);   /* end < begin */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0);
+    st32(va(ISAAC_IR_TOUCHED_END_RVA), ld32(va(ISAAC_IR_TOUCHED_BEGIN_RVA)));
+    a = mk_touched("t3e.png", &ac);
+    st32(va(ISAAC_IR_TOUCHED_END_RVA), ld32(va(ISAAC_IR_TOUCHED_END_RVA)) + 2U);     /* unaligned end */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0);
+    st32(va(ISAAC_IR_TOUCHED_END_RVA), ld32(va(ISAAC_IR_TOUCHED_BEGIN_RVA)));
+    CHECK(st()->retained_new == 0 && st()->ineligible == 5 && isaac_ir_oracle_live_records() == 0);
+#if defined(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED)
+    CHECK(IRT(OFFERS) == 5 && IRT(VEC) == 5 && IRT(ADMIT) == 0 && IRT(DIRTY) == 0 && IRT(PAIR) == 0);
+#endif
+
+    /* F4. T3: a pending {batch, Image} pair, or the Image latched as the most
+     *     recent pair's -- Unregister would have dropped those draws. */
+    begin("touched-pending-pair", 64, 0);
+    a = mk_touched("t4a.png", &ac);
+    pair_add(0x1234U, a);
+    st32(va(ISAAC_IR_LAST_PAIR_IMAGE_RVA), 0U);          /* the pair alone */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0);
+    CHECK(ld32(va(ISAAC_IR_PAIRS_END_RVA)) == ld32(va(ISAAC_IR_PAIRS_BEGIN_RVA)));
+    a = mk_touched("t4b.png", &ac);
+    st32(va(ISAAC_IR_LAST_PAIR_IMAGE_RVA), a);           /* the latch alone */
+    offer(a, ac);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0);
+    st32(va(ISAAC_IR_LAST_PAIR_IMAGE_RVA), 0U);
+    a = mk_touched("t4c.png", &ac);
+    pair_add(0x1234U, a + IMG_STRIDE);                   /* another Image's pair does not count */
+    st32(va(ISAAC_IR_LAST_PAIR_IMAGE_RVA), a + IMG_STRIDE);
+    offer(a, ac);
+#if IRT_ON
+    CHECK(retained_events_only() && manager_present(a) == 1 && st()->retained_new == 1);
+#else
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0 && st()->retained_new == 0);
+#endif
+#if defined(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED)
+    CHECK(IRT(OFFERS) == 3 && IRT(PAIR) == 2 && IRT(ADMIT) == 1 && IRT(VEC) == 0);
+#endif
+
+    /* F5. The base module's behaviour for an untouched Image with a pending
+     *     pair is unchanged in every mode (retained); the new counter names
+     *     how often that happens. */
+    begin("pair-untouched-counted", 64, 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "t5.png", 512, 512, 4, 1, &ac);
+    st32(a + ISAAC_IR_IMG_FLAGS, 0x01U);
+    pair_add(0x1234U, a);
+    offer(a, ac);
+    CHECK(retained_events_only() && manager_present(a) == 1 && st()->retained_new == 1);
+#if defined(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED)
+    CHECK(IRT(PAIR_UNTOUCHED) == 1 && IRT(OFFERS) == 0);
+#endif
+
+#if IRT_ON
+    /* F6. Rule E.  While a walk of the TOUCHED vector is on the stack, an
+     *     eviction must not Unregister a different touched Image (the OFF
+     *     build never shrinks the vector there).  The pinned record is passed
+     *     over; the budget stays a hard cap. */
+    begin("touched-rule-e", 64, 0);
+    isaac_ir_oracle_set_budget(mib + mib / 2U, 0U);
+    a = mk_touched("t6a.png", &ac);
+    offer(a, ac);
+    CHECK(manager_present(a) == 1 && isaac_ir_oracle_retained_bytes() == mib);
+    s_walker_active = 1; s_walker_image = 0U;
+    b = mk(va(ISAAC_IR_VT_PNG_RVA), "t6b.png", 512, 512, 4, 1, &bc);
+    offer(b, bc);                                        /* over budget: `a` is the LRU tail */
+    CHECK(count_unreg_of(a) == 0 && manager_present(a) == 1 && fv_count(FV_TOUCHED, a) == 1);
+    CHECK(count_unreg_of(b) == 1 && manager_present(b) == 0);
+    CHECK(s_walker_violations == 0 && s_vec_erases == 0 && IRT(PINNED_SKIP) == 1);
+    CHECK(isaac_ir_oracle_retained_bytes() == mib && isaac_ir_oracle_live_records() == 1);
+    /* a touched candidate: every record an eviction can reach is pinned ->
+     * the candidate itself is Unregistered at once (its own release: the one
+     * shrink the OFF build performs here too) */
+    b = mk_touched("t6c.png", &bc);
+    s_walker_image = b;
+    offer(b, bc);
+    CHECK(count_unreg_of(b) == 1 && manager_present(b) == 0 && fv_count(FV_TOUCHED, b) == 0);
+    CHECK(count_unreg_of(a) == 0 && manager_present(a) == 1 && fv_count(FV_TOUCHED, a) == 1);
+    CHECK(s_walker_violations == 0 && s_vec_erases == 1);
+    CHECK(IRT(EVICT_BLOCKED) == 1 && IRT(BUDGET_REFUSE) == 1 && IRT(PINNED_SKIP) == 3);
+    CHECK(isaac_ir_oracle_retained_bytes() == mib && isaac_ir_oracle_live_records() == 1);
+    CHECK(isaac_ir_oracle_retained_bytes() <= mib + mib / 2U && s_deadlock == 0 && s_fault_hit == 0);
+    /* the sweep unpins it; the next over-budget candidate evicts it */
+    s_walker_active = 0;
+    fake_sweep(a);
+    b = mk(va(ISAAC_IR_VT_PNG_RVA), "t6d.png", 512, 512, 4, 1, &bc);
+    offer(b, bc);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0 && manager_present(b) == 1);
+    CHECK(IRT(PINNED_SKIP) == 3 && IRT(EVICT_BLOCKED) == 1 && isaac_ir_oracle_retained_bytes() == mib);
+
+    /* F7. A stale record is never pinned (the game Unregistered the Image
+     *     behind our back and its memory still reads flags 0x11). */
+    begin("touched-stale-not-pinned", 64, 0);
+    isaac_ir_oracle_set_budget(mib, 0U);
+    a = mk_touched("t7a.png", &ac);
+    offer(a, ac);
+    do_unregister(&s_cpu, 0x5bfc46U, a);
+    st32(a + ISAAC_IR_IMG_FLAGS, 0x11U);
+    b = mk(va(ISAAC_IR_VT_PNG_RVA), "t7b.png", 512, 512, 4, 1, &bc);
+    offer(b, bc);
+    CHECK(manager_present(b) == 1 && IRT(PINNED_SKIP) == 0 && st()->dropped_stale == 1);
+    CHECK(isaac_ir_oracle_live_records() == 1 && isaac_ir_oracle_retained_bytes() == mib);
+#endif
+}
+#endif
+
+#if defined(ISAAC_VITA_IMAGE_PRELOAD)
+/* -------------------------------------------------------------- preload --- */
+/* The runner builds these legs with
+ *   ISAAC_VITA_IMAGE_PRELOAD_LIST = "gfx/BulletAtlas.png,gfx/b.png"
+ *   ISAAC_VITA_IMAGE_PRELOAD_MAX_KB = 2048, _RESERVE_MB = 8 or 4 (P_NEED_KIB below). */
+#define IRP(f) isaac_ir_oracle_preload(ISAAC_IRP_F_##f)
+#define DP(f) (IRP(f) - s_p0[ISAAC_IRP_F_##f])
+static uint32_t s_p0[ISAAC_IRP_F_ENTRIES + 1];
+static void p_begin(const char *name, uint32_t budget_mb, uint32_t headroom_mb)
+{
+    unsigned k;
+#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)
+    s_pin_n = 0U;                        /* keeps the PIN armed line of this begin */
+    memset(s_pin_log, 0, sizeof s_pin_log);
+#endif
+    begin(name, budget_mb, headroom_mb);
+    for (k = 0; k <= ISAAC_IRP_F_ENTRIES; ++k)
+        s_p0[k] = isaac_ir_oracle_preload(k);
+    s_load_flags = 0x01U; s_load_pw = 1024U; s_load_ph = 512U;
+    s_load_fail = 0; s_load_orphan = 0; s_load_break_esp = 0; s_release_break_esp = 0; s_hook_break_esp = 0;
+    s_load_calls = 0; s_load_bad_args = 0; s_release_calls = 0; s_hook_calls = 0;
+    s_heap_hr = 20U << 20; s_heap_terminal = 0;
+    st32(va(ISAAC_IR_CTRL_VT_RVA) + ISAAC_IR_CTRL_VT_RELEASE, va(OFF_FAKE_RELEASE));
+}
+/* Level::Init has returned: the SFX floor seam calls the preload with the
+ * caller's ESP; whatever happens, ESP comes back. */
+static void level(CPU *c)
+{
+    uint32_t esp0;
+    cpu_bind(c);
+    esp0 = c->esp;
+    ev_reset();
+    isaac_vita_image_preload_level_init(c);
+    CHECK(c->esp == esp0);
+}
+static uint32_t last_image(uint32_t back) { return va(OFF_IMG) + (s_img_n - back) * IMG_STRIDE; }
+static uint32_t last_ctrl(uint32_t back) { return va(OFF_CTRL) + (s_ctrl_n - back) * CTRL_STRIDE; }
+
+/* The `h` gate in KiB (RESERVE_MB + 2 x MAX_KB with MAX_KB 2048), written out
+ * per reserve the runner builds, and which bench-route column applies. */
+#if ISAAC_VITA_IMAGE_PRELOAD_MAX_KB != 2048
+#error the preload scenarios are written for MAX_KB 2048
+#endif
+#if ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB == 8
+#define P_NEED_KIB 12288U
+#define P_NEED_TEXT " need_kb=12288 "
+#define P_ROUTE_RUN(r) ((r).run8)
+#elif ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB == 4
+#define P_NEED_KIB 8192U
+#define P_NEED_TEXT " need_kb=8192 "
+#define P_ROUTE_RUN(r) ((r).run4)
+#else
+#error the preload scenarios know RESERVE_MB 8 and 4
+#endif
+
+#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)
+/* ---------------------------------------------------------- preload pin --- */
+/* ISAAC_VITA_IMAGE_PRELOAD_PIN = 1 (OBSERVE) or 2 (ON).  Every scenario runs
+ * in both modes: OBSERVE must take the OFF decisions (the expectations of
+ * the #else arms are OFF's) and only print; ON pins.  The PIN counters are
+ * reset by each arm (p_begin), so they are read absolutely. */
+#define PP(f) isaac_ir_oracle_preload_pin(ISAAC_IRPP_F_##f)
+#if ISAAC_VITA_IMAGE_PRELOAD_PIN == 2
+#define PIN_ON 1
+#define PIN_MODE " mode=on "
+#else
+#define PIN_ON 0
+#define PIN_MODE " mode=observe "
+#endif
+#define PIN_STATE_WAITING 1U   /* IRP_WAITING */
+#define PIN_STATE_ON_FREE 3U   /* IRP_ON_FREE = IRP_USED + 1 */
+static int pin_has(const char *needle)
+{
+    unsigned k;
+    const unsigned n = s_pin_n < PIN_KEEP ? s_pin_n : PIN_KEEP;
+
+    for (k = 0; k < n; ++k)
+        if (strstr(s_pin_log[k], needle) != NULL)
+            return 1;
+    return 0;
+}
+/* `n` (<= 4) other 2 MiB sheets the game decoded and let go of (strong 1
+ * offers, in order).  Returns the first; the events are the last offer's. */
+static uint32_t pin_others(unsigned n)
+{
+    static const char *const names[] = { "o1.png", "o2.png", "o3.png", "o4.png" };
+    uint32_t first = 0U, img, ctrl;
+    unsigned k;
+
+    for (k = 0; k < n && k < 4U; ++k) {
+        img = mk(va(ISAAC_IR_VT_PNG_RVA), names[k], 1024, 512, 4, 1, &ctrl);
+        if (k == 0U)
+            first = img;
+        offer(img, ctrl);
+    }
+    return first;
+}
+
+/* The image of the n-th (from 0) Unregister among the last offer's events. */
+static uint32_t pin_unreg_nth(unsigned n)
+{
+    unsigned i, k = 0U;
+
+    for (i = 0; i < s_event_n && i < 4096U; ++i)
+        if (s_events[i].kind == EV_UNREG && k++ == n)
+            return s_events[i].a;
+    return 0U;
+}
+
+static void pin_scenarios(void)
+{
+    uint32_t a, ac, b, o1, s, sc;
+    const uint32_t sheet = 1024U * 512U * 4U;
+
+    /* Q1. "Present" is another key that ends in the list name (a mod's copy,
+     *     held by the game).  OBSERVE prints it and does nothing, as OFF;
+     *     ON replays Load, which decodes the game's own key (alias). */
+    p_begin("pin-present-alias", 12, 0);
+    CHECK(pin_has("KAGE VITA IMAGE PRELOAD PIN: armed" PIN_MODE "share=1/2 set_max=4 lines_max=64 build="));
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "mods/x/gfx/BulletAtlas.png", 1024, 512, 4, 2, &ac);
+    level(&s_cpu);
+    CHECK(DP(PRESENT) == 1 && ld16(ac + ISAAC_IR_CTRL_STRONG) == 2 && manager_present(a) == 1);
+    CHECK(pin_has("KAGE VITA IMAGE PRELOAD PIN: present name=gfx/BulletAtlas.png level="));
+    CHECK(pin_has(" k=1/1 image="));
+    CHECK(pin_has(" strong=2 flags=00000000 bytes=2097152 rec=0 own=0 key=mods/x/gfx/BulletAtlas.png"));
+#if PIN_ON
+    CHECK(s_load_calls == 2 && DP(LOADED) == 2 && DP(RETAINED) == 2 && manager_count() == 3);
+    CHECK(PP(ALIAS) == 1 && PP(EXACT) == 0 && PP(HELD) == 0);
+    CHECK(PP(PINNED) == 2 && PP(PINS) == 2 && PP(PINNED_BYTES) == 2U * sheet && PP(REFUSED) == 0);
+    CHECK(pin_has(" mode=on pins=2 pinned_bytes=4194304 share=6291456 released=0 pinned=2 own=0 exact=0 alias=1 held=0"));
+#else
+    CHECK(s_load_calls == 1 && DP(LOADED) == 1 && manager_count() == 2);
+    CHECK(PP(ALIAS) == 0 && PP(PINNED) == 0 && PP(PINS) == 0);
+    CHECK(pin_has(" mode=observe pins=0 pinned_bytes=0 share=6291456 released=0 pinned=0 own=0 exact=0 alias=0 held=0"));
+#endif
+
+    /* Q2. Budget pressure before the fight: the eviction walks past the
+     *     pinned sheets (ON) and takes the oldest unpinned one; the fight's
+     *     Load then hits, and letting go of it releases the pin (`used`). */
+    p_begin("pin-pressure-hit", 8, 0);
+    level(&s_cpu);
+    a = last_image(2); ac = last_ctrl(2);
+    b = last_image(1);
+    CHECK(DP(RETAINED) == 2 && PP(PINNED) == (PIN_ON ? 2U : 0U) && PP(REFUSED) == 0);
+    o1 = pin_others(3);
+    CHECK(isaac_ir_oracle_retained_bytes() <= (8U << 20) && PP(YIELD) == 0);
+#if PIN_ON
+    CHECK(count_unreg_of(o1) == 1 && count_unreg_of(a) == 0 && PP(SKIP) == 2);
+    CHECK(manager_present(a) == 1 && manager_present(b) == 1 && DP(EVICTED_UNUSED) == 0);
+    load_hit(ac);
+    sprite_dies(a, ac);
+    CHECK(DP(HIT) == 1 && DP(MISS) == 0 && PP(USED) == 1 && PP(PIN0) == 0 && PP(PIN1) == 1);
+    CHECK(PP(PINNED_BYTES) == sheet && isaac_ir_oracle_retained_bytes() <= (8U << 20));
+#else
+    CHECK(count_unreg_of(a) == 1 && count_unreg_of(o1) == 0 && manager_present(a) == 0);
+    CHECK(manager_present(b) == 1 && DP(EVICTED_UNUSED) == 1 && PP(SKIP) == 0);
+#endif
+
+    /* Q3. The exact key is present and the game holds it (strong 2).  ON's
+     *     replay is a strcmp hit on it (`exact`, nothing decoded) and marks
+     *     it held; when the room lets go, the retention seam records it and
+     *     it is pinned (`on_free`); pressure walks past it; the fight's
+     *     Load hits it.  OBSERVE / OFF: the same release is a miss. */
+    p_begin("pin-held-freed-reloaded", 8, 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "resources/gfx/BulletAtlas.png", 1024, 512, 4, 2, &ac);
+    level(&s_cpu);
+    CHECK(DP(PRESENT) == 1 && ld16(ac + ISAAC_IR_CTRL_STRONG) == 2 && manager_present(a) == 1);
+    CHECK(pin_has(" strong=2 flags=00000000 bytes=2097152 rec=0 own=0 key=resources/gfx/BulletAtlas.png"));
+#if PIN_ON
+    CHECK(s_load_calls == 2 && PP(EXACT) == 1 && PP(ALIAS) == 0 && PP(HELD) == 1);
+    CHECK(PP(STATE0) == PIN_STATE_ON_FREE && PP(PIN0) == 0 && PP(PIN1) == 1);
+    CHECK(DP(DROPPED) == 0 && DP(RETAINED) == 1 && DP(LOADED) == 2);
+    CHECK(pin_has("KAGE VITA IMAGE PRELOAD: image name=gfx/BulletAtlas.png result=held image="));
+#else
+    CHECK(s_load_calls == 1 && PP(EXACT) == 0 && PP(HELD) == 0 && PP(STATE0) == 0);
+#endif
+    sprite_dies(a, ac);                          /* the room's last holder lets go */
+    CHECK(isaac_ir_oracle_live_records() == 2 && manager_present(a) == 1);
+#if PIN_ON
+    CHECK(PP(ON_FREE) == 1 && PP(PIN0) == 1 && PP(STATE0) == PIN_STATE_WAITING);
+    CHECK(PP(LOST) == 0 && DP(MISS) == 0 && PP(PINNED_BYTES) == 2U * sheet);
+#else
+    CHECK(DP(MISS) == 1 && PP(ON_FREE) == 0);
+#endif
+    o1 = pin_others(3);
+    CHECK(isaac_ir_oracle_retained_bytes() <= (8U << 20));
+#if PIN_ON
+    CHECK(count_unreg_of(o1) == 1 && count_unreg_of(a) == 0 && PP(SKIP) == 2);
+    CHECK(manager_present(a) == 1 && DP(EVICTED_UNUSED) == 0);
+    load_hit(ac);                                /* the fight's Load: no decode */
+    sprite_dies(a, ac);
+    CHECK(DP(HIT) == 1 && PP(USED) == 1 && PP(PIN0) == 0 && s_load_calls == 2);
+#else
+    CHECK(DP(EVICTED_UNUSED) == 1 && manager_present(a) == 1 && count_unreg_of(o1) == 0);
+    load_hit(ac);
+    sprite_dies(a, ac);
+    CHECK(DP(HIT) == 0 && DP(MISS) == 2 && s_load_calls == 1);
+#endif
+
+    /* Q4. No pin outlives its floor: the next Level::Init releases every pin
+     *     before its walk (here the walk cannot run: manager Mutex held), and
+     *     the LRU is free to take the unused sheets again. */
+    p_begin("pin-floor-release", 8, 0);
+    level(&s_cpu);
+    a = last_image(2);
+    CHECK(PP(PINS) == (PIN_ON ? 2U : 0U) && PP(PINNED_BYTES) == (PIN_ON ? 2U * sheet : 0U));
+    st8(va(OFF_MGR_CS) + ISAAC_IR_CS_HELD, 1U);
+    level(&s_cpu);
+    st8(va(OFF_MGR_CS) + ISAAC_IR_CS_HELD, 0U);
+    CHECK(DP(SKIP_LOCK) == 2 && PP(PINS) == 0 && PP(PINNED_BYTES) == 0);
+    CHECK(PP(FLOOR) == (PIN_ON ? 2U : 0U));
+    CHECK(PP(STATE0) == PIN_STATE_WAITING && PP(STATE1) == PIN_STATE_WAITING);
+    CHECK(pin_has(PIN_MODE "pins=0 pinned_bytes=0 share=4194304 released="));
+#if PIN_ON
+    CHECK(pin_has(" mode=on pins=0 pinned_bytes=0 share=4194304 released=2 pinned=0 own=0 exact=0 alias=0 held=0"));
+#endif
+    o1 = pin_others(3);
+    CHECK(count_unreg_of(a) == 1 && count_unreg_of(o1) == 0 && manager_present(a) == 0);
+    CHECK(DP(EVICTED_UNUSED) == 1 && PP(SKIP) == 0 && isaac_ir_oracle_retained_bytes() <= (8U << 20));
+
+    /* Q5. The sheet an earlier floor left retained and unused is present
+     *     as itself (own=1 in both modes); ON re-pins it without a Load. */
+    p_begin("pin-own-repin", 12, 0);
+    level(&s_cpu);
+    level(&s_cpu);
+    CHECK(s_load_calls == 2 && DP(PRESENT) == 2 && DP(LOADED) == 2);
+    CHECK(pin_has(" rec=1 own=1 key=resources/gfx/BulletAtlas.png"));
+    CHECK(pin_has(" rec=1 own=1 key=resources/gfx/b.png"));
+#if PIN_ON
+    CHECK(PP(OWN) == 2 && PP(FLOOR) == 2 && PP(PINNED) == 4 && PP(PINS) == 2);
+    CHECK(PP(PINNED_BYTES) == 2U * sheet && PP(EXACT) == 0 && PP(ALIAS) == 0);
+    CHECK(pin_has(" mode=on pins=2 pinned_bytes=4194304 share=6291456 released=2 pinned=2 own=2 exact=0 alias=0 held=0"));
+#else
+    CHECK(PP(OWN) == 0 && PP(PINNED) == 0 && PP(PINS) == 0);
+#endif
+
+    /* Q6. A pin never blocks an eviction: free memory under the headroom,
+     *     every record pinned -> the oldest pin yields and goes. */
+    p_begin("pin-yield-headroom", 12, 16);
+    level(&s_cpu);
+    a = last_image(2); b = last_image(1);
+    CHECK(DP(RETAINED) == 2 && PP(PINS) == (PIN_ON ? 2U : 0U));
+    s_free_ram = 15U << 20; s_free_vram = 0U;    /* 15 < 16 */
+    s = mk(va(ISAAC_IR_VT_PNG_RVA), "small.png", 64, 64, 4, 1, &sc);
+    offer(s, sc);
+    CHECK(count_unreg_of(a) == 1 && count_unreg_of(b) == 0 && manager_present(b) == 1);
+    CHECK(DP(EVICTED_UNUSED) == 1 && st()->headroom_evict >= 1U);
+#if PIN_ON
+    CHECK(PP(YIELD) == 1 && PP(SKIP) == 2 && PP(PIN0) == 0 && PP(PIN1) == 1);
+    CHECK(PP(PINNED_BYTES) == sheet && PP(DROPPED) == 0);
+#else
+    CHECK(PP(YIELD) == 0 && PP(SKIP) == 0);
+#endif
+
+    /* Q7. A pinned sheet Unregistered behind our back (a foreign Clear):
+     *     the pin is released as `stale` and the record dropped without a
+     *     guest Unregister; the budget still holds. */
+    p_begin("pin-stale", 8, 0);
+    level(&s_cpu);
+    a = last_image(2);
+    do_unregister(&s_cpu, 0x5bfc46U, a);
+    CHECK(manager_present(a) == 0 && PP(PINS) == (PIN_ON ? 2U : 0U));
+    o1 = pin_others(3);
+    CHECK(count_unreg_of(a) == 0 && count_unreg_of(o1) == 0 && PP(DROPPED) == 0);
+    CHECK(PP(STALE) == (PIN_ON ? 1U : 0U) && PP(PINS) == (PIN_ON ? 1U : 0U));
+    CHECK(isaac_ir_oracle_retained_bytes() == 4U * sheet);
+
+    /* Q7b. ... and its address reused by a new Image before any eviction
+     *      looked: the retention seam drops the dead record on the new
+     *      offer, and the pin goes with it (`dropped`). */
+    p_begin("pin-dropped-address-reused", 8, 0);
+    level(&s_cpu);
+    a = last_image(2);
+    do_unregister(&s_cpu, 0x5bfc46U, a);
+    {
+        const uint32_t keep_n = s_img_n;
+
+        s_img_n = (a - va(OFF_IMG)) / IMG_STRIDE;
+        s = mk(va(ISAAC_IR_VT_PNG_RVA), "reused.png", 64, 64, 4, 1, &sc);
+        s_img_n = keep_n;
+    }
+    CHECK(s == a && manager_present(a) == 1);
+    offer(s, sc);
+    CHECK(PP(DROPPED) == (PIN_ON ? 1U : 0U) && PP(STALE) == 0);
+    CHECK(PP(PINS) == (PIN_ON ? 1U : 0U) && PP(PINNED_BYTES) == (PIN_ON ? sheet : 0U));
+    CHECK(isaac_ir_oracle_live_records() == 2 && isaac_ir_oracle_retained_bytes() == sheet + 64U * 64U * 4U);
+
+    /* Q8. The held exact sheet carries flag 0x10 (drawn: on the TOUCHED
+     *     flush list).  Without ADMIT_TOUCHED ON the retention seam refuses
+     *     it, the observer frees it, and the next offer settles it as `lost`
+     *     (Load will decode it again); with ADMIT_TOUCHED ON it is admitted
+     *     and pinned like Q3. */
+    p_begin("pin-held-lost", 8, 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "resources/gfx/BulletAtlas.png", 1024, 512, 4, 2, &ac);
+#if defined(IR_ORACLE_FLUSH)
+    touched_add(a);
+#else
+    st32(a + ISAAC_IR_IMG_FLAGS, 0x10U);
+#endif
+    level(&s_cpu);
+    CHECK(pin_has(" strong=2 flags=00000010 bytes=2097152 rec=0 own=0 key=resources/gfx/BulletAtlas.png"));
+    sprite_dies(a, ac);
+    CHECK(PP(LOST) == 0);
+    s = mk(va(ISAAC_IR_VT_PNG_RVA), "small.png", 64, 64, 4, 1, &sc);
+    offer(s, sc);
+#if PIN_ON && defined(IR_ORACLE_FLUSH) && IRT_ON
+    CHECK(PP(HELD) == 1 && PP(ON_FREE) == 1 && PP(LOST) == 0 && PP(PIN0) == 1);
+    CHECK(manager_present(a) == 1 && PP(STATE0) == PIN_STATE_WAITING && DP(MISS) == 0);
+#elif PIN_ON
+    CHECK(PP(HELD) == 1 && PP(LOST) == 1 && PP(ON_FREE) == 0 && PP(PIN0) == 0);
+    CHECK(manager_present(a) == 0 && PP(STATE0) == 0 && DP(MISS) == 0);
+    CHECK(pin_has("KAGE VITA IMAGE PRELOAD PIN: lost name=gfx/BulletAtlas.png level="));
+    CHECK(pin_has(" flags=00000010 lost=1 exit=ineligible"));
+#else
+    CHECK(PP(LOST) == 0 && PP(HELD) == 0 && DP(MISS) == 1);
+#endif
+
+    /* Q9. Q3's held sheet, but the room's last holder lets go while the
+     *     manager Mutex is held: ir_keep keeps it at the LRU tail (irp_offer
+     *     does not run).  ON still pins it there (review F-BA item 4);
+     *     nothing is `lost` in either mode, the sheet is the manager's. */
+    p_begin("pin-held-freed-under-lock", 8, 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "resources/gfx/BulletAtlas.png", 1024, 512, 4, 2, &ac);
+    level(&s_cpu);
+#if PIN_ON
+    CHECK(PP(HELD) == 1 && PP(STATE0) == PIN_STATE_ON_FREE && PP(PIN0) == 0 && PP(PIN1) == 1);
+#endif
+    st8(va(OFF_MGR_CS) + ISAAC_IR_CS_HELD, 1U);
+    sprite_dies(a, ac);
+    st8(va(OFF_MGR_CS) + ISAAC_IR_CS_HELD, 0U);
+    CHECK(manager_present(a) == 1 && count_unreg_of(a) == 0 && isaac_ir_oracle_live_records() == 2);
+    CHECK(PP(LOST) == 0 && DP(MISS) == 0 && st()->held_keep == 1);
+#if PIN_ON
+    CHECK(PP(ON_FREE) == 1 && PP(PIN0) == 1 && PP(STATE0) == PIN_STATE_WAITING);
+    CHECK(PP(PINNED_BYTES) == 2U * sheet);
+#else
+    CHECK(PP(ON_FREE) == 0 && PP(PIN0) == 0);
+#endif
+    o1 = pin_others(3);
+    CHECK(isaac_ir_oracle_retained_bytes() <= (8U << 20) && PP(LOST) == 0);
+#if PIN_ON
+    CHECK(count_unreg_of(o1) == 1 && count_unreg_of(a) == 0 && manager_present(a) == 1);
+    CHECK(PP(SKIP) == 2 && PP(YIELD) == 0);
+#else
+    CHECK(count_unreg_of(a) == 1 && count_unreg_of(o1) == 0 && manager_present(a) == 0);
+#endif
+
+    /* Q10. The held sheet's release is taken back between the wrapper's
+     *      unlocked pre-check and its lock replay (the observer's
+     *      `reacquired` no-op): the sheet is still the game's, so it is not
+     *      `lost` and stays held; the release that follows pins it (review
+     *      F-BA item 5).  OBSERVE / OFF: two misses, as before. */
+    p_begin("pin-held-reacquired", 8, 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "resources/gfx/BulletAtlas.png", 1024, 512, 4, 2, &ac);
+    level(&s_cpu);
+    s_race_bump = 1;
+    sprite_dies(a, ac);
+    CHECK(s_race_bump == 0 && ld16(ac + ISAAC_IR_CTRL_STRONG) == 2 && manager_present(a) == 1);
+    CHECK(count_unreg_of(a) == 0 && isaac_ir_oracle_live_records() == 1);
+    s = mk(va(ISAAC_IR_VT_PNG_RVA), "small.png", 64, 64, 4, 1, &sc);
+    offer(s, sc);
+    CHECK(PP(LOST) == 0 && PP(ON_FREE) == 0);
+#if PIN_ON
+    CHECK(PP(HELD) == 1 && PP(STATE0) == PIN_STATE_ON_FREE && PP(PIN0) == 0 && DP(MISS) == 0);
+#else
+    CHECK(DP(MISS) == 1);
+#endif
+    sprite_dies(a, ac);
+    CHECK(manager_present(a) == 1 && isaac_ir_oracle_live_records() == 3 && PP(LOST) == 0);
+#if PIN_ON
+    CHECK(PP(ON_FREE) == 1 && PP(PIN0) == 1 && PP(STATE0) == PIN_STATE_WAITING && DP(MISS) == 0);
+    CHECK(PP(PINNED_BYTES) == 2U * sheet);
+#else
+    CHECK(PP(ON_FREE) == 0 && PP(PIN0) == 0 && DP(MISS) == 2);
+#endif
+
+    /* R1. A retained sheet (x) the game held is let go under headroom
+     *     pressure while every other record is pinned (review F-BA item 1).
+     *     ir_wrap moves x's record to the head and releases tails; the walk
+     *     must not take x's own record (that Unregisters the Image the
+     *     observer's caller holds and leaves a stale index): the oldest pin
+     *     yields, as OFF's tail walk takes the tail.  Immediate frees: one
+     *     tail recovers the headroom and x is retained. */
+    p_begin("pin-candidate-own-record-headroom", 12, 16);
+    level(&s_cpu);
+    a = last_image(2); b = last_image(1);
+    CHECK(PP(PINS) == (PIN_ON ? 2U : 0U));
+    s = mk(va(ISAAC_IR_VT_PNG_RVA), "x.png", 64, 64, 4, 1, &sc);
+    offer(s, sc);
+    CHECK(isaac_ir_oracle_live_records() == 3);
+    load_hit(sc);
+    s_free_ram = 15U << 20; s_free_vram = 0U;    /* 15 < 16 */
+    sprite_dies(s, sc);
+    CHECK(count_unreg_of(s) == 0 && count_unreg_of(a) == 1 && count_unreg_of(b) == 0);
+    CHECK(manager_present(s) == 1 && manager_present(b) == 1 && manager_present(a) == 0);
+    CHECK(isaac_ir_oracle_live_records() == 2 && isaac_ir_oracle_retained_bytes() == sheet + 64U * 64U * 4U);
+    CHECK(st()->headroom_pass == 0 && DP(EVICTED_UNUSED) == 1);
+#if PIN_ON
+    CHECK(PP(YIELD) == 1 && PP(CAND_SKIP) == 1 && PP(SKIP) == 2);
+    CHECK(PP(PINS) == 1 && PP(PIN0) == 0 && PP(PIN1) == 1 && PP(PINNED_BYTES) == sheet);
+#else
+    CHECK(PP(YIELD) == 0 && PP(CAND_SKIP) == 0 && PP(SKIP) == 0);
+#endif
+
+    /* R1b. ... and vitaGL defers the frees (s_deferred_free): no tail
+     *      recovers the headroom.  Both pins yield in turn, x's record is
+     *      forgotten and the real observer Unregisters x last, exactly as
+     *      OFF: the table ends empty and consistent. */
+    p_begin("pin-candidate-own-record-deferred", 12, 16);
+    level(&s_cpu);
+    a = last_image(2); b = last_image(1);
+    s = mk(va(ISAAC_IR_VT_PNG_RVA), "x.png", 64, 64, 4, 1, &sc);
+    offer(s, sc);
+    load_hit(sc);
+    s_free_ram = 15U << 20; s_free_vram = 0U;
+    s_deferred_free = 1;
+    sprite_dies(s, sc);
+    CHECK(ev_count(EV_UNREG) == 3 && pin_unreg_nth(0) == a && pin_unreg_nth(1) == b && pin_unreg_nth(2) == s);
+    CHECK(manager_present(s) == 0 && manager_present(b) == 0 && manager_present(a) == 0);
+    CHECK(isaac_ir_oracle_live_records() == 0 && isaac_ir_oracle_retained_bytes() == 0);
+    CHECK(st()->headroom_pass == 1 && st()->headroom_evict == 3);
+#if PIN_ON
+    CHECK(PP(YIELD) == 2 && PP(CAND_SKIP) == 2 && PP(SKIP) == 3 && PP(PINS) == 0);
+#else
+    CHECK(PP(YIELD) == 0 && PP(CAND_SKIP) == 0);
+#endif
+
+    /* R2. Budget path (review F-BA item 2): a 6 MiB sheet the game let go
+     *     of is recorded at the head and the table is 2 MiB over budget
+     *     while both 2 MiB pins hold.  The walk must not evict the sheet it
+     *     just recorded while a pin can yield: the oldest pin yields, OFF's
+     *     choice.  (The sheet's own release stays the last resort of a
+     *     budget eviction; touched-rule-e's on+pin leg reaches it.) */
+    p_begin("pin-candidate-budget", 8, 0);
+    level(&s_cpu);
+    a = last_image(2); b = last_image(1);
+    CHECK(PP(PINS) == (PIN_ON ? 2U : 0U));
+    s = mk(va(ISAAC_IR_VT_PNG_RVA), "big.png", 1024, 1536, 4, 1, &sc);
+    offer(s, sc);
+    CHECK(count_unreg_of(s) == 0 && count_unreg_of(a) == 1 && count_unreg_of(b) == 0);
+    CHECK(manager_present(s) == 1 && manager_present(b) == 1);
+    CHECK(isaac_ir_oracle_live_records() == 2 && isaac_ir_oracle_retained_bytes() == (8U << 20));
+#if PIN_ON
+    CHECK(PP(YIELD) == 1 && PP(CAND_SKIP) == 1 && PP(PINS) == 1 && PP(PIN1) == 1);
+#else
+    CHECK(PP(YIELD) == 0 && PP(CAND_SKIP) == 0);
+#endif
+
+#if PIN_ON && defined(IR_ORACLE_FLUSH) && IRT_ON
+    /* R3. R1 with ADMIT_TOUCHED ON and no pin at all: the record older than
+     *     x is rule E's (a touched sheet on a flush list), which no eviction
+     *     may take and which cannot yield.  The headroom walk passes x's own
+     *     record and finds nothing (evict_blocked); x's record is forgotten
+     *     and the real observer frees x, as OFF.  (The IMG lane's own walker,
+     *     used without PIN ON, has no barrier: review F-BA item 3.) */
+    p_begin("pin-candidate-rule-e-headroom", 12, 16);
+    a = mk_touched("t9.png", &ac);
+    offer(a, ac);
+    s = mk(va(ISAAC_IR_VT_PNG_RVA), "x.png", 64, 64, 4, 1, &sc);
+    offer(s, sc);
+    CHECK(isaac_ir_oracle_live_records() == 2 && manager_present(a) == 1 && manager_present(s) == 1);
+    load_hit(sc);
+    s_free_ram = 15U << 20; s_free_vram = 0U;    /* 15 < 16 */
+    sprite_dies(s, sc);
+    CHECK(count_unreg_of(a) == 0 && manager_present(a) == 1 && fv_count(FV_TOUCHED, a) == 1);
+    CHECK(count_unreg_of(s) == 1 && manager_present(s) == 0 && ev_count(EV_UNREG) == 1);
+    CHECK(isaac_ir_oracle_live_records() == 1 && isaac_ir_oracle_retained_bytes() == 512U * 512U * 4U);
+    CHECK(st()->headroom_pass == 1 && st()->headroom_evict == 1);
+    CHECK(PP(CAND_SKIP) == 1 && PP(YIELD) == 0 && PP(PINS) == 0);
+    CHECK(IRT(PINNED_SKIP) == 1 && IRT(EVICT_BLOCKED) == 1 && IRT(BUDGET_REFUSE) == 0);
+#endif
+}
+#endif
+
+static void preload_scenarios(void)
+{
+    uint32_t a, ac, b, bc;
+    const uint32_t sheet = 1024U * 512U * 4U;
+
+    /* P1. Both list sheets are decoded at floor load and end up retained:
+     *     strong 1 (the manager's), a record each, the caller's stack back. */
+    p_begin("preload-retained", 12, 0);
+    CHECK(IRP(ENTRIES) == 2);
+    level(&s_cpu);
+    CHECK(s_load_calls == 2 && s_load_bad_args == 0 && s_release_calls == 2 && s_hook_calls == 2);
+    CHECK(s_deadlock == 0 && s_fault_hit == 0 && s_unknown_targets == 0 && ev_count(EV_UNREG) == 0);
+    CHECK(DP(LEVELS) == 1 && DP(LOADED) == 2 && DP(RETAINED) == 2 && DP(DROPPED) == 0);
+    CHECK(DP(FAIL) == 0 && DP(PRESENT) == 0 && DP(HIT) == 0 && DP(MISS) == 0 && DP(BREACH) == 0);
+    CHECK(DP(LOADED_BYTES) == 2U * sheet && isaac_ir_oracle_live_records() == 2);
+    CHECK(isaac_ir_oracle_retained_bytes() == 2U * sheet && manager_count() == 2);
+    CHECK(strncmp(s_last_log, "KAGE VITA IMAGE PRELOAD: level=", 31) == 0);
+    CHECK(strstr(s_last_log, " n=2 loaded=2 retained=2 dropped=0 present=0 fail=0 skipped=0 bytes=4194304 ") != NULL);
+    CHECK(strstr(s_last_log, " hr_kb=20480..20480" P_NEED_TEXT "fault=0") != NULL);
+    a = last_image(2); ac = last_ctrl(2);
+    b = last_image(1); bc = last_ctrl(1);
+    CHECK(manager_present(a) == 1 && ld16(ac + ISAAC_IR_CTRL_STRONG) == 1);
+    CHECK(manager_present(b) == 1 && ld16(bc + ISAAC_IR_CTRL_STRONG) == 1);
+    CHECK(guest_str_eq(ld32(a + ISAAC_IR_IMG_NAME), "resources/gfx/BulletAtlas.png"));
+    CHECK(guest_str_eq(ld32(b + ISAAC_IR_IMG_NAME), "resources/gfx/b.png"));
+    /* the next floor finds them in the manager: no Load */
+    level(&s_cpu);
+    CHECK(DP(LEVELS) == 2 && DP(PRESENT) == 2 && DP(LOADED) == 2 && s_load_calls == 2);
+    CHECK(strstr(s_last_log, " n=2 loaded=0 retained=0 dropped=0 present=2 fail=0 skipped=0 bytes=0 ") != NULL);
+    /* the fight takes the sheet from the manager (no decode) and lets go:
+     * one hit per preloaded sheet, however often it is reused afterwards */
+    load_hit(ac);
+    sprite_dies(a, ac);
+    CHECK(retained_events_only() && DP(HIT) == 1 && DP(MISS) == 0 && st()->reuse == 1);
+    load_hit(ac);
+    sprite_dies(a, ac);
+    CHECK(DP(HIT) == 1 && DP(MISS) == 0 && st()->reuse == 2);
+
+    /* P2. A list sheet the game decoded itself is a miss; the name match is
+     *     a whole path component, ASCII case and slash direction folded. */
+    p_begin("preload-miss", 12, 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "resources/gfx/b.png", 64, 64, 4, 1, &ac);
+    offer(a, ac);
+    CHECK(DP(MISS) == 1 && DP(HIT) == 0);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "resources/gfx/xb.png", 64, 64, 4, 1, &ac);
+    offer(a, ac);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "xgfx/b.png", 64, 64, 4, 1, &ac);
+    offer(a, ac);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "fx/b.png", 64, 64, 4, 1, &ac);
+    offer(a, ac);
+    CHECK(DP(MISS) == 1);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "RESOURCES\\GFX\\B.PNG", 64, 64, 4, 1, &ac);
+    offer(a, ac);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "gfx/b.png", 64, 64, 4, 1, &ac);
+    offer(a, ac);
+    CHECK(DP(MISS) == 3 && DP(HIT) == 0 && DP(LEVELS) == 0);
+
+    /* P3. The retention seam refuses the sheet (quads queued): the real
+     *     observer frees it again -- dropped, nothing leaks. */
+    p_begin("preload-dropped", 12, 0);
+    s_load_flags = 0x05U;
+    level(&s_cpu);
+    CHECK(DP(LOADED) == 2 && DP(DROPPED) == 2 && DP(RETAINED) == 0 && DP(MISS) == 0);
+    CHECK(manager_count() == 0 && isaac_ir_oracle_live_records() == 0 && ev_count(EV_DESTROY) == 2);
+    CHECK(strstr(s_last_log, " n=2 loaded=2 retained=0 dropped=2 present=0 fail=0 ") != NULL);
+
+    /* P4. Load produced no Image (file missing): nothing to release. */
+    p_begin("preload-fail", 12, 0);
+    s_load_fail = 1;
+    level(&s_cpu);
+    CHECK(s_load_calls == 2 && s_release_calls == 0 && s_hook_calls == 0);
+    CHECK(DP(FAIL) == 2 && DP(LOADED) == 0 && DP(RETAINED) == 0 && manager_count() == 0);
+
+    /* P4b. Release reports "last reference gone" (al = 0 under garbage upper
+     *      bytes): the Image is already destroyed, the observer must not see it. */
+    p_begin("preload-release-last", 12, 0);
+    s_load_orphan = 1;
+    level(&s_cpu);
+    CHECK(s_load_calls == 2 && s_release_calls == 2 && s_hook_calls == 0 && s_load_bad_args == 0);
+    CHECK(DP(LOADED) == 2 && DP(DROPPED) == 2 && DP(RETAINED) == 0 && ev_count(EV_DESTROY) == 2);
+    CHECK(isaac_ir_oracle_live_records() == 0 && s_fault_hit == 0);
+
+    /* P5. The gates, one at a time; none of them reaches Load. */
+    p_begin("preload-skip-budget0", 0, 0);
+    level(&s_cpu);
+    CHECK(DP(SKIP_STATE) == 2 && s_load_calls == 0);
+    p_begin("preload-skip-lock", 12, 0);
+    st8(va(OFF_MGR_CS) + ISAAC_IR_CS_HELD, 1U);
+    level(&s_cpu);
+    st8(va(OFF_MGR_CS) + ISAAC_IR_CS_HELD, 0U);
+    CHECK(DP(SKIP_LOCK) == 2 && s_load_calls == 0 && s_deadlock == 0);
+    p_begin("preload-skip-terminal", 12, 0);
+    s_heap_terminal = 1;
+    level(&s_cpu);
+    CHECK(DP(SKIP_TERMINAL) == 2 && s_load_calls == 0);
+    p_begin("preload-skip-vmem-budget", 1, 0);
+    level(&s_cpu);
+    CHECK(DP(SKIP_VMEM) == 2 && s_load_calls == 0);
+    p_begin("preload-skip-vmem-headroom", 12, 16);
+    s_free_ram = 17U << 20; s_free_vram = 0U;            /* 17 < 16 + 2 */
+    level(&s_cpu);
+    CHECK(DP(SKIP_VMEM) == 2 && s_load_calls == 0);
+    p_begin("preload-skip-heap", 12, 0);
+    s_heap_hr = (P_NEED_KIB << 10) - 1U;                 /* reserve + 2 x 2 MiB, one byte short */
+    level(&s_cpu);
+    CHECK(DP(SKIP_HEAP) == 2 && s_load_calls == 0);
+    CHECK(strstr(s_last_log, " loaded=0 retained=0 dropped=0 present=0 fail=0 skipped=2 ") != NULL);
+    CHECK(strstr(s_last_log, P_NEED_TEXT) != NULL);      /* the level line names the gate */
+    s_heap_hr = P_NEED_KIB << 10;                        /* exactly enough */
+    level(&s_cpu);
+    CHECK(DP(SKIP_HEAP) == 2 && DP(LOADED) == 2 && DP(RETAINED) == 2 && s_load_calls == 2);
+    /* ... and a call on another CPU than the retention seam's */
+    cpu_bind(&s_cpu_foreign);
+    isaac_vita_image_preload_level_init(&s_cpu_foreign);
+    CHECK(DP(SKIP_STATE) == 2 && s_load_calls == 2);
+    /* The bench route (review B1).  Guest heap headroom in KiB as the device
+     * logged it, native.log of bench run H2 (11.11): :291 level 1
+     * before the fight sounds 14427, :315 after them 11807, :379 level 2
+     * 11651, :4306 level 3 7484; and the extremes of 19 fight-ON runs after
+     * the fight sounds (img.review.md:33): level 1 11469..11849, level 2
+     * 11323..11691.  The preload reads the headroom after the fight sounds,
+     * so RESERVE_MB 8 decodes on none of the three floors and 4 on the first
+     * two.  The expectations are a table, not the gate's formula. */
+    {
+        static const struct { uint32_t kib; int run8, run4; } route[] = {
+            { 14427U, 1, 1 }, { 11807U, 0, 1 }, { 11651U, 0, 1 }, { 7484U, 0, 0 },
+            { 11469U, 0, 1 }, { 11849U, 0, 1 }, { 11323U, 0, 1 }, { 11691U, 0, 1 },
+        };
+        unsigned r;
+        for (r = 0; r < sizeof route / sizeof route[0]; ++r) {
+            p_begin("preload-heap-gate-bench-route", 12, 0);
+            s_heap_hr = route[r].kib << 10;
+            level(&s_cpu);
+            if (P_ROUTE_RUN(route[r]))
+                CHECK(DP(SKIP_HEAP) == 0 && DP(LOADED) == 2 && DP(RETAINED) == 2 && s_load_calls == 2);
+            else
+                CHECK(DP(SKIP_HEAP) == 2 && DP(LOADED) == 0 && s_load_calls == 0);
+            CHECK(strstr(s_last_log, P_NEED_TEXT) != NULL);
+        }
+    }
+    p_begin("preload-skip-stack", 12, 0);
+    cpu_bind(&s_cpu);
+    s_cpu.esp = s_cpu.stack_floor + 0x40U;
+    isaac_vita_image_preload_level_init(&s_cpu);
+    CHECK(s_cpu.esp == s_cpu.stack_floor + 0x40U && DP(SKIP_STACK) == 2 && s_load_calls == 0);
+
+    /* P6. A replay that does not honour its stack contract stops the walk
+     *     with the caller's ESP restored. */
+    p_begin("preload-breach-load", 12, 0);
+    s_load_break_esp = 1;
+    level(&s_cpu);
+    CHECK(DP(BREACH) == 1 && s_load_calls == 1 && s_release_calls == 0 && DP(LOADED) == 0);
+    p_begin("preload-breach-release", 12, 0);
+    s_release_break_esp = 1;
+    level(&s_cpu);
+    CHECK(DP(BREACH) == 1 && s_load_calls == 1 && s_release_calls == 1 && s_hook_calls == 0);
+    p_begin("preload-breach-observer", 12, 0);
+    s_hook_break_esp = 1;
+    level(&s_cpu);
+    CHECK(DP(BREACH) == 1 && s_load_calls == 1 && s_hook_calls == 1 && DP(LOADED) == 0);
+
+    /* P7. The LRU may evict a preloaded sheet before anything used it: that
+     *     is counted, and the game's own later decode is a miss. */
+    p_begin("preload-evicted-unused", 4, 0);
+    level(&s_cpu);
+    CHECK(DP(RETAINED) == 2 && isaac_ir_oracle_retained_bytes() == 2U * sheet);
+    a = last_image(2);
+#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN) && ISAAC_VITA_IMAGE_PRELOAD_PIN == 2
+    {
+        /* PIN ON: the share cap (budget 4 MiB / 2) pins the first sheet
+         * only; the eviction walks past it and takes the second one. */
+        const uint32_t second = last_image(1);
+
+        CHECK(PP(PINNED) == 1 && PP(REFUSED) == 1 && PP(PIN0) == 1 && PP(PIN1) == 0);
+        b = mk(va(ISAAC_IR_VT_PNG_RVA), "other.png", 1024, 512, 4, 1, &bc);
+        offer(b, bc);
+        CHECK(count_unreg_of(second) == 1 && manager_present(a) == 1 && DP(EVICTED_UNUSED) == 1);
+        CHECK(PP(SKIP) == 1 && PP(YIELD) == 0 && isaac_ir_oracle_retained_bytes() == 2U * sheet);
+        /* a second copy of the pinned key, registered by some other Load:
+         * a miss, and the receipt says the name is in the manager twice */
+        a = mk(va(ISAAC_IR_VT_PNG_RVA), "resources/gfx/BulletAtlas.png", 1024, 512, 4, 1, &ac);
+        offer(a, ac);
+        CHECK(DP(MISS) == 1 && DP(HIT) == 0 && PP(TWINS) == 1 && PP(PIN0) == 1);
+        CHECK(pin_has("KAGE VITA IMAGE PRELOAD PIN: miss name=gfx/BulletAtlas.png level="));
+        CHECK(pin_has(" state=1 pinned=1 twins=2 key=resources/gfx/BulletAtlas.png"));
+        CHECK(isaac_ir_oracle_retained_bytes() <= (4U << 20));
+    }
+#else
+    b = mk(va(ISAAC_IR_VT_PNG_RVA), "other.png", 1024, 512, 4, 1, &bc);
+    offer(b, bc);
+    CHECK(count_unreg_of(a) == 1 && manager_present(a) == 0 && DP(EVICTED_UNUSED) == 1);
+    a = mk(va(ISAAC_IR_VT_PNG_RVA), "resources/gfx/BulletAtlas.png", 1024, 512, 4, 1, &ac);
+    offer(a, ac);
+    CHECK(DP(MISS) == 1 && DP(HIT) == 0);
+#endif
+#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)
+    pin_scenarios();
+#endif
+
+    /* P8. The receipts fit isaac_vita_log's 384-byte body at u32 max. */
+    p_begin("preload-receipt-length", 12, 0);
+    isaac_ir_oracle_saturate_stats();
+    s_max_log_len = 0; s_totals_seen = 0;
+#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)
+    s_pin_totals_seen = 0;
+#endif
+    isaac_vita_image_retain_report("loading-complete");
+    CHECK(s_max_log_len < 384U);
+    CHECK(s_totals_seen == 1);
+#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)
+    CHECK(s_pin_totals_seen == 1);
+#endif
+    isaac_vita_image_retain_disarm();
+}
+#endif
+
+#if defined(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE)
+/* ------------------------------------------------------------ big trace --- */
+/* ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE (built with MIN_KB=1024): one line per
+ * decision about a sheet of >= 1 MiB, per-reason ineligible totals.  The
+ * scenarios above already ran with the trace compiled in, so the trace is
+ * also shown not to change any retain/evict/passthrough outcome. */
+#if defined(IR_ORACLE_FLUSH) && IRT_ON
+#define BIG_INEL_DIRTY " what=inel-dirty "
+#else
+#define BIG_INEL_DIRTY " what=inel-rt "
+#endif
+static int big_has(unsigned i, const char *needle)
+{
+    return i < BIG_KEEP && i < s_big_n && strstr(s_big[i], needle) != NULL;
+}
+
+static const char *big_name_of(unsigned i)
+{
+    const char *p = (i < BIG_KEEP && i < s_big_n) ? strstr(s_big[i], " name=") : NULL;
+    return p ? p + 6 : "<no name field>";
+}
+
+/* A name longer than the name arena's 0x20 stride: takes nine slots. */
+static void big_set_name(uint32_t image, const char *name)
+{
+    uint32_t p = va(OFF_NAME) + s_name_n * 0x20U;
+    s_name_n += 9U;
+    memcpy((char *)(uintptr_t)p, name, strlen(name) + 1U);
+    st32(image + ISAAC_IR_IMG_NAME, p);
+}
+
+static void big_totals(unsigned t[8])
+{
+    unsigned n, k;
+    for (k = 0; k < 8U; ++k) t[k] = 0xdeadU;
+    big_reset();
+    isaac_vita_image_retain_report("big");
+    n = s_big_n;
+    CHECK(n == 1U);
+    {
+        static const char head[] =
+            "KAGE VITA IMAGE RETAIN BIG TOTALS: inel(vt/rt/tex/name/bytes)=";
+        static const char *const key[3] = { " last_foreign_vt=", " lines=", " suppressed=" };
+        const char *q = s_big[0] + sizeof head - 1U;
+        char *end = NULL;
+        int ok = strncmp(s_big[0], head, sizeof head - 1U) == 0;
+
+        for (k = 0; ok && k < 5U; ++k) {
+            t[k] = (unsigned)strtoul(q, &end, 10);
+            ok = end != q && *end == (k < 4U ? '/' : ' ');
+            q = end + 1;
+        }
+        for (k = 0; ok && k < 3U; ++k) {
+            q = strstr(s_big[0], key[k]);
+            ok = q != NULL;
+            if (ok) {
+                q += strlen(key[k]);
+                t[5U + k] = (unsigned)strtoul(q, &end, k == 0U ? 16 : 10);
+                ok = end != q && *end == ' ';
+            }
+        }
+        CHECK(ok);
+    }
+    CHECK(strstr(s_big[0], " min_bytes=1048576 why=big") != NULL);
+    CHECK(strlen(s_big[0]) < 384U);
+}
+
+static void big_trace_scenarios(void)
+{
+    uint32_t image, ctrl, image2, ctrl2, image3, ctrl3, i;
+    unsigned t[8];
+    char line[160];
+
+    /* B1. Banner with the resolved threshold; a new big sheet; the size
+     *     boundary (1 MiB reports, one row less does not). */
+    big_reset();
+    begin("big-new-and-threshold", 12, 0);
+    CHECK(s_big_n == 1U && big_has(0, "KAGE VITA IMAGE RETAIN BIG TRACE: on min_bytes=1048576 max_lines=512 "));
+    big_reset();
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "gfx/big_sheet.png", 1024, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    CHECK(s_big_n == 1U && st()->retained_new == 1);
+    snprintf(line, sizeof line,
+             "KAGE VITA IMAGE RETAIN BIG: what=new image=%08x bytes=2097152 dim=1024x512x4 flags=00000000 tex0=%08x live=0/0 n=1 name=gfx/big_sheet.png",
+             (unsigned)image, (unsigned)ld32(image + ISAAC_IR_IMG_TEX0));
+    CHECK(strcmp(s_big[0], line) == 0);
+    big_reset();
+    image2 = mk(va(ISAAC_IR_VT_PNG_RVA), "small", 512, 256, 4, 1, &ctrl2);   /* 512 KiB */
+    offer(image2, ctrl2);
+    image2 = mk(va(ISAAC_IR_VT_PCX_RVA), "under", 512, 511, 4, 1, &ctrl2);   /* 1 MiB - 2048 */
+    offer(image2, ctrl2);
+    CHECK(s_big_n == 0U && st()->retained_new == 3);
+    image2 = mk(va(ISAAC_IR_VT_PIC_RVA), "edge", 512, 512, 4, 1, &ctrl2);    /* exactly 1 MiB */
+    offer(image2, ctrl2);
+    CHECK(s_big_n == 1U && big_has(0, " what=new ") && big_has(0, " bytes=1048576 dim=512x512x4 "));
+    CHECK(strcmp(big_name_of(0), "edge") == 0);
+    /* reuse: the game takes the sheet again and drops it again */
+    big_reset();
+    load_hit(ctrl);
+    sprite_dies(image, ctrl);
+    CHECK(s_big_n == 1U && big_has(0, " what=reuse ") && st()->reuse == 1);
+    CHECK(strcmp(big_name_of(0), "gfx/big_sheet.png") == 0);
+
+    /* B2. Every ineligible reason is counted; big ones are named; the five
+     *     counts add up to the module's own `ineligible` total. */
+    big_reset();
+    begin("big-ineligible-reasons", 12, 0);
+    big_reset();
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "rt", 1024, 512, 4, 1, &ctrl);
+    st32(image + ISAAC_IR_IMG_FLAGS, 0x4U);
+    offer(image, ctrl);
+    CHECK(s_big_n == 1U && big_has(0, BIG_INEL_DIRTY) && big_has(0, " flags=00000004 "));
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "rt2", 64, 64, 4, 1, &ctrl);          /* small: counted, not named */
+    st32(image + ISAAC_IR_IMG_FLAGS, 0x10U);
+    offer(image, ctrl);
+    CHECK(s_big_n == 1U);
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "tex0", 1024, 512, 4, 1, &ctrl);
+    st32(image + ISAAC_IR_IMG_TEX0, 0U);
+    offer(image, ctrl);
+    CHECK(s_big_n == 2U && big_has(1, " what=inel-tex ") && big_has(1, " tex0=00000000 "));
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "texu", 1024, 512, 4, 1, &ctrl);
+    st32(image + ISAAC_IR_IMG_TEX0, ISAAC_IR_TEX_UNSET);
+    offer(image, ctrl);
+    CHECK(s_big_n == 3U && big_has(2, " what=inel-tex ") && big_has(2, " tex0=ffffffff "));
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), NULL, 1024, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    CHECK(s_big_n == 4U && big_has(3, " what=inel-name ") && strcmp(big_name_of(3), "") == 0);
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "zero", 1024, 512, 0, 1, &ctrl);      /* bytes 0: counted, not named */
+    offer(image, ctrl);
+    CHECK(s_big_n == 4U);
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "huge", 4096, 2048, 4, 1, &ctrl);     /* 32 MiB > ISAAC_IR_BYTES_CAP */
+    offer(image, ctrl);
+    CHECK(s_big_n == 5U && big_has(4, " what=inel-bytes ") && big_has(4, " bytes=33554432 dim=4096x2048x4 "));
+    image = mk(va(ISAAC_IR_VT_PNG_RVA) + 0x40U, "foreign", 1024, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    CHECK(s_big_n == 5U);                                                    /* foreign class: fields not read */
+    CHECK(st()->ineligible == 8 && st()->oversize == 0 && st()->retained_new == 0);
+    big_totals(t);
+    CHECK(t[0] == 1U && t[1] == 2U && t[2] == 2U && t[3] == 1U && t[4] == 2U);
+    CHECK(t[0] + t[1] + t[2] + t[3] + t[4] == st()->ineligible - st()->oversize);
+    CHECK(t[5] == va(ISAAC_IR_VT_PNG_RVA) + 0x40U && t[6] == 5U && t[7] == 0U);
+
+    /* B3. Fail-closed exits: budget 0, oversize, absent, headroom. */
+    big_reset();
+    begin("big-pass-budget0", 0, 0);
+    big_reset();
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "b0", 1024, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    CHECK(s_big_n == 1U && big_has(0, " what=pass-budget0 ") && manager_present(image) == 0);
+    begin("big-oversize-absent", 4, 0);
+    big_reset();
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "Obig", 1024, 2048, 4, 1, &ctrl);     /* 8 MiB > 4 MiB */
+    offer(image, ctrl);
+    CHECK(s_big_n == 1U && big_has(0, " what=oversize ") && st()->oversize == 1);
+    image = new_image(va(ISAAC_IR_VT_PNG_RVA), "ghost", 1024, 512, 4, 0U);    /* never registered */
+    ctrl = new_ctrl(1);
+    offer(image, ctrl);
+    CHECK(s_big_n == 2U && big_has(1, " what=absent ") && st()->absent == 1);
+    CHECK(strcmp(big_name_of(1), "ghost") == 0);
+    big_totals(t);
+    CHECK(t[0] + t[1] + t[2] + t[3] + t[4] == 0U && st()->ineligible == 1 && t[6] == 2U);
+    begin("big-headroom-pass", 12, 64);
+    big_reset();
+    s_free_ram = 4U << 20; s_free_vram = 0U; s_deferred_free = 1;
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "hp", 1024, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    CHECK(s_big_n == 1U && big_has(0, " what=headroom-pass ") && st()->headroom_pass == 1);
+    CHECK(manager_present(image) == 0);
+
+    /* B4. A retained big sheet leaves: stale (the game cleared the manager
+     *     behind the module) and budget eviction, each before the fact. */
+    begin("big-stale-and-evict", 4, 0);
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "A", 1024, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    manager_clear_behind_our_back();
+    image2 = mk(va(ISAAC_IR_VT_PNG_RVA), "B", 1024, 512, 4, 1, &ctrl2);
+    offer(image2, ctrl2);
+    big_reset();
+    image3 = mk(va(ISAAC_IR_VT_PNG_RVA), "C", 1024, 512, 4, 1, &ctrl3);
+    offer(image3, ctrl3);                    /* 6 MiB > 4 MiB: the tail (A) goes, and it is dead */
+    CHECK(s_big_n == 2U && big_has(0, " what=new ") && strcmp(big_name_of(0), "C") == 0);
+    snprintf(line, sizeof line,
+             "KAGE VITA IMAGE RETAIN BIG: what=stale image=%08x bytes=2097152 live=2/4194304 n=4",
+             (unsigned)image);
+    CHECK(strcmp(s_big[1], line) == 0);
+    CHECK(st()->dropped_stale == 1 && st()->budget_evict == 0);
+    big_reset();
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "D", 1024, 512, 4, 1, &ctrl);
+    offer(image, ctrl);                      /* now B is the tail and it is alive */
+    CHECK(s_big_n == 2U && big_has(0, " what=new ") && strcmp(big_name_of(0), "D") == 0);
+    CHECK(big_has(1, " what=evict-budget ") && strcmp(big_name_of(1), "B") == 0);
+    CHECK(st()->budget_evict == 1 && manager_present(image2) == 0);
+
+    /* B5. Name handling and line length: the tail of a long name is kept,
+     *     bytes outside 0x21..0x7e print as '?', the worst line fits the
+     *     384-byte log body. */
+    begin("big-name-and-length", 12, 0);
+    big_reset();
+    {
+        char longname[131], expect[97];
+        for (i = 0; i < 130U; ++i) longname[i] = (char)('a' + (i % 26U));
+        longname[100] = (char)0x01; longname[101] = ' '; longname[102] = (char)0x7f;
+        longname[130] = '\0';
+        for (i = 0; i < 96U; ++i) expect[i] = longname[34U + i];
+        expect[66] = '?'; expect[67] = '?'; expect[68] = '?';
+        expect[96] = '\0';
+        image = mk(va(ISAAC_IR_VT_PNG_RVA), "x", 65535, 65535, 0xffffffffU, 1, &ctrl);
+        big_set_name(image, longname);
+        st32(image + ISAAC_IR_IMG_FLAGS, 0xffffffffU);
+        st32(image + ISAAC_IR_IMG_TEX0, 0xfffffffeU);
+        offer(image, ctrl);
+        CHECK(s_big_n == 1U && big_has(0, BIG_INEL_DIRTY) && big_has(0, " bytes=4294967295 dim=65535x65535x4294967295 "));
+        CHECK(strcmp(big_name_of(0), expect) == 0);
+        CHECK(strlen(s_big[0]) < 384U);
+    }
+
+    /* B6. The line cap: 512 lines, the rest only counted. */
+    big_reset();
+    begin("big-line-cap", 12, 0);
+    image = mk(va(ISAAC_IR_VT_PNG_RVA), "cap", 1024, 512, 4, 1, &ctrl);
+    offer(image, ctrl);
+    for (i = 0; i < 519U; ++i) {
+        load_hit(ctrl);
+        sprite_dies(image, ctrl);
+    }
+    CHECK(s_big_n == 1U + 512U + 520U / ISAAC_IR_REPORT_EVERY && st()->reuse == 519);   /* + the periodic TOTALS lines */
+    big_totals(t);
+    CHECK(t[6] == 512U && t[7] == 8U);
+    isaac_vita_image_retain_disarm();
+}
+#endif
 
 int main(void)
 {
@@ -1931,9 +3320,21 @@ int main(void)
     }
 
     memory_hostile_scenarios();
+#if defined(IR_ORACLE_FLUSH)
+    flush_scenarios();
+#endif
+#if defined(ISAAC_VITA_IMAGE_PRELOAD)
+    preload_scenarios();
+#endif
+#if defined(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE)
+    big_trace_scenarios();
+#endif
 
     CHECK(s_unknown_targets == 0);
     CHECK(s_deadlock == 0);
+#if defined(IR_ORACLE_FLUSH)
+    CHECK(s_walker_violations == 0);
+#endif
 
     if (s_fail == 0)
         printf("IMAGE RETAIN ORACLE PASS: checks=%u scenarios=%u records=%u\n",

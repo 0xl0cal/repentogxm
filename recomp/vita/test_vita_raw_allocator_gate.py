@@ -227,6 +227,8 @@ EXPECTED_SOURCE_FIXTURE_CACHE = {
         "ISAAC_VITA_HEAP_STAGE_PROFILE": "OFF",
         "ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH": "OFF",
         "ISAAC_VITA_HEAP_LEAN_IMPORT": "OFF",
+        "ISAAC_VITA_HEAP_IMPORT_LEAN2": "OFF",
+        "ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY": "OFF",
         "ISAAC_VITA_HEAP_FREE_PREFILTER": "OFF",
         "ISAAC_VITA_HEAP_FREE_COST_PROFILE": "OFF",
         "ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH_MASK": "OFF",
@@ -297,12 +299,16 @@ EXPECTED_SOURCE_FIXTURE_CACHE = {
         "ISAAC_VITA_INFLATE_TABLE_MEMO": "OFF",
         "ISAAC_VITA_UNIFORM_SET_RECEIPT": "OFF",
         "ISAAC_VITA_ARCHIVE_READ_TRAIL": "OFF",
+        "ISAAC_VITA_PNG_WINDOW_PROFILE": "OFF",
+        "ISAAC_VITA_ANM2_WINDOW_PROFILE": "OFF",
         "ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR": "OFF",
         "ISAAC_VITA_NATIVE_INFLATE": "OFF",
         "ISAAC_VITA_LUA_GCCOLLECT_CLAMP": "OFF",
         "ISAAC_VITA_LUA_GC_PROFILE": "OFF",
+        "ISAAC_VITA_LUA_GC_IDLE_STEP": "OFF",
         "ISAAC_VITA_LUA_GC_FINALIZER_PACE": "OFF",
         "ISAAC_VITA_LUA_INTEGER2STR": "OFF",
+        "ISAAC_VITA_LUA_VM_COMPUTED_GOTO": "OFF",
         "ISAAC_VITA_LUA_NATIVE_GETCLASS": "OFF",
         "ISAAC_VITA_LUA_BINDING_REPLAY": "OFF",
         "ISAAC_VITA_LUA_COST_PROFILE": "OFF",
@@ -443,6 +449,40 @@ def expected_source_tests(root: Path) -> None:
         {**lean_record, runtime_root / "guest_0144.c": {"source": runtime_root / "guest_0144.c",
                                                          "definitions": {lean_key: ["1"]}}},
         lean_on, lean_key, "heap lean import", {"host_vita_heap.c"}), "scope changed")
+    lean2_key = "ISAAC_VITA_HEAP_IMPORT_LEAN2"
+    lean2v_key = "ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY"
+    must_fail("import lean2 without lean import", lambda: gate.expected_sources(
+        source_root, manifest, {**stage_parent, lean2_key: "ON"}),
+        "requires HEAP_OVERFLOW_MSPACE and HEAP_LEAN_IMPORT")
+    must_fail("import lean2 verify without lean2", lambda: gate.expected_sources(
+        source_root, manifest, {**lean_on, lean2v_key: "ON"}), "requires HEAP_IMPORT_LEAN2")
+    lean2_on = {**lean_on, lean2_key: "ON"}
+    lean2v_on = {**lean2_on, lean2v_key: "ON"}
+    for label, cache_on in (("lean2", lean2_on), ("lean2 verify", lean2v_on)):
+        if gate.expected_sources(source_root, manifest, cache_on) != \
+                gate.expected_sources(source_root, manifest, stage_parent):
+            raise AssertionError(f"import {label} must keep the same source closure")
+    lean2_record = {heap_c: {"source": heap_c, "definitions": {lean_key: ["1"], lean2_key: ["1"]}}}
+    lean2v_record = {heap_c: {"source": heap_c, "definitions": {
+        lean_key: ["1"], lean2_key: ["1"], lean2v_key: ["1"]}}}
+    gate._verify_heap_define_scope(lean2_record, lean2_on, lean2_key, "heap import lean2",
+                                   {"host_vita_heap.c"})
+    gate._verify_heap_define_scope(lean2_record, lean2_on, lean2v_key, "heap import lean2 verify",
+                                   {"host_vita_heap.c"})
+    gate._verify_heap_define_scope(lean2v_record, lean2v_on, lean2v_key, "heap import lean2 verify",
+                                   {"host_vita_heap.c"})
+    must_fail("import lean2 defined while OFF", lambda: gate._verify_heap_define_scope(
+        lean2_record, lean_on, lean2_key, "heap import lean2", {"host_vita_heap.c"}), "scope changed")
+    must_fail("import lean2 verify defined while OFF", lambda: gate._verify_heap_define_scope(
+        lean2v_record, lean2_on, lean2v_key, "heap import lean2 verify", {"host_vita_heap.c"}),
+        "scope changed")
+    must_fail("import lean2 stray owner", lambda: gate._verify_heap_define_scope(
+        {**lean2_record, runtime_root / "guest_0144.c": {"source": runtime_root / "guest_0144.c",
+                                                          "definitions": {lean2_key: ["1"]}}},
+        lean2_on, lean2_key, "heap import lean2", {"host_vita_heap.c"}), "scope changed")
+    must_fail("import lean2 noncanonical", lambda: gate._verify_heap_define_scope(
+        {heap_c: {"source": heap_c, "definitions": {lean2_key: ["2"]}}},
+        lean2_on, lean2_key, "heap import lean2", {"host_vita_heap.c"}), "non-canonical")
     watch_key = "ISAAC_VITA_NATIVE_VORBIS_FREE_WATCH"
     must_fail("free watch without native vorbis", lambda: gate.expected_sources(
         source_root, manifest, {**cache, watch_key: "ON", "ISAAC_VITA_NATIVE_VORBIS": "OFF"}),
@@ -726,6 +766,8 @@ def expected_source_tests(root: Path) -> None:
          {"host_vita_lua_gc.c"}),
         ({"ISAAC_VITA_LUA": "ON"}, {"ISAAC_VITA_LUA_GC_PROFILE": "ON"},
          {"host_vita_lua_gc.c"}),
+        ({"ISAAC_VITA_LUA": "ON"}, {"ISAAC_VITA_LUA_GC_IDLE_STEP": "ON"},
+         {"host_vita_lua_gc.c"}),
         ({"ISAAC_VITA_LUA": "ON"}, {"ISAAC_VITA_LUA_NATIVE_GETCLASS": "ON"},
          {"host_vita_lua_getclass.c"}),
         ({"ISAAC_VITA_LUA": "ON", "ISAAC_VITA_LUA_NATIVE_GETCLASS": "ON"},
@@ -746,6 +788,10 @@ def expected_source_tests(root: Path) -> None:
         ({"ISAAC_VITA_LUA": "ON", "ISAAC_VITA_LUA_COST_PROFILE": "ON"},
          {"ISAAC_VITA_LUA_INTEGER2STR": "ON"},
          {"host_vita_lua_integer2str_selftest.c"}),
+        # the computed-goto VM swaps lvm.c inside the Lua archive only; no
+        # runtime unit joins the closure (the bridge log is host_vita_lua.c)
+        ({"ISAAC_VITA_LUA": "ON"}, {"ISAAC_VITA_LUA_VM_COMPUTED_GOTO": "ON"},
+         set()),
         ({"ISAAC_VITA_FLOOR_THUNK_FASTPATH": "ON"},
          {"ISAAC_VITA_KAGE_QUAD_FASTPATH": "ON"},
          {"host_vita_kage_quad_fastpath.c"}),
@@ -919,6 +965,61 @@ def expected_source_tests(root: Path) -> None:
             "archive read trail must select exactly its one runtime unit "
             "over the archive file cache and the phase profiler: "
             f"{sorted(str(p) for p in trail_on_sources - trail_base_sources)}")
+    # PNG / ANM2 window profiles: both nested directly under KAGE.  PNG has
+    # no CMake FATAL (outside KAGE it adds nothing); ANM2 is FATAL without
+    # KAGE or PHASE_PROFILE.  Each selects exactly its one runtime unit.
+    png_on_sources = gate.expected_sources(
+        source_root, manifest,
+        {**cache, "ISAAC_VITA_PNG_WINDOW_PROFILE": "ON"},
+    )
+    if (png_on_sources - baseline !=
+            {runtime_root / "host_vita_png_outer_profile.c"} or
+            baseline - png_on_sources):
+        raise AssertionError(
+            "PNG window profile must select exactly its one runtime unit: "
+            f"{sorted(str(p) for p in png_on_sources - baseline)}")
+    png_kage_off = {**cache, "ISAAC_VITA_KAGE": "OFF"}
+    if (gate.expected_sources(
+            source_root, manifest,
+            {**png_kage_off, "ISAAC_VITA_PNG_WINDOW_PROFILE": "ON"}) !=
+            gate.expected_sources(source_root, manifest, png_kage_off)):
+        raise AssertionError(
+            "PNG window profile outside KAGE must add nothing (CMake nests "
+            "it under if(ISAAC_VITA_KAGE) without a FATAL)")
+    must_fail(
+        "ANM2 window profile without the phase profiler",
+        lambda: gate.expected_sources(
+            source_root, manifest,
+            {**cache, "ISAAC_VITA_ANM2_WINDOW_PROFILE": "ON"},
+        ),
+        "ISAAC_VITA_ANM2_WINDOW_PROFILE requires translated KAGE and "
+        "PHASE_PROFILE=ON",
+    )
+    must_fail(
+        "ANM2 window profile without the translated KAGE target",
+        lambda: gate.expected_sources(
+            source_root, manifest,
+            {**cache, "ISAAC_VITA_KAGE": "OFF",
+             "ISAAC_VITA_PHASE_PROFILE": "ON",
+             "ISAAC_VITA_ANM2_WINDOW_PROFILE": "ON"},
+        ),
+        "ISAAC_VITA_ANM2_WINDOW_PROFILE requires translated KAGE and "
+        "PHASE_PROFILE=ON",
+    )
+    anm2_base = {**cache, "ISAAC_VITA_PHASE_PROFILE": "ON"}
+    anm2_base_sources = gate.expected_sources(
+        source_root, manifest, anm2_base)
+    anm2_on_sources = gate.expected_sources(
+        source_root, manifest,
+        {**anm2_base, "ISAAC_VITA_ANM2_WINDOW_PROFILE": "ON"},
+    )
+    if (anm2_on_sources - anm2_base_sources !=
+            {runtime_root / "host_vita_anm2_outer_profile.c"} or
+            anm2_base_sources - anm2_on_sources):
+        raise AssertionError(
+            "ANM2 window profile must select exactly its one runtime unit "
+            "over the phase profiler: "
+            f"{sorted(str(p) for p in anm2_on_sources - anm2_base_sources)}")
     # Static SFX window profile: diagnostic builds compile its TU under
     # KAGE and CMake refuses it without PHASE_PROFILE or AUDIO; the gate
     # must know the unit and refuse the knob exactly where CMake does.
@@ -2325,6 +2426,11 @@ def png_decode_profile_scope_tests(root: Path) -> None:
     records[unrelated] = {
         "source": unrelated, "definitions": {}, "undefinitions": [],
     }
+    outer = (scope / "host_vita_png_outer_profile.c").resolve()
+    outer.write_text("int png_outer_profile_fixture;\n", encoding="utf-8")
+    records[outer] = {
+        "source": outer, "definitions": {}, "undefinitions": [],
+    }
 
     inactive = {
         "ISAAC_VITA_PNG_DECODE_PROFILE": "OFF",
@@ -2380,6 +2486,40 @@ def png_decode_profile_scope_tests(root: Path) -> None:
         "is not a controlled build ID",
     )
 
+    # PNG_WINDOW_PROFILE alone: CMake resolves only the two ImagePng wrapper
+    # roots and defines the macro on their owner(s), not on the profiler TU.
+    window_only = {**inactive, "ISAAC_VITA_PNG_WINDOW_PROFILE": "ON"}
+    must_fail(
+        "PNG window profile without the wrapper owners' definition",
+        lambda: gate.verify_png_decode_profile_compile_scope(
+            records, window_only),
+        "compile-definition scope changed",
+    )
+    window_owner_definitions = []
+    for name in ("guest_0001.c", "guest_0002.c"):
+        definitions = records[(scope / name).resolve()]["definitions"]
+        assert isinstance(definitions, dict)
+        definitions["ISAAC_VITA_PNG_DECODE_PROFILE"] = ["1"]
+        window_owner_definitions.append(definitions)
+    gate.verify_png_decode_profile_compile_scope(records, window_only)
+    must_fail(
+        "PNG wrapper owners defined while both PNG profiles are OFF",
+        lambda: gate.verify_png_decode_profile_compile_scope(records, inactive),
+        "compile-definition scope changed",
+    )
+    decode_only_owner = records[(scope / "guest_0003.c").resolve()]["definitions"]
+    assert isinstance(decode_only_owner, dict)
+    decode_only_owner["ISAAC_VITA_PNG_DECODE_PROFILE"] = ["1"]
+    must_fail(
+        "decode-only PNG owner defined under the window profile alone",
+        lambda: gate.verify_png_decode_profile_compile_scope(
+            records, window_only),
+        "compile-definition scope changed",
+    )
+    decode_only_owner.clear()
+    for definitions in window_owner_definitions:
+        definitions.clear()
+
     runtime_definitions = records[runtime]["definitions"]
     assert isinstance(runtime_definitions, dict)
     runtime_definitions["ISAAC_VITA_PNG_DECODE_PROFILE"] = ["1"]
@@ -2404,6 +2544,24 @@ def png_decode_profile_scope_tests(root: Path) -> None:
         '"fixture-build"'
     ]
     gate.verify_png_decode_profile_compile_scope(records, active)
+
+    # DECODE with WINDOW: CMake also defines the macro on the outer profile TU.
+    both_png = {**active, "ISAAC_VITA_PNG_WINDOW_PROFILE": "ON"}
+    must_fail(
+        "PNG decode+window without the outer profile unit",
+        lambda: gate.verify_png_decode_profile_compile_scope(records, both_png),
+        "compile-definition scope changed",
+    )
+    outer_definitions = records[outer]["definitions"]
+    assert isinstance(outer_definitions, dict)
+    outer_definitions["ISAAC_VITA_PNG_DECODE_PROFILE"] = ["1"]
+    gate.verify_png_decode_profile_compile_scope(records, both_png)
+    must_fail(
+        "PNG outer profile unit defined under the decode profile alone",
+        lambda: gate.verify_png_decode_profile_compile_scope(records, active),
+        "compile-definition scope changed",
+    )
+    outer_definitions.clear()
 
     combined = {
         **active,

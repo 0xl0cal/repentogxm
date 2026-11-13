@@ -445,6 +445,47 @@ static uint32_t record_client_bytes(int32_t count, uint32_t stride, uint32_t add
     return (uint32_t)count * stride;
 }
 
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+# if !(defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER) || \
+     !defined(ISAAC_VITA_KAGE_BIND_PACKET) || !defined(ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+#  error "the draw packet stages W-pkt and S4 records for the render thread (CMake checks)"
+# endif
+# if ISAAC_VITA_GL_DRAW_PACKET != 1 && ISAAC_VITA_GL_DRAW_PACKET != 2
+#  error "ISAAC_VITA_GL_DRAW_PACKET is 1 (VERIFY) or 2 (ON); OFF leaves it undefined"
+# endif
+/* RENDER60 lane C (contract in gl_record_backend.h).  record_enqueue2 keeps
+ * its return-RVA capture and oracle mutations, then offers the record to
+ * record_dp_intercept (defined after the surface, which owns the opcode
+ * names); what it does not take is appended by record_append, the
+ * unchanged rest of the old body. */
+static int record_dp_intercept(uint32_t opcode, uint32_t rva, const void *args,
+    uint32_t arg_bytes, uint32_t client, uint32_t client_bytes,
+    uint32_t client2, uint32_t client2_bytes);
+static void record_dp_flush(uint32_t reason);
+static void record_append(uint32_t opcode, uint32_t rva, const void *args, uint32_t arg_bytes,
+    uint32_t client, uint32_t client_bytes, uint32_t client2, uint32_t client2_bytes);
+# if ISAAC_VITA_GL_DRAW_PACKET == 1
+static void record_dpv_note(const IsaacGlRecordHeader *h, const void *payload);
+# endif
+static void record_enqueue2(uint32_t opcode, const void *args, uint32_t arg_bytes,
+    uint32_t client, uint32_t client_bytes, uint32_t client2, uint32_t client2_bytes)
+{
+    uint32_t rva = guest_gl_backend_return_rva();
+# if defined(ISAAC_GL_RECORD_ORACLE_MUTATE_NO_COPY)
+    client_bytes = 0u; /* oracle self-test: replay reads the live guest buffer */
+# endif
+# if defined(ISAAC_GL_RECORD_ORACLE_MUTATE_NO_RVA)
+    rva = 0u; /* oracle self-test: stack provenance lost */
+# endif
+    if (record_dp_intercept(opcode, rva, args, arg_bytes, client, client_bytes,
+            client2, client2_bytes))
+        return;
+    record_append(opcode, rva, args, arg_bytes, client, client_bytes, client2, client2_bytes);
+}
+static void record_append(uint32_t opcode, uint32_t rva, const void *args, uint32_t arg_bytes,
+    uint32_t client, uint32_t client_bytes, uint32_t client2, uint32_t client2_bytes)
+{
+#else
 static void record_enqueue2(uint32_t opcode, const void *args, uint32_t arg_bytes,
     uint32_t client, uint32_t client_bytes, uint32_t client2, uint32_t client2_bytes)
 {
@@ -454,6 +495,7 @@ static void record_enqueue2(uint32_t opcode, const void *args, uint32_t arg_byte
 #endif
 #if defined(ISAAC_GL_RECORD_ORACLE_MUTATE_NO_RVA)
     rva = 0u; /* oracle self-test: stack provenance lost */
+#endif
 #endif
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
@@ -517,8 +559,20 @@ static void record_enqueue(uint32_t opcode, const void *args, uint32_t arg_bytes
     record_enqueue2(opcode, args, arg_bytes, client, client_bytes, 0u, 0u);
 }
 
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+static int record_dp_staged(void);
+#endif
 static void record_sync(void)
 {
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    /* Every S call enqueues its own record first, and no staged opcode is
+     * an S call, so nothing can be staged here: s_last_pos is the end of
+     * that record.  Fail closed if a future caller breaks this. */
+# if !defined(ISAAC_GL_RECORD_ORACLE_MUTATE_DP_NO_SYNC_GUARD)
+    if (record_dp_staged())
+        record_fault("GL draw packet: synchronous call behind staged records");
+# endif
+#endif
     ++s_syncs;
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
     ++s_pw.syncs;
@@ -597,11 +651,23 @@ static void record_locations_reset_epoch(IsaacGlRecordLocations *memo)
  * surface (0..78) and S4's 79/80, which stay reserved when S4 is OFF.
  * Analyzers map it by name (tools/bench/bench_run.py). */
 enum { REC_KAGE_BIND_PACKET = REC_WORKER_CALL + 3 };
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+/* RENDER60 lane C: one record per draw's state calls (+ the draw itself),
+ * after W-pkt's 81 (the knob requires W-pkt, CMake checks). */
+enum { REC_DRAW_PACKET = REC_WORKER_CALL + 4 };
+_Static_assert(REC_DRAW_PACKET + 1u == ISAAC_GL_RECORD_OPCODE_SLOTS,
+    "lane C: ISAAC_GL_RECORD_OPCODE_SLOTS (gl_record_backend.h) must end at REC_DRAW_PACKET");
+#  if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
+_Static_assert(REC_DRAW_PACKET + 1u == ISAAC_GL_RECORD_CENSUS_OPS,
+    "census: one slot per opcode, REC_DRAW_PACKET last (gl_record_backend.h)");
+#  endif
+# else
 _Static_assert(REC_KAGE_BIND_PACKET + 1u == ISAAC_GL_RECORD_OPCODE_SLOTS,
     "W-pkt: ISAAC_GL_RECORD_OPCODE_SLOTS (gl_record_backend.h) must end at REC_KAGE_BIND_PACKET");
 # if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
 _Static_assert(REC_KAGE_BIND_PACKET + 1u == ISAAC_GL_RECORD_CENSUS_OPS,
     "census: one slot per opcode, REC_KAGE_BIND_PACKET last (gl_record_backend.h)");
+# endif
 # endif
 #endif
 #if defined(ISAAC_GL_RECORD_OPCODE_CENSUS) && \
@@ -1057,6 +1123,11 @@ static void record_replay(void *context, const IsaacGlRecordHeader *h, const voi
         timed = 2u;
     if (timed) started = record_now_us();
 #endif
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+# if ISAAC_VITA_GL_DRAW_PACKET == 1
+    record_dpv_note(h, payload);   /* VERIFY: what the next packet must carry */
+# endif
+#endif
     record_dispatch(h, payload);
 #if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     {
@@ -1078,7 +1149,16 @@ void isaac_gl_record_drain(void)
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
     /* On the consumer everything earlier already ran (records are ordered). */
     if (!record_on_consumer() && s_worker)
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    {
+        /* staged calls first: write_pos is read after the publish */
+        if (record_dp_staged())
+            record_dp_flush(ISAAC_GL_DRAW_PACKET_FLUSH_SYNC);
         record_wait(s_ring.write_pos, &s_pw.call_waits, &s_pw.call_wait_us);
+    }
+# else
+        record_wait(s_ring.write_pos, &s_pw.call_waits, &s_pw.call_wait_us);
+# endif
 #else
     if (s_active && !isaac_gl_record_ring_drain(&s_ring))
         record_fault("GL recorder nested drain");
@@ -1297,6 +1377,414 @@ static void record_replay_bind_packet(const IsaacGlRecordHeader *h, const void *
     }
 }
 #endif
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+/* ---- RENDER60 lane C: the draw packet ----------------------------------
+ * Producer: the game thread, as for every record_enqueue2 (the ring has one
+ * producer).  A staged call is the bind packet's op (RecordBindPacketOp
+ * above): the 8-byte header, the call's record payload - its arguments; no
+ * staged opcode carries a client copy - zero-padded to 8 bytes.  A draw that
+ * arrives with calls staged becomes the packet's LAST op: header with
+ * payload_bytes 0 ("the rest of the packet"; a draw's copies exceed 16 bits),
+ * then its RecordDraw in the staging buffer, while its two client copies go
+ * through the ring's own client spans.  Every staged op ends 8-aligned, so
+ * the ring places the copies relative to the draw's arguments exactly as for
+ * a separate draw record (gl_record_ring.c ring_layout: the second span
+ * starts 8-aligned after the first), and record_replay_draw finds them.
+ * The packet's header RVA is its first op's; each op replays with its own. */
+# define RECORD_DP_BYTES 2048u
+/* Room always left behind the staged calls for a fused draw's op + args. */
+# define RECORD_DP_DRAW_TAIL ((uint32_t)(sizeof(RecordBindPacketOp) + sizeof(RecordDraw)))
+# define RECORD_DP_STAGE_LIMIT (RECORD_DP_BYTES - RECORD_DP_DRAW_TAIL)
+/* The most client bytes (index + vertex copy) a fused draw may carry
+ * (drawpkt.review.md item 6).  A fused record's ring size is at most
+ * header + RECORD_DP_BYTES + client + client2 + 14 (two 8-alignments,
+ * gl_record_ring.c ring_layout), so under this bound it stays within half
+ * the ring: never refused by ring_layout and never the spsc_append
+ * "tail + bytes > ring" wait.  A larger draw is published alone after the
+ * staged calls (fr f), exactly the record it is without the knob. */
+# if defined(ISAAC_GL_RECORD_ORACLE_DP_FUSE_CLIENT_MAX)
+#  define RECORD_DP_FUSE_CLIENT_MAX ((uint32_t)ISAAC_GL_RECORD_ORACLE_DP_FUSE_CLIENT_MAX)   /* oracle */
+# else
+#  define RECORD_DP_FUSE_CLIENT_MAX (ISAAC_GL_RECORD_RING_BYTES / 2u - RECORD_DP_BYTES - (uint32_t)sizeof(IsaacGlRecordHeader) - 16u)
+# endif
+_Static_assert((uint32_t)sizeof(IsaacGlRecordHeader) + RECORD_DP_BYTES + 14u +
+    (ISAAC_GL_RECORD_RING_BYTES / 2u - RECORD_DP_BYTES - (uint32_t)sizeof(IsaacGlRecordHeader) - 16u)
+    <= ISAAC_GL_RECORD_RING_BYTES / 2u, "lane C: a fused draw record fits in half the ring");
+_Static_assert(sizeof(RecordDraw) % 8u == 0u,
+    "lane C: a fused draw's arguments end 8-aligned, as the staged ops do");
+_Static_assert(REC_ATTRIBS_DISABLE == REC_ATTRIBS_ENABLE + 1 &&
+    REC_KAGE_BIND_PACKET == REC_ATTRIBS_ENABLE + 2, "lane C: 79..81 are contiguous");
+_Static_assert(REC_KAGE_BIND_PACKET == ISAAC_GL_RECORD_KAGE_BIND_PACKET_OPCODE,
+    "gl_record_backend.h: the bind packet's census slot");
+static struct {
+    uint64_t storage[RECORD_DP_BYTES / sizeof(uint64_t)];
+    uint32_t used, subs;
+    uint32_t count[ISAAC_GL_DRAW_PACKET_FLUSH_FULL + 1];   /* this window */
+} s_dp;
+static uint32_t s_dp_window[ISAAC_GL_DRAW_PACKET_WORDS];
+
+static int record_dp_staged(void) { return s_dp.used != 0u; }
+
+/* The per-draw state records (RENDER60-ROUTE-kage-offload.md 3.1): blend,
+ * W-pkt Shader::Bind, S4 attribute enable/disable. */
+static int record_dp_covered(uint32_t opcode)
+{
+    return opcode == REC_glBlendFuncSeparate ||
+        opcode - (uint32_t)REC_ATTRIBS_ENABLE <=
+            (uint32_t)(REC_KAGE_BIND_PACKET - REC_ATTRIBS_ENABLE);
+}
+
+/* REC_DRAW_PACKET into the ring.  Oracles also count packets that start
+ * right behind a wrap marker (drawpkt.review.md item 5): the append then
+ * moved the write offset back to the packet's own size (spsc_append writes
+ * the marker into the tail and the record at offset 0), where an append
+ * without a wrap ends further on, or at 0 when it filled the tail exactly.
+ * Every packet is at most half the ring (RECORD_DP_FUSE_CLIENT_MAX), so
+ * "ended before it started, not at 0" is exactly "wrapped". */
+# if (defined(ISAAC_GL_VITA_BACKEND_ORACLE) || defined(ORACLE_ATTRIB_RECORDER)) && \
+     defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+static uint32_t s_dp_after_wrap;
+static void record_dp_publish(uint32_t rva, const void *args, uint32_t bytes,
+    uint32_t client, uint32_t client_bytes, uint32_t client2, uint32_t client2_bytes)
+{
+    uint32_t from = s_ring.write_pos % ISAAC_GL_RECORD_RING_BYTES, to;
+    record_append(REC_DRAW_PACKET, rva, args, bytes, client, client_bytes, client2, client2_bytes);
+    to = s_ring.write_pos % ISAAC_GL_RECORD_RING_BYTES;
+    if (to != 0u && to < from)
+        ++s_dp_after_wrap;
+}
+uint32_t isaac_gl_record_oracle_draw_packets_after_wrap(void) { return s_dp_after_wrap; }
+# else
+#  define record_dp_publish(rva, args, bytes, c, cb, c2, c2b) \
+    record_append(REC_DRAW_PACKET, (rva), (args), (bytes), (c), (cb), (c2), (c2b))
+# endif
+
+/* Publish what is staged: a packet, or (ON) one call as its own record. */
+static void record_dp_flush(uint32_t reason)
+{
+    RecordBindPacketOp first;
+    uint32_t used = s_dp.used, subs = s_dp.subs;
+    if (!used)
+        return;
+    /* Cleared first: a fault inside the append reaches isaac_gl_record_drain
+     * through the fault hook, which must find nothing staged. */
+    s_dp.used = s_dp.subs = 0u;
+    ++s_dp.count[reason];
+    if (used > s_dp.count[ISAAC_GL_DRAW_PACKET_MAX])
+        s_dp.count[ISAAC_GL_DRAW_PACKET_MAX] = used;
+    memcpy(&first, s_dp.storage, sizeof first);
+    if (subs == 1u) {
+        ++s_dp.count[ISAAC_GL_DRAW_PACKET_SINGLES];
+# if ISAAC_VITA_GL_DRAW_PACKET == 2
+        /* the call's own record, byte for byte what it was without the knob */
+        record_append(first.opcode, first.return_rva,
+            (const uint8_t *)s_dp.storage + sizeof first, first.payload_bytes,
+            0u, 0u, 0u, 0u);
+        return;
+# endif
+    }
+# if defined(ISAAC_GL_RECORD_ORACLE_MUTATE_DP_VERIFY_CORRUPT)
+    ((uint8_t *)s_dp.storage)[sizeof first] ^= 1u;   /* oracle self-test: VERIFY must see it */
+# endif
+    ++s_dp.count[ISAAC_GL_DRAW_PACKET_PACKETS];
+    record_dp_publish(first.return_rva, s_dp.storage, used, 0u, 0u, 0u, 0u);
+}
+
+static void record_dp_stage(uint32_t opcode, uint32_t rva, const void *args, uint32_t arg_bytes)
+{
+    RecordBindPacketOp op;
+    uint32_t step = (uint32_t)sizeof op + ((arg_bytes + 7u) & ~7u);
+    uint8_t *at;
+    if (step > RECORD_DP_STAGE_LIMIT)
+        record_fault("GL draw packet: staged call too large");
+    if (s_dp.used + step > RECORD_DP_STAGE_LIMIT)
+        record_dp_flush(ISAAC_GL_DRAW_PACKET_FLUSH_FULL);
+    at = (uint8_t *)s_dp.storage + s_dp.used;
+    op.opcode = (uint16_t)opcode;
+    op.payload_bytes = (uint16_t)arg_bytes;
+    op.return_rva = rva;
+    memset(at + step - 8u, 0, 8u);   /* the padding lies in the last 8 bytes */
+    memcpy(at, &op, sizeof op);
+    if (arg_bytes)
+        memcpy(at + sizeof op, args, arg_bytes);
+    s_dp.used += step;
+    ++s_dp.subs;
+    ++s_dp.count[ISAAC_GL_DRAW_PACKET_SUBS];
+    s_dp.count[ISAAC_GL_DRAW_PACKET_BYTES] += step;
+}
+
+/* A draw with calls staged: one record for both (VERIFY: the draw's own
+ * record first, which runs, then the packet, which is compared). */
+static void record_dp_draw(uint32_t rva, const void *args, uint32_t arg_bytes,
+    uint32_t client, uint32_t client_bytes, uint32_t client2, uint32_t client2_bytes)
+{
+    RecordBindPacketOp op, first;
+    uint8_t *at = (uint8_t *)s_dp.storage + s_dp.used;
+    uint32_t bytes = s_dp.used + (uint32_t)sizeof op + arg_bytes;
+    if (arg_bytes != sizeof(RecordDraw))
+        record_fault("GL draw packet: unexpected draw record");
+    op.opcode = (uint16_t)REC_glDrawElements;
+    op.payload_bytes = 0u;   /* the last op: the rest of the packet */
+    op.return_rva = rva;
+    memcpy(at, &op, sizeof op);
+    memcpy(at + sizeof op, args, arg_bytes);
+    if (s_dp.used > s_dp.count[ISAAC_GL_DRAW_PACKET_MAX])
+        s_dp.count[ISAAC_GL_DRAW_PACKET_MAX] = s_dp.used;
+    s_dp.used = s_dp.subs = 0u;   /* first, as in record_dp_flush */
+    ++s_dp.count[ISAAC_GL_DRAW_PACKET_FUSED];
+    ++s_dp.count[ISAAC_GL_DRAW_PACKET_PACKETS];
+    memcpy(&first, s_dp.storage, sizeof first);
+# if ISAAC_VITA_GL_DRAW_PACKET == 1
+    record_append(REC_glDrawElements, rva, args, arg_bytes, client, client_bytes,
+        client2, client2_bytes);
+# endif
+    record_dp_publish(first.return_rva, s_dp.storage, bytes, client, client_bytes,
+        client2, client2_bytes);
+}
+
+/* record_enqueue2, after the RVA capture: 1 = taken (nothing else to do). */
+static int record_dp_intercept(uint32_t opcode, uint32_t rva, const void *args,
+    uint32_t arg_bytes, uint32_t client, uint32_t client_bytes,
+    uint32_t client2, uint32_t client2_bytes)
+{
+    if (record_dp_covered(opcode) && !client_bytes && !client2_bytes) {
+        record_dp_stage(opcode, rva, args, arg_bytes);
+        return ISAAC_VITA_GL_DRAW_PACKET == 2;   /* VERIFY: its own record too */
+    }
+    if (opcode == REC_glDrawElements) {
+        ++s_dp.count[ISAAC_GL_DRAW_PACKET_DRAWS];
+        if (!s_dp.used)
+            return 0;
+        if (client_bytes > RECORD_DP_FUSE_CLIENT_MAX ||
+                client2_bytes > RECORD_DP_FUSE_CLIENT_MAX - client_bytes) {
+            record_dp_flush(ISAAC_GL_DRAW_PACKET_FLUSH_FULL);   /* too large to fuse */
+            return 0;
+        }
+        record_dp_draw(rva, args, arg_bytes, client, client_bytes, client2, client2_bytes);
+        return 1;
+    }
+# if !defined(ISAAC_GL_RECORD_ORACLE_MUTATE_DP_NO_RECORD_FLUSH)
+    if (s_dp.used)   /* (oracle self-test without it: this record overtakes them) */
+        record_dp_flush(ISAAC_GL_DRAW_PACKET_FLUSH_RECORD);
+# endif
+    return 0;
+}
+
+
+# if ISAAC_VITA_GL_DRAW_PACKET == 1
+/* VERIFY, render thread.  The separate records replayed since the last
+ * packet, encoded as that packet must carry them, are folded into a running
+ * hash; the packet's payload must give the same hash and length.  A covered
+ * record is its op header + payload + zero padding; a draw that follows a
+ * covered record (it was fused: the producer fuses exactly when something
+ * is staged) is the op header with payload_bytes 0 + its whole payload.
+ * Any other record replayed while the log is non-empty is "late": the
+ * producer let it overtake staged calls.  Word-wise FNV-1a: a difference in
+ * one 32-bit word always changes the result (each step is a bijection). */
+typedef struct RecordDpHash { uint32_t h, acc, n; } RecordDpHash;
+#  define RECORD_DP_HASH_INIT 2166136261u   /* FNV-1a offset basis */
+#  define RECORD_DP_HASH_PRIME 16777619u
+static void record_dp_hash_byte(RecordDpHash *s, uint32_t byte)
+{
+    s->acc |= byte << (8u * (s->n & 3u));
+    if ((++s->n & 3u) == 0u) {
+        s->h = (s->h ^ s->acc) * RECORD_DP_HASH_PRIME;
+        s->acc = 0u;
+    }
+}
+static void record_dp_hash(RecordDpHash *s, const void *data, uint32_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    while (len && (s->n & 3u)) { record_dp_hash_byte(s, *p++); --len; }
+    for (; len >= 4u; p += 4, len -= 4u, s->n += 4u) {
+        uint32_t word;
+        memcpy(&word, p, 4u);
+        s->h = (s->h ^ word) * RECORD_DP_HASH_PRIME;
+    }
+    while (len) { record_dp_hash_byte(s, *p++); --len; }
+}
+static uint32_t record_dp_hash_end(const RecordDpHash *s)
+{
+    return (s->n & 3u) ? (s->h ^ s->acc) * RECORD_DP_HASH_PRIME : s->h;
+}
+static struct {
+    RecordDpHash log;
+    uint32_t subs, verified, verified_subs, mismatch, late, total_bad;
+} s_dpv = {{RECORD_DP_HASH_INIT, 0u, 0u}, 0u, 0u, 0u, 0u, 0u, 0u};
+static void record_dpv_reset(void)
+{
+    s_dpv.log.h = RECORD_DP_HASH_INIT;
+    s_dpv.log.acc = s_dpv.log.n = 0u;
+    s_dpv.subs = 0u;
+}
+static void record_dpv_note(const IsaacGlRecordHeader *h, const void *payload)
+{
+    static const uint8_t zero[8] = {0};
+    RecordBindPacketOp op;
+    uint32_t pad = 0u;
+    if (h->opcode == REC_DRAW_PACKET)
+        return;   /* compared by its own replay */
+    if (record_dp_covered(h->opcode)) {
+        op.payload_bytes = (uint16_t)h->payload_bytes;
+        pad = ((h->payload_bytes + 7u) & ~7u) - h->payload_bytes;
+    } else if (h->opcode == REC_glDrawElements && s_dpv.log.n) {
+        op.payload_bytes = 0u;
+    } else {
+        if (s_dpv.log.n) {
+            ++s_dpv.late;
+            ++s_dpv.total_bad;
+            record_dpv_reset();
+        }
+        return;
+    }
+    op.opcode = (uint16_t)h->opcode;
+    op.return_rva = h->return_rva;
+    record_dp_hash(&s_dpv.log, &op, (uint32_t)sizeof op);
+    record_dp_hash(&s_dpv.log, payload, h->payload_bytes);
+    record_dp_hash(&s_dpv.log, zero, pad);
+    ++s_dpv.subs;
+}
+# endif
+
+/* Render thread, both modes: a packet's ops in staging order.  ON runs each
+ * through record_dispatch with its own return RVA - what the separate
+ * records ran (record_replay holds s_replaying across the packet; the S4 ops
+ * keep the consumer attribute shadow themselves, record_replay_attribs, and
+ * no staged opcode is one of the per-call attribute records record_replay
+ * shadows).  The opcode census counts the packet, not its ops.  VERIFY runs
+ * nothing (the separate records already ran): the same walk re-encodes each
+ * op as record_dpv_note encodes a separate record, into *rehash, so the ON
+ * framing - op steps, the rest-of-packet draw, each op's RVA - runs on the
+ * device under a check (drawpkt.review.md item 4).  Returns 0; a malformed
+ * packet faults in ON and returns 1 in VERIFY (counted as mm). */
+# if ISAAC_VITA_GL_DRAW_PACKET == 2
+#  define RECORD_DP_MALFORMED(message) record_fault(message)
+# else
+#  define RECORD_DP_MALFORMED(message) return 1
+# endif
+static int record_dp_walk(const IsaacGlRecordHeader *h, const void *payload, void *rehash)
+{
+    const uint8_t *cursor = (const uint8_t *)payload;
+    const uint8_t *end = cursor + h->payload_bytes;
+# if ISAAC_VITA_GL_DRAW_PACKET == 2
+    (void)rehash;
+# endif
+    while (cursor < end) {
+        RecordBindPacketOp op;
+        IsaacGlRecordHeader sub;
+        uint32_t rest = (uint32_t)(end - cursor), bytes, rva;
+        if (rest < sizeof op)
+            RECORD_DP_MALFORMED("GL recorder: truncated draw packet");
+        memcpy(&op, cursor, sizeof op);
+        rest -= (uint32_t)sizeof op;
+        if (op.opcode == REC_glDrawElements) {
+            if (op.payload_bytes || rest < sizeof(RecordDraw))
+                RECORD_DP_MALFORMED("GL recorder: malformed draw packet");
+            bytes = rest;
+            sub.payload_bytes = rest;
+        } else {
+            bytes = ((uint32_t)op.payload_bytes + 7u) & ~7u;
+#  if defined(ISAAC_GL_RECORD_ORACLE_MUTATE_DP_FRAMING)
+            bytes = ((uint32_t)op.payload_bytes + 15u) & ~7u;   /* oracle self-test: off by 8 */
+#  endif
+            if (bytes > rest || !record_dp_covered(op.opcode))
+                RECORD_DP_MALFORMED("GL recorder: malformed draw packet");
+            sub.payload_bytes = op.payload_bytes;
+        }
+# if defined(ISAAC_GL_RECORD_ORACLE_MUTATE_DP_DROP_LAST)
+        /* oracle self-test: the last staged call of a draw-less packet is lost */
+        if (op.opcode != REC_glDrawElements && bytes == rest && cursor != (const uint8_t *)payload)
+            break;
+# endif
+        sub.bytes = (uint32_t)sizeof op + bytes;
+        sub.opcode = op.opcode;
+        sub.return_rva = op.return_rva;
+# if defined(ISAAC_GL_RECORD_ORACLE_MUTATE_DP_RVA)
+        rva = h->return_rva;   /* oracle self-test: every op gets the packet's RVA */
+# else
+        rva = op.return_rva;
+# endif
+# if ISAAC_VITA_GL_DRAW_PACKET == 2
+        s_rva = rva;
+        record_dispatch(&sub, cursor + sizeof op);
+# else
+        {
+            static const uint8_t zero[8] = {0};
+            RecordBindPacketOp again;
+            again.opcode = op.opcode;
+            again.payload_bytes = op.opcode == REC_glDrawElements ? 0u : (uint16_t)sub.payload_bytes;
+            again.return_rva = rva;
+            record_dp_hash((RecordDpHash *)rehash, &again, (uint32_t)sizeof again);
+            record_dp_hash((RecordDpHash *)rehash, cursor + sizeof op, sub.payload_bytes);
+            record_dp_hash((RecordDpHash *)rehash, zero, bytes - sub.payload_bytes);
+        }
+# endif
+        cursor += sizeof op + bytes;
+    }
+    return 0;
+}
+# undef RECORD_DP_MALFORMED
+
+# if ISAAC_VITA_GL_DRAW_PACKET == 1
+/* The packet's bytes, and the same bytes as the ON walk frames them, must
+ * both equal the log of the separate records. */
+static void record_dpv_check(const IsaacGlRecordHeader *h, const void *payload)
+{
+    RecordDpHash packet = {RECORD_DP_HASH_INIT, 0u, 0u}, walked = {RECORD_DP_HASH_INIT, 0u, 0u};
+    int malformed;
+    record_dp_hash(&packet, payload, h->payload_bytes);
+    malformed = record_dp_walk(h, payload, &walked);
+    ++s_dpv.verified;
+    s_dpv.verified_subs += s_dpv.subs;
+    if (malformed || packet.n != s_dpv.log.n ||
+            record_dp_hash_end(&packet) != record_dp_hash_end(&s_dpv.log) ||
+            walked.n != s_dpv.log.n || record_dp_hash_end(&walked) != record_dp_hash_end(&s_dpv.log)) {
+        ++s_dpv.mismatch;
+        ++s_dpv.total_bad;
+    }
+    record_dpv_reset();
+}
+# endif
+
+static void record_replay_draw_packet(const IsaacGlRecordHeader *h, const void *payload)
+{
+# if ISAAC_VITA_GL_DRAW_PACKET == 1
+    record_dpv_check(h, payload);   /* the separate records already ran */
+# else
+    (void)record_dp_walk(h, payload, NULL);
+# endif
+}
+
+/* Window halves, inside isaac_gl_record_worker_take (game thread) and its
+ * record_take_render closure (render thread); store = a window was asked. */
+static void record_dp_take_produce(int store)
+{
+    if (store)
+        memcpy(s_dp_window, s_dp.count, sizeof s_dp.count);
+    memset(s_dp.count, 0, sizeof s_dp.count);
+}
+static void record_dp_take_replay(int store)
+{
+# if ISAAC_VITA_GL_DRAW_PACKET == 1
+    if (store) {
+        s_dp_window[ISAAC_GL_DRAW_PACKET_VERIFIED] = s_dpv.verified;
+        s_dp_window[ISAAC_GL_DRAW_PACKET_VERIFIED_SUBS] = s_dpv.verified_subs;
+        s_dp_window[ISAAC_GL_DRAW_PACKET_MISMATCH] = s_dpv.mismatch;
+        s_dp_window[ISAAC_GL_DRAW_PACKET_LATE] = s_dpv.late;
+        s_dp_window[ISAAC_GL_DRAW_PACKET_TOTAL_BAD] = s_dpv.total_bad;
+    }
+    s_dpv.verified = s_dpv.verified_subs = s_dpv.mismatch = s_dpv.late = 0u;
+# else
+    (void)store;   /* ON: the VERIFY words stay 0 */
+# endif
+}
+
+int isaac_gl_record_draw_packet_mode(void) { return ISAAC_VITA_GL_DRAW_PACKET; }
+void isaac_gl_record_draw_packet_window(uint32_t out[ISAAC_GL_DRAW_PACKET_WORDS])
+{
+    memcpy(out, s_dp_window, sizeof s_dp_window);
+}
+#endif
 
 static void record_custom_replay(const IsaacGlRecordHeader *h, const void *payload)
 {
@@ -1304,6 +1792,9 @@ static void record_custom_replay(const IsaacGlRecordHeader *h, const void *paylo
     switch (h->opcode) {
 #if defined(ISAAC_VITA_KAGE_BIND_PACKET)
     case REC_KAGE_BIND_PACKET: record_replay_bind_packet(h, payload); break;
+#endif
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    case REC_DRAW_PACKET: record_replay_draw_packet(h, payload); break;
 #endif
     case REC_glDrawElements: record_replay_draw(h, payload); break;
     case REC_NATIVE_BIND_RBO: s_rbo.bind(a[0], a[1]); break;
@@ -1334,6 +1825,10 @@ static void record_custom_replay(const IsaacGlRecordHeader *h, const void *paylo
  * with the return RVA the translated call site would have pushed; flush
  * publishes the staged calls as one REC_KAGE_BIND_PACKET record. */
 #define RECORD_BIND_PACKET_BYTES 512u
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+_Static_assert(sizeof(RecordBindPacketOp) + RECORD_BIND_PACKET_BYTES <= RECORD_DP_STAGE_LIMIT,
+    "lane C: the largest staged call (a full bind packet) fits an empty buffer");
+# endif
 #define RECORD_BIND_MEMO_SLOTS 4u
 #define RECORD_BIND_MEMO_NAME 16u   /* names up to 15 bytes are memoised */
 static struct {
@@ -1652,6 +2147,12 @@ static uint32_t record_post_closure(void (*fn)(void *), void *context)
 {
     uint8_t a[sizeof fn + sizeof context];
     uint32_t position;
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    /* producer (worker_call/_post returned on the consumer): staged calls
+     * run before the closure, which may observe their GL state */
+    if (record_dp_staged())
+        record_dp_flush(ISAAC_GL_DRAW_PACKET_FLUSH_CLOSURE);
+#endif
     memcpy(a, &fn, sizeof fn);
     memcpy(a + sizeof fn, &context, sizeof context);
     position = isaac_gl_record_spsc_append(&s_ring, REC_WORKER_CALL, 0u, a, sizeof a,
@@ -1701,6 +2202,10 @@ void isaac_gl_record_worker_stop(void)
 {
     if (!s_worker) return;
 #if defined(_WIN32)
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    if (record_dp_staged() && !record_on_consumer())
+        record_dp_flush(ISAAC_GL_DRAW_PACKET_FLUSH_SYNC);
+# endif
     InterlockedExchange((volatile LONG *)&s_worker_stop, 1);
     isaac_gl_record_spsc_kick(&s_ring);
     WaitForSingleObject(s_worker_handle, INFINITE);
@@ -1761,6 +2266,9 @@ static void record_take_render(void *context)
     s_rw.window_start = now;
     s_rw.window_busy_mark = busy;
     s_rw.frames = s_rw.frame_overflow = s_rw.swap_us = 0u;
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    record_dp_take_replay(out != NULL);
+#endif
 #if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     if (out) {
         uint64_t first = record_now_us(), last = first;
@@ -1819,6 +2327,9 @@ void isaac_gl_record_worker_take(IsaacGlRecordWorkerWindow *out)
     s_pw.copied_base = s_ring.copied_bytes;
     s_pw.mb_calls = s_pw.mb_samples = s_pw.mb_us = s_pw.ap_samples = s_pw.ap_us = 0u;
     s_pw.mb_queries = s_pw.clock_us = s_pw.render_skips = 0u;
+#if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    record_dp_take_produce(out != NULL);
+#endif
 #if defined(ISAAC_GL_RECORD_OPCODE_CENSUS)
     if (out) {
         uint32_t i;
@@ -1847,6 +2358,59 @@ int isaac_gl_record_worker_behind(uint32_t position)
         !isaac_gl_record_spsc_reached(&s_ring, position);
 }
 
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+/* Producer, GL admit wait (R60-DRYADMIT-SPEC-20261028.md): sleep until the
+ * record ending at position is done (1) or record_now_us() reaches
+ * deadline_us (0).  Slices of at most 2000 us (the consumer's own sleep,
+ * gl_record_ring.c spsc_sleep_os) re-check done_pos after a lost wake-up.
+ * Not counted in h(n,us): ph120.aw us(sum,max) has it. */
+int isaac_gl_record_worker_wait_until(uint32_t position, uint64_t deadline_us)
+{
+    if (!s_worker || !position || record_on_consumer())
+        return 1;
+    for (;;) {
+        uint64_t now;
+        if (isaac_gl_record_spsc_reached(&s_ring, position))
+            return 1;
+        now = record_now_us();
+        if (now >= deadline_us)
+            return 0;
+        (void)isaac_gl_record_spsc_wait_done_for(&s_ring, position,
+            deadline_us - now > 2000u ? 2000u : (uint32_t)(deadline_us - now));
+    }
+}
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+# if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES)
+_Static_assert(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES >= 1 &&
+               ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES <= ISAAC_GL_RECORD_RING_BYTES,
+               "the admit-behind bound must fit in the record ring");
+# endif
+/* Producer, GL admit behind (R60-FABLE-PLAN.md lane B): appended minus
+ * consumed.  Both are the ring's monotonic 32-bit byte positions
+ * (gl_record_ring.h write_pos / read_pos), so the difference is right across
+ * a ring wrap (a wrap marker's bytes count until the consumer passes it) and
+ * across the 2^32 position wrap: the expression of gl_record_ring.c
+ * spsc_append's high-water sample.  write_pos is this thread's own; read_pos
+ * is one aligned 32-bit load of the consumer's published position, at worst
+ * stale by the records it has finished since (the answer only shrinks). */
+uint32_t isaac_gl_record_worker_outstanding(void)
+{
+    if (!s_worker || record_on_consumer())
+        return 0u;
+# if defined(ISAAC_VITA_GL_DRAW_PACKET)
+    /* the staged calls are outstanding work: publish them, then measure */
+    if (record_dp_staged())
+        record_dp_flush(ISAAC_GL_DRAW_PACKET_FLUSH_SYNC);
+# endif
+# if defined(ISAAC_GL_RECORD_ORACLE_MUTATE_OUTSTANDING_OFFSET) /* oracle self-test: storage offsets */
+    return s_ring.write_pos % ISAAC_GL_RECORD_RING_BYTES -
+        s_ring.read_pos % ISAAC_GL_RECORD_RING_BYTES;
+# else
+    return s_ring.write_pos - s_ring.read_pos;
+# endif
+}
+#endif
 void isaac_gl_record_worker_note_render_skip(void) { ++s_pw.render_skips; }
 
 void isaac_gl_record_worker_quiesce(void)

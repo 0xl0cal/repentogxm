@@ -315,6 +315,18 @@ static uint32_t sfxp_headroom(void)
     return used < SFXP_HEAP_TOTAL ? SFXP_HEAP_TOTAL - used : 0U;
 }
 
+#if defined(ISAAC_VITA_IMAGE_PRELOAD)
+/* ISAAC_VITA_IMAGE_PRELOAD (host_vita_image_retain.c) shares this unit's
+ * Level::Init seam and its guest-heap headroom reading; undefined leaves no
+ * token of it here. */
+void isaac_vita_image_preload_level_init(CPU *__restrict c);
+uint32_t isaac_vita_image_preload_heap_headroom(void);
+uint32_t isaac_vita_image_preload_heap_headroom(void)
+{
+    return sfxp_headroom();
+}
+#endif
+
 /* ------------------------------------------------------- the replay ------ */
 
 /* Play's bounds test (0x488e26..0x488e46) on the SFXManager at `sfx`:
@@ -664,4 +676,20 @@ void __wrap_sub_00311e60(CPU *__restrict c)
     }
     __real_sub_00311e60(c);
     sfxp_after_level_init(c, level);
+#if defined(ISAAC_VITA_IMAGE_PRELOAD)
+    if (!c->fault) {
+        /* After the sounds: the sheet preload replays ImageManager::Load on
+         * this CPU, so the registers Level::Init returned go back after it.
+         * The order is deliberate: the fight sounds keep first call on the
+         * guest heap (their gate is unchanged by this knob), and the sheet
+         * preload gates on what they left (vita/README.md, "heap gate on
+         * the bench route"). */
+        sfxp_saved saved;
+
+        sfxp_save(c, &saved);
+        isaac_vita_image_preload_level_init(c);
+        if (!c->fault)
+            sfxp_restore(c, &saved);
+    }
+#endif
 }

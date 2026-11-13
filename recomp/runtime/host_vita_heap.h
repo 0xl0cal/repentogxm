@@ -404,4 +404,20 @@ int isaac_vita_heap_import(CPU *__restrict c, const char *name);
 int isaac_vita_heap_import_counted(CPU *__restrict c, const char *name,
                                    unsigned *call_count);
 
+#if defined(ISAAC_VITA_HEAP_IMPORT_LEAN2) && ISAAC_VITA_HEAP_IMPORT_LEAN2
+/* ISAAC_VITA_HEAP_IMPORT_LEAN2 receipt for host proofs: ledger slots whose
+ * floor-lifetime sidecar token is nonzero (must stay 0 when the sidecar cut
+ * is compiled in) and, under _VERIFY, checks and disagreements per kind
+ * (sidecars, owner, reserve, prefetch). */
+#define ISAAC_VITA_GUEST_HEAP_LEAN2_KINDS 4U
+typedef struct isaac_vita_guest_heap_lean2_stats {
+    int verify;
+    uint32_t sidecar_nonzero;
+    uint32_t checks[ISAAC_VITA_GUEST_HEAP_LEAN2_KINDS];
+    uint32_t bad[ISAAC_VITA_GUEST_HEAP_LEAN2_KINDS];
+} isaac_vita_guest_heap_lean2_stats;
+int isaac_vita_guest_heap_lean2_stats_get(
+    isaac_vita_guest_heap_lean2_stats *stats_out);
+#endif
+
 #endif

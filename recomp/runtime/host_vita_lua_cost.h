@@ -31,6 +31,12 @@ void isaac_vita_lua_cost_cb_leave(void);
 /* Emit the current window now (host oracles; not called on the device). */
 void isaac_vita_lua_cost_flush(void);
 
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+/* Lifetime modular totals pcall n/us, callback n/us, GC n/us; unaffected by
+ * the unit's own window roll-over (kage_vita_update_hitch.h). */
+void isaac_vita_lua_cost_hitch_peek(uint32_t out[6]);
+#endif
+
 #if defined(ISAAC_VITA_LUA_COST_PROFILE_ORACLE)
 /* Host oracles supply the clock (microseconds) and the line sink. */
 uint64_t isaac_vita_lua_cost_oracle_clock(void);

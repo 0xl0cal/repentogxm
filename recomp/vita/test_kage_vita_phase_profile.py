@@ -943,6 +943,57 @@ def main() -> int:
                           "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
                           "-DISAAC_VITA_GL_THREAD_WORKER=1")
         )
+        # ISAAC_VITA_GL_THREAD_ADMIT_WAIT (R60-DRYADMIT-SPEC-20261028.md 3.7)
+        # on the gl-worker set with GL render admission, which it requires:
+        # ph120.aw after ph120.rw (records 12 -> 13) in OBSERVE and ON.
+        completed_gl_worker_admit_wait = {
+            mode: compile_and_run(
+                f"gl-worker-admit-wait-{mode}", (
+                    "-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                    "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                    "-DISAAC_VITA_GL_THREAD_WORKER=1",
+                    "-DISAAC_VITA_GL_THREAD_RENDER_ADMISSION=1",
+                    f"-DISAAC_VITA_GL_THREAD_ADMIT_WAIT={value}"))
+            for mode, value in (("observe", 1), ("on", 2))
+        }
+        # ISAAC_VITA_GL_THREAD_ADMIT_BEHIND (R60-FABLE-PLAN.md lane B) on the
+        # same set: ph120.ab + ph120.abp after ph120.rw (records 12 -> 14)
+        # in OBSERVE and ON.
+        completed_gl_worker_admit_behind = {
+            mode: compile_and_run(
+                f"gl-worker-admit-behind-{mode}", (
+                    "-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                    "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                    "-DISAAC_VITA_GL_THREAD_WORKER=1",
+                    "-DISAAC_VITA_GL_THREAD_RENDER_ADMISSION=1",
+                    f"-DISAAC_VITA_GL_THREAD_ADMIT_BEHIND={value}",
+                    "-DISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES=65536"))
+            for mode, value in (("observe", 1), ("on", 2))
+        }
+        # ISAAC_VITA_GL_DRAW_PACKET (RENDER60 lane C) on the gl-worker set:
+        # ph120.dp after ph120.rw (records 12 -> 13) in VERIFY and ON.
+        completed_gl_worker_draw_packet = {
+            mode: compile_and_run(
+                f"gl-worker-draw-packet-{mode}", (
+                    "-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                    "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                    "-DISAAC_VITA_GL_THREAD_WORKER=1",
+                    f"-DISAAC_VITA_GL_DRAW_PACKET={value}"))
+            for mode, value in (("verify", 1), ("on", 2))
+        }
+        # ... and with the opcode census as CMake gives it (W-pkt and S4
+        # defines on the phase profile): 83 slots, ph120.dp then ro + rop
+        # (records 12 -> 17).
+        completed_gl_worker_census_draw_packet = compile_and_run(
+            "gl-worker-census-draw-packet", (
+                "-DISAAC_VITA_GFUEL_SEED_NATIVE=1",
+                "-DISAAC_VITA_CAMERA_RING_NATIVE=1",
+                "-DISAAC_VITA_GL_THREAD_WORKER=1",
+                "-DISAAC_GL_RECORD_OPCODE_CENSUS=1",
+                "-DISAAC_VITA_KAGE_BIND_PACKET=1",
+                "-DISAAC_VITA_GL_RECORD_ATTRIB_BATCH=1",
+                "-DISAAC_VITA_GL_DRAW_PACKET=2")
+        )
         # ISAAC_VITA_GL_RECORD_OPCODE_CENSUS on the gl-worker set: ph120.ro
         # plus three ph120.rop records after rw (records 12 -> 16), and
         # "; ro=<N>; rop=<N>" only under it.
@@ -1539,6 +1590,58 @@ def main() -> int:
             "phase profile gl-worker oracle returned unexpected output: "
             f"{completed_gl_worker.stdout!r}"
         )
+    # ph120.aw: 380 B all-ones (21 ten-digit numbers; review fix pass added
+    # hl, ov and hd), one record after rw.
+    expected_gl_worker_admit_wait = expected_gl_worker.replace(
+        "records=12", "records=13").replace("rw=265; ", "rw=265; aw=380; ")
+    assert "records=13;" in expected_gl_worker_admit_wait and \
+        "rw=265; aw=380; " in expected_gl_worker_admit_wait, \
+        expected_gl_worker_admit_wait
+    for mode, completed in completed_gl_worker_admit_wait.items():
+        if expected_gl_worker_admit_wait not in completed.stdout:
+            raise AssertionError(
+                f"phase profile gl-worker-admit-wait-{mode} oracle returned "
+                f"unexpected output: {completed.stdout!r}"
+            )
+    # ph120.ab: 311 B all-ones (17 ten-digit numbers), ph120.abp: 226 B
+    # (11), two records after rw.
+    expected_gl_worker_admit_behind = expected_gl_worker.replace(
+        "records=12", "records=14").replace(
+        "rw=265; ", "rw=265; ab=311; abp=226; ")
+    assert "records=14;" in expected_gl_worker_admit_behind and \
+        "rw=265; ab=311; abp=226; " in expected_gl_worker_admit_behind, \
+        expected_gl_worker_admit_behind
+    for mode, completed in completed_gl_worker_admit_behind.items():
+        if expected_gl_worker_admit_behind not in completed.stdout:
+            raise AssertionError(
+                f"phase profile gl-worker-admit-behind-{mode} oracle returned "
+                f"unexpected output: {completed.stdout!r}"
+            )
+    # ph120.dp: 328 B all-ones (18 ten-digit numbers, mode=VERIFY), one
+    # record after rw.
+    expected_gl_worker_draw_packet = expected_gl_worker.replace(
+        "records=12", "records=13").replace("rw=265; ", "rw=265; dp=328; ")
+    assert "records=13;" in expected_gl_worker_draw_packet and \
+        "rw=265; dp=328; " in expected_gl_worker_draw_packet, \
+        expected_gl_worker_draw_packet
+    for mode, completed in completed_gl_worker_draw_packet.items():
+        if expected_gl_worker_draw_packet not in completed.stdout:
+            raise AssertionError(
+                f"phase profile gl-worker-draw-packet-{mode} oracle returned "
+                f"unexpected output: {completed.stdout!r}"
+            )
+    expected_gl_worker_census_draw_packet = expected_gl_worker.replace(
+        "records=12", "records=17").replace(
+        "rw=265; ", "rw=265; dp=328; ro=173; rop=490; ")
+    assert "records=17;" in expected_gl_worker_census_draw_packet and \
+        "dp=328; ro=173; rop=490; " in expected_gl_worker_census_draw_packet, \
+        expected_gl_worker_census_draw_packet
+    if expected_gl_worker_census_draw_packet not in \
+            completed_gl_worker_census_draw_packet.stdout:
+        raise AssertionError(
+            "phase profile gl-worker-census-draw-packet oracle returned "
+            f"unexpected output: {completed_gl_worker_census_draw_packet.stdout!r}"
+        )
     # ph120.ro: 173 B all-ones (five ten-digit numbers); ph120.rop: 490 B
     # (three all-ones slots of twelve), inside the 512-byte allowance.
     expected_gl_worker_census = expected_gl_worker.replace(
@@ -1601,6 +1704,10 @@ def main() -> int:
         print(f"[clear-latch-{mode}] " + completed.stdout.strip())
     print("[all-on-clear-latch] " + completed_all_on_clear_latch.stdout.strip())
     print("[gl-worker] " + expected_gl_worker)
+    print("[gl-worker-admit-wait observe,on] " + expected_gl_worker_admit_wait)
+    print("[gl-worker-admit-behind observe,on] " + expected_gl_worker_admit_behind)
+    print("[gl-worker-draw-packet verify,on] " + expected_gl_worker_draw_packet)
+    print("[gl-worker-census-draw-packet] " + expected_gl_worker_census_draw_packet)
     print("[gl-worker-census] " + expected_gl_worker_census)
     print("[gl-worker-census-clear-latch] " + expected_gl_worker_census_clear_latch)
     print("[session-gl] " + expected_session_gl)

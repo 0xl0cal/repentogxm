@@ -32,6 +32,11 @@ typedef struct isaac_vita_static_sfx_window {
  * counters untouched. Nonblocking; call once at profile start to discard. */
 int isaac_vita_static_sfx_profile_take_window(
     isaac_vita_static_sfx_window *out);
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+/* Copy without reset (kage_vita_update_hitch.h). */
+int isaac_vita_static_sfx_profile_peek_window(
+    isaac_vita_static_sfx_window *out);
+#endif
 
 /* Import adapters pass values already read. Outside a tracked static scope
  * begin returns UINT64_MAX without reading the clock. */

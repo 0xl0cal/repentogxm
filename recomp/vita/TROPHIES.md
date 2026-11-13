@@ -1,9 +1,9 @@
 # PS Vita trophies (`ISAAC_VITA_TROPHIES`)
 
-Status: implemented behind default-OFF knobs; not in the release recipe
-(`release/v0.1.1-alpha.cmake` pins both knobs OFF). Turning it on for a release
-waits for the device gates below and the maintainer's distribution decision
-(the trophy packs carry game-derived text and art and are never committed).
+Status: implemented behind default-OFF knobs; ON in the v0.2.0-alpha recipe
+(`release/v0.2.0-alpha.cmake`; `release/v0.1.1-alpha.cmake` pins both knobs
+OFF). The trophy packs carry game-derived text and art: they are built locally
+and never committed.
 
 Reworked 2026-10-09 after the first device runs (FW 3.65, NoTrpDrm 1.1 under
 `*main`): at most **two** trophy contexts can be live in one process (the third

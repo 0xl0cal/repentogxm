@@ -561,6 +561,9 @@ static void kage_loading_display_callback(void *framebuffer_pointer)
 static void kage_loading_swap_closure(void *unused)
 {
     (void)unused;
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    gl_vita_backend_fbo_deferred_attach_present();
+#endif
     gl_vita_backend_attrib_sync();
     vglSwapBuffers(GL_FALSE);
 }
@@ -583,6 +586,9 @@ static void kage_loading_swap(uint32_t completed_calls)
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
     isaac_gl_record_worker_call(kage_loading_swap_closure, NULL);
 #else
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    gl_vita_backend_fbo_deferred_attach_present();
+#endif
     gl_vita_backend_attrib_sync();
     vglSwapBuffers(GL_FALSE);
 #endif

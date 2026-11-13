@@ -2392,6 +2392,11 @@ void __real_sub_005a3b30(CPU *c)
             CHECK(isaac_vita_static_sfx_profile_take_window(&busy) == 0 &&
                   memcmp(&busy, &expected, sizeof busy) == 0,
                   "active-load snapshot consumed or wrote output");
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+            CHECK(isaac_vita_static_sfx_profile_peek_window(&busy) == 0 &&
+                  memcmp(&busy, &expected, sizeof busy) == 0,
+                  "active-load peek succeeded or wrote output");
+#endif
         }
         __wrap_sub_005bf4e0(c);
         __wrap_sub_005bf4e0(c);
@@ -2529,6 +2534,40 @@ static void test_static_sfx_profile(void)
           s_get_error_calls == native_errors + 1U &&
           s_sfx_override_calls == 1U && s_sfx_play_calls == 2U,
           "same-TU Play override missed upload, double counted or replayed original");
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+    {
+        /* ISAAC_VITA_UPDATE_HITCH_PROBE: the production peek.  Mode 5 is an
+         * outer WAV load with a nested (skipped) OGG, so the window and the
+         * skipped count are both non-zero when it is peeked.  Mode 6 above
+         * already peeked under the held scope lock. */
+        isaac_vita_static_sfx_window a, b;
+        s_sfx_mode = 5U;
+        memset(&c, 0, sizeof c);
+        s_sfx_now = 1000U;
+        errno = EDOM;
+        __wrap_sub_005a3b30(&c);
+        memset(&a, 0x5a, sizeof a);
+        memset(&b, 0xa5, sizeof b);
+        CHECK(isaac_vita_static_sfx_profile_peek_window(NULL) == 0,
+              "NULL static SFX peek accepted");
+        CHECK(isaac_vita_static_sfx_profile_peek_window(&a) == 1 &&
+              isaac_vita_static_sfx_profile_peek_window(&b) == 1 &&
+              memcmp(&a, &b, sizeof a) == 0,
+              "peek is not repeatable (it reset or consumed something)");
+        CHECK(a.wav.count == 1U && a.ogg.count == 0U && a.skipped == 0U,
+              "peek did not return the open window as it stands");
+        CHECK(isaac_vita_static_sfx_profile_take_window(&w) == 1 &&
+              w.skipped == 1U && w.wav.count == 1U,
+              "peek consumed the window or the skipped count");
+        w.skipped = 0U;
+        CHECK(memcmp(&w, &a, sizeof w) == 0,
+              "take after peek differs from the peeked window");
+        CHECK(isaac_vita_static_sfx_profile_peek_window(&a) == 1 &&
+              memcmp(&a, &empty, sizeof a) == 0,
+              "peek after take is not the empty window");
+        puts("Static SFX peek: PASS (production peek_window: repeatable, no reset, skipped count left for take, refused under the scope lock)");
+    }
+#endif
     puts("Static SFX scopes: PASS (actual adapters; mocked loaders/AL/clock; CPU, errno, nested/busy/take-zero, raw error count, rollback/saturation)");
 }
 #endif

@@ -65,8 +65,60 @@ VT_RVA = {"PNG": 0x766028, "PCX": 0x765E90, "PIC": 0x7662F0}
 VT_LOADER_RVA = {"PNG": 0x5A0C50, "PCX": 0x5A0630, "PIC": 0x5A0630}
 CTRL_VT_RVA = 0x608360
 CTRL_VT_SLOTS = {4: 0x7B70, 8: 0x7B50, 0xC: 0x7AF0}   # TryAddRef, AddRef, Release
-ORACLE_PASS = "IMAGE RETAIN ORACLE PASS: checks=644 scenarios=66 records=1024"
-ORACLE_PASS_PHYCONT = "IMAGE RETAIN ORACLE PASS: checks=657 scenarios=69 records=1024"
+ORACLE_PASS = "IMAGE RETAIN ORACLE PASS: checks=667 scenarios=71 records=1024"
+ORACLE_PASS_PHYCONT = "IMAGE RETAIN ORACLE PASS: checks=680 scenarios=74 records=1024"
+# ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE=1 (MIN_KB=1024): the same scenarios with the
+# trace compiled in, plus the big-trace scenarios.
+BIG_TRACE_DEFS = ["-DISAAC_VITA_IMAGE_RETAIN_BIG_TRACE=1",
+                  "-DISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB=1024"]
+ORACLE_PASS_BIG = "IMAGE RETAIN ORACLE PASS: checks=1245 scenarios=79 records=1024"
+ORACLE_PASS_BIG_PHYCONT = "IMAGE RETAIN ORACLE PASS: checks=1258 scenarios=82 records=1024"
+# Each mutant is one exact, unique text replacement in the module; the
+# trace-ON oracle must compile it and FAIL.
+BIG_TRACE_MUTANTS = [
+    ("threshold-inclusive",
+     "    if (bytes < (uint64_t)ISAAC_IRB_MIN_BYTES)\n        return;\n    if (s_irb.lines",
+     "    if (bytes <= (uint64_t)ISAAC_IRB_MIN_BYTES)\n        return;\n    if (s_irb.lines"),
+    ("reason-rt-mask",
+     "    if ((flags & 0x14U) != 0U)\n        return \"inel-rt\";",
+     "    if ((flags & 0x10U) != 0U)\n        return \"inel-rt\";"),
+    ("reason-tex-unset",
+     "    if (tex0 == 0U || tex0 == ISAAC_IR_TEX_UNSET)\n        return \"inel-tex\";",
+     "    if (tex0 == 0U)\n        return \"inel-tex\";"),
+    ("reason-counter-swap",
+     "    case 't': ++s_irb.inel_tex; break;",
+     "    case 't': ++s_irb.inel_name; break;"),
+    ("foreign-vt-not-latched",
+     "++s_irb.inel_vt; s_irb.last_foreign_vt = ld32(image); return;",
+     "++s_irb.inel_vt; return;"),
+    ("name-head-not-tail",
+     "    start = len > ISAAC_IRB_NAME_MAX ? len - ISAAC_IRB_NAME_MAX : 0U;",
+     "    start = 0U; if (len > ISAAC_IRB_NAME_MAX) len = ISAAC_IRB_NAME_MAX;"),
+    ("name-space-kept", "(ch > 0x20U && ch < 0x7fU)", "(ch >= 0x20U && ch < 0x7fU)"),
+    ("name-del-kept", "(ch > 0x20U && ch < 0x7fU)", "(ch > 0x20U && ch <= 0x7fU)"),
+    ("line-cap-off-by-one",
+     "#define ISAAC_IRB_MAX_LINES 512U", "#define ISAAC_IRB_MAX_LINES 513U"),
+    ("suppressed-not-counted",
+     "        ++s_irb.suppressed;\n        return;\n    }\n    ++s_irb.lines;\n    name_va",
+     "        return;\n    }\n    ++s_irb.lines;\n    name_va"),
+    ("new-reuse-swapped", "? \"reuse\" : \"new\";", "? \"new\" : \"reuse\";"),
+    ("evict-reason-swapped",
+     "reason == IR_REASON_BUDGET ? \"evict-budget\" :",
+     "reason == IR_REASON_BUDGET ? \"evict-headroom\" :"),
+    ("stale-silent", "        IRB_NOTE_RECORD(image, bytes, \"stale\");\n", ""),
+    ("oversize-silent", "        IRB_NOTE(image, \"oversize\");\n", ""),
+    ("absent-silent", "        IRB_NOTE(image, \"absent\");\n", ""),
+    ("budget0-silent", "        IRB_NOTE(image, \"pass-budget0\");\n", ""),
+    ("headroom-pass-silent", "                IRB_NOTE(image, \"headroom-pass\");\n", ""),
+    ("ineligible-silent", "        IRB_INELIGIBLE(image);\n", "        (void)irb_ineligible;\n"),
+    ("note-after-touch",
+     "    IRB_NOTE(image, irb_touch_what(image, ctrl));\n    ir_touch(image, ctrl, bytes, 0);\n",
+     "    ir_touch(image, ctrl, bytes, 0);\n    IRB_NOTE(image, irb_touch_what(image, ctrl));\n"),
+    ("threshold-wrong-unit",
+     "#define ISAAC_IRB_MIN_BYTES ((uint32_t)(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB) * 1024U)",
+     "#define ISAAC_IRB_MIN_BYTES ((uint32_t)(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB) * 1000U)"),
+    ("totals-not-reset-at-arm", "    memset(&s_irb, 0, sizeof s_irb);\n", ""),
+]
 # The game's Mutex class: vtable (+0xc Enter sub_00562e00, +0x10 Leave
 # sub_00562ec0), {vt, u8 init @+4, CRITICAL_SECTION* @+8}, held byte at
 # CS+0x18.  Enter = EnterCriticalSection; while (held) Sleep(1000); held = 1.
@@ -464,6 +516,546 @@ def run_oracle(cc: list[str], work: Path) -> None:
                 print(f"host oracle phycont={phy} stack_required={required} {opt}: {out}")
 
 
+def oracle_command(cc: list[str], opt: str, phy: int, module: Path, exe: Path,
+                   extra: list[str]) -> list[str]:
+    command = [*cc, "-std=c11", opt, "-Wall", "-Wextra", "-Werror",
+               "-DISAAC_VITA_IMAGE_RETAIN=1", "-DISAAC_VITA_IMAGE_RETAIN_ORACLE=1",
+               "-DGUEST_IMAGE_BASE=0x98000000U", "-DGUEST_STACK_REQUIRED=1",
+               *(["-DISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT=1"] if phy else []),
+               *extra, "-I", str(RUNTIME), str(module), str(ORACLE), "-o", str(exe)]
+    if os.name != "nt":
+        command.append("-no-pie")
+    return command
+
+
+def verify_big_trace_cmake() -> None:
+    text = (VITA / "CMakeLists.txt").read_text(encoding="utf-8")
+    require(len(re.findall(r"^option\(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE\n\s+\"[^\"]+\" OFF\)$",
+                           text, re.M)) == 1, "cmake: BIG_TRACE is not declared exactly once with default OFF")
+    require(len(re.findall(r'^set\(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB "1024" CACHE STRING$',
+                           text, re.M)) == 1, "cmake: BIG_TRACE_MIN_KB (default 1024) missing")
+    block = re.findall(
+        r"if\(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE\)\n(?:\s+#[^\n]*\n)*\s+set_property\(SOURCE\n"
+        r"\s+\"\$\{ISAAC_RUNTIME\}/host_vita_image_retain\.c\"\n"
+        r"\s+APPEND PROPERTY COMPILE_DEFINITIONS\n"
+        r"\s+ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE=1\n"
+        r"\s+ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB=\$\{ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB\}\)", text)
+    require(len(block) == 1, "cmake: the BIG_TRACE defines are not appended to host_vita_image_retain.c alone")
+    require(text.count("ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE=1") == 1,
+            "cmake: the BIG_TRACE define is appended in more than one place")
+    users = sorted(p.name for p in RUNTIME.iterdir() if p.suffix in (".c", ".h")
+                   and "ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE" in p.read_text(encoding="utf-8", errors="replace"))
+    require(users == ["host_vita_image_retain.c", "vita_image_retain_oracle.c"],
+            f"runtime files naming the BIG_TRACE knob: {users}")
+    require("vita_image_retain_oracle.c" not in text, "cmake: the oracle is listed in the Vita CMakeLists.txt")
+    print("big trace cmake: option OFF, MIN_KB 1024, defines -> host_vita_image_retain.c only; "
+          "knob named by the module and its oracle only: PASS")
+
+
+def run_big_trace(cc: list[str], work: Path) -> None:
+    suffix = ".exe" if os.name == "nt" else ""
+    verify_big_trace_cmake()
+    # OFF leaves no token of the trace in the unit (what the compiler sees).
+    pre = [*cc, "-std=c11", "-E", "-P", "-DISAAC_VITA_IMAGE_RETAIN=1",
+           "-DISAAC_VITA_IMAGE_RETAIN_ORACLE=1", "-DGUEST_IMAGE_BASE=0x98000000U",
+           "-DGUEST_STACK_REQUIRED=1", "-I", str(RUNTIME), str(MODULE)]
+    off = run(pre)
+    require("isaac_vita_image_retain_report" in off, "preprocessed module lacks the control symbol")
+    leaked = [token for token in ("irb_", "s_irb", "RETAIN BIG", "ISAAC_IRB_", "IRB_NOTE", "IRB_INELIGIBLE")
+              if token in off]
+    require(not leaked, f"BIG_TRACE OFF leaves trace tokens in the unit: {leaked}")
+    on = run([*pre, *BIG_TRACE_DEFS])
+    require("s_irb" in on and "RETAIN BIG" in on, "BIG_TRACE ON does not reach the unit")
+    print("big trace OFF: no irb_/s_irb/'RETAIN BIG'/IRB_ token in the preprocessed unit (ON has them): PASS")
+    for phy, expect in ((0, ORACLE_PASS_BIG), (1, ORACLE_PASS_BIG_PHYCONT)):
+        for opt in ("-O2", "-O0"):
+            exe = work / f"ir-big-p{phy}{opt}{suffix}"
+            run(oracle_command(cc, opt, phy, MODULE, exe, BIG_TRACE_DEFS))
+            out = run([str(exe)]).strip()
+            require(out == expect, f"big trace oracle (phycont={phy} {opt}) said: {out}")
+            print(f"big trace oracle phycont={phy} {opt}: {out}")
+    text = MODULE.read_bytes().decode("utf-8")
+    killed = 0
+    for name, old, new in BIG_TRACE_MUTANTS:
+        require(text.count(old) == 1, f"mutant {name}: anchor occurs {text.count(old)} times")
+        mutant = work / f"mutant-{name}.c"
+        mutant.write_bytes(text.replace(old, new).encode("utf-8"))
+        exe = work / f"ir-big-mutant-{name}{suffix}"
+        run(oracle_command(cc, "-O2", 0, mutant, exe, BIG_TRACE_DEFS))      # must still compile
+        result = subprocess.run([str(exe)], check=False, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        verdict = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        first = result.stderr.strip().splitlines()[0] if result.stderr.strip() else ""
+        require(result.returncode == 1 and verdict.startswith("IMAGE RETAIN ORACLE FAIL: "),
+                f"mutant {name} SURVIVED: rc={result.returncode} {verdict}")
+        killed += 1
+        print(f"  mutant {name}: killed ({first[first.find('['):][:150]})")
+    print(f"big trace mutants: {killed}/{len(BIG_TRACE_MUTANTS)} killed")
+
+
+# ------------------------------------------------ batch-flush flags / preload ---
+# ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED (1 = OBSERVE, 2 = ON) and
+# ISAAC_VITA_IMAGE_PRELOAD.  Every byte string below was copied from the
+# frozen PE (pe.read), not recalled.
+FLAG_WORD = 0x10                       # Image flags at +0x10
+DIRTY_VEC = (0x7E7D10, 0x7E7D14)
+TOUCHED_VEC = (0x7E7D1C, 0x7E7D20)
+PAIRS_VEC = (0x7E7D28, 0x7E7D2C)
+LAST_PAIR_IMAGE = 0x7E7D38
+FLUSH_PE_PINS = [
+    # Unregister's scrubs (inside sub_0056d220, before the bucket erase).
+    (0x56D280, "a1107dbe008b35147dbe00", "Unregister: mov eax,[DIRTY.begin]; mov esi,[DIRTY.end]"),
+    (0x56D2AF, "832d147dbe0004", "Unregister: sub [DIRTY.end],4"),
+    (0x56D2C1, "a11c7dbe008b35207dbe00", "Unregister: mov eax,[TOUCHED.begin]; mov esi,[TOUCHED.end]"),
+    (0x56D2EF, "832d207dbe0004", "Unregister: sub [TOUCHED.end],4"),
+    (0x56D2F6, "8b35287dbe00a12c7dbe00", "Unregister: mov esi,[PAIRS.begin]; mov eax,[PAIRS.end]"),
+    (0x56D305, "8d7e088b57fc3bca7540", "Unregister: pair scan compares the word at pair+4 (the Image)"),
+    # The last-pair Image latch.
+    (0x5608E1, "a1387dbe0085", "pair append: mov eax,[last_pair_image]; test"),
+    (0x5608EA, "c7405c00000000", "pair append: mov [eax+0x5c],0"),
+    (0x5608F6, "893d387dbe00", "pair append: mov [last_pair_image],edi"),
+    # The idle sweep in the clear wrapper sub_00564f50: timeGetTime() -
+    # [image+0x74] > 5000 -> call [vt+0x74]; and [image+0x10],~0x10.
+    (0x564FD0, "ff15c064a0008b0e2b41743d88130000", "sweep: call timeGetTime; sub eax,[img+0x74]; cmp eax,5000"),
+    (0x564FE0, "76328b01ff50748b0e8b411483", "sweep: jbe; call [vt+0x74]"),
+    # The flag writers.
+    (0x5601F6, "834e1004", "quad queue: or [esi+0x10],4"),
+    (0x56D4BC, "836110fb", "sub_0056d4a0: and [ecx+0x10],~4"),
+    (0x56D5CF, "83491010", "flush: or [ecx+0x10],0x10"),
+    (0x56D7F5, "83491010", "flush: or [ecx+0x10],0x10"),
+    (0x56D80F, "83491010", "flush: or [ecx+0x10],0x10"),
+    (0x561F81, "836110ef", "sweep sub_00561f40: and [ecx+0x10],~0x10"),
+    (0x564FEC, "836110ef", "sweep sub_00564f50: and [ecx+0x10],~0x10"),
+    # The Load call the preload replays, and the destructor of its `out`.
+    (0x565FAD, "6a006848f9bb008bca5083e1038d85c8fbfffff3a450e818680000",
+     "push 0; push 0xbbf948; ...; push eax (name); ...; push eax (&out); call sub_0056c7e0"),
+    (0x565FEE, "8b8dccfbffff85c974208b018b400cffd084c07415a12cd6bf0085c0740c8d8dc8fbffff51ffd083",
+     "~SmartPointer(out): ctrl->vt[+0xc](); al -> [0xbfd62c](&out); add esp,4"),
+    (0x56C7E0, "558bec6aff68", "Load prologue"),
+    (0x56CC82, "c21000", "Load: ret 0x10"),
+    (0x007AF0, "568bf1576aff8b46088d4e08ff500c0f", "ctrl Release (vtable +0xc): thiscall"),
+]
+FLUSH_HEADER_FACTS = {
+    "IMG_FLAG_DIRTY": 0x04, "IMG_FLAG_TOUCHED": 0x10,
+    "DIRTY_BEGIN_RVA": DIRTY_VEC[0], "DIRTY_END_RVA": DIRTY_VEC[1],
+    "TOUCHED_BEGIN_RVA": TOUCHED_VEC[0], "TOUCHED_END_RVA": TOUCHED_VEC[1],
+    "PAIRS_BEGIN_RVA": PAIRS_VEC[0], "PAIRS_END_RVA": PAIRS_VEC[1],
+    "LAST_PAIR_IMAGE_RVA": LAST_PAIR_IMAGE, "TOUCHED_IDLE_MS": 0x1388,
+    "LOAD_RVA": 0x56C7E0, "LOAD_SITE_RVA": 0x565FC8,
+    "LOAD_VERTEX_DESC_RVA": 0x7BF948, "LOAD_RELEASE_SITE_RVA": 0x565FFF,
+    "LOAD_OBSERVER_SITE_RVA": 0x566015, "CTRL_VT_RELEASE": 0x0C,
+}
+OBSERVE_DEFS = ["-DISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=1"]
+ADMIT_DEFS = ["-DISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=2"]
+PRELOAD_DEFS = ["-DISAAC_VITA_IMAGE_PRELOAD=1",
+                '-DISAAC_VITA_IMAGE_PRELOAD_LIST="gfx/BulletAtlas.png,gfx/b.png"',
+                "-DISAAC_VITA_IMAGE_PRELOAD_MAX_KB=2048",
+                "-DISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB=8"]
+# The device arms of the fix pass build RESERVE_MB=4 (review B1): the same
+# scenarios with the heap gate at 8192 KiB and the bench-route table's other column.
+PRELOAD4_DEFS = [d.replace("_RESERVE_MB=8", "_RESERVE_MB=4") for d in PRELOAD_DEFS]
+assert PRELOAD4_DEFS != PRELOAD_DEFS and len(PRELOAD4_DEFS) == len(PRELOAD_DEFS)
+# ISAAC_VITA_IMAGE_PRELOAD_PIN (lane F-BA): the scenarios that differ by mode
+# are pin_scenarios() in the oracle plus the split tail of P7.
+PIN_OBSERVE_DEFS = ["-DISAAC_VITA_IMAGE_PRELOAD_PIN=1"]
+PIN_ON_DEFS = ["-DISAAC_VITA_IMAGE_PRELOAD_PIN=2"]
+PIN_TOKENS = ("irpp_", "s_irpp", "ISAAC_IRPP_", "IMAGE PRELOAD PIN", "IRP_ON_FREE",
+              "isaac_ir_oracle_preload_pin")
+# (name, phycont, defines, expected verdict)
+FLUSH_LEGS = [
+    ("observe", 0, OBSERVE_DEFS, "checks=673 scenarios=71"),
+    ("on", 0, ADMIT_DEFS, "checks=696 scenarios=73"),
+    ("preload", 0, PRELOAD_DEFS, "checks=782 scenarios=96"),
+    ("observe+preload", 0, [*OBSERVE_DEFS, *PRELOAD_DEFS], "checks=788 scenarios=96"),
+    ("on+preload", 0, [*ADMIT_DEFS, *PRELOAD_DEFS], "checks=811 scenarios=98"),
+    ("observe+big", 0, [*OBSERVE_DEFS, *BIG_TRACE_DEFS], "checks=1251 scenarios=79"),
+    ("on+big", 0, [*ADMIT_DEFS, *BIG_TRACE_DEFS], "checks=1274 scenarios=81"),
+    ("on+preload+big+phycont", 1, [*ADMIT_DEFS, *PRELOAD_DEFS, *BIG_TRACE_DEFS],
+     "checks=1402 scenarios=109"),
+    ("preload reserve=4", 0, PRELOAD4_DEFS, "checks=782 scenarios=96"),
+    ("on+preload reserve=4", 0, [*ADMIT_DEFS, *PRELOAD4_DEFS], "checks=811 scenarios=98"),
+    ("pin observe", 0, [*PRELOAD4_DEFS, *PIN_OBSERVE_DEFS], "checks=895 scenarios=110"),
+    ("pin on", 0, [*PRELOAD4_DEFS, *PIN_ON_DEFS], "checks=921 scenarios=110"),
+    ("on+pin on", 0, [*ADMIT_DEFS, *PRELOAD4_DEFS, *PIN_ON_DEFS], "checks=957 scenarios=113"),
+    ("pin on reserve=8", 0, [*PRELOAD_DEFS, *PIN_ON_DEFS], "checks=921 scenarios=110"),
+    ("on+pin on+big+phycont", 1, [*ADMIT_DEFS, *PRELOAD4_DEFS, *PIN_ON_DEFS, *BIG_TRACE_DEFS],
+     "checks=1548 scenarios=124"),
+]
+# (name, defines of the leg that must kill it, old, new)
+FLUSH_MUTANTS = [
+    ("t1-dirty-admitted", ADMIT_DEFS,
+     "    if ((flags & ISAAC_IR_IMG_FLAG_DIRTY) != 0U)\n        return IRT_DIRTY;\n",
+     "    if ((flags & ISAAC_IR_IMG_FLAG_DIRTY) != 0U && flags == 0U)\n        return IRT_DIRTY;\n"),
+    ("t2-touched-count-ignored", ADMIT_DEFS,
+     "                      IR_VA(ISAAC_IR_TOUCHED_END_RVA), image) != 1 ||",
+     "                      IR_VA(ISAAC_IR_TOUCHED_END_RVA), image) < 0 ||"),
+    ("t2-touched-twice-ok", ADMIT_DEFS,
+     "                      IR_VA(ISAAC_IR_TOUCHED_END_RVA), image) != 1 ||",
+     "                      IR_VA(ISAAC_IR_TOUCHED_END_RVA), image) < 1 ||"),
+    ("t2-dirty-vector-ignored", ADMIT_DEFS,
+     "                          IR_VA(ISAAC_IR_DIRTY_END_RVA), image) != 0)",
+     "                          IR_VA(ISAAC_IR_DIRTY_END_RVA), image) < 0)"),
+    ("t2-malformed-vector-empty", ADMIT_DEFS,
+     "            ((end - begin) >> 2) > ISAAC_IR_FLUSH_VEC_MAX)\n        return -1;",
+     "            ((end - begin) >> 2) > ISAAC_IR_FLUSH_VEC_MAX)\n        return 1;"),
+    ("t3-pair-ignored", ADMIT_DEFS,
+     "    if (irt_pair_pending(image))\n        return IRT_PAIR;\n",
+     "    if (irt_pair_pending(image) && image == 0U)\n        return IRT_PAIR;\n"),
+    ("t3-latch-ignored", ADMIT_DEFS,
+     "    return irt_pair_count(image) != 0 ||\n           ld32(IR_VA(ISAAC_IR_LAST_PAIR_IMAGE_RVA)) == image;",
+     "    return irt_pair_count(image) != 0;"),
+    ("t3-pair-first-word", ADMIT_DEFS,
+     "        if (ld32(p + 4U) == image)\n            ++n;\n    }\n    return n;\n}\n\nstatic int irt_pair_pending",
+     "        if (ld32(p) == image)\n            ++n;\n    }\n    return n;\n}\n\nstatic int irt_pair_pending"),
+    ("rule-e-off", ADMIT_DEFS,
+     "        if (!irt_record_pinned(idx))\n            return idx;",
+     "        if (!irt_record_pinned(idx) || idx != ISAAC_IR_NIL)\n            return idx;"),
+    ("rule-e-pins-stale", ADMIT_DEFS,
+     "            ld16(ctrl + ISAAC_IR_CTRL_STRONG) != 1U)\n        return 0;\n    return (ld32(image + ISAAC_IR_IMG_FLAGS) & ISAAC_IRT_FLUSH_MASK) != 0U;",
+     "            ld16(ctrl + ISAAC_IR_CTRL_STRONG) != 1U)\n        return 1;\n    return (ld32(image + ISAAC_IR_IMG_FLAGS) & ISAAC_IRT_FLUSH_MASK) != 0U;"),
+    ("hard-cap-off", ADMIT_DEFS,
+     "    if (s_ir.retained_bytes > s_ir.budget_bytes && !ir_manager_lock_held()) {\n        /* Rule E left",
+     "    if (s_ir.retained_bytes > s_ir.budget_bytes && ir_manager_lock_held()) {\n        /* Rule E left"),
+    ("observe-admits", OBSERVE_DEFS,
+     "#define ISAAC_IRT_ON (ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED == 2)",
+     "#define ISAAC_IRT_ON (ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED >= 1)"),
+    ("observe-undercounts", OBSERVE_DEFS,
+     "        if (!ISAAC_IRT_ON && irt_rest_eligible(image, &bytes) &&",
+     "        if (!ISAAC_IRT_ON && !irt_rest_eligible(image, &bytes) &&"),
+    ("admit-bytes-on-reuse", ADMIT_DEFS,
+     "        if (ir_hash_find(image) == ISAAC_IR_NIL)\n            s_irt.admit_bytes += bytes;",
+     "        s_irt.admit_bytes += bytes;"),
+    ("pair-untouched-not-counted", ADMIT_DEFS,
+     "        if (irt_pair_pending(image))\n            ++s_irt.pair_untouched;\n", ""),
+    ("counters-not-reset-at-arm", ADMIT_DEFS, "    memset(&s_irt, 0, sizeof s_irt);\n    isaac_vita_log(", "    isaac_vita_log("),
+    ("preload-own-offer-counted", PRELOAD_DEFS,
+     "    if (s_irp.busy || s_irp.n == 0U || !ir_image_vtable_ok(image))",
+     "    if (s_irp.n == 0U || !ir_image_vtable_ok(image))"),
+    ("preload-hit-every-reuse", PRELOAD_DEFS,
+     "                s_irp.state[i] = IRP_USED;\n                ++s_irp.hit;",
+     "                ++s_irp.hit;"),
+    ("preload-name-substring", PRELOAD_DEFS,
+     "    if (len > want && irp_fold((uint8_t)ld8(name + len - want - 1U)) != (uint8_t)'/')\n        return 0;\n", ""),
+    ("preload-name-case", PRELOAD_DEFS,
+     "    if (ch >= (uint8_t)'A' && ch <= (uint8_t)'Z')\n        return (uint8_t)(ch + 32U);\n    return ch == (uint8_t)'\\\\' ? (uint8_t)'/' : ch;",
+     "    return ch == (uint8_t)'\\\\' ? (uint8_t)'/' : ch;"),
+    ("preload-under-lock", PRELOAD_DEFS,
+     "    if (ir_manager_lock_held()) {\n        ++s_irp.skip[IRP_SKIP_LOCK];\n        return 1;\n    }\n", ""),
+    ("preload-terminal-ignored", PRELOAD_DEFS,
+     "    if (isaac_vita_guest_heap_terminal()) {\n        ++s_irp.skip[IRP_SKIP_TERMINAL];\n        return 1;\n    }\n", ""),
+    ("preload-present-reloaded", PRELOAD_DEFS,
+     "    if (irp_find_in_manager(i, &image, &ctrl)) {\n        ++s_irp.present;\n        return 1;\n    }\n", ""),
+    ("preload-budget-ignored", PRELOAD_DEFS,
+     "    if (est > s_ir.budget_bytes ||\n", "    if (\n"),
+    ("preload-headroom-ignored", PRELOAD_DEFS,
+     "             ir_free_bytes() < (uint64_t)s_ir.headroom_bytes + (uint64_t)est)) {",
+     "             ir_free_bytes() < (uint64_t)s_ir.headroom_bytes)) {"),
+    ("preload-heap-gate-factor", PRELOAD_DEFS,
+     "    if (hr0 < reserve || (hr0 - reserve) / ISAAC_IRP_HEAP_FACTOR < est) {",
+     "    if (hr0 < reserve || (hr0 - reserve) < est) {"),
+    ("preload-heap-gate-strict", PRELOAD_DEFS,
+     "    if (hr0 < reserve || (hr0 - reserve) / ISAAC_IRP_HEAP_FACTOR < est) {",
+     "    if (hr0 < reserve || (hr0 - reserve) / ISAAC_IRP_HEAP_FACTOR <= est) {"),
+    ("preload-heap-gate-reserve-ignored", PRELOAD4_DEFS,
+     "    if (hr0 < reserve || (hr0 - reserve) / ISAAC_IRP_HEAP_FACTOR < est) {",
+     "    if (hr0 / ISAAC_IRP_HEAP_FACTOR < est) {"),
+    ("preload-need-kb-without-factor", PRELOAD4_DEFS,
+     "                   ISAAC_IRP_HEAP_FACTOR *\n                   (uint32_t)ISAAC_VITA_IMAGE_PRELOAD_MAX_KB),",
+     "                   (uint32_t)ISAAC_VITA_IMAGE_PRELOAD_MAX_KB),"),
+    ("preload-load-esp-unchecked", PRELOAD_DEFS,
+     "    if (c->esp != base) {                  /* Load is `ret 0x10` */",
+     "    if (c->esp != base && c->esp == 0U) {  /* Load is `ret 0x10` */"),
+    ("preload-release-esp-unchecked", PRELOAD_DEFS,
+     "        if (c->esp != base) {              /* Release is a plain `ret` */",
+     "        if (c->esp != base && c->esp == 0U) {"),
+    ("preload-observer-esp-unchecked", PRELOAD_DEFS,
+     "            if (c->esp != base - 4U) {     /* cdecl: the caller drops &out */",
+     "            if (c->esp != base - 4U && c->esp == 0U) {"),
+    ("preload-esp-not-restored", PRELOAD_DEFS,
+     "        }\n    }\n    c->esp = saved;\n    return 1;\n}", "        }\n    }\n    return 1;\n}"),
+    ("preload-wrong-load-site", PRELOAD_DEFS,
+     "    gpush(c, ISAAC_IR_LOAD_SITE_RVA);", "    gpush(c, ISAAC_IR_LOAD_RELEASE_SITE_RVA);"),
+    ("preload-arg-order", PRELOAD_DEFS,
+     "    gpush(c, 0U);\n    gpush(c, IR_VA(ISAAC_IR_LOAD_VERTEX_DESC_RVA));\n",
+     "    gpush(c, IR_VA(ISAAC_IR_LOAD_VERTEX_DESC_RVA));\n    gpush(c, 0U);\n"),
+    ("preload-observer-always", PRELOAD_DEFS,
+     "        if ((c->eax & 0xFFU) != 0U && hook != 0U) {", "        if (c->eax != 0U && hook != 0U) {"),
+    ("preload-no-release", PRELOAD_DEFS,
+     "    if (ctrl != 0U) {\n        gpush(c, ISAAC_IR_LOAD_RELEASE_SITE_RVA);",
+     "    if (ctrl != 0U && image == 0U) {\n        gpush(c, ISAAC_IR_LOAD_RELEASE_SITE_RVA);"),
+    ("preload-dropped-as-retained", PRELOAD_DEFS,
+     "        if (idx != ISAAC_IR_NIL && s_ir.rec[idx].ctrl == ctrl &&\n                ir_present_in_manager(image, ctrl)) {\n            ++s_irp.retained;",
+     "        if (idx != ISAAC_IR_NIL || ctrl != 0U) {\n            ++s_irp.retained;"),
+    ("preload-evicted-not-counted", PRELOAD_DEFS,
+     "#if defined(ISAAC_VITA_IMAGE_PRELOAD)\n    irp_evicting(image, ctrl);\n#endif\n", ""),
+    ("preload-foreign-cpu", PRELOAD_DEFS,
+     "    if (!s_ir.armed || s_ir.budget_bytes == 0U || s_ir.in_evict ||\n            (s_ir.cpu != NULL && s_ir.cpu != c)) {\n        ++s_irp.skip[IRP_SKIP_STATE];",
+     "    if (!s_ir.armed || s_ir.budget_bytes == 0U || s_ir.in_evict) {\n        ++s_irp.skip[IRP_SKIP_STATE];"),
+    # IMAGE_PRELOAD_PIN (lane F-BA).
+    ("pin-walker-takes-pins", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "        k = irpp_pin_of(idx);\n        if (k >= 0) {",
+     "        k = irpp_pin_of(idx);\n        if (k >= 0 && s_irpp.skip == 0xFFFFFFFFu) {"),
+    ("pin-share-cap-ignored", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "    if ((uint64_t)s_irpp.pinned_bytes + bytes > s_ir.budget_bytes / ISAAC_IRPP_SHARE) {",
+     "    if ((uint64_t)s_irpp.pinned_bytes + bytes > s_ir.budget_bytes) {"),
+    ("pin-floor-kept", [*PRELOAD4_DEFS, *PIN_ON_DEFS], "        irpp_unpin(i, IRPP_FLOOR);\n", ""),
+    ("pin-kept-after-use", [*PRELOAD4_DEFS, *PIN_ON_DEFS], "                irpp_unpin(i, IRPP_USED);\n", ""),
+    ("pin-held-not-detected", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "    if (ld16(ctrl + ISAAC_IR_CTRL_STRONG) >= 2U && (exact || kept)) {",
+     "    if (ld16(ctrl + ISAAC_IR_CTRL_STRONG) >= 3U && (exact || kept)) {"),
+    ("pin-held-dropped-counted", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "        if (!kept && s_irp.dropped != 0U)\n            --s_irp.dropped;",
+     "        if (!kept && s_irp.dropped == 0xFFFFFFFFu)\n            --s_irp.dropped;"),
+    ("pin-lost-never-settled", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)\n    irpp_settle();\n#endif\n    if (s_irp.busy",
+     "    if (s_irp.busy"),
+    ("pin-on-free-not-pinned", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "    ++s_irpp.on_free;\n    irpp_pin(i);", "    ++s_irpp.on_free;"),
+    ("pin-observe-decides", [*PRELOAD4_DEFS, *PIN_OBSERVE_DEFS],
+     "    if (!ISAAC_IRPP_ON) {\n        s_irpp.set_n = 0U;\n        return 1;\n    }\n", ""),
+    ("pin-own-replayed", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "    if (own) {\n        /* The sheet", "    if (own == 2U) {\n        /* The sheet"),
+    ("pin-twins-not-counted", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "    if (twins >= 2U)\n        ++s_irpp.twins;\n", ""),
+    ("pin-stale-kept", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "            irpp_unpin(i, IRPP_STALE);\n            return -1;", "            return (int)i;"),
+    ("pin-never-yields", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "    if (oldest != ISAAC_IR_NIL) {\n        irpp_unpin((uint32_t)oldest_k, IRPP_YIELD);",
+     "    if (oldest != ISAAC_IR_NIL && oldest_k < -1) {\n        irpp_unpin((uint32_t)oldest_k, IRPP_YIELD);"),
+    ("pin-dropped-pin-kept", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)\n    irpp_dropped(*image, *ctrl);\n#endif\n", ""),
+    ("pin-alias-as-exact", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "        if (s_irpp.set_image[k] == image && s_irpp.set_ctrl[k] == ctrl)\n            exact = 1U;",
+     "        if (s_irpp.set_image[k] != 0U)\n            exact = 1U;"),
+    ("pin-on-free-ignores-admit", [*ADMIT_DEFS, *PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)\n    irpp_touched(image, ctrl);\n#endif\n", ""),
+    # F-BA fix pass (review items 1, 2, 4, 5): each must die in the scenario written for it.
+    ("pin-walker-takes-candidate", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "        if (is_cand) {\n            cand = idx;\n            cand_k = -1;",
+     "        if (is_cand && cand_k < -1) {\n            cand = idx;\n            cand_k = -1;"),
+    ("pin-headroom-takes-candidate", [*ADMIT_DEFS, *PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "        if (reason == IR_REASON_BUDGET) {", "        if (reason != IR_REASON_TABLE_FULL) {"),
+    ("pin-budget-never-takes-candidate", [*ADMIT_DEFS, *PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "        if (reason == IR_REASON_BUDGET) {", "        if (reason == IR_REASON_BUDGET && cand_k < -1) {"),
+    ("pin-kept-not-pinned", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "#if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)\n        irpp_kept(image, ctrl);\n#endif\n", ""),
+    ("pin-reacquired-lost", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "            s_irp.ctrl[i] != s_irpp.pend_ctrl ||\n"
+     "            ir_present_in_manager(s_irpp.pend_image, s_irpp.pend_ctrl))",
+     "            s_irp.ctrl[i] != s_irpp.pend_ctrl)"),
+    ("pin-lost-exit-unread", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+     "    if (s_ir.st.ineligible != s_irpp.pend_st[2])\n", "    if (s_ir.st.ineligible == 0xFFFFFFFFu)\n"),
+]
+# Mutants that must be killed by one named scenario (the first CHECK failure
+# names it): a fix-pass mutant killed elsewhere would mean its scenario does
+# not test what it claims.
+FLUSH_MUTANT_KILLED_BY = {
+    "pin-walker-takes-candidate": "pin-candidate-own-record-headroom",
+    "pin-headroom-takes-candidate": "pin-candidate-rule-e-headroom",
+    "pin-budget-never-takes-candidate": "touched-rule-e",
+    "pin-kept-not-pinned": "pin-held-freed-under-lock",
+    "pin-reacquired-lost": "pin-held-reacquired",
+    "pin-lost-exit-unread": "pin-held-lost",
+}
+assert set(FLUSH_MUTANT_KILLED_BY) <= {m[0] for m in FLUSH_MUTANTS}
+FLUSH_TOKENS = ("irt_", "s_irt", "ISAAC_IRT_", "RETAIN TOUCHED", "irp_", "s_irp", "ISAAC_IRP_",
+                "IMAGE PRELOAD", "isaac_vita_image_preload", "inel-dirty", "pass-pinned")
+
+
+def verify_flush_pe(pe: PE) -> None:
+    for rva, hexbytes, what in FLUSH_PE_PINS:
+        want = bytes.fromhex(hexbytes)
+        require(pe.read(rva, len(want)) == want, f"PE {rva:#x} changed: {what}")
+    _name, va, _vsize, roff, rsize = pe.text
+    text = pe.data[roff:roff + rsize]
+
+    def sites(pattern: bytes) -> list[int]:
+        return [va + m.start() for m in re.finditer(pattern, text, re.S)]
+
+    # Every `or/and dword [reg+0x10], imm8` in .text that sets or clears the
+    # two bits (83 /1 and 83 /4, mod=01 disp8 0x10).
+    set10 = sites(rb"\x83[\x48-\x4f]\x10\x10")
+    set04 = sites(rb"\x83[\x48-\x4f]\x10\x04")
+    clr10 = sites(rb"\x83[\x60-\x67]\x10\xef")
+    clr04 = sites(rb"\x83[\x60-\x67]\x10\xfb")
+    require(set10 == [0x56D5CF, 0x56D7F5, 0x56D80F], f"writers of |= 0x10: {[hex(s) for s in set10]}")
+    require(set04 == [0x5601F6], f"writers of |= 0x04: {[hex(s) for s in set04]}")
+    require(clr10 == [0x561F81, 0x564FEC], f"writers of &= ~0x10: {[hex(s) for s in clr10]}")
+    require(clr04 == [0x14257, 0x14414, 0x3DC8F8, 0x3EBEDB, 0x471DE4, 0x4E4D7A, 0x504539, 0x56D4BC],
+            f"writers of &= ~0x04: {[hex(s) for s in clr04]}")
+    # Byte-sized and imm32 forms of the same writes (80 /1 ib, 81 /1 id).
+    other = (sites(rb"\x80[\x48-\x4f]\x10[\x10\x14]") + sites(rb"\x81[\x48-\x4f]\x10[\x10\x14]\x00\x00\x00") +
+             sites(rb"\x80[\x60-\x67]\x10[\xef\xeb]") + sites(rb"\x81[\x60-\x67]\x10[\xef\xeb]\xff\xff\xff"))
+    # The Load call site and the two return words the replay pushes.
+    require(pe.read(0x565FC3, 1) == b"\xe8" and
+            0x565FC8 + struct.unpack("<i", pe.read(0x565FC4, 4))[0] == 0x56C7E0,
+            "0x565fc3 is not `call sub_0056c7e0`")
+    require(pe.read(0x565FFD, 2) == bytes.fromhex("ffd0"), "0x565ffd is not `call eax` (Release)")
+    require(pe.read(0x566013, 2) == bytes.fromhex("ffd0"), "0x566013 is not `call eax` (observer)")
+    require(pe.u32(CTRL_VT_RVA + 0xC) == PE_IMAGE_BASE + 0x7AF0, "ctrl vtable +0xc is not Release 0x7af0")
+    for rva in (*DIRTY_VEC, *TOUCHED_VEC, *PAIRS_VEC, LAST_PAIR_IMAGE):
+        require(pe.in_bss(rva) or pe.u32(rva) == 0, f"{rva:#x} is not zero-initialised data")
+    text_h = HEADER.read_text(encoding="utf-8")
+    defines = {m.group(1): int(m.group(2), 16) for m in re.finditer(
+        r"^#define ISAAC_IR_(\w+)\s+0x([0-9A-Fa-f]+)U", text_h, re.M)}
+    for key, value in FLUSH_HEADER_FACTS.items():
+        require(defines.get(key) == value, f"ISAAC_IR_{key} = {defines.get(key)} but the PE says {value:#x}")
+    print(f"flush-flag PE pins: {len(FLUSH_PE_PINS)} byte strings; |=0x10 at "
+          f"{[hex(s) for s in set10]} only, |=0x04 at {[hex(s) for s in set04]} only, "
+          f"&=~0x10 at {[hex(s) for s in clr10]} only, &=~0x04 at {len(clr04)} sites "
+          f"(0x56d4bc + 7 more `and [reg+0x10],~4`); byte/imm32 forms of these writes: "
+          f"{[hex(s) for s in other] or 'none'}; {len(FLUSH_HEADER_FACTS)} header constants: PASS")
+
+
+def verify_flush_cmake() -> None:
+    text = (VITA / "CMakeLists.txt").read_text(encoding="utf-8")
+    require(len(re.findall(r'^set\(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED "OFF" CACHE STRING$', text, re.M)) == 1,
+            "cmake: ADMIT_TOUCHED is not a STRING knob with default OFF")
+    require('if(NOT ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED MATCHES "^(OFF|OBSERVE|ON)$")' in text,
+            "cmake: ADMIT_TOUCHED values are not validated")
+    for value, define in (("OBSERVE", 1), ("ON", 2)):
+        block = re.findall(
+            r'if\(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED STREQUAL "%s"\)\n(?:\s+#[^\n]*\n)*\s+set_property\(SOURCE\n'
+            r'\s+"\$\{ISAAC_RUNTIME\}/host_vita_image_retain\.c"\n'
+            r"\s+APPEND PROPERTY COMPILE_DEFINITIONS\n"
+            r"\s+ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=%d\)" % (value, define), text)
+        require(len(block) == 1, f"cmake: ADMIT_TOUCHED={value} does not append ={define} to the module alone")
+    require(len(re.findall(r"ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=[0-9]", text)) == 2,
+            "cmake: an ADMIT_TOUCHED define is appended in an unexpected place")
+    require(len(re.findall(r"^option\(ISAAC_VITA_IMAGE_PRELOAD\n\s+\"[^\"]+\" OFF\)$", text, re.M)) == 1,
+            "cmake: IMAGE_PRELOAD is not declared exactly once with default OFF")
+    require('set(ISAAC_VITA_IMAGE_PRELOAD_LIST "gfx/BulletAtlas.png" CACHE STRING' in text,
+            "cmake: IMAGE_PRELOAD_LIST default changed")
+    require('set(ISAAC_VITA_IMAGE_PRELOAD_MAX_KB "2048" CACHE STRING' in text and
+            'set(ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB "8" CACHE STRING' in text,
+            "cmake: IMAGE_PRELOAD_MAX_KB / RESERVE_MB defaults changed")
+    require("if(NOT ISAAC_VITA_IMAGE_RETAIN OR NOT ISAAC_VITA_SFX_FLOOR_PRELOAD)" in text,
+            "cmake: IMAGE_PRELOAD does not require IMAGE_RETAIN and SFX_FLOOR_PRELOAD")
+    require(text.count("ISAAC_VITA_IMAGE_PRELOAD=1") == 2 and
+            text.count('ISAAC_VITA_IMAGE_PRELOAD_LIST=\\"${ISAAC_VITA_IMAGE_PRELOAD_LIST}\\"') == 1,
+            "cmake: the IMAGE_PRELOAD defines are not appended to exactly the two units")
+    require("Isaac Vita image preload: ON, list '${ISAAC_VITA_IMAGE_PRELOAD_LIST}'" in text and
+            "Isaac Vita image retain admit touched (flag 0x10): ${ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED}" in text,
+            "cmake: the resolved values are not printed at configure time")
+    users = sorted(p.name for p in RUNTIME.iterdir() if p.suffix in (".c", ".h")
+                   and "ISAAC_VITA_IMAGE_PRELOAD" in p.read_text(encoding="utf-8", errors="replace"))
+    require(users == ["host_vita_image_retain.c", "host_vita_image_retain.h",
+                      "host_vita_sfx_floor_preload.c", "vita_image_retain_oracle.c"],
+            f"runtime files naming the IMAGE_PRELOAD knob: {users}")
+    users = sorted(p.name for p in RUNTIME.iterdir() if p.suffix in (".c", ".h")
+                   and "ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED" in p.read_text(encoding="utf-8", errors="replace"))
+    require(users == ["host_vita_image_retain.c", "host_vita_image_retain.h", "vita_image_retain_oracle.c"],
+            f"runtime files naming the ADMIT_TOUCHED knob: {users}")
+    require(len(re.findall(r'^set\(ISAAC_VITA_IMAGE_PRELOAD_PIN "OFF" CACHE STRING$', text, re.M)) == 1,
+            "cmake: IMAGE_PRELOAD_PIN is not a STRING knob with default OFF")
+    require('if(NOT ISAAC_VITA_IMAGE_PRELOAD_PIN MATCHES "^(OFF|OBSERVE|ON)$")' in text,
+            "cmake: IMAGE_PRELOAD_PIN values are not validated")
+    require(re.search(r'if\(NOT ISAAC_VITA_IMAGE_PRELOAD_PIN STREQUAL "OFF" AND\n\s+NOT ISAAC_VITA_IMAGE_PRELOAD\)\n'
+                      r'\s+message\(FATAL_ERROR', text) is not None,
+            "cmake: IMAGE_PRELOAD_PIN does not require IMAGE_PRELOAD")
+    for value, define in (("OBSERVE", 1), ("ON", 2)):
+        block = re.findall(
+            r'if\(ISAAC_VITA_IMAGE_PRELOAD_PIN STREQUAL "%s"\)\n(?:\s+#[^\n]*\n)*\s+set_property\(SOURCE\n'
+            r'\s+"\$\{ISAAC_RUNTIME\}/host_vita_image_retain\.c"\n'
+            r"\s+APPEND PROPERTY COMPILE_DEFINITIONS\n"
+            r"\s+ISAAC_VITA_IMAGE_PRELOAD_PIN=%d\)" % (value, define), text)
+        require(len(block) == 1, f"cmake: IMAGE_PRELOAD_PIN={value} does not append ={define} to the module alone")
+    require(len(re.findall(r"ISAAC_VITA_IMAGE_PRELOAD_PIN=[0-9]", text)) == 2,
+            "cmake: an IMAGE_PRELOAD_PIN define is appended in an unexpected place")
+    # The PIN defines sit inside `if(ISAAC_VITA_IMAGE_PRELOAD)` of the define block.
+    preload_on = text.index("            ISAAC_VITA_IMAGE_PRELOAD=1\n")
+    preload_else = text.index('        message(STATUS "Isaac Vita image preload: OFF")')
+    require(all(preload_on < m.start() < preload_else
+                for m in re.finditer(r"ISAAC_VITA_IMAGE_PRELOAD_PIN=[0-9]", text)),
+            "cmake: an IMAGE_PRELOAD_PIN define is appended outside the IMAGE_PRELOAD=ON branch")
+    require('message(STATUS "Isaac Vita image preload pin: ${ISAAC_VITA_IMAGE_PRELOAD_PIN}")' in text,
+            "cmake: the resolved IMAGE_PRELOAD_PIN value is not printed at configure time")
+    users = sorted(p.name for p in RUNTIME.iterdir() if p.suffix in (".c", ".h")
+                   and "ISAAC_VITA_IMAGE_PRELOAD_PIN" in p.read_text(encoding="utf-8", errors="replace"))
+    require(users == ["host_vita_image_retain.c", "host_vita_image_retain.h", "vita_image_retain_oracle.c"],
+            f"runtime files naming the IMAGE_PRELOAD_PIN knob: {users}")
+    print("flush/preload cmake: ADMIT_TOUCHED STRING OFF|OBSERVE|ON (default OFF, =1/=2 on the module only), "
+          "IMAGE_PRELOAD OFF with LIST/MAX_KB/RESERVE_MB, needs IMAGE_RETAIN + SFX_FLOOR_PRELOAD, "
+          "IMAGE_PRELOAD_PIN STRING OFF|OBSERVE|ON (default OFF, needs IMAGE_PRELOAD, =1/=2 on the module "
+          "only, inside the PRELOAD=ON branch), resolved values printed: PASS")
+
+
+def run_flush(cc: list[str], work: Path) -> None:
+    suffix = ".exe" if os.name == "nt" else ""
+    verify_flush_cmake()
+    pre = [*cc, "-std=c11", "-E", "-P", "-DISAAC_VITA_IMAGE_RETAIN=1",
+           "-DISAAC_VITA_IMAGE_RETAIN_ORACLE=1", "-DGUEST_IMAGE_BASE=0x98000000U",
+           "-DGUEST_STACK_REQUIRED=1", "-I", str(RUNTIME), str(MODULE)]
+    off = run(pre)
+    leaked = [token for token in FLUSH_TOKENS if token in off]
+    require(not leaked, f"ADMIT_TOUCHED/IMAGE_PRELOAD OFF leave tokens in the unit: {leaked}")
+    leaked = [token for token in FLUSH_TOKENS if token in run([*pre, *BIG_TRACE_DEFS])]
+    require(not leaked, f"ADMIT_TOUCHED/IMAGE_PRELOAD OFF leave tokens in the BIG_TRACE unit: {leaked}")
+    on = run([*pre, *ADMIT_DEFS, *PRELOAD_DEFS, *BIG_TRACE_DEFS])
+    missing = [token for token in FLUSH_TOKENS if token not in on and token != "ISAAC_IRT_" and token != "ISAAC_IRP_"]
+    require(not missing, f"the ON unit lacks {missing}")
+    print(f"ADMIT_TOUCHED=OFF + IMAGE_PRELOAD=OFF: none of {len(FLUSH_TOKENS)} tokens in the "
+          f"preprocessed unit (ON has them): PASS")
+    for what, unit in (("OFF", off), ("IMAGE_PRELOAD without PIN", run([*pre, *ADMIT_DEFS, *PRELOAD4_DEFS])),
+                       ("BIG_TRACE", run([*pre, *BIG_TRACE_DEFS]))):
+        leaked = [token for token in PIN_TOKENS if token in unit]
+        require(not leaked, f"IMAGE_PRELOAD_PIN OFF leaves tokens in the {what} unit: {leaked}")
+    for defs in (PIN_OBSERVE_DEFS, PIN_ON_DEFS):
+        unit = run([*pre, *ADMIT_DEFS, *PRELOAD4_DEFS, *defs])
+        missing = [token for token in PIN_TOKENS if token not in unit]
+        require(not missing, f"the IMAGE_PRELOAD_PIN unit ({defs[0]}) lacks {missing}")
+    print(f"IMAGE_PRELOAD_PIN=OFF: none of {len(PIN_TOKENS)} tokens in the OFF, PRELOAD-without-PIN "
+          f"and BIG_TRACE units (OBSERVE and ON have all of them): PASS")
+    bad = subprocess.run([*pre, *PRELOAD4_DEFS, "-DISAAC_VITA_IMAGE_PRELOAD_PIN=3"], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+    require(bad.returncode != 0 and b"ISAAC_VITA_IMAGE_PRELOAD_PIN must be 1 (OBSERVE) or 2 (ON)" in bad.stdout,
+            "IMAGE_PRELOAD_PIN=3 is accepted")
+    bad = subprocess.run([*pre, *PIN_ON_DEFS], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    require(bad.returncode != 0 and b"ISAAC_VITA_IMAGE_PRELOAD_PIN needs ISAAC_VITA_IMAGE_PRELOAD" in bad.stdout,
+            "IMAGE_PRELOAD_PIN without IMAGE_PRELOAD is accepted")
+    print("IMAGE_PRELOAD_PIN=3 and IMAGE_PRELOAD_PIN without IMAGE_PRELOAD: #error: PASS")
+    bad = subprocess.run([*pre, "-DISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=3"], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+    require(bad.returncode != 0 and b"must be 1 (OBSERVE) or 2 (ON)" in bad.stdout,
+            "ADMIT_TOUCHED=3 is accepted")
+    bad = subprocess.run([*pre, "-DISAAC_VITA_IMAGE_PRELOAD=1"], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+    require(bad.returncode != 0 and b"needs _LIST, _MAX_KB and _RESERVE_MB" in bad.stdout,
+            "IMAGE_PRELOAD without its parameters is accepted")
+    print("ADMIT_TOUCHED=3 and IMAGE_PRELOAD without parameters: #error: PASS")
+    for name, phy, defs, expect in FLUSH_LEGS:
+        for opt in ("-O2", "-O0"):
+            exe = work / f"ir-flush-{name.replace('+', '-')}{opt}{suffix}"
+            run(oracle_command(cc, opt, phy, MODULE, exe, defs))
+            out = run([str(exe)]).strip()
+            require(out == f"IMAGE RETAIN ORACLE PASS: {expect} records=1024",
+                    f"oracle ({name} {opt}) said: {out}")
+            print(f"host oracle {name} {opt}: {out}")
+    text = MODULE.read_bytes().decode("utf-8")
+    killed = 0
+    for name, defs, old, new in FLUSH_MUTANTS:
+        require(text.count(old) == 1, f"mutant {name}: anchor occurs {text.count(old)} times")
+        mutant = work / f"mutant-{name}.c"
+        mutant.write_bytes(text.replace(old, new).encode("utf-8"))
+        exe = work / f"ir-flush-mutant-{name}{suffix}"
+        command = oracle_command(cc, "-O2", 0, mutant, exe, defs)
+        command.insert(command.index("-Werror") + 1, "-Wno-unused")       # a mutant may orphan a helper
+        run(command)
+        result = subprocess.run([str(exe)], check=False, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        verdict = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        first = result.stderr.strip().splitlines()[0] if result.stderr.strip() else ""
+        require(result.returncode == 1 and verdict.startswith("IMAGE RETAIN ORACLE FAIL: "),
+                f"mutant {name} SURVIVED: rc={result.returncode} {verdict}")
+        if name in FLUSH_MUTANT_KILLED_BY:
+            want = f"[{FLUSH_MUTANT_KILLED_BY[name]}]: "
+            require(want in first, f"mutant {name} killed outside {want!r}: {first}")
+        killed += 1
+        print(f"  mutant {name}: killed ({first[first.find('['):][:150]})")
+    print(f"flush/preload mutants: {killed}/{len(FLUSH_MUTANTS)} killed "
+          f"({len(FLUSH_MUTANT_KILLED_BY)} by their named scenario)")
+
+
 # Production free-memory readers: the module (not the oracle build) picks
 # them by ISAAC_VITA_GL_THREAD_WORKER x ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT.
 # The PHYCONT reader once existed only in the direct-vitaGL branch, so a
@@ -479,6 +1071,15 @@ STUB_HEADERS = {
                                 "uint64_t sceKernelGetProcessTimeWide(void);\n",
     "psp2/kernel/sysmem.h": "#pragma once\n",
 }
+FLUSH_PRODUCTION_DEFS = [
+    ("admit_touched=observe", OBSERVE_DEFS), ("admit_touched=on", ADMIT_DEFS),
+    ("image_preload", PRELOAD_DEFS), ("admit_touched=on image_preload", [*ADMIT_DEFS, *PRELOAD_DEFS]),
+    ("admit_touched=on image_preload big_trace", [*ADMIT_DEFS, *PRELOAD_DEFS, *BIG_TRACE_DEFS]),
+    ("image_preload pin=observe", [*PRELOAD4_DEFS, *PIN_OBSERVE_DEFS]),
+    ("image_preload pin=on", [*PRELOAD4_DEFS, *PIN_ON_DEFS]),
+    ("admit_touched=on image_preload pin=on big_trace",
+     [*ADMIT_DEFS, *PRELOAD4_DEFS, *PIN_ON_DEFS, *BIG_TRACE_DEFS]),
+]
 
 
 def run_flavours(cc: list[str], work: Path) -> None:
@@ -496,6 +1097,19 @@ def run_flavours(cc: list[str], work: Path) -> None:
                  "-I", str(RUNTIME), "-I", str(stubs), str(MODULE)])
             print(f"production flavour gl_thread_worker={worker} phycont={phy}: "
                   f"compiles (-Werror): PASS")
+    run([*cc, "-std=c11", "-fsyntax-only", "-Wall", "-Wextra", "-Werror",
+         *RETAIN_DEFS, *BIG_TRACE_DEFS, "-DGUEST_IMAGE_BASE=0x98000000U",
+         "-DISAAC_VITA_GL_THREAD_WORKER=1", "-DISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT=1",
+         "-I", str(RUNTIME), "-I", str(stubs), str(MODULE)])
+    print("production flavour gl_thread_worker=1 phycont=1 big_trace=1: compiles (-Werror): PASS")
+    for name, defs in FLUSH_PRODUCTION_DEFS:
+        for worker in (0, 1):
+            run([*cc, "-std=c11", "-fsyntax-only", "-Wall", "-Wextra", "-Werror",
+                 *RETAIN_DEFS, *defs, "-DGUEST_IMAGE_BASE=0x98000000U",
+                 *(["-DISAAC_VITA_GL_THREAD_WORKER=1"] if worker else []),
+                 "-DISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT=1",
+                 "-I", str(RUNTIME), "-I", str(stubs), str(MODULE)])
+        print(f"production flavour {name} (gl_thread_worker=0/1, phycont=1): compiles (-Werror): PASS")
 
 
 # -------------------------------------------------------------------- ARM ---
@@ -525,6 +1139,40 @@ def arm_cross(arm_cc: str, work: Path) -> None:
     print(f"ARM cross-compile ({arm_cc}): 0 errors, -Werror clean, "
           f"T __wrap_sub_0056d8c0, U __real_sub_0056d8c0, undefined="
           f"{sorted(s for s in symbols if symbols[s] == 'U')}: PASS")
+    require("isaac_vita_image_preload_level_init" not in symbols and
+            not any(s.startswith(("irt_", "irp_", "irpp_")) for s in symbols),
+            "the default ARM object carries ADMIT_TOUCHED / IMAGE_PRELOAD / IMAGE_PRELOAD_PIN symbols")
+    for name, defs, wanted in (("admit_touched=observe", OBSERVE_DEFS, ()),
+                               ("admit_touched=on", ADMIT_DEFS, ()),
+                               ("image_preload", PRELOAD_DEFS,
+                                ("isaac_vita_image_preload_level_init",)),
+                               ("image_preload reserve=4", PRELOAD4_DEFS,
+                                ("isaac_vita_image_preload_level_init",)),
+                               ("admit_touched=on image_preload", [*ADMIT_DEFS, *PRELOAD_DEFS],
+                                ("isaac_vita_image_preload_level_init",)),
+                               ("image_preload pin=observe", [*PRELOAD4_DEFS, *PIN_OBSERVE_DEFS],
+                                ("isaac_vita_image_preload_level_init",)),
+                               ("image_preload pin=on", [*PRELOAD4_DEFS, *PIN_ON_DEFS],
+                                ("isaac_vita_image_preload_level_init",)),
+                               ("admit_touched=on image_preload pin=on",
+                                [*ADMIT_DEFS, *PRELOAD4_DEFS, *PIN_ON_DEFS],
+                                ("isaac_vita_image_preload_level_init",))):
+        flavour = work / f"host_vita_image_retain.{name.replace('=', '-').replace(' ', '-')}.o"
+        run([arm_cc, *EBOOT_FLAGS, *RETAIN_DEFS, *defs,
+             "-include", str(VITA / "isaac_vita_raw_allocator_poison.h"),
+             "-I", str(RUNTIME), "-I", str(VITA), "-c", str(MODULE), "-o", str(flavour)])
+        table = {}
+        for line in run([prefix + "nm", str(flavour)]).splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                table[parts[-1]] = parts[-2]
+        for needed in wanted:
+            require(table.get(needed) == "T", f"ARM {name}: {needed} not defined (T)")
+        bad = [s for s in table if table[s] == "U" and re.fullmatch(
+            r"(malloc|calloc|realloc|free|printf|sceClibPrintf|sub_0056d8c0|sub_0056d220|sub_0056c7e0)", s)]
+        require(not bad, f"ARM {name} references {bad}")
+        print(f"ARM cross-compile {name}: 0 errors, -Werror clean, new undefined="
+              f"{sorted(s for s in table if table[s] == 'U' and s not in symbols)}: PASS")
 
 
 def main() -> int:
@@ -540,6 +1188,7 @@ def main() -> int:
     pe = PE(args.pe)
     facts = verify_pe(pe)
     verify_header(facts)
+    verify_flush_pe(pe)
     if args.generated:
         verify_generated(args.generated)
     else:
@@ -556,6 +1205,8 @@ def main() -> int:
         if not args.skip_oracle:
             cc = shlex.split(args.cc) if args.cc else default_cc()
             run_oracle(cc, work)
+            run_big_trace(cc, work)
+            run_flush(cc, work)
             run_flavours(cc, work)
         if args.arm_cc:
             arm_cross(args.arm_cc, work)

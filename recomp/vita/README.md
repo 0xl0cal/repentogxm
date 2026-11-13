@@ -117,16 +117,77 @@ are OFF unless noted.
 - Lua: `ISAAC_VITA_LUA` with `ISAAC_LUA53_SOURCE_DIR`,
   `ISAAC_VITA_LUA_GCSTEP_CLAMP_KB=128` (default),
   `ISAAC_VITA_LUA_GCCOLLECT_CLAMP`, `ISAAC_VITA_LUA_GC_FINALIZER_PACE`
-  (default OFF; with `ISAAC_VITA_LUA_GC_FINALIZER_MAX=8` and
-  `ISAAC_VITA_LUA_GC_FINALIZER_COST=512` the Lua archive compiles a two-line
-  derivation of `lgc.c`, `lua53_gc_finalizer_pace.py`, so a paced step runs at
-  most ~K*1024/COST + 16 `__gc` finalizers instead of a whole cycle's
-  ~1,400-1,700; `ISAAC_VITA_LUA_GC_SWEEP_COST` (default 5 = pristine, line
-  untouched; 32 proposed) is a third derived line, lgc.c:39, so a step sweeps
-  ~K*1024/SWEEP objects instead of ~26,000 per 128 KB; meant to pair with
-  `ISAAC_VITA_LUA_GCSTEP_CLAMP_KB=40`, and a clamp below 128 *without* the
-  pace makes the finalizer hitch worse; the sub-knobs refuse a non-default
-  value while PACE is OFF; OFF keeps the pristine Lua closure byte-identical),
+  (default OFF; ON compiles the Lua archive from derivations of `lgc.c`
+  and `lbaselib.c`, `lua53_gc_finalizer_pace.py`, 17 + 2 lines, listed in
+  its docstring -- review r5: a paced GC step charges a finalizer
+  `(budget + GCSTEPSIZE) / ISAAC_VITA_LUA_GC_FINALIZER_STEP`
+  (default 192, 72..320), so it runs about STEP finalizers and at most
+  `floor(5*STEP/4) + 2*MAX` = 256 whatever its budget (a `__gc` that
+  calls `collectgarbage` with an option other than `"count"` or
+  `"isrunning"` latches its state, and the rest of that step is
+  pristine's); a paced step that ends in GCScallfin keeps at most
+  GCSTEPSIZE bytes of credit, a paced step's debt is restored after its
+  tail finalizers (an allocating `__gc` neither holds off the drain nor
+  chains steps), and the pause after a cycle that ended late is
+  shortened by the lateness.  The pacer serves the engine's own
+  `lua_gc` schedule only: the first time a Lua script calls
+  `collectgarbage` with any option other than `"count"` or `"isrunning"`
+  (seen in the derived `lbaselib.c`, before the call runs) that Lua state
+  is handed back to pristine 5.3.3 for the rest of its life, with whatever
+  finalizer backlog it holds (pristine bit for bit only when that happens
+  before its first paced step; later, how close it stays to pristine is
+  measured per leg, `LUA-GC-R5-round2.md`); the engine's own GCSTEP,
+  GCCOLLECT, GCCOUNT and the GCCOLLECT clamp never latch.  That bounds a
+  step, not the heap; the heap against pristine is a host measurement
+  (`LUA-GC-R5.md`; up to +12 % where finalizers allocate or resurrect,
+  +16-21 % where every 100th `__gc` raises, `LUA-GC-R5-round2.md`);
+  `ISAAC_VITA_LUA_GC_FINALIZER_MAX` (default 8) caps the `gcfinnum`
+  doubling of `runafewfinalizers` in a paced step after the atomic phase
+  only (pristine doubling elsewhere, e.g. after an emergency collection);
+  `ISAAC_VITA_LUA_GC_SWEEP_STEP` (default 6144; 0 = pristine line 39) is
+  the same quota for the sweep, ~6,144 objects a step instead of ~26,000
+  per 128 KB;
+  `ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES` (default 0 = no guard,
+  the derivation is byte for byte the one without the knob; or
+  16000..1073741824, host-proven at 65536) bounds review round 2's B3 (and
+  the B1 shape): the derived `lgc.c` (three more lines: 61, 821, 958) sums
+  what the `__gc` finalizers of one GC cycle allocate, and once a cycle
+  passes the budget that Lua state is latched to pristine 5.3.3 exactly as
+  by a script's `collectgarbage` -- so a mod whose finalizers allocate runs
+  paced for one cycle's budget and pristine from there on, and the pacer's
+  gain is lost for that state (`test_vita_lua_gc_finalizer_alloc_latch.py`:
+  at the engine's schedule the guard build latches at loop 178-182 and is
+  in pristine's band where the build without it marks up to 1.5x, runs
+  loops 7-25x longer at p99 or passes 256 MB; with finalizers that
+  allocate nothing its collector trajectory is bit-identical to the build
+  without the guard).  It does not see a `__gc` that allocates nothing net
+  (one that resurrects its object or raises): those costs stay as stated
+  above.  B3 is thereby bounded by falling back to pristine, not resolved;
+  65536 is the only budget measured (no sweep, far below B3's ~250 KB per
+  loop, so moderately allocating finalizers lose the pacer too), the B2
+  chain shape has no leg, and a budget under about 40000 may latch on
+  ordinary Lua-function finalizers (an estimate from the Lua sources, not
+  measured).  With the pacer ON the runtime logs, at the first `lua_gc`
+  import, `[isaac-lua] finalizer pace: on=1 alloc_latch_bytes=N
+  gcstep_clamp_kb=K` (the resolved knobs; PACE ON with budget 0 prints
+  this line and nothing else, and CMake warns that there is no latch).
+  With a budget it also logs `[isaac-lua] finalizer pace state: state=P
+  latched=0|1 alloc_latches=N` whenever the calling Lua state or its latch
+  changes (latched=1 with an unchanged count is a script's
+  `collectgarbage`), and `[isaac-lua] finalizer alloc latch: LATCHED
+  latches=N budget=B state=P state_latched=0|1` per budget latch: the
+  count is the process's, `state_latched=0` means the budget was passed
+  in another state (for instance by the finalizers `lua_close` ran on the
+  previous one) and the calling state is still paced.  Any `latched=1` /
+  `state_latched=1` line on the console means the pacer is off for that
+  state: read these lines before any A/B, such a run measures pristine;
+  validated with `ISAAC_VITA_LUA_GCSTEP_CLAMP_KB=128` (the pace test's
+  matrix) and `64` (the allocation-latch test's 100/120/200
+  finalizers-per-loop legs, with and without the latch) only
+  (another clamp warns); the sub-knobs refuse a non-default value while
+  PACE is OFF; the r0 knobs `ISAAC_VITA_LUA_GC_FINALIZER_COST` /
+  `_SWEEP_COST` are retired and refused unless at their old defaults; OFF
+  keeps the pristine Lua closure byte-identical),
   `ISAAC_VITA_LUA_SCOPE_FASTPATH` (default
   ON), `ISAAC_VITA_LUA_IMPORT_FASTDISPATCH`, `ISAAC_VITA_LUA_NATIVE_INDEX`,
   `ISAAC_VITA_LUA_NATIVE_GETCLASS`, `ISAAC_VITA_LUA_ARENA_MB=0` (default =
@@ -188,11 +249,12 @@ are OFF unless noted.
   `[isaac-lua] getclass stats:` gains
   `direct=1 memo(class hit/miss/stale,identity hit/miss/stale)=`. The host
   oracle is `recomp/test_vita_lua_getclass.py` (direct variants with GC debt,
-  string-cache and dead-slot snapshots, stack-moving `__gc` stress). OFF
-  compiles the API path only. CMake stops at the first FATAL, so a negative
-  configure of either knob (one expected to fail at that knob's FATAL) must
-  also switch off every lever of its initial cache that fails earlier:
-  `cmake_knob_probe.py` configures only this
+  string-cache and dead-slot snapshots, stack-moving `__gc` stress; position
+  transcripts that force a collector step at each GC point of a call in turn,
+  and one mutant per `luaC_checkGC` call site that must fail the oracle). OFF
+  compiles the API path only. CMake stops at the first FATAL, so a box
+  negative for either knob must also switch off every lever of its init
+  cache that fails earlier: `cmake_knob_probe.py` configures only this
   file's knob block on a host without the SDK (`-C <init> -S recomp/vita
   -B <dir> -D KEY=VAL ...`), and `test_cmake_knob_probe.py` checks that
   both knobs' FATALs are the first ones their negatives reach.
@@ -246,6 +308,52 @@ are OFF unless noted.
   newlib-shaped stdio over a fault-injecting fake `sceIo` layer, mutants,
   the CMake negatives through `cmake_knob_probe.py`); the bridge variant is
   `loadfile-retry` in `recomp/test_vita_lua_runtime.py`.
+  `ISAAC_VITA_LUA_GC_STATE_PROFILE` (default OFF, measurement only; needs
+  `ISAAC_VITA_LUA_GC_PROFILE` and `ISAAC_VITA_LUA_GC_FINALIZER_PACE`)
+  derives `lgc.c` with `--state-profile`: nine more lines of
+  `lua53_gc_finalizer_pace.py` (`STATE_PROFILE_LINES`) call three hooks of
+  `host_vita_lua_gc.c` from `luaC_step`, and every gc window is followed by
+  `[isaac-lua] gc state` (steps and time by origin: `upd` = LuaEngine::Update's
+  paced step, `alloc` = allocation-driven steps the gc window cannot see,
+  `other`; atomic steps by origin), `gc cls` (time by collector state),
+  `gc asub` (the five cuts of `atomic()`) and `gc worst` (the window's longest
+  `luaC_step`, split the same way, with its debt and heap figures).  The hooks
+  read their arguments and write the unit's statics: the collector's decisions
+  are those of the build without them.  `ISAAC_VITA_LUA_GC_IDLE_STEP`
+  (default OFF; needs `ISAAC_VITA_FULLSPEED_SCHEDULER`, refuses
+  `ISAAC_VITA_FULLSPEED_HEAD_ADVANCE`) asks the scheduler what follows the
+  loop tail the paced step stands on
+  (`kage_vita_fullspeed_scheduler_gc_idle_query`, a read-only query): when
+  the tick ran Game::Update and no wait follows, the step is carried -- but
+  only a step that cannot run `atomic()` there
+  (`host_vita_lua_gc_idle_rule.h`: the collector is sweeping or calling
+  finalizers, or it is in propagate and a bounded walk of the gray list,
+  512 objects, proves the list longer than the step's budget).  A pause,
+  atomic or unproven propagate step runs in place, as without the knob.
+  The carried step runs whole, with its own budget, behind the
+  interpolated render and in front of the 30-Hz floor wait: inside the
+  next LuaEngine::Update's `lua_gc(GCCOUNT)` import (return word
+  `0x4022ec`), so the guest's controller reads the heap after it, as it
+  does without the knob.  At most one step is carried, never across a
+  `lua_State`; when the scheduler is not in charge the call is the
+  build's without the knob.  The controller's decisions are close to, not
+  identical with, the build without the knob: a carried step runs on a
+  heap one render older.  It moves a part of the Update step's time out
+  of the render admission's way; the renders it admits and a carried step
+  that overruns can delay the next Game::Update (the model in
+  `kage_vita_gc_idle_scheduler_oracle.c` prints pps, updates/s and the
+  lateness for both; updates/s must be gated on the device).  Logs
+  `[isaac-lua] gc idle` / `gc idle us` / `gc idle why` per 120 steps; the
+  `gc idle step:` banner is printed with the first window, not at boot.
+  A step the allocator starts inside a carried step's finalizers, and an
+  emergency full collection, are charged to the place of the step they
+  interrupt.  Host proofs: `recomp/test_vita_lua_gc_state_idle.py`
+  (clang -m32, real Lua 5.3.3; derivation, neutrality, accounting against
+  an outside observer, scripted scheduler answers over a real collector,
+  the guest controller replayed, twelve mutants, the real scheduler under
+  a clock model); reader: `recomp/vita/lua_gc_state_report.py`
+  (`--bid BID` for the device's cumulative log, `--bench DIR` for a
+  per-phase split).
 - Video: `ISAAC_VITA_THEORA_PRECACHE_FRAMES=0` (default, untouched); a value
   of 1..64 caps theoraplayer's per-clip RGBA frame queue so the 816x480
   ending videos (1.5 MiB per frame, 8-16 frames requested) fit the heap that
@@ -721,6 +829,172 @@ are OFF unless noted.
   `skip(a,l,n,f)=0,0,0,0`, `p=120`, `g=60` **and** `ph120.s` `at=` deltas of
   2000 ms per 120 loops (2018 ms is 29.7 UPS; `g=60` per 120 loops holds by
   construction and proves nothing about UPS).
+  With the GL render thread (`ISAAC_VITA_GL_THREAD_WORKER` +
+  `ISAAC_VITA_GL_THREAD_RENDER_ADMISSION`) the main-thread swap wait is
+  ~0.01 ms and C2 does nothing; the same 50-FPS cycle comes back through the
+  admission gate instead. `ISAAC_VITA_GL_THREAD_ADMIT_WAIT` (`OFF|OBSERVE|ON`,
+  default OFF; requires `GL_THREAD_RENDER_ADMISSION`; FATAL with
+  `FULLSPEED_HEAD_ADVANCE`, `FULLSPEED_RENDER_COST_EXCLUDES_PRESENT` and
+  `FULLSPEED_FLOOR_DEBT=ON`, `FLOOR_DEBT=OBSERVE` allowed; spec and report
+  `R60-DRYADMIT-SPEC-20261028.md` and
+  `R60-DRYADMIT-20261028.md`) targets it. MEASURED on the 500-MHz Vita
+  (LDA/LDB/LDC, 28.10, A4P recipe): Basement I rooms present about 100 of 120
+  frames per 120-loop window (`ph120.s skip(a,l,n,f)=20,0,20,0`, `ph120.rw
+  rs` about 20 per window) while U is 3-7 ms and R 4-10 ms: on about one
+  frame in five or six the present closure runs about 11 ms longer than
+  usual (`ph120.rt` fr95 14.8-17.2 ms, 27.2 in LDC P8, against fr50
+  3.7-4.7 ms; water fr95 4.4-6.5 ms), and the next interpolated gate finds
+  the render thread behind and refuses. Only about half of that tail is
+  inside `vglSwapBuffers`: `sw_pf` (swap ms per present) is 1.09-1.30 in
+  the dry phases against 0.13-0.14 in the water rooms (0.43-0.45 in
+  transitions), about 1 ms of the ~2 ms per present the tail costs on
+  average (ESTIMATED: 11 ms / 5.5); the rest is replay. Stock asks only
+  whether the closure has finished, not whether it will finish in time.
+  ON, at that gate: compute `latest = floor - (cost + reserve)`, with cost
+  the larger of the last Render cost and the largest of the last 4 (a
+  design choice: on the oracle's render-jitter case it cuts lateness from
+  6147 to 2255 us per 600 updates for 28 fewer presents), the last instant
+  the stock time test below still admits the frame (no fixed cap); sleep in
+  slices of at most 2 ms on the ring's producer semaphore until the closure
+  is done or the deadline, which is `latest` capped at the next loop head
+  (not capped while Theora video has priority); then re-read the clock,
+  re-take the tick-due skip, refuse if the clock is past `latest`, and run
+  the stock time test on it. A timeout, no live floor, or a failed re-check
+  refuses exactly as stock (same counters, same `rs`). Two signals arm a
+  30-phase back-off (the next 30 non-full phases take the stock refusal):
+  the Game::Update right after an admitted-by-wait frame starts >= 1 us
+  past its floor although its loop head did not sleep (`lt`), or the next
+  Present had to wait for an admitted-by-wait closure and the loop head
+  after it did not sleep (`hl`; this is what a GPU-bound room shows). The
+  wait is in the guest sampler's `pace` bucket, so the sampler's U does not
+  include it; `ph120.t` `upd`, `ph120.s` and `busy_pct` do (the gate runs
+  between the update-entry and render-entry marks,
+  `kage_vita_phase_profile.c` `note_update_entry`/`note_render_entry`), so
+  they rise by about `aw us` per window. OBSERVE never waits: behaviour is
+  OFF's, and it checks at the next Present whether each refused closure had
+  finished by `latest`. Both modes print, right after `ph120.rw`,
+  `[kage-vita] ph120.aw bid= win= loops= n= ok= to= nw= bo= tt=
+  us(sum,max)= lt(c,us)= hl(c,us)= ov= fit(e,a)= miss(us,max)= hd(n,us)=`
+  (380 B at all-ones): n = gates that found the render thread behind; ok =
+  waited, then rendered; to = waited to the deadline, refused; nw = no
+  window; bo = refused inside a back-off; tt = closure done, then refused
+  by the re-check or the time test; us = waited us; lt = late Game::Update
+  starts after an ok; hl = loop heads that did not sleep after a Present
+  held on an ok's closure, us past their due time; ov = the largest wake
+  past a timed-out wait's deadline (a 2-ms slice bounds it); fit(e,a) =
+  refusals with a window checked at the next Present, of which the closure
+  had finished by `latest` (OBSERVE's prediction of ON's gain: exact when
+  the render thread is CPU-tail-bound, an upper bound when the GPU queue is
+  the limit); miss = how late the others were; hd = Present holds on an
+  ok's closure. Per window: `rw.rs = n - ok - tt`, `n >= ok + to + nw + bo +
+  tt` (ON: equal), `fit.e <= n - ok - tt - nw + 1`, OBSERVE `ok = to = bo
+  = tt = lt = hl = ov = hd = us = 0` (`tools/bench/bench_run.py` checks the
+  first three: `aw_bad`). Receipts: `KAGE VITA GL ADMIT WAIT:
+  mode=observe|on bound=time-test slice_us=2000 backoff=30
+  record=ph120.aw` after `KAGE VITA GL RENDER THREAD:`, and the CADENCE30
+  banner carries ` gl-admit-wait=observe` or ` gl-admit-wait=on
+  backoff=30`; `bench_run.py` takes the mode from the banner, whose bid it
+  checks. OFF appends no definition: every object is byte-identical.
+  Host oracle (MODEL, 40 pinned worker cases in
+  `kage_vita_fullspeed_scheduler_oracle.c`): 11-16 ms tails every fifth
+  closure go from 1000 to 1200 presents per 10 windows at 600 updates,
+  max update gap 33334 us and the same update digest as a tail-free room;
+  a 17-ms tail and the EID-fight shape stay at 1000; random 1-in-5 tails
+  reach 1189-1200 (OFF 1087); with 3 ms of render-body jitter ON gains
+  125/57 presents at 14/16-ms tails but starts 600 updates 1.6/2.3 ms later
+  in total, the largest update-span moves in the oracle (+0.9 ms with
+  service jitter added, +0.05 ms in a jittered GPU-queue room, 0 elsewhere
+  outside a 266-ms stall that OFF has too); a 19-ms GPU queue gains 26
+  presents in the fight shape and loses 1 in the light shape (11 Present
+  holds each, every one arming a back-off); OBSERVE equals OFF in all 40.
+  Not a fix for P8 (ceiling 107.6/120 if every refusal were admitted, LDC).
+  Device gates: the report, section "Device gates"; the game thread (core
+  0) and the render thread (core 1) wake each other across cores, which the
+  oracle models as 200 us (1 and 2 ms in the wake cases).
+  `ISAAC_VITA_GL_THREAD_ADMIT_BEHIND` (`OFF|OBSERVE|ON`, default OFF) with
+  `ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES` (decimal 1..524288, default
+  65536; plan `R60-FABLE-PLAN.md`, lane B) is the other way through the
+  same gate. Requires `GL_THREAD_RENDER_ADMISSION` and, for OBSERVE,
+  `ISAAC_VITA_PHASE_PROFILE` (its records are OBSERVE's only output: FATAL
+  without it). ON builds without the phase profile (the release recipe):
+  no decision reads the counters the profile takes, so it renders the same
+  frames and only the two records below are missing (the configure receipt
+  says so); FATAL with `GL_THREAD_ADMIT_WAIT` (each owns
+  the behind arm), `FULLSPEED_HEAD_ADVANCE`,
+  `FULLSPEED_RENDER_COST_EXCLUDES_PRESENT` and `FULLSPEED_FLOOR_DEBT=ON`
+  (`FLOOR_DEBT=OBSERVE` allowed). Where the admit wait sleeps on the game
+  thread until the closure is done, this knob never waits: ON, at an
+  interpolated gate that finds the render thread a frame behind, reads the
+  record ring's outstanding bytes (`isaac_gl_record_worker_outstanding`:
+  producer position minus the consumer's published position, right across
+  a ring wrap) and, when they are at most the bound, lets the frame go on
+  to the stock time test, which still decides. Over the bound, or inside a
+  back-off, it takes the stock refusal (same counters, same `rs`). The
+  frame's own Present then waits for the closure it was behind, and the
+  Present after it for the frame's own closure; when such a hold is
+  followed by a loop head that did not sleep (the admit wait's `hl`
+  condition, same expression), the next 30 non-full phases take the stock
+  refusal. A hold the loop absorbs arms nothing. OBSERVE renders nothing
+  extra: behaviour is OFF's. Both modes print two records right after
+  `ph120.rw`, taken at the same loop-head edge:
+  `[kage-vita] ph120.ab bid= win= loops= n= st(p,f,x)= ov= wa= ok= bo= tt=
+  ob(50,max)= hl(c,us)= hd(n,us)=` (311 B at all-ones) and
+  `[kage-vita] ph120.abp bid= win= loops= pm(c,ok,us,max)=
+  wp(c,ok,us,max)= phl=` (226 B). n = gates that found the render thread
+  behind; st = the stock time test at the stock last-Render cost there
+  (passing, failing, not live: stock admits); ov = outstanding bytes over
+  the bound; wa = within the bound and st not f (what ON renders outside a
+  back-off); ok = rendered while behind; bo = within the bound, refused in
+  a back-off; tt = within the bound, refused by the stock time test;
+  ob = outstanding bytes at the gate (lower median of the window's first
+  64 gates, maximum of all); hl = loop heads that did not sleep after a
+  hold, us past their due time; hd = Present holds on or right after a
+  behind-admitted frame. abp is the closure check of every refusal at the
+  next Present: pm = checked, closure done by the refused frame's
+  predicted Present (gate + the last Render's body up to its Present),
+  hold of the others (sum, max); wp = the same over the wa frames; phl =
+  of pm, the hold would have carried the Render return (gate + last Render
+  cost + hold) to or past the next loop head's due time: the predicted
+  hold + late head. Per window: `rw.rs = n - ok`, `st.p + st.f + st.x =
+  n`, `ov + wa <= n`, ON `n = ov + bo + ok + tt`, OBSERVE `ok = bo = tt =
+  hl = hd = 0` (`tools/bench/bench_run.py`: `ab_bad`). The bytes are the
+  recorded GL stream only: a render thread blocked in the swap behind a
+  full GPU queue has few bytes outstanding and passes the bound, which is
+  what `pm`/`phl` in OBSERVE and `hl` in ON are there to show. Receipts:
+  `KAGE VITA GL ADMIT BEHIND: mode=observe|on bytes=<n> backoff=30
+  record=ph120.ab` after `KAGE VITA GL RENDER THREAD:` (bytes read back
+  from the scheduler's object), and the CADENCE30 banner carries
+  ` gl-admit-behind=observe|on bytes=<n> backoff=30`. OFF appends no
+  definition: every object is byte-identical; `gl_record_ring.c` is not
+  touched in any mode. Adds one clock read per Present. Host oracle (MODEL,
+  the 40 worker cases, three passes each): with every behind gate over the
+  bound ON prints the stock numbers in all 40; with every gate within it
+  the 11-17 ms closure tails go from 1000 to 1200 presents per 10 windows
+  at 30.000 UPS and max update gap 33334 us (the numbers stock prints when
+  its gate is never told "behind"), while the 19-ms GPU-queue rooms reach
+  1062-1063 presents (stock 1000-1056) at 29.70-29.73 UPS with a 47-50 ms
+  largest update gap, back-off included (without it: 29.46-29.48); with
+  bytes proportional to the closure's remaining time those rooms stay at
+  30.000 UPS. OBSERVE equals OFF in all three passes. Directed runs, both
+  modes, gate forced behind: a passing time test is `st p` (ON renders), a
+  failing one `st f` (ON refuses by the stock time test: `tt`, counted in
+  `rs`; over the bound it is `ov`, not `tt`), a menu `st x` (ON renders);
+  every refusal's predicted Present / Render-return instants are held
+  against the oracle's own measurement of the last Render. `wa` in OBSERVE
+  is an upper bound on what ON renders: OBSERVE has no behind-admitted
+  frame, so no hold and no back-off, and ON refuses `bo` of those gates.
+  Device rule (plan S2/S4), decided on the OBSERVE run: ON for water only if
+  at least 0.4 of the P2 behind gates are `st p` or `x` (`ab_pass`) and no
+  `pm` hold exceeds 2 ms (`pm_max`); ON for dry only if P6 `phl` (`ab_phl`,
+  the predicted hold + late head) stays under 1 per window. `hl` is counted
+  in ON only and is 0 in every OBSERVE run by construction, so it decides
+  nothing there: it is the control of the ON run itself (P6 `ab_hl` under 1
+  per window, P2 `hd` 0). In the ON run read updates/s and the largest
+  update gap first, pps second: the model's GPU-queue rooms gain presents
+  and lose updates (29.70-29.73), and ON is not kept at under the base's
+  updates/s. `tools/bench/bench_run.py` fails the run (`AB_RECORD_MISSING`)
+  when the banner names the knob and a window with `ph120.rw` has no
+  `ph120.ab` or `ph120.abp`, and warns (`AB_IDENTITY`) on `ab_bad`.
   `ISAAC_VITA_FULLSPEED_FLOOR_DEBT` (`OFF|OBSERVE|ON`, default OFF; requires
   fullspeed cadence; FATAL with `ISAAC_VITA_FULLSPEED_HEAD_ADVANCE`) targets
   the UPS lost to
@@ -997,6 +1271,532 @@ are OFF unless noted.
   `recomp/vita/test_gl_record_opcode_census.py [--plant]` (CMake shapes,
   define scope, knobs-OFF token identity). OFF: every object
   byte-identical.
+- Update hitch probe: `ISAAC_VITA_UPDATE_HITCH_PROBE` (default OFF) with
+  `ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US` (STRING, default `30000`; a
+  decimal integer 1000..10000000, anything else FATAL). FATAL unless
+  translated KAGE, `ISAAC_VITA_PHASE_PROFILE` and
+  `ISAAC_VITA_FULLSPEED_SCHEDULER`. Diagnostic only; it changes no decision.
+  It answers "this one `Game::Update` took 110 ms, inside what?". The window
+  records already cover the same seams (`ph120.sp`, `ph120.sfx`,
+  `ph120.pngi`, `ph120.fh`, the `[isaac-lua] cost` line, `ph120.hot`), but as
+  totals over 120 updates, so they cannot say which update paid. The probe
+  brackets ONE update with the two clock values the scheduler already holds
+  (`kage_vita_fullspeed_scheduler.c`: `s_update_begin_us`, set when the floor
+  wait is over, and the `end_us` read in `..._note_game_update_end`; no clock
+  read is added, `test_kage_vita_update_hitch.py` compares the read count ON
+  against OFF) and, for every update lasting AT LEAST the threshold, prints
+  two records, each one log call with one newline, paired by `n=`:
+
+  ```
+  [kage-vita] ph120.uh bid=<bid> abi=1 n=<event> win=<w> loop=<l> tid=<hex>
+      thr_us=<threshold> us=<update wall us> begin=<16 hex us> frame=<a>><b>
+      gl(tex,draw,clear,fbo)=..  fh(hit,miss)=..  pngi(attempt,elided,bytes)=..
+      png(images,native,decode_us,io_us)=..
+      sfx(wav_c,wav_us,ogg_c,ogg_us,riff_c,riff_us,up_c,up_us,play_c,play_us)=..
+      lua(pc_n,pc_us,cb_n,cb_us,gc_n,gc_us)=..  smp(seq)=..
+  [kage-vita] ph120.uhs bid=<bid> abi=1 n=<event> samples=<n> lost=<n>
+      self=<rva>:<count>,.. caller=<rva>:<count>,..
+  ```
+
+  (shown wrapped; on the device each is one line). `win`/`loop` are the
+  phase-profile window that will report this update and its outer loop, the
+  same numbers as that update's `ph120.sp loop=`. `us` is NOT that record's
+  `upd`: `ph120.sp upd` is the whole upd phase (Manager::Update entry to
+  render entry) and contains the scheduler's `Game::Update` floor wait
+  (0..33 ms, `pace` in `ph120.ik`), while the probe's begin is taken after
+  that wait and its end when `Game::Update` returns. So `us <= upd` for the
+  same loop, short by the floor wait plus the Manager::Update code around
+  `Game::Update`. Two readings follow: a window whose `ph120.sp kind=upd`
+  is at or above the threshold with NO `ph120.uh` for that loop means the
+  time is outside `Game::Update` (floor wait or Manager::Update) and is a
+  finding about that window, not a probe defect; and `us > upd` for the
+  same loop cannot happen. `tools/bench/update_hitch.py` prints this
+  comparison per window (`ph120.sp kind=upd cross-check`). Every group value is the
+  difference of a cumulative counter across exactly this update: `gl` =
+  `glTexImage2D`, draw, clear and FBO-bind calls counted by the GL backend;
+  `fh` = CRT FILE lookup hint hits/misses (`ISAAC_VITA_CRT_FILE_LOOKUP_HINT`);
+  `pngi` = ImagePng texel-buffer inits (`ISAAC_VITA_PNG_TEXEL_INIT_ELISION`;
+  one per PNG image loaded); `png` = native PNG decode
+  (`ISAAC_VITA_PNG_WINDOW_PROFILE`); `sfx` = static sample loads, uploads and
+  plays (`ISAAC_VITA_STATIC_SFX_PROFILE`; RIFF time is inside the WAV scope);
+  `lua` = pcall, Lua->guest callback and GC step count/us
+  (`ISAAC_VITA_LUA_COST_PROFILE`; callbacks and VM GC steps are inside pcall
+  time, do not add them); `smp(seq)` = guest sampler samples attributed
+  during the update (`ISAAC_VITA_GUEST_SAMPLER`). A group whose seam is not
+  compiled into the build prints `=off`; one whose snapshot could not be
+  read at either end prints `=na`. Neither is a zero. `ph120.uhs` lists the
+  six most frequent self and caller functions (translated RVAs, hex; the
+  sampler's markers `ffffffe` = native code behind an indirect call,
+  `fffffff` = unnamed indirect callee) among the sampler's 1 kHz samples
+  that fell inside the update. The sampler keeps the last 512; a longer
+  update reports the rest as `lost`, and the oldest kept slot is always
+  dropped when the ring wrapped (the writer may be rewriting it). Nothing is
+  filtered: one record pair per qualifying update, room loads included.
+  `ph120.uhs` is printed exactly when `smp(seq)` printed a number, so a
+  `ph120.uh` with a numeric `smp(seq)` and no `ph120.uhs` is a lost log
+  line (the reader raises on it; `--allow-unpaired` counts it instead).
+  Widest records, executed by the host test: `ph120.uh` 711 bytes and
+  `ph120.uhs` 274 with every field at its maximum, inside the 768-byte line
+  buffer and the async logger's 1024-byte line.
+  First-update banner, once, with the RESOLVED threshold and seams:
+  `KAGE VITA UPDATE HITCH PROBE: bid=<bid> abi=1 threshold_us=<n> trail=512
+  top=6 seams: gl=on fh=.. pngi=.. png=.. sfx=.. lua=.. smp=..`.
+  Not covered: file I/O time (`ISAAC_VITA_IO_WINDOW_PROFILE` has only a
+  take-and-zero reader) and heap stages; with the GL thread worker
+  (`ISAAC_VITA_GL_THREAD_RECORD`/`_WORKER`, ON in the bench recipe) the `gl`
+  counts are taken where the backend counts them, i.e. when the render
+  thread replays the recorded call, which may be after the update returned:
+  there `gl(tex..)` is supporting evidence only and may read 0 for an
+  update that did create textures; decide on `pngi`, `fh` and `ph120.uhs`.
+  No record at all: the probe's begin is made at the end of the scheduler's
+  `Game::Update` pacing, so it is skipped (and the matching end dropped)
+  when the scheduler is runtime-disabled or a pace wait fails; if that
+  happens before the first update there is no banner either. A probe build
+  whose log has no banner: read the scheduler's own lines
+  (`runtime_disables`, the FULLSPEED banner) before suspecting the probe.
+  The `sfx` snapshot holds the static-SFX scope lock for one struct copy,
+  twice per update, and a load or play entering on another thread in that
+  instant runs unprofiled: the probe can add to `ph120.sfx` `skipped`
+  (compare it between the probe build and its A side), nothing else in
+  `ph120.sfx` moves. Cost when ON: per update one counter
+  snapshot (a spin-lock pair for `fh`, a try-lock for `sfx`); per printed
+  event a second snapshot, a sort of at most 512 entries twice and two log
+  lines, all after the end clock value, so outside the reported `us`. The
+  sampler thread adds two stores per sample. CMake appends the define to
+  `kage_vita_phase_profile.c`, `kage_vita_fullspeed_scheduler.c`,
+  `host_vita_static_sfx_profile.c`, `host_vita_lua_cost.c` and
+  `kage_vita_guest_sampler.c` only; OFF: every object byte-identical. Not to
+  be confused with `ISAAC_VITA_UPDATE_PROBE` (`ph120.ut/uz/uk`, link-time
+  wraps of named guest functions). Gates:
+  `recomp/vita/test_kage_vita_update_hitch.py` (production records incl.
+  the widest one, the scheduler call sites ON == OFF, the Lua cost, sampler
+  (trail keys == `ph120.hot`/`ph120.hotc`) and static-SFX peek accessors,
+  OFF preprocessed surface, CMake shape, parser and `ph120.sp` cross-check,
+  mutants) and `tools/bench/update_hitch.py NATIVE.log --bid <bid>
+  [--allow-unpaired]` to read a device log.
+- Image retain, sheets on a batch-flush list:
+  `ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED` (STRING `OFF` | `OBSERVE` | `ON`,
+  default `OFF`; anything else FATAL, and FATAL unless
+  `ISAAC_VITA_IMAGE_RETAIN` is ON). What the two bits of an Image's flags
+  word (`+0x10`) that the retention seam refuses really are (frozen PE; they
+  are not render-target lists): `0x04` = the Image is in the batch renderer's
+  DIRTY vector `[0x7e7d10, 0x7e7d14)`, it has quads queued for the next flush
+  (set only at `0x5601f6`, cleared after every flush by `sub_0056d4a0`);
+  `0x10` = it is in the TOUCHED vector `[0x7e7d1c, 0x7e7d20)`, a flush drew
+  it and its batch buffers are still allocated (set only by the flush
+  `sub_0056d500`, cleared only by the idle sweep at `0x561f81` / `0x564fec`
+  once the sheet has not been drawn for 5000 ms). `ImageManager::Unregister`
+  erases the Image from both vectors and drops its pending `{batch, Image}`
+  pairs (`0x56d280` / `0x56d2c1` / `0x56d2f6`). So every sheet that was on
+  screen in the last 5 s carries `0x10`, and with the knob OFF the seam hands
+  each of them to the real observer: the sheet is freed and decoded again on
+  its next use (BulletAtlas: five `inel-rt` frees in one bench fight).
+  - `ON` retains such a candidate when (T1) `0x04` is clear, (T2) the
+    TOUCHED vector is well formed and holds the Image exactly once and the
+    DIRTY vector does not hold it, (T3) no pending pair names it and it is
+    not the Image of the most recent pair. That state -- registered, in the
+    TOUCHED vector, strong == 1 -- is the one the OFF build is in whenever
+    another owner still holds the sheet; the vector's walkers read Image
+    fields only. `0x04` candidates stay refused (the next flush would draw
+    quads the OFF build drops). Rule E: an LRU eviction never Unregisters a
+    record whose Image has `flags & 0x14` at that moment (it runs inside the
+    release of a different Image, where the OFF build never shrinks the
+    vector); such records are passed over (at most 16 per eviction) and
+    become evictable when the game's sweep clears `0x10`. The byte budget
+    stays a hard cap: when the passed-over records leave the table over
+    budget, the candidate itself is Unregistered at once. Rule E is
+    conservatism, not a memory-safety requirement: no walker of the TOUCHED
+    vector calls the observer (its only references are the two sweeps,
+    Unregister, the flush and the static destructor), so an eviction there
+    would not re-enter the seam; the rule only keeps ON inside the set of
+    vector states the OFF build produces. Its cost: when the 16 records
+    nearest the LRU tail are all pinned, nothing is evicted
+    (`evict_blocked`) and a clean candidate that OFF would have retained
+    is Unregistered instead (`budget_refuse`) -- a possible per-room loss
+    against OFF, so `budget_refuse` and `evict_blocked` are device gates.
+    Each passed-over record costs one scan of the manager's 32 buckets
+    (presence is proven before the Image is read, as everywhere in this
+    unit); `pinned_skip` counts those scans.
+    Assumption (not verified): no batch flush runs after the ImageManager
+    destructor `sub_0056c660` at shutdown (its only callers are the
+    shutdown sequence and atexit). The Image destructor does not erase
+    itself from the TOUCHED vector, so a retained `0x10` Image leaves a
+    dangling entry there at exit, which only a later flush would read.
+  - `OBSERVE` takes the same decisions as OFF and only counts. Its
+    `admit` / `admit_bytes` are an UPPER BOUND on what ON would keep: they
+    are counted per offer from T1..T3, the texture / name / size tests
+    and the byte budget only, without ON's presence-in-manager, memory
+    headroom, table-capacity and strong-count checks, and `admit_bytes`
+    adds the same sheet again on every offer.
+  - Boot banner, before the `ARM: armed=1` line:
+    `KAGE VITA IMAGE RETAIN TOUCHED: armed mode=<observe|on> idle_ms=5000 pin_skip_max=16 build=<link id>`.
+    Every retain report adds
+    `KAGE VITA IMAGE RETAIN TOUCHED: mode= offers= admit= admit_bytes= dirty= vec= pair= pinned_skip= evict_blocked= budget_refuse= pair_untouched= why=`
+    -- `offers` = strong == 1 candidates with `flags & 0x14`; `admit` = kept
+    (ON; a candidate later dropped by the hard cap is in `admit` and in
+    `budget_refuse`) or would be kept (OBSERVE; `admit_bytes` then adds the
+    sheet's bytes on every offer, in ON only when a new record is made);
+    `dirty` / `vec` / `pair` = refused by T1 / T2 / T3; `pair_untouched` =
+    candidates with clean flags and a pending pair, which the seam has
+    always retained. Device gate for ON: no `what=inel-rt` line for a sheet
+    with `flags=00000011` in the big-sheet trace, `vec=0`, and
+    `retained_bytes <= budget` in every `KAGE VITA IMAGE RETAIN:` line.
+  Host proof: `python recomp/test_vita_image_retain.py --pe <frozen PE>
+  [--generated <corpus>] [--arm-cc arm-vita-eabi-gcc]` (PE pins of every
+  writer of the two bits and of Unregister's three scrubs, the oracle in
+  OFF / OBSERVE / ON with a model of the three vectors, mutants).
+- Image preload at floor load: `ISAAC_VITA_IMAGE_PRELOAD` (default OFF) with
+  `ISAAC_VITA_IMAGE_PRELOAD_LIST` (STRING, default `gfx/BulletAtlas.png`;
+  comma-separated names as the game passes them to Load, at most 8 names of
+  at most 95 characters and 160 in all, letters / digits / `_ . / -` only),
+  `ISAAC_VITA_IMAGE_PRELOAD_MAX_KB` (STRING, default `2048`, 1..16384: the
+  decoded size the gates budget per name) and
+  `ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB` (STRING, default `8`, 0..64). FATAL
+  unless `ISAAC_VITA_IMAGE_RETAIN` and `ISAAC_VITA_SFX_FLOOR_PRELOAD` are ON.
+  After `Level::Init` returns (the SFX floor preload's `--wrap` of
+  `sub_00311e60`, after its own lists), each list name that is not in the
+  ImageManager is decoded by replaying the game's own call at `0x565fad`
+  (`push 0 / push 0xbbf948 / push name / push &out / call sub_0056c7e0`),
+  then the `SmartPointer<Image>` destructor of `out` (`0x565fee`: Release,
+  and the observer when it returns true). The observer is the retention
+  seam, so the sheet ends up retained with the manager's reference only and
+  the fight's first Load of it is a manager hit. A name is skipped (counted,
+  never an error) when the seam is not armed / budget 0 / inside an
+  eviction / on another CPU (`s`), the manager Mutex is held (`l`), the
+  guest heap is terminal (`t`), MAX_KB exceeds the retain budget or free
+  vitaGL memory is below the retain headroom + MAX_KB (`v`), guest heap
+  headroom is below RESERVE_MB + 2 x MAX_KB (`h`; the factor 2 is a model
+  of the decoder's scratch, not a measurement), or the guest stack has no
+  room for the replay frame (`k`). Lines:
+  `KAGE VITA IMAGE PRELOAD: armed n= truncated= max_kb= reserve_mb= heap_factor= list=<resolved list> build=` (boot),
+  `KAGE VITA IMAGE PRELOAD: image name= result=<retained|dropped|fail> image= bytes= dim= flags= us= hr_kb=<before>..<after> live= key=` (per decode),
+  `KAGE VITA IMAGE PRELOAD: level= n= loaded= retained= dropped= present= fail= skipped= bytes= us= hr_kb=<before>..<after> need_kb= fault=` (per floor;
+  `need_kb` = RESERVE_MB + 2 x MAX_KB in KiB, the `h` gate the first `hr_kb` value is compared with),
+  `KAGE VITA IMAGE PRELOAD: hit name= ...` / `miss name= ...` / `evicted-unused name= ...`,
+  and in every retain report
+  `KAGE VITA IMAGE PRELOAD: totals levels= loaded= retained= dropped= present= fail= hit= miss= evicted_unused= skip(s,l,t,v,h,k)= breach= bytes= us= why=`.
+  `hit` = a preloaded sheet was taken from the manager and released again
+  (once per preloaded sheet); `miss` = a list sheet the game had to decode
+  itself; `evicted_unused` = the LRU released a preloaded sheet before any
+  use. Limits: the preload removes the first decode only -- a sheet that is
+  on screen and then freed is decoded again unless
+  `ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=ON` keeps it; a preloaded sheet is
+  an ordinary LRU record and can be evicted before the fight.
+  Heap gate on the bench route: the headroom is read after the SFX floor
+  and fight preloads of the same `Level::Init` (the fight sounds keep
+  first call on the heap; their gate is unchanged). Device values
+  (`bench-H2-20261111/native.log`, KiB): level 1 14427 before the fight
+  sounds and 11807 after, level 2 11651, level 3 7484; over 19 fight-ON
+  runs 11469..11849 after the fight sounds on level 1 and 11323..11691 on
+  level 2. The default gate needs 12288 KiB, so with `RESERVE_MB=8` and
+  the fight preload ON the image preload is skipped (`h`) on all three
+  floors of that route. `RESERVE_MB=4` (gate 8192 KiB) decodes on levels
+  1 and 2 and skips level 3. Calling the image preload first would pass
+  level 1 only (level 2 has 11651 KiB before any sound is loaded), so the
+  order is not the lever. The default stays 8 until a device run shows
+  what a decode really takes (`hr_kb=<before>..<after>` of the `image`
+  line); the fight itself decodes the same sheet at whatever headroom it
+  finds, so the preload moves that allocation earlier, it does not add one.
+- Image preload pin: `ISAAC_VITA_IMAGE_PRELOAD_PIN` (STRING `OFF` | `OBSERVE`
+  | `ON`, default `OFF`; anything else FATAL, and FATAL unless
+  `ISAAC_VITA_IMAGE_PRELOAD` is ON). OFF appends no define, so the module is
+  byte-identical. Why it exists: the IMG device run of 12.11 (IA) printed
+  `present=1` on levels 1, 2 and 3 -- the walk found a manager entry under
+  the name and did nothing -- and the fight still decoded
+  `gfx/BulletAtlas.png`. Either that entry is not the key the fight asks for
+  (the name test is a folded path-suffix match, so any
+  `<dir>/gfx/BulletAtlas.png`, e.g. a `mods/` copy, passes) or it is the right
+  entry and it left the LRU before the fight. OBSERVE changes no decision and
+  prints what "present" was:
+  `KAGE VITA IMAGE PRELOAD PIN: present name= level= k=<i>/<matches> image= strong= flags= bytes= rec=<retained record 0|1> own=<the unused sheet of an earlier walk> key=<last 96 bytes>`
+  for each match (first 4 per name), and on every miss
+  `KAGE VITA IMAGE PRELOAD PIN: miss name= level= image= flags= state= pinned= twins=<manager entries under the name> key=`.
+  ON also acts:
+  a present name is replayed through Load behind the same gates, and Load's
+  own lookup decides -- it hands back one of the matches (`exact`, nothing
+  decoded) or a new Image (`alias`: the match was another key; the sheet is
+  decoded and retained as without the pin); an unused sheet of an earlier
+  walk is re-pinned without a replay (`own`). The retained sheet is then
+  pinned: the eviction walker steps past it until its first use (`used`, the
+  game took it from the manager and let go), the next `Level::Init`
+  (`floor`; every pin is released there and the walk re-takes what is still
+  unused), or until its record goes (`dropped`, `stale`). An exact match the
+  game still holds (strong >= 2 after the replay; Load hits it for as long as
+  that lasts, the image line reads `result=held`) is pinned when its last
+  holder lets go if the retention seam records it then (`on_free`; also when
+  that release is kept under the manager Mutex), stays waiting when the game
+  took it back before the observer's lock replay, and otherwise is counted
+  `lost` with a
+  `KAGE VITA IMAGE PRELOAD PIN: lost name= level= image= flags= lost= exit=<pressure|oversize|ineligible|absent|pass>` line
+  (`exit` = the observer exit the release took instead of a record, e.g.
+  `ineligible` for flags 0x10 with `ADMIT_TOUCHED` OFF). Pins hold at most
+  budget / 2 bytes (`refused` beyond that) and never block an eviction: when
+  every record an eviction can reach is pinned, the oldest pin yields
+  (`yield`). The eviction walker never takes the record of the sheet being
+  released by the current offer before the observer's lock replay (a
+  headroom release: that sheet is still its caller's), and in a budget
+  eviction only after every other pin has yielded (the observer's own
+  Unregister, as without pins); `cskip` counts the walks that passed that
+  record and took another one or none. The byte budget, the headroom release
+  and the table bound hold exactly as without pins; only the order in which
+  LRU records leave changes. Lines:
+  `KAGE VITA IMAGE PRELOAD PIN: armed mode= share=1/2 set_max=4 lines_max=64 build=` (boot),
+  `KAGE VITA IMAGE PRELOAD PIN: level= mode= pins= pinned_bytes= share= released= pinned= own= exact= alias= held=` (per floor, just before the
+  preload's `level=` line), and in every retain report
+  `KAGE VITA IMAGE PRELOAD PIN: totals mode= pinned= refused= used= floor= yield= stale= dropped= skip= cskip= own= exact= alias= held= on_free= lost= twins= pins= pinned_bytes= why=`.
+  `skip` counts pinned records an eviction walked past. With ON, the
+  preload's `loaded` / `bytes` include exact replays that decoded nothing;
+  `exact=` separates them. Present / miss / lost lines: at most 64 per arm
+  of the seam (the counters keep counting).
+  `RESERVE_MB=4` is what lets the walk run on levels 1 and 2 of the bench
+  route (see the heap gate above).
+- Image retain big-sheet trace: `ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE` (default
+  OFF) with `ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB` (STRING, default
+  `1024`; a decimal integer 1..65536, anything else FATAL when the trace is
+  ON). FATAL unless `ISAAC_VITA_IMAGE_RETAIN` is ON. A diagnostic, not a
+  lever: it answers "why was this big sheet decoded again" for the
+  retention seam (`host_vita_image_retain.c`). The seam only ever sees an
+  Image when the game's observer (`sub_0056d8c0`) is handed it with
+  strong == 1; for each such offer of a sheet whose `pw * ph * bpp` is at
+  least MIN_KB KiB it logs one line
+
+  `KAGE VITA IMAGE RETAIN BIG: what=<w> image=<va> bytes=<n> dim=<pw>x<ph>x<bpp> flags=<x> tex0=<x> live=<records>/<bytes> n=<line no> name=<ImageManager name>`
+
+  with `what` one of: `new` / `reuse` (retained), `inel-rt` (flags & 0x14:
+  on a batch-flush list, see `ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED`; with
+  that knob ON the refusals read `inel-dirty` / `inel-fvec` / `inel-pair`
+  and a candidate dropped by its hard cap `pass-pinned`), `inel-tex` (texture name 0 or unset: never
+  uploaded), `inel-name` (no name), `inel-bytes` (size 0 or above the
+  16 MiB cap), `absent` (not in the manager), `oversize` (above the whole
+  budget), `headroom-pass` (free memory below the headroom after releasing
+  LRU tails), `pass-budget0`, `pass-table`, `reacquired`, `keep-held` /
+  `keep-nested` (offered under the manager Mutex), and before a retained
+  sheet is released `evict-budget` / `evict-headroom` / `evict-table`. A
+  record that is dropped without the Image being readable prints the short
+  form `what=stale|stale-reused image= bytes= live= n=`. `live=` is the
+  table before the decision. The name is the last 96 bytes of the
+  manager's key, bytes outside 0x21..0x7e shown as `?`. At most 512 lines
+  per boot; the rest are counted. Every retain report (periodic, every 64
+  offers, and at loading-complete) adds
+
+  `KAGE VITA IMAGE RETAIN BIG TOTALS: inel(vt/rt/tex/name/bytes)=a/b/c/d/e last_foreign_vt=<x> lines=<n> suppressed=<n> min_bytes=<n> why=<tag>`
+
+  where the five counts split the report's `ineligible` total (minus
+  `oversize`) for sheets of every size; an Image of a class other than the
+  three retained ones is only counted (`vt`), its fields are not read.
+  Boot banner with the resolved threshold, printed just before the
+  `KAGE VITA IMAGE RETAIN ARM: armed=1` line:
+  `KAGE VITA IMAGE RETAIN BIG TRACE: on min_bytes=<MIN_KB*1024> max_lines=512 build=<link id>`.
+  Reading it: a sheet that is decoded again and never appears here was
+  never offered at strong == 1 (it left through one of the game's direct
+  `Unregister` calls, 0x5bfc46 / 0x5bfca6, or is not an ImageManager entry);
+  one that appears as `new` and is decoded again with no `evict-*` /
+  `stale` line in between was retained and the reload missed it (a Load
+  miss, not a retention miss). Cost: no clock read, no guest write; guest
+  reads only on the candidate path (a few offers per second, never the
+  strong != 1 hot path), one log line per big-sheet decision. Gates:
+  `recomp/test_vita_image_retain.py --pe <frozen PE>` (the whole retain
+  oracle rerun with the trace compiled in, the big-trace scenarios, 21
+  mutants, OFF token check, production flavour compile). OFF: the unit is
+  byte-identical (no token of the trace reaches the compiler).
+- GL render-thread wait timeout: `ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US`
+  (STRING, default empty = unset; a decimal integer 100..2000, anything else
+  FATAL; FATAL unless `ISAAC_VITA_GL_THREAD_WORKER`; T2 of
+  `R60-EXT-SYNTH.md`). A dry-room
+  render-thread lever: it changes only *when* the GL render thread wakes.
+  The render thread (the record ring's consumer) sleeps on its semaphore
+  until the game thread kicks it (the game thread's own waits, PRESENT, a
+  full ring, every 64 KiB of records) or until a timeout, stock 2000 us
+  (`gl_record_ring.c` `spsc_sleep_os`). MEASURED from the 28.10 dry phases
+  (bench-D6A2a/b/c, DAOBSa, P6/P7; R60-EXT-SYNTH section 1): 1.6-1.9 sleeps
+  per present ran to that timeout with records already published
+  (`ph120.rw sl(n,t)`, t), the render thread is only 29-34 % busy, and the
+  49-51 presents/s there come from the interpolated gate finding the render
+  thread a frame behind (`ph120.rw rs` 16-20 per window), not from the game
+  thread. Set, the consumer's wait in `isaac_gl_record_spsc_wait_work` times
+  out after this many us; every producer (game-thread) wait keeps 2000 us
+  (append and wait_done on `spsc_sleep_os`; the admit wait's slices on their
+  own). Record order, payloads, the Dekker sleep-flag protocol and replay are
+  unchanged, and the game thread runs no new instruction. CMake appends
+  `-DISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US=<n>` to `gl_record_ring.c`
+  only; the unit's `#error`s refuse it off Vita, without the worker and
+  outside 100..2000. Cost: core 1 (the render thread sits alone on USER_1)
+  wakes up to 2000/n times as often while idle; ESTIMATED gain up to about
+  0.7 ms of render-thread tail per present in dry rooms (R60-EXT-SYNTH T2),
+  0 on the game thread. Receipt, once, from the render thread at its first
+  idle wait (its `thr` is the `render_tid` of `KAGE VITA GL RENDER
+  THREAD:`): `KAGE VITA GL RING: consumer_timeout_us=<n>
+  producer_timeout_us=2000 record=ph120.rw`; configure prints `Isaac Vita GL
+  record consumer timeout: <n> us (...)`. Device gate (seeded bench with
+  dry phases, same session, the unset twin as the A side): the receipt is
+  present; dry P6/P7 `ph120.rw rs` per window falls below 16-20 and `pps_q`
+  rises above 49-51; `ph120.rt` fr95 falls; P2 `pps_q` and UPS not lower
+  than the twin. `sl(n,t)` per present is expected to **rise**, not fall:
+  each timeout is now a shorter poll, so t counts more wakes that each find
+  a smaller backlog (up to about 2000/n times as many); that rise is the
+  sign the knob is live, not a gain. The backlog a wake finds is what
+  should fall, and no counter measures it directly. Values to try: 500,
+  then 250. The device granularity of the `sceKernelWaitSema` timeout is
+  not read (UNREAD): 100 is the floor the knob accepts, not a measured
+  resolution. The receipt prints the compile-time value, so it cannot show
+  whether the kernel honours 500/250 us. A cheap reading of that from the
+  same records (ESTIMATED, not a gate): every idle sleep ends after at most
+  n us and a kick only shortens it, so with the timeout honoured `sl` n per
+  second over a quiet window is at least about idle_share x 1e6 / n
+  (idle_share = 1 - render-thread busy share); if the set arm's value stays
+  near the unset arm's, the kernel rounds the timeout up (or the eboot is
+  not the knob's). Gate `recomp/vita/test_kage_vita_fullspeed_scheduler.py`
+  (`cmake -P` of the option block and the recorder/worker define section,
+  16 cases; source contract; `cc -E` identity against the base with the knob
+  unset). Unset: no definition, every object byte-identical.
+- FBO deferred attach: `ISAAC_VITA_FBO_DEFERRED_ATTACH` (default OFF;
+  design `FABLE-A0-1-STALL.md`, 2026-11-11). FATAL unless the KAGE
+  runtime, `ISAAC_VITA_VITAGL_STOCK_REFERENCE` and
+  `ISAAC_VITA_STOCK_FBO_RT_REUSE`, and with the first-frame, known-colour,
+  screenshot or raw-GXM probes (they call vitaGL behind the boundary) or
+  with `ISAAC_VITA_FBO_RASTER_SCALE` / `ISAAC_VITA_DISPLAY_RASTER_720`
+  (their native viewports and re-specifies were not read for exactness).
+  What: the game binds one FBO and re-points its colour attachment many
+  times a frame; some attaches are followed only by a `GetTexel` read the
+  backend already serves from texture memory (`FBO_READBACK_FIX`), then by
+  the next attach. Each such attach still made vitaGL switch render
+  target, and a size change retired the depth buffer and destroyed and
+  re-created the render target (10 creates + 10 destroys per 2 s window
+  in dry rooms, about 210 ms; read storms 84 and more per window, the
+  3-6 s spawn-room stall). With the knob,
+  `glFramebufferTexture2D(FRAMEBUFFER|DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0,
+  TEXTURE_2D, tex != 0, level 0)` on a non-zero draw framebuffer is held
+  in one slot in `gl_vita_backend.c` and reaches vitaGL right before the
+  first call that can observe it: draw, clear (native or owed
+  materialisation), a `glReadPixels` vitaGL serves, a swap (frame present,
+  loading screen, continue overlay), any texture delete / `glTexImage2D` /
+  `glTexSubImage2D` and the FXRAY mask restore's native re-specify,
+  `glGetIntegerv`, `glFramebufferRenderbuffer`, `glDeleteFramebuffers`,
+  another attach shape or another FBO, install/uninstall, and the native
+  manager-framebuffer delete in `manual_kage_vita.c`
+  `destroy_render_targets` (KAGE Shutdown and re-initialisation; without
+  that flush the attach would land in a deleted framebuffer at
+  uninstall). A second attach to the same
+  FBO with nothing in between replaces the held one (the first is never
+  sent). `glCheckFramebufferStatus` on the held FBO is answered locally
+  (vitaGL's rule is "complete iff a colour texture is attached", and the
+  held texture is non-zero). `glBindFramebuffer` and `glViewport` do not
+  flush. Why exact: vitaGL's attach has no effect that outlives the next
+  attach to the same FBO except through a consumer, and every consumer
+  flushes first; the flush binds the held FBO as draw framebuffer for the
+  one call and binds the guest's back, so vitaGL evaluates
+  `in_use_framebuffer == active_write_fb` on the same state as at guest
+  time. Scissor and viewport are recomputed by vitaGL lazily at draw from
+  the framebuffer then in use. Not covered (documented residual): the
+  trophy setup pump's `vglSwapBuffers(GL_TRUE)` is not a flush point (it
+  runs only inside `kage_vita_backend_initialize`, before the backend is
+  installed, so nothing can be held); a dropped attach skips the P8
+  restore patch 0011 does at the attach, so a laser atlas vitaGL holds
+  in P8 form that the guest attaches and never draws to, clears or
+  natively reads stays P8 (it is restored by the next attach that is
+  forwarded); vitaGL's out-of-memory `glFinish` inside a native texture
+  upload other than the wrapped ones is not modelled. The gain needs
+  `ISAAC_VITA_FBO_READBACK_FIX` (otherwise the read is a native consumer
+  and flushes). Receipts: banner `KAGE VITA FBO DEFERRED ATTACH: on
+  slot=1 shape=color0,tex2d,level0
+  flush=draw,clear,owed,read,present,texture,other status=local
+  bind=noflush receipt=ph120.da` once at install, and with
+  `ISAAC_VITA_PHASE_PROFILE` one line per window `ph120.da bid= win=
+  loops= attach(d,x,s)=deferred,dropped,status-local
+  flush(dr,cl,ow,rd,pr,tx,ot)=...` (d == x + sum of flushes, less at most
+  one held across the window edge; the first window includes boot).
+  Defines `ISAAC_VITA_FBO_DEFERRED_ATTACH=1` on `gl_vita_backend.c`,
+  `kage_vita_backend.c`, `kage_vita_continue_profile.c`,
+  `kage_vita_loading.c`, `kage_vita_phase_profile.c` and
+  `manual_kage_vita.c` only. Host gate:
+  `python -B recomp/vita/test_fbo_deferred_attach.py` (source/CMake
+  shape, hook placement and OFF surface identity against the lane base
+  22327fa, not optional; the FABLE model
+  `host_tests/a01_rt_reuse_sim.py` replayed with the rule, S1 rc 10 -> 0,
+  S4 worst rc 100 -> 1; the real backend built OFF and ON for MSVC x86
+  against a mock vitaGL in three flavours, 13 scenarios, every consumer
+  the scenarios reach seeing identical framebuffer state and ON attaches
+  == OFF minus the superseded ones; four mutants - the owed flush
+  removed or moved inside the owed quad's bind window, the destroy flush
+  removed - must fail that comparison; scenario 14,
+  `host_tests/gl_record_scenario.c run_defer`, the same attach patterns
+  with a `ISAAC_VITA_KAGE_BIND_PACKET` record and a
+  `ISAAC_VITA_GL_RECORD_ATTRIB_BATCH` record between an attach and what
+  follows it: per-call, deferred recorder and render worker give one
+  byte-identical native trace each for OFF and ON, and ON == OFF with
+  the rule applied; the script also holds an attach across a bind of
+  another framebuffer and supersedes it there, reads
+  `glGetIntegerv(GL_ALPHA_BITS)` over a held attach, and runs two Binds
+  whose uniform is not in the location cache, 251 Binds = 253 bind
+  packets in all; mutants - a packet-replayed call that forwards the
+  held attach, a draw that does not, `glGetIntegerv` that does not, the
+  attach of another framebuffer dropped instead of forwarded, a packet
+  published late, a cold Bind that does not publish the staged half of
+  its packet before the location query - must fail). The mock does not
+  model render target reuse, depth retire, reference counts or the P8
+  restore; scenario 14 drives the recorder's producer API, not the
+  Shader::Bind seam TUs, and runs without `ISAAC_VITA_FBO_CLEAR_ELISION`
+  and `ISAAC_VITA_FBO_READBACK_FIX` (the elision flavour was measured
+  inert in that script, the readback one prints caller stack bytes; both
+  stay with the 13 oracle scenarios); the ON code in
+  `manual_kage_vita.c`, `kage_vita_loading.c` and the two present hooks
+  is not host-compilable. `kage_vita_continue_profile.c` is a source of
+  the link only with `ISAAC_VITA_CONTINUE_PROFILE`, which
+  `ISAAC_VITA_GL_THREAD_WORKER` refuses: its two hooks are in no build
+  with the render thread.
+  Not built for ARM and not run on the device yet. Device gates, written
+  in records a build with the render thread has (`ph120.gx rt()` needs
+  `ISAAC_VITA_GL_TIME_PROFILE`, refused with `ISAAC_VITA_GL_THREAD_WORKER`;
+  `ph120.wr` / `ph120.ft` belong to the wait probe, which is not on this
+  line). Timing pair, knob OFF and ON, seeded, EID loaded, the bench's dry
+  phases included: the banner is present in the ON arm only; `ph120.da`
+  x > 0 and rd == 0 in dry rooms, d == x + sum of flushes (less at most
+  one held across the window edge); `ph120.rt fr(50,95,max)` p95 in the
+  dry phases not above OFF and `ph120.rw rs` not above OFF; presents per
+  second in the water phases within the noise of OFF. Census pair, the
+  same two arms with `ISAAC_VITA_GXM_RT_CREATE_CENSUS` (below) and the GL
+  op census: the receipt shows seen c >= 1; dry-room windows show
+  `ph120.gr create c` 0 where OFF shows about 10 (and destroy n likewise);
+  every window with census op 43 >= 150 has c at most 1 per 20 presents
+  where OFF has about one per read; op 43 itself is unchanged. Both:
+  screenshots of a water room and a dry room identical to OFF; no EID
+  load error in `game.log`. A run with no window at op 43 >= 150 says
+  nothing about the stall: check the P8 windows. OFF: every object
+  byte-identical (all code is inside
+  `#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)`).
+- GXM render-target census: `ISAAC_VITA_GXM_RT_CREATE_CENSUS` (default
+  OFF; measurement only; FATAL unless the KAGE runtime and
+  `ISAAC_VITA_PHASE_PROFILE`). Why: with `ISAAC_VITA_GL_THREAD_WORKER` no
+  other receipt counts render-target creates (see the gates above). What:
+  the link gets `-Wl,--wrap=sceGxmCreateRenderTarget
+  -Wl,--wrap=sceGxmDestroyRenderTarget`; the two wrappers
+  (`recomp/runtime/kage_vita_gxm_rt_census.h`, defined in
+  `kage_vita_phase_profile.c`, the one source that gets the definition)
+  call the real import with the same arguments, return its value and add
+  to 32-bit atomics: calls, failures, process-clock microseconds, the
+  longest create. `libvitaGL.a` is byte-identical. Receipts: once, before
+  the first record, `KAGE VITA GXM RT CREATE CENSUS: on
+  wrap=sceGxmCreateRenderTarget,sceGxmDestroyRenderTarget
+  seen(c,x,d)=C,X,D receipt=ph120.gr` with the totals since process start
+  (c >= 1 is the proof that vitaGL's own calls go through the wrapper:
+  its display target is created before the first window; c == 0 means
+  the wrap is not in the link and every record below is void); then one
+  line per window after `ph120.da`: `ph120.gr bid= win= loops=
+  create(c,x,us,max)=ok,failed,us,longest destroy(n,us)=calls,us` (a
+  create vitaGL retries with one scene slot is two calls: x 1, c 1). The
+  time is in the calling thread's wrapper, so it is added to that
+  thread's work (two clock reads per call); it is not for a timing arm.
+  Host gate: `python -B recomp/vita/test_gxm_rt_create_census.py` from
+  `recomp/` (source and CMake shape; `kage_vita_phase_profile.c` without
+  the knob compiles to the same host object as the base text; with it,
+  three configurations compile with `-Werror` and define the two
+  `__wrap_` symbols; `host_tests/gxm_rt_census_oracle.c` runs the real
+  wrappers against a scripted clock and scripted `__real_` functions,
+  exact text of three windows and two receipts; 11 header mutants must
+  fail it). Not proven on the host: that GNU ld routes the references
+  inside `libvitaGL.a` (the raw GXM probe's five `--wrap`s are the
+  precedent on this link); the receipt's c is the run-time proof. OFF:
+  no definition, no link option, every object byte-identical.
 - Manager settings page: `ISAAC_VITA_MANAGER_SETTINGS_UI` (default OFF;
   FATAL unless `ISAAC_VITA_RUNTIME_SETTINGS` is ON; `tools/build_vita.py
   --manager-settings-ui`). Adds `manager_settings.c`, `manager_settings_ui.c`
@@ -1585,6 +2385,55 @@ and consumer thread, both GPR spellings, stack-guard / entry-census /
 leaf-call / sampler / opcode-census flavours) plus must-FAIL mutants;
 `test_gl_record_opcode_census.py` covers the census bound.
 
+`ISAAC_VITA_GL_DRAW_PACKET` (`OFF|VERIFY|ON`, default OFF; RENDER60 lane C,
+`ROAD60-SYNTHESIS.md` row 1) cuts the ring records of a draw.  The game
+thread stages the per-draw state records - `glBlendFuncSeparate`, the S4
+attribute enable/disable records (79/80) and the W-pkt bind packet (81) - in
+a small buffer and publishes them with the next `glDrawElements` as one
+record, `REC_DRAW_PACKET` (opcode 82), instead of one record each (5.94-5.98
+records per draw on the device).  Any other record, a closure, a drain, an
+outstanding-bytes query or a full buffer publishes what is staged first (ON:
+a single staged call as its own record, byte for byte), so the render thread
+sees the same records in the same order.  A draw whose index + vertex copies
+exceed half the ring minus the 2 KiB staging buffer and a record header is
+not fused: the staged calls go first and the draw alone, as without the knob,
+so a fused record never exceeds half the ring.  It runs each staged call through
+the ordinary replay with its own arguments and return RVA.  VERIFY publishes
+every call as its own record as well (those run), and the render thread
+hashes them and compares each packet with them (`mm`), counting a record
+that overtook staged calls (`late`); it also walks each packet with the ON
+decoder's framing code and compares that re-encoding with the same hash, so
+the decoder's op steps, rest-of-packet draw and per-op RVAs run on the device
+under a check.  FATAL unless `GL_THREAD_WORKER`,
+`KAGE_BIND_PACKET`, `GL_RECORD_ATTRIB_BATCH` and, for VERIFY,
+`ISAAC_VITA_PHASE_PROFILE` are ON.  ON decides from the staged bytes and
+calls only (the `ph120.dp` counters are stats no decision reads), so a release
+build with `PHASE_PROFILE=OFF` keeps ON's behaviour and loses only `ph120.dp`.  The define reaches `gl_record_backend.c`
+and `kage_vita_phase_profile.c` only, and configure prints `Isaac Vita GL draw
+packet: VERIFY|ON (...)`.  Record, after `ph120.rw` at the same loop-head
+edge: `[kage-vita] ph120.dp bid= win= loops= mode= d= f= pk= p1= sub= B= mx=
+fr(r,c,s,f)= v(p,s)= mm= late= tot=` (328 B at all-ones): d = draws, f = of
+them inside a packet, pk = packets, p1 = staged runs of exactly one call (ON
+publishes each as its own record, VERIFY as a one-call packet, also in pk),
+sub = staged calls, B = staged bytes, mx = most bytes at one
+publish, fr = publishes forced by a record / closure / sync / full buffer
+(or a draw too large to fuse),
+v(p,s) = VERIFY packets compared and records compared with, tot = mm + late
+since start.  Ring records of the draw path per draw in ON: `(pk + p1 + d -
+f) / d`.  The opcode census counts a packet as one slot-82 record, not its
+calls.  OFF appends no definition: every object is byte-identical.
+`test_gl_draw_packet.py` checks the OFF token streams against the base, the
+CMake block under `cmake -P`, the MSVC scenario (`gl_record_scenario.c`,
+modes main/defer/drawpkt: OFF, VERIFY, ON and ON+census traces equal with
+RVAs, VERIFY `mm 0 late 0`, packets replayed from right behind a ring wrap
+marker in main and drawpkt), eleven must-FAIL mutants (the walker's op step
+off by 8 in ON and VERIFY, and its RVA and lost-op defects in VERIFY too) and the big-draw
+guard with its bound lowered to 0 (trace equal to OFF, no draw fused);
+`tools/bench/bench_run.py` reads `ph120.dp` (FAIL `DP_VERIFY` on mm or late
+in a phase window or tot > 0 anywhere in the run, `DP_VERIFY_EMPTY`,
+`DP_VERIFY_COVERAGE` for |v(p) - pk| > 1 in a window, `DP_RECORD_MISSING`;
+WARN `DP_VERIFY_SUBS`, `DP_RECORDS_PER_DRAW`).
+
 `ISAAC_VITA_SHADER_ATTRIB_DIRECT_STATE` (default OFF; FATAL unless
 `ISAAC_VITA_SHADER_ATTRIB_FASTPATH`; FATAL with `ISAAC_VITA_GL_WRAPPER_TIME`
 or `ISAAC_VITA_STALL_PROBE`, whose per-attribute split and breadcrumbs
@@ -1865,6 +2714,27 @@ gates and single-owner census.
   The guest does call `glReadPixels`; a read of framebuffer 0 would get
   panel rows, 2 below the guest's. Device logs so far show none
   (`KAGE VITA FBO READBACK: ... display=0` with `ISAAC_VITA_FBO_READBACK_FIX`).
+- `ISAAC_VITA_FBO_READBACK_CENSUS_SKIP` = `OFF` (default) | `OBSERVE` | `ON`
+  (lane TXR; FATAL without `ISAAC_VITA_FBO_READBACK_FIX`; one define on
+  `gl_vita_backend.c` only, 1 or 2). The readback fix logs its first eight
+  offscreen reads in detail, and each detail line walked the whole attached
+  texture (a census of its non-zero texels) through uncached memory: 85 ms
+  for a 664x432 surface, 108-111 ms for a 784x472 one, 8 walks
+  and 0.73-0.88 s per boot in the 44 bench runs of 2026-11-12, every walk with
+  the game thread waiting inside `GetTexelRegion`. The game's read is served
+  before the detail line and does not depend on it. `OBSERVE` keeps the walk
+  and times it (` census_us=` on each `fbo-readback-mem` line and
+  `census=observe walks= ... census_us= census_max_us=` on the receipt);
+  `ON` skips it: `fbo-readback-mem: census=skip at=<texel> flip=<texel>` and
+  `census=skip ... census_skips=` on the receipt (a view stock does not walk
+  either -- no texture data, an edge over the cap, a short stride -- prints
+  `census=0` instead, so the `census=skip` lines equal `census_skips`). Both
+  print `KAGE VITA FBO READBACK CENSUS: mode=observe|skip detail_lines=8
+  receipt=fbo-readback-mem` once at the first install. Without the readback
+  fix the knob stops the compile (`#error`), as CMake stops the configure.
+  Host oracle modes `readback-census-observe` / `readback-census-skip`, and
+  the same two on the production shape
+  (`prod-elision-drop-readback-census-observe` / `-census-skip`).
 - `ISAAC_VITA_RENDER_SURFACE_RASTER_432` (experimental, default OFF) requires
   translated KAGE, `DIRECT_DEFAULT`, `RENDER_SURFACE_NATIVE` and
   `TEXTURE_ALIGN8_POLICY`. The exact outer Render Surface factory at

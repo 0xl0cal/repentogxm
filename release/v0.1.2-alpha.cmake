@@ -16,6 +16,9 @@
 # REPLACE this file with the shipped build's cache (release/README.md step 1);
 # tools/release/check_release_recipe.py must then pass on both this file and
 # that CMakeCache.txt. This DRAFT paragraph is dropped at the tag.
+# The test build also set ISAAC_VITA_LUA_GC_FINALIZER_COST=512 and
+# ISAAC_VITA_LUA_GC_SWEEP_COST=5; the tree replaced both knobs with the _STEP
+# pair (release/v0.2.0-alpha.cmake), so their lines are dropped here.
 #
 # Paths are per machine and are given on the command line. Reproduce the
 # build from a fresh build directory (softfp VitaSDK, Ninja, Python 3.10+,
@@ -244,11 +247,9 @@ set(ISAAC_VITA_LUA_COST_PROFILE OFF CACHE BOOL "")
 set(ISAAC_VITA_LUA_GCCOLLECT_CLAMP ON CACHE BOOL "")
 set(ISAAC_VITA_LUA_GCCOLLECT_STEP_KB 256 CACHE STRING "")
 set(ISAAC_VITA_LUA_GCSTEP_CLAMP_KB 128 CACHE STRING "")
-set(ISAAC_VITA_LUA_GC_FINALIZER_COST 512 CACHE STRING "")
 set(ISAAC_VITA_LUA_GC_FINALIZER_MAX 8 CACHE STRING "")
 set(ISAAC_VITA_LUA_GC_FINALIZER_PACE OFF CACHE BOOL "")
 set(ISAAC_VITA_LUA_GC_PROFILE OFF CACHE BOOL "")
-set(ISAAC_VITA_LUA_GC_SWEEP_COST 5 CACHE STRING "")
 set(ISAAC_VITA_LUA_GETCLASS_DIRECT OFF CACHE BOOL "")
 set(ISAAC_VITA_LUA_IMPORT_FASTDISPATCH ON CACHE BOOL "")
 set(ISAAC_VITA_LUA_INTEGER2STR ON CACHE BOOL "")

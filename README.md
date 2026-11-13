@@ -30,31 +30,34 @@ updates per second; the port presents up to 60 frames per second.
 
 [Video of v0.1.1-alpha and v0.1.0-alpha in same rooms](https://www.youtube.com/watch?v=1u4kBMvUUZI)
 
-The current release is v0.1.1-alpha (2026-09-07);
-[release/RELEASE_NOTES.md](release/RELEASE_NOTES.md) lists what changed. 
+The current release is v0.2.0-alpha (2026-11-13);
+[release/RELEASE_NOTES.md](release/RELEASE_NOTES.md) lists what changed.
 
-Telegram channel with any updates: [@localgxm](https://t.me/localgxm). 
+Telegram channel with any updates: [@localgxm](https://t.me/localgxm).
 
-Measured on one PS Vita with EID loaded ([STATUS.md](STATUS.md) names the
-build behind each number):
+Measured on one PS Vita at 500 MHz with EID loaded, a seeded bench run that
+plays the same rooms every time (two runs of the development build with the
+same speed-ups plus measurement code, 2026-11-13; frames drawn per second over
+each phase):
 
 | Scene | Result |
 |---|---|
-| Menus | 60 FPS |
-| Rooms with enemies | 55-59 FPS |
-| Dense rooms (about 78 draw calls per frame) | 33-34 FPS |
+| Quiet rooms (Downpour, Basement I) | 59.6-59.7 FPS |
+| Fights (Downpour with water, Basement I) | 57.0-58.9 FPS |
+| Rooms with a big spawn | 49-58 FPS |
+| Floor transition, including the loads | about 40 FPS |
 | Laser-heavy rooms (Circle of Protection, Brimstone) | slower than ordinary rooms; not measured on this build |
-| Door transition with resource loads | 0.9-1.1 s stall |
-| Floor change | 1.5-4.3 s |
-| Continue from the main menu; process start to the menu | about 7 s; about 4 s |
+
+The first few seconds of a fight and floor transitions still drop below 60.
 
 Below 60 FPS the cost is CPU render time: translated game code, vitaGL draws
 and Lua; laser rooms add GPU fill on the laser layers. Music can run dry and
 restart during a load stall. An open EID description box costs 8-10 ms of Lua
 per frame and breaks 60 FPS. No other mod has been tested.
 
-Not tested: PS TV, language switching, front-touch zones, a full run to a
-final boss. [PLAN.md](PLAN.md) lists the priorities.
+Switching the language to Chinese inside the game can freeze it; set the
+language before starting. Not tested: PS TV, front-touch zones, a full run to
+a final boss. [PLAN.md](PLAN.md) lists the priorities.
 
 ## How it works
 
@@ -192,8 +195,9 @@ option set is [release/v0.1.1-alpha.cmake](release/v0.1.1-alpha.cmake) as of
 the `v0.1.1-alpha` tag, a CMake initial cache whose header lists the three
 commands that reproduce the build. On later revisions that file is the
 release profile of the development line, not a copy of the shipped build: it
-also pins knobs added after the release, three of them ON. The draft for the
-next release is [release/v0.1.2-alpha.cmake](release/v0.1.2-alpha.cmake).
+also pins knobs added after the release, three of them ON. The recipe of the
+current release is [release/v0.2.0-alpha.cmake](release/v0.2.0-alpha.cmake);
+`release/v0.1.2-alpha.cmake` belongs to v0.1.2, which was never published.
 The option reference is [recomp/vita/README.md](recomp/vita/README.md).
 
 ## Broken or in progress

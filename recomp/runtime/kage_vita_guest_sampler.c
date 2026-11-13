@@ -360,6 +360,25 @@ static SceUID s_thread = -1;
 static uint32_t s_started;          /* production start guard */
 #endif
 static uint32_t s_ticks;           /* samples attempted, lifetime */
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+/* Update hitch probe: the last attributed (self, caller) pairs in time
+ * order, next to (not instead of) the window aggregation. */
+# include "kage_vita_update_hitch.h"
+static KageVitaUpdateHitchTrail s_hitch_trail;
+
+uint32_t kage_vita_guest_sampler_trail_seq(void)
+{
+    return kage_vita_update_hitch_trail_seq(&s_hitch_trail);
+}
+
+uint32_t kage_vita_guest_sampler_trail_copy(
+    uint32_t begin_seq, uint32_t end_seq, uint32_t *self, uint32_t *caller,
+    uint32_t *lost)
+{
+    return kage_vita_update_hitch_trail_copy(
+        &s_hitch_trail, begin_seq, end_seq, self, caller, lost);
+}
+#endif
 
 static const char *const s_phase_names[KAGE_VITA_GUEST_SAMPLER_PHASE_COUNT] =
     { "svc", "upd", "rnd", "swp", "lim", "oth", "pace" };
@@ -885,6 +904,10 @@ static void kvgs_sample(void)
         kvgs_count(buffer, KVGS_KEY(0U, phase, callee));
         kvgs_count(buffer, KVGS_KEY(1U, phase,
                                     kvgs_function_containing(value)));
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+        kage_vita_update_hitch_trail_push(
+            &s_hitch_trail, callee, kvgs_function_containing(value));
+#endif
         ++buffer->samples[phase];
         if (i >= KVGS_STACK_SCAN_WORDS_LEGACY)
             ++buffer->deep;

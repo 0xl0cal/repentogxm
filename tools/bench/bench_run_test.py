@@ -22,6 +22,17 @@ Legs:
            --smoke-root holds them, on the full downloaded logs
   phases   a synthetic run built from real record lines (P2b window 41 ph120.t/hs/c/s, the GPU
            oracle's ph120.gpu, glthread-ab2 window 2 ph120.rt/rw) with hand-computed expectations
+  admitwait the GL admit wait record (ISAAC_VITA_GL_THREAD_ADMIT_WAIT): one synthetic ph120.aw per
+           window in OBSERVE and ON, the receipt's mode, the phase sums, aw_bad from one mutated rs
+           and from I2 / I3, aw_missing from one window without the record
+  admitbehind the GL admit behind records (ISAAC_VITA_GL_THREAD_ADMIT_BEHIND): one synthetic ph120.ab +
+           ph120.abp per window in OBSERVE and ON, the banner's mode and bound, the phase sums and
+           shares, ab_bad from one mutated rs and from J1 / J3 / J4, ab_missing from one window
+           without either record
+  drawpacket the GL draw packet record (ISAAC_VITA_GL_DRAW_PACKET): one synthetic ph120.dp per
+           window in VERIFY and ON, the printed mode, the phase sums and per-draw ratios, FAIL
+           DP_VERIFY from one window with mm or late, FAIL DP_RECORD_MISSING from one window
+           without the record, WARN DP_RECORDS_PER_DRAW only in ON
   negative one mutation per File-1 / slot / completeness rule; each must FAIL with its code
   residual the sampler oracle's scenario 8 records (ph120.hotw/hotl/hotu/hcl/hotr, ph120.fe) in
            every window, hotw/fe split over lines: per-render values, union of split lines,
@@ -522,6 +533,471 @@ def rows_of(res: dict) -> dict:
     return {r["phase"]: r for r in res["phases"]}
 
 
+# GL admit wait (ISAAC_VITA_GL_THREAD_ADMIT_WAIT): one synthetic ph120.aw per window, printed after
+# ph120.rw as kage_vita_profile_log_gl_admit_wait does, with rs on rw (kage_vita_profile_log_render_wake).
+# OBSERVE: rs = n = 20, fit 20,18; ON: n = 20 ok = 18 to = 1 nw = 1, rs = 2.  Also hl, ov, hd
+# (kage_vita_profile_log_gl_admit_wait), and the mode from the bid-checked CADENCE30 banner.
+AW_MODES = {
+    "observe": {"rs": 20, "n": 20, "ok": 0, "to": 0, "nw": 0, "bo": 0, "tt": 0, "us": (0, 0), "lt": (0, 0),
+                "hl": (0, 0), "ov": 0, "fit": (20, 18), "miss": (3000, 500), "hd": (0, 0)},
+    "on": {"rs": 2, "n": 20, "ok": 18, "to": 1, "nw": 1, "bo": 0, "tt": 0, "us": (18000, 2000), "lt": (1, 40),
+           "hl": (2, 70), "ov": 310, "fit": (1, 0), "miss": (800, 800), "hd": (3, 900)},
+}
+AW_BANNER = ("[1.000 thr 0x40010003] KAGE VITA CADENCE30: bid={bid} tick_units=50000 game_tick_units=100000 "
+             "max_catchup=4 stale_catchup=1 max_full_skip=4 parity=4a264 frame=1a30dc reserve=pre-game"
+             "{aw} fps_lock=60")
+
+
+def aw_native(mode: str, bad_window=None, missing_window=None, banner_bid=BID, receipt=None,
+              banner=True) -> str:
+    v = AW_MODES[mode]
+    token = {"observe": " gl-admit-wait=observe", "on": " gl-admit-wait=on backoff=30"}.get(mode, "")
+    out = []
+    for line in good_native():
+        if " ph120.rw " in line:
+            k = int(line.split(" win=")[1].split()[0])
+            rs = v["rs"] + (1 if k == bad_window else 0)
+            out.append(line.replace(" mq=3240", f" mq=3240 ck=760 rs={rs}"))
+            if k != missing_window:
+                out.append(f"[kage-vita] ph120.aw bid={BID} win={k} loops={120 * k} n={v['n']} ok={v['ok']} "
+                           f"to={v['to']} nw={v['nw']} bo={v['bo']} tt={v['tt']} us(sum,max)={v['us'][0]},"
+                           f"{v['us'][1]} lt(c,us)={v['lt'][0]},{v['lt'][1]} hl(c,us)={v['hl'][0]},"
+                           f"{v['hl'][1]} ov={v['ov']} fit(e,a)={v['fit'][0]},{v['fit'][1]} "
+                           f"miss(us,max)={v['miss'][0]},{v['miss'][1]} hd(n,us)={v['hd'][0]},{v['hd'][1]}")
+            continue
+        out.append(line)
+        if line is APPLIED:
+            if banner:
+                out.append(AW_BANNER.format(bid=banner_bid, aw=token))
+            out.append(f"[6.200 thr 0x40010003] KAGE VITA GL ADMIT WAIT: mode={receipt or mode} "
+                       "bound=time-test slice_us=2000 backoff=30 record=ph120.aw")
+    return "\n".join(out) + "\n"
+
+
+def leg_admit_wait() -> None:
+    nonce = "0123456789ab"
+    game = "\n".join(good_game(nonce)) + "\n"
+    plain = rows_of(b.diagnose("\n".join(good_native()) + "\n", game, nonce))
+    check("admit wait: no ph120.aw -> no aw columns", all("aw_n" not in r for r in plain.values()),
+          str([k for r in plain.values() for k in r if k.startswith("aw_")]))
+    nat0 = b.parse_native(aw_native("on"))
+    pw, _ = b.phase_windows(nat0, b.parse_game(game))
+    win = dict((name, sel) for name, sel, _ in pw)["P2 fight-maxroom"][0]
+    for mode, v in AW_MODES.items():
+        res = b.diagnose(aw_native(mode), game, nonce)
+        check(f"admit wait {mode}: run ok, mode parsed", res["ok"] and res.get("aw_mode") == mode,
+              f"{res['verdict']} {res.get('aw_mode')}")
+        r = rows_of(res)["P2 fight-maxroom"]
+        nw = r.get("windows")
+        exp = {"aw_windows": nw, "aw_n": nw * v["n"], "aw_ok": nw * v["ok"], "aw_to": nw * v["to"],
+               "aw_nw": nw * v["nw"], "aw_bo": nw * v["bo"], "aw_tt": nw * v["tt"], "aw_lt": nw * v["lt"][0],
+               "fit_e": nw * v["fit"][0], "fit_a": nw * v["fit"][1], "aw_ms": nw * v["us"][0] / 1e3,
+               "aw_max": v["us"][1] / 1e3, "aw_lt_ms": nw * v["lt"][1] / 1e3,
+               "aw_hl": nw * v["hl"][0], "aw_hl_ms": nw * v["hl"][1] / 1e3, "aw_ov": v["ov"] / 1e3,
+               "aw_hd": nw * v["hd"][0], "aw_hd_ms": nw * v["hd"][1] / 1e3,
+               "miss_ms": nw * v["miss"][0] / 1e3, "aw_bad": 0, "aw_missing": 0,
+               "refused": nw * v["rs"]}
+        for k, want in exp.items():
+            check(f"admit wait {mode}: P2 {k}", near(r.get(k), want), f"{r.get(k)} != {want}")
+        text = b.report(res)
+        check(f"admit wait {mode}: report table and build line",
+              "GL admit wait per phase (ph120.aw, gl-admit-wait " + mode in text
+              and f"; gl-admit-wait {mode}" in text and "aw_missing" in text and "aw_hd_ms" in text
+              and "disagrees with the banner" not in text, text[-400:])
+        # The mode comes from the bid-checked banner, never from the bid-less receipt.
+        other = "on" if mode == "observe" else "observe"
+        stale = b.diagnose(aw_native(mode, banner_bid="rel:another-build-0000000000000000"), game, nonce)
+        check(f"admit wait {mode}: banner of another bid -> mode unknown",
+              stale.get("aw_mode") is None and "gl-admit-wait unknown" in b.report(stale),
+              f"{stale.get('aw_mode')}")
+        nob = b.diagnose(aw_native(mode, banner=False), game, nonce)
+        check(f"admit wait {mode}: receipt alone -> mode unknown", nob.get("aw_mode") is None,
+              f"{nob.get('aw_mode')}")
+        dis = b.diagnose(aw_native(mode, receipt=other), game, nonce)
+        check(f"admit wait {mode}: receipt {other} vs banner -> banner wins, disagreement reported",
+              dis.get("aw_mode") == mode
+              and f"GL ADMIT WAIT receipt mode={other} disagrees with the banner" in b.report(dis),
+              f"{dis.get('aw_mode')} {dis.get('aw_receipt')}")
+        bad = rows_of(b.diagnose(aw_native(mode, bad_window=win), game, nonce))
+        check(f"admit wait {mode}: one mutated rs -> P2 aw_bad 1",
+              bad["P2 fight-maxroom"].get("aw_bad") == 1
+              and sum(x.get("aw_bad", 0) for x in bad.values()) == 1,
+              str({p: x.get("aw_bad") for p, x in bad.items()}))
+        miss = rows_of(b.diagnose(aw_native(mode, missing_window=win), game, nonce))["P2 fight-maxroom"]
+        check(f"admit wait {mode}: one window without ph120.aw -> aw_missing 1",
+              miss.get("aw_missing") == 1 and miss.get("aw_windows") == nw - 1,
+              f"{miss.get('aw_missing')} {miss.get('aw_windows')}")
+    # I2 and I3 on their own (I1 holds): ok + to + nw + bo + tt > n, and fit e past n - ok - tt - nw + 1
+    for what, patch in (("I2", {"bo": 1, "rs": 2}), ("I3", {"fit": (3, 0)})):
+        AW_MODES["probe"] = dict(AW_MODES["on"], **patch)
+        try:
+            r = rows_of(b.diagnose(aw_native("probe", bad_window=None), game, nonce))["P2 fight-maxroom"]
+        finally:
+            del AW_MODES["probe"]
+        check(f"admit wait: {what} broken in every window -> aw_bad = windows", r.get("aw_bad") == r.get("windows"),
+              f"{r.get('aw_bad')} {r.get('windows')}")
+
+
+# GL admit behind (ISAAC_VITA_GL_THREAD_ADMIT_BEHIND): one synthetic ph120.ab + ph120.abp per window, printed
+# after ph120.rw as kage_vita_profile_log_gl_admit_behind does, with rs = n - ok on rw.
+# OBSERVE: n = 20 = st 12 + 5 + 3, ov 4, wa 13, rs 20; pm 20 checked, 9 done in time; wp 13, 8.
+# ON: the same gates, ok 9, bo 2, tt 5, rs 11; pm 11 checked, 4 done; wp 2, 1; one hl, three hd.
+AB_MODES = {
+    "observe": {"rs": 20, "n": 20, "st": (12, 5, 3), "ov": 4, "wa": 13, "ok": 0, "bo": 0, "tt": 0,
+                "ob": (30000, 90000), "hl": (0, 0), "hd": (0, 0), "pm": (20, 9, 33000, 4100),
+                "wp": (13, 8, 9000, 2600), "phl": 6},
+    "on": {"rs": 11, "n": 20, "st": (12, 5, 3), "ov": 4, "wa": 13, "ok": 9, "bo": 2, "tt": 5,
+           "ob": (28000, 70000), "hl": (1, 350), "hd": (3, 1200), "pm": (11, 4, 21000, 5200),
+           "wp": (2, 1, 700, 700), "phl": 2},
+}
+AB_BANNER = ("[1.000 thr 0x40010003] KAGE VITA CADENCE30: bid={bid} tick_units=50000 game_tick_units=100000 "
+             "max_catchup=4 stale_catchup=1 max_full_skip=4 parity=4a264 frame=1a30dc reserve=pre-game"
+             "{ab} fps_lock=60")
+
+
+def ab_native(mode: str, bad_window=None, missing_window=None, missing="ab", banner_bid=BID,
+              receipt=None, banner=True, bytes_=65536) -> str:
+    v = AB_MODES[mode]
+    token = f" gl-admit-behind={'on' if v['ok'] or mode == 'on' else 'observe'} bytes={bytes_} backoff=30"
+    out = []
+    for line in good_native():
+        if " ph120.rw " in line:
+            k = int(line.split(" win=")[1].split()[0])
+            rs = v["rs"] + (1 if k == bad_window else 0)
+            out.append(line.replace(" mq=3240", f" mq=3240 ck=760 rs={rs}"))
+            if k != missing_window or missing != "ab":
+                out.append(f"[kage-vita] ph120.ab bid={BID} win={k} loops={120 * k} n={v['n']} "
+                           f"st(p,f,x)={v['st'][0]},{v['st'][1]},{v['st'][2]} ov={v['ov']} wa={v['wa']} "
+                           f"ok={v['ok']} bo={v['bo']} tt={v['tt']} ob(50,max)={v['ob'][0]},{v['ob'][1]} "
+                           f"hl(c,us)={v['hl'][0]},{v['hl'][1]} hd(n,us)={v['hd'][0]},{v['hd'][1]}")
+            if k != missing_window or missing != "abp":
+                out.append(f"[kage-vita] ph120.abp bid={BID} win={k} loops={120 * k} "
+                           f"pm(c,ok,us,max)={','.join(map(str, v['pm']))} "
+                           f"wp(c,ok,us,max)={','.join(map(str, v['wp']))} phl={v['phl']}")
+            continue
+        if " ph120.rt " in line:
+            # the render thread's sync waits, joined per window (ab_s_w, ab_s_ms)
+            out.append(line.replace(" s(n,w,us)=0,0,0 ", " s(n,w,us)=7,3,4500 "))
+            continue
+        out.append(line)
+        if line is APPLIED:
+            if banner:
+                out.append(AB_BANNER.format(bid=banner_bid, ab=token))
+            out.append(f"[6.200 thr 0x40010003] KAGE VITA GL ADMIT BEHIND: mode={receipt or mode} "
+                       f"bytes={bytes_} backoff=30 record=ph120.ab")
+    return "\n".join(out) + "\n"
+
+
+def leg_admit_behind() -> None:
+    done = [0]
+
+    def ck(name: str, cond: bool, detail="") -> None:
+        done[0] += 1
+        check(name, cond, detail)
+
+    nonce = "0123456789ab"
+    game = "\n".join(good_game(nonce)) + "\n"
+    plain = rows_of(b.diagnose("\n".join(good_native()) + "\n", game, nonce))
+    ck("admit behind: no ph120.ab -> no ab columns",
+          all("ab_n" not in r and "pm_c" not in r for r in plain.values()),
+          str([k for r in plain.values() for k in r if k.startswith("ab_")]))
+    ck("admit behind: no ph120.ab -> no report table",
+          "GL admit behind" not in b.report(b.diagnose("\n".join(good_native()) + "\n", game, nonce)), "")
+    nat0 = b.parse_native(ab_native("on"))
+    pw, _ = b.phase_windows(nat0, b.parse_game(game))
+    win = dict((name, sel) for name, sel, _ in pw)["P2 fight-maxroom"][0]
+    ck("admit behind: the synthetic ph120.rt carries s(n,w,us)=7,3,4500",
+          " s(n,w,us)=7,3,4500 " in ab_native("on") and " s(n,w,us)=0,0,0 " not in ab_native("on"), "")
+    for mode, v in AB_MODES.items():
+        res = b.diagnose(ab_native(mode), game, nonce)
+        ck(f"admit behind {mode}: run ok, mode and bound parsed",
+              res["ok"] and res.get("ab_mode") == mode and res.get("ab_bytes") == 65536,
+              f"{res['verdict']} {res.get('ab_mode')} {res.get('ab_bytes')}")
+        r = rows_of(res)["P2 fight-maxroom"]
+        nw = r.get("windows")
+        exp = {"ab_windows": nw, "ab_n": nw * v["n"], "ab_stp": nw * v["st"][0], "ab_stf": nw * v["st"][1],
+               "ab_stx": nw * v["st"][2], "ab_ov": nw * v["ov"], "ab_wa": nw * v["wa"],
+               "ab_ok": nw * v["ok"], "ab_bo": nw * v["bo"], "ab_tt": nw * v["tt"],
+               "ab_pass": (v["st"][0] + v["st"][2]) / v["n"], "ab_wa_share": v["wa"] / v["n"],
+               "ab_ob50": v["ob"][0], "ab_obmax": v["ob"][1], "ab_hl": nw * v["hl"][0],
+               "ab_hl_ms": nw * v["hl"][1] / 1e3, "ab_hd": nw * v["hd"][0],
+               "ab_hd_ms": nw * v["hd"][1] / 1e3, "ab_s_w": nw * 3, "ab_s_ms": nw * 4.5,
+               "pm_c": nw * v["pm"][0], "pm_ok": nw * v["pm"][1], "pm_ms": nw * v["pm"][2] / 1e3,
+               "pm_max": v["pm"][3] / 1e3, "wp_c": nw * v["wp"][0], "wp_ok": nw * v["wp"][1],
+               "wp_ms": nw * v["wp"][2] / 1e3, "wp_max": v["wp"][3] / 1e3, "ab_phl": nw * v["phl"],
+               "ab_bad": 0, "ab_missing": 0, "refused": nw * v["rs"]}
+        for k, want in exp.items():
+            ck(f"admit behind {mode}: P2 {k}", near(r.get(k), want), f"{r.get(k)} != {want}")
+        text = b.report(res)
+        ck(f"admit behind {mode}: report tables and build line",
+              f"GL admit behind per phase (ph120.ab, gl-admit-behind {mode} bytes=65536;" in text
+              and "GL admit behind, refusals checked at the next Present (ph120.abp;" in text
+              and f"; gl-admit-behind {mode} bytes=65536" in text and "ab_missing" in text
+              and "ab_wa_share" in text and "disagrees with the banner" not in text, text[-400:])
+        other = "on" if mode == "observe" else "observe"
+        stale = b.diagnose(ab_native(mode, banner_bid="rel:another-build-0000000000000000"), game, nonce)
+        ck(f"admit behind {mode}: banner of another bid -> mode unknown",
+              stale.get("ab_mode") is None and stale.get("ab_bytes") is None
+              and "gl-admit-behind unknown bytes=unknown" in b.report(stale), f"{stale.get('ab_mode')}")
+        nob = b.diagnose(ab_native(mode, banner=False), game, nonce)
+        ck(f"admit behind {mode}: receipt alone -> mode unknown", nob.get("ab_mode") is None,
+              f"{nob.get('ab_mode')}")
+        dis = b.diagnose(ab_native(mode, receipt=other), game, nonce)
+        ck(f"admit behind {mode}: receipt {other} vs banner -> banner wins, disagreement reported",
+              dis.get("ab_mode") == mode
+              and f"GL ADMIT BEHIND receipt mode/bytes={other}/65536 disagrees with the banner" in b.report(dis),
+              f"{dis.get('ab_mode')} {dis.get('ab_receipt')}")
+        ck(f"admit behind {mode}: complete run -> no AB diagnostic",
+              not any(code.startswith("AB_") for _, code, _ in res["diagnostics"]),
+              str([x for x in res["diagnostics"] if x[1].startswith("AB_")]))
+        bad_res = b.diagnose(ab_native(mode, bad_window=win), game, nonce)
+        bad = rows_of(bad_res)
+        ck(f"admit behind {mode}: one mutated rs -> P2 ab_bad 1",
+              bad["P2 fight-maxroom"].get("ab_bad") == 1
+              and sum(x.get("ab_bad", 0) for x in bad.values()) == 1,
+              str({p: x.get("ab_bad") for p, x in bad.items()}))
+        ck(f"admit behind {mode}: one mutated rs -> WARN AB_IDENTITY naming P2, run still ok",
+              bad_res["ok"] and [(lv, msg) for lv, code, msg in bad_res["diagnostics"]
+                                 if code == "AB_IDENTITY"] == [
+                  ("WARN", "ph120.ab / ph120.abp windows breaking a per-window identity (ab_bad): P2 1")],
+              str([x for x in bad_res["diagnostics"] if x[1].startswith("AB_")]))
+        for record in ("ab", "abp"):
+            miss_res = b.diagnose(ab_native(mode, missing_window=win, missing=record), game, nonce)
+            ck(f"admit behind {mode}: one window without ph120.{record} -> BENCH FAILED (AB_RECORD_MISSING)",
+                  not miss_res["ok"] and miss_res["verdict"].startswith("BENCH FAILED (AB_RECORD_MISSING)")
+                  and f"P2 1 of {nw}" in miss_res["verdict"], miss_res["verdict"])
+            miss = rows_of(b.diagnose(ab_native(mode, missing_window=win, missing=record), game,
+                                      nonce))["P2 fight-maxroom"]
+            ck(f"admit behind {mode}: one window without ph120.{record} -> ab_missing 1",
+                  miss.get("ab_missing") == 1
+                  and miss.get("ab_windows") == nw - (1 if record == "ab" else 0)
+                  and near(miss.get("pm_c"), (nw - 1) * v["pm"][0]),
+                  f"{miss.get('ab_missing')} {miss.get('ab_windows')} {miss.get('pm_c')}")
+    # The banner says OBSERVE and no window has either record (a build without the phase-profile
+    # records): every phase is named, the run is not a BENCH OK.
+    none = b.diagnose("".join(line + "\n" for line in ab_native("observe").splitlines()
+                              if " ph120.ab " not in line and " ph120.abp " not in line), game, nonce)
+    ck("admit behind: banner and no ph120.ab at all -> BENCH FAILED (AB_RECORD_MISSING), every phase named",
+          not none["ok"] and none["verdict"].startswith("BENCH FAILED (AB_RECORD_MISSING)")
+          and all(f"{r['phase'].split()[0]} {r['windows']} of {r['windows']}" in none["verdict"]
+                  for r in none["phases"]) and len(none["phases"]) >= 5, none["verdict"])
+    # ... and without the banner the same log is an ordinary run (no knob, nothing owed).
+    plain_ab = b.diagnose("".join(line + "\n" for line in ab_native("observe", banner=False).splitlines()
+                                  if " ph120.ab " not in line and " ph120.abp " not in line), game, nonce)
+    ck("admit behind: no banner and no ph120.ab -> nothing owed", plain_ab["ok"]
+          and not any(code.startswith("AB_") for _, code, _ in plain_ab["diagnostics"]), plain_ab["verdict"])
+    other_bound = b.diagnose(ab_native("on", bytes_=131072), game, nonce)
+    ck("admit behind: the bound comes from the banner", other_bound.get("ab_bytes") == 131072
+          and "gl-admit-behind on bytes=131072" in b.report(other_bound), f"{other_bound.get('ab_bytes')}")
+    # J1, J3 and J4 on their own (J2 holds): each broken in every window.
+    for what, patch in (("J1", {"st": (12, 5, 2)}), ("J3 ov + wa", {"ov": 8}), ("J3 ok", {"wa": 8, "ov": 0}),
+                        ("J4 pm ok", {"pm": (11, 12, 0, 0)}), ("J4 pm c", {"pm": (13, 4, 0, 0)}),
+                        ("J4 wp c", {"wp": (12, 1, 0, 0)}), ("J4 wp ok", {"wp": (2, 3, 0, 0)}),
+                        ("J4 phl", {"phl": 12})):
+        AB_MODES["probe"] = dict(AB_MODES["on"], **patch)
+        try:
+            r = rows_of(b.diagnose(ab_native("probe"), game, nonce))["P2 fight-maxroom"]
+        finally:
+            del AB_MODES["probe"]
+        ck(f"admit behind: {what} broken in every window -> ab_bad = windows",
+              r.get("ab_bad") == r.get("windows"), f"{r.get('ab_bad')} {r.get('windows')}")
+    # ... and the carried refusal (pm c = n - ok + 1) is not a break.
+    AB_MODES["probe"] = dict(AB_MODES["on"], pm=(12, 4, 0, 0))
+    try:
+        r = rows_of(b.diagnose(ab_native("probe"), game, nonce))["P2 fight-maxroom"]
+    finally:
+        del AB_MODES["probe"]
+    ck("admit behind: pm c = n - ok + 1 (carried across the edge) is not bad", r.get("ab_bad") == 0,
+          f"{r.get('ab_bad')}")
+    print(f"admit behind: {done[0]} checks (OBSERVE and ON: mode and bound from the bid-checked banner, "
+          "32 hand-checked P2 values each, report tables, stale / missing banner, receipt disagreement, "
+          "ab_bad from one mutated rs and from J1 / J3 / J4, the carried refusal, ab_missing per record; "
+          "a window or a whole run without ph120.ab / ph120.abp is BENCH FAILED (AB_RECORD_MISSING), "
+          "ab_bad is WARN AB_IDENTITY)")
+
+
+# GL draw packet (ISAAC_VITA_GL_DRAW_PACKET=VERIFY|ON): one synthetic
+# ph120.dp per window, printed after ph120.rw as kage_vita_profile_log_draw_packet does (format copied:
+# recomp/runtime/kage_vita_phase_profile.c, "ph120.dp bid=%.32s win=%u loops=%u mode=%s d=%u f=%u pk=%u
+# p1=%u sub=%u B=%u mx=%u fr(r,c,s,f)=%u,%u,%u,%u v(p,s)=%u,%u mm=%u late=%u tot=%u").  Per window:
+# 9700 draws, 9650 of them in 9650 packets, 40 calls published alone, 38600 staged calls (4 per draw:
+# blend, bind packet, attrib enable, attrib disable), 2.4 MB staged; VERIFY compares every packet with
+# the 5 separate records it stands for.  ph120.rt r = 48721 (the synthetic rt line of W41).
+DP_MODES = {
+    # VERIFY counts a single in p1 AND publishes it as a one-call packet (pk); v(p) = pk and
+    # v(s) = sub + f per window: 9650 + 40, 38640 + 9650
+    "VERIFY": {"d": 9700, "f": 9650, "pk": 9690, "p1": 40, "sub": 38640, "B": 2400000, "mx": 640,
+               "fr": (30, 25, 12, 0), "v": (9690, 48290)},
+    "ON": {"d": 9700, "f": 9650, "pk": 9650, "p1": 40, "sub": 38600, "B": 2400000, "mx": 640,
+           "fr": (30, 25, 12, 0), "v": (0, 0)},
+}
+
+
+def dp_native(mode: str, bad_window=None, bad="mm", missing_window=None, p1=None, mode_text=None,
+              edit=None, tail_tot=0) -> str:
+    """edit = {window: {field: value}} overrides one window's fields; tail_tot appends one more
+    ph120.dp after the last ph120.rw (a window no phase selects) whose tot is raised by it."""
+    base = dict(DP_MODES[mode])
+    if p1 is not None:
+        base["p1"] = p1
+    out = []
+    tot = 0
+    last = None
+    for line in good_native():
+        out.append(line)
+        if " ph120.rw " in line:
+            k = int(line.split(" win=")[1].split()[0])
+            last = k
+            v = dict(base, **((edit or {}).get(k, {})))
+            mm = 1 if (k == bad_window and bad == "mm") else 0
+            late = 2 if (k == bad_window and bad == "late") else 0
+            tot += mm + late
+            if k == missing_window:
+                continue
+            out.append(dp_line(mode_text or mode, k, v, mm, late, tot))
+    if tail_tot:
+        out.append(dp_line(mode_text or mode, last + 1, base, 0, 0, tot + tail_tot))
+    return "\n".join(out) + "\n"
+
+
+def dp_line(mode: str, k: int, v: dict, mm: int, late: int, tot: int) -> str:
+    return (f"[kage-vita] ph120.dp bid={BID} win={k} loops={120 * k} mode={mode} "
+            f"d={v['d']} f={v['f']} pk={v['pk']} p1={v['p1']} sub={v['sub']} B={v['B']} "
+            f"mx={v['mx']} fr(r,c,s,f)={','.join(map(str, v['fr']))} "
+            f"v(p,s)={','.join(map(str, v['v']))} mm={mm} late={late} tot={tot}")
+
+
+def leg_draw_packet() -> None:
+    done = [0]
+
+    def ck(name: str, cond: bool, detail="") -> None:
+        done[0] += 1
+        check(name, cond, detail)
+
+    nonce = "0123456789ab"
+    game = "\n".join(good_game(nonce)) + "\n"
+    base = b.diagnose("\n".join(good_native()) + "\n", game, nonce)
+    ck("draw packet: no ph120.dp -> no dp columns",
+       all(not any(k.startswith("dp_") for k in r) for r in rows_of(base).values()),
+       str([k for r in rows_of(base).values() for k in r if k.startswith("dp_")]))
+    ck("draw packet: no ph120.dp -> no report table and no DP diagnostic",
+       "GL draw packet" not in b.report(base)
+       and not any(code.startswith("DP_") for _, code, _ in base["diagnostics"]), "")
+    nat0 = b.parse_native(dp_native("ON"))
+    pw, _ = b.phase_windows(nat0, b.parse_game(game))
+    win = dict((name, sel) for name, sel, _ in pw)["P2 fight-maxroom"][0]
+    ck("draw packet: the synthetic line parses as one ph120.dp per window",
+       all("ph120.dp" in w for k, w in nat0["wins"].items() if "ph120.rw" in w)
+       and nat0["wins"][win]["ph120.dp"].get("fr") == "30,25,12,0"
+       and nat0["wins"][win]["ph120.dp"].get("v") == "0,0", str(nat0["wins"][win].get("ph120.dp")))
+    for mode, v in DP_MODES.items():
+        res = b.diagnose(dp_native(mode), game, nonce)
+        ck(f"draw packet {mode}: run ok, no DP diagnostic",
+           res["ok"] and not any(code.startswith("DP_") for _, code, _ in res["diagnostics"]),
+           f"{res['verdict']} {[x for x in res['diagnostics'] if x[1].startswith('DP_')]}")
+        r = rows_of(res)["P2 fight-maxroom"]
+        nw = r.get("windows")
+        ck(f"draw packet {mode}: P2 has windows", isinstance(nw, int) and nw > 0, f"{nw}")
+        exp = {"dp_windows": nw, "dp_d": nw * v["d"], "dp_f": nw * v["f"], "dp_pk": nw * v["pk"],
+               "dp_p1": nw * v["p1"], "dp_sub": nw * v["sub"], "dp_B": nw * v["B"], "dp_mm": 0,
+               "dp_late": 0, "dp_mx": v["mx"], "dp_fr_r": nw * v["fr"][0], "dp_fr_c": nw * v["fr"][1],
+               "dp_fr_s": nw * v["fr"][2], "dp_fr_f": nw * v["fr"][3], "dp_vp": nw * v["v"][0],
+               "dp_vs": nw * v["v"][1], "dp_tot": 0,
+               # (pk + p1 + d - f) / d: VERIFY (9690 + 40 + 50) / 9700, ON (9650 + 40 + 50) / 9700
+               "dp_path_pd": (v["pk"] + v["p1"] + v["d"] - v["f"]) / v["d"],
+               "dp_rec_pd": 48721 / v["d"], "dp_sub_pd": v["sub"] / v["d"], "dp_bad": 0, "dp_missing": 0,
+               "dp_verify_windows": nw if mode == "VERIFY" else 0, "dp_cov": 0, "dp_vsx": 0}
+        for k, want in exp.items():
+            ck(f"draw packet {mode}: P2 {k}", near(r.get(k), want), f"{r.get(k)} != {want}")
+        ck(f"draw packet {mode}: P2 mode", r.get("dp_mode") == mode, f"{r.get('dp_mode')}")
+        text = b.report(res)
+        ck(f"draw packet {mode}: report table", f"GL draw packet per phase (ph120.dp, mode {mode} as the" in text
+           and "dp_path_pd" in text and "dp_missing" in text, text[-400:])
+        # one window with a differing packet / an overtaking record: FAIL DP_VERIFY naming P2
+        for what in ("mm", "late"):
+            bad_res = b.diagnose(dp_native(mode, bad_window=win, bad=what), game, nonce)
+            bad = rows_of(bad_res)
+            ck(f"draw packet {mode}: one window with {what} -> P2 dp_bad 1, only P2",
+               bad["P2 fight-maxroom"].get("dp_bad") == 1
+               and sum(x.get("dp_bad", 0) for x in bad.values()) == 1
+               and bad["P2 fight-maxroom"].get(f"dp_{what}") == (1 if what == "mm" else 2),
+               str({p: x.get("dp_bad") for p, x in bad.items()}))
+            want = "(mm 1, late 0)" if what == "mm" else "(mm 0, late 2)"
+            ck(f"draw packet {mode}: one window with {what} -> BENCH FAILED (DP_VERIFY)",
+               not bad_res["ok"] and bad_res["verdict"].startswith("BENCH FAILED (DP_VERIFY)")
+               and f"P2 1 {want}" in bad_res["verdict"], bad_res["verdict"])
+        miss_res = b.diagnose(dp_native(mode, missing_window=win), game, nonce)
+        ck(f"draw packet {mode}: one window without ph120.dp -> BENCH FAILED (DP_RECORD_MISSING)",
+           not miss_res["ok"] and miss_res["verdict"].startswith("BENCH FAILED (DP_RECORD_MISSING)")
+           and "P2 1" in miss_res["verdict"], miss_res["verdict"])
+        miss = rows_of(miss_res)["P2 fight-maxroom"]
+        ck(f"draw packet {mode}: one window without ph120.dp -> dp_missing 1, sums over the rest",
+           miss.get("dp_missing") == 1 and miss.get("dp_windows") == nw - 1
+           and near(miss.get("dp_d"), (nw - 1) * v["d"])
+           and near(miss.get("dp_rec_pd"), 48721 / v["d"]),
+           f"{miss.get('dp_missing')} {miss.get('dp_windows')} {miss.get('dp_d')} {miss.get('dp_rec_pd')}")
+        # p1 so large that the draw path is 2.03 records per draw: WARN in ON only
+        fat_res = b.diagnose(dp_native(mode, p1=10000), game, nonce)
+        warns = [(lv, msg) for lv, code, msg in fat_res["diagnostics"] if code == "DP_RECORDS_PER_DRAW"]
+        if mode == "ON":
+            ck("draw packet ON: path 2.03 records per draw -> WARN DP_RECORDS_PER_DRAW, run still ok",
+               fat_res["ok"] and len(warns) >= 1 and warns[0][0] == "WARN" and "P2 2.03" in warns[0][1],
+               str(warns))
+        else:
+            ck("draw packet VERIFY: path 2.03 records per draw -> no DP_RECORDS_PER_DRAW (VERIFY "
+               "publishes every call alone as well)", fat_res["ok"] and not warns, str(warns))
+    # every VERIFY condition a device gate relies on must be one diagnose() checks
+    def dp_codes(res, level):
+        return [(code, msg) for lv, code, msg in res["diagnostics"] if lv == level and code.startswith("DP_")]
+    zero = dict(DP_MODES["VERIFY"], v=(0, 0))
+    res = b.diagnose(dp_native("VERIFY", edit={k: zero for k in nat0["wins"]}), game, nonce)
+    ck("draw packet VERIFY: v(p,s) = 0,0 in every window -> BENCH FAILED (DP_VERIFY_EMPTY) naming P2",
+       not res["ok"] and ("DP_VERIFY_EMPTY" in res["verdict"]) and any(
+           code == "DP_VERIFY_EMPTY" and "P2" in msg for code, msg in dp_codes(res, "FAIL")), res["verdict"])
+    res = b.diagnose(dp_native("ON", edit={k: zero for k in nat0["wins"]}), game, nonce)
+    ck("draw packet ON: v(p,s) = 0,0 (ON compares nothing) -> no DP diagnostic",
+       res["ok"] and not dp_codes(res, "FAIL") and not dp_codes(res, "WARN"), res["verdict"])
+    res = b.diagnose(dp_native("VERIFY", tail_tot=1), game, nonce)
+    ck("draw packet VERIFY: tot = 1 only after the last phase window (mm = late = 0 everywhere) -> "
+       "BENCH FAILED (DP_VERIFY) with the run's tot",
+       not res["ok"] and res["verdict"].startswith("BENCH FAILED (DP_VERIFY)")
+       and "tot (mm + late since boot) = 1" in res["verdict"]
+       and sum(r.get("dp_bad", 0) for r in rows_of(res).values()) == 0, res["verdict"])
+    pk = DP_MODES["VERIFY"]["pk"]
+    for dv, fail in ((1, False), (-1, False), (2, True), (-2, True)):
+        vw = dict(DP_MODES["VERIFY"], v=(pk + dv, DP_MODES["VERIFY"]["v"][1]))
+        res = b.diagnose(dp_native("VERIFY", edit={win: vw}), game, nonce)
+        cov = [msg for code, msg in dp_codes(res, "FAIL") if code == "DP_VERIFY_COVERAGE"]
+        if fail:
+            ck(f"draw packet VERIFY: one P2 window with v(p) = pk {dv:+d} -> BENCH FAILED "
+               "(DP_VERIFY_COVERAGE) naming P2 1",
+               not res["ok"] and res["verdict"].startswith("BENCH FAILED (DP_VERIFY_COVERAGE)")
+               and len(cov) == 1 and "P2 1 of" in cov[0]
+               and rows_of(res)["P2 fight-maxroom"].get("dp_cov") == 1, res["verdict"])
+        else:
+            ck(f"draw packet VERIFY: one P2 window with v(p) = pk {dv:+d} (the take's packet) -> run ok, "
+               "no DP diagnostic", res["ok"] and not dp_codes(res, "FAIL") and not dp_codes(res, "WARN"),
+               res["verdict"])
+    vw = dict(DP_MODES["VERIFY"], v=(pk, DP_MODES["VERIFY"]["v"][1] - 3))
+    res = b.diagnose(dp_native("VERIFY", edit={win: vw}), game, nonce)
+    warns = [msg for code, msg in dp_codes(res, "WARN") if code == "DP_VERIFY_SUBS"]
+    ck("draw packet VERIFY: one P2 window with v(s) = sub + f - 3 -> WARN DP_VERIFY_SUBS naming P2 1, run ok",
+       res["ok"] and len(warns) == 1 and "P2 1 of" in warns[0]
+       and rows_of(res)["P2 fight-maxroom"].get("dp_vsx") == 1, f"{res['verdict']} {warns}")
+    res = b.diagnose(dp_native("VERIFY", bad_window=win, bad="mm", edit={win: vw}), game, nonce)
+    ck("draw packet VERIFY: the same v(s) gap in a window with mm > 0 -> DP_VERIFY only, no DP_VERIFY_SUBS",
+       not res["ok"] and not [c for c, _ in dp_codes(res, "WARN") if c == "DP_VERIFY_SUBS"], res["verdict"])
+    # a printed mode the recorder never prints (BAD) is reported as printed, not hidden
+    odd = rows_of(b.diagnose(dp_native("ON", mode_text="BAD"), game, nonce))["P2 fight-maxroom"]
+    ck("draw packet: mode=BAD is carried to the row", odd.get("dp_mode") == "BAD", f"{odd.get('dp_mode')}")
+    print(f"draw packet: {done[0]} checks (VERIFY and ON: 22 hand-checked P2 values each, mode, report "
+          "table; one window with mm or late, or tot > 0 anywhere in the run, is BENCH FAILED (DP_VERIFY); "
+          "VERIFY with v(p) = 0 is DP_VERIFY_EMPTY, |v(p) - pk| > 1 is DP_VERIFY_COVERAGE, v(s) != sub + f "
+          "is WARN DP_VERIFY_SUBS; one window "
+          "without ph120.dp is BENCH FAILED (DP_RECORD_MISSING); more than 2 records per draw is WARN "
+          "DP_RECORDS_PER_DRAW in ON only)")
+
+
 def leg_census() -> None:
     nonce = "0123456789ab"
     game = "\n".join(good_game(nonce)) + "\n"
@@ -533,8 +1009,8 @@ def leg_census() -> None:
     check("opcode names from the generated enum", names.get(1) == "glActiveTexture" and
           names.get(24) == "glDrawElements" and names.get(78) == "WORKER_CALL" and
           names.get(79) == "ATTRIBS_ENABLE" and names.get(80) == "ATTRIBS_DISABLE" and
-          names.get(81) == "KAGE_BIND_PACKET" and max(names) == 81,
-          str({k: names.get(k) for k in (1, 24, 78, 79, 80, 81)}))
+          names.get(81) == "KAGE_BIND_PACKET" and names.get(82) == "DRAW_PACKET" and max(names) == 82,
+          str({k: names.get(k) for k in (1, 24, 78, 79, 80, 81, 82)}))
     c = rows_of(res)["P2 fight-maxroom"].get("census") or {}
     check("census windows", (c.get("windows"), c.get("incomplete"), c.get("mismatch"), c.get("presents"))
           == (9, 0, 0, 1080), str({k: c.get(k) for k in ("windows", "incomplete", "mismatch", "presents")}))
@@ -2845,6 +3321,118 @@ def leg_listing() -> None:
     print("listing: actions and verify")
 
 
+# Image preload (+ pin): the receipts of host_vita_image_retain.c in the shapes its printf formats produce
+# (the module strings: 'armed' irp_arm, 'present' irpp_present, 'image' irp_one, PIN 'level'
+# irpp_level_end, 'level' isaac_vita_image_preload_level_init, 'hit'/'miss' irp_offer,
+# 'totals' irp_report/irpp_report, 'lost' irpp_settle).
+IRP_KEY = "resources/gfx/BulletAtlas.png"
+IRP_LINES = [
+    "KAGE VITA IMAGE PRELOAD: armed n=1 truncated=0 max_kb=2048 reserve_mb=4 heap_factor=2 "
+    f"list=gfx/BulletAtlas.png build={BID}",
+    f"KAGE VITA IMAGE PRELOAD PIN: armed mode=on share=1/2 set_max=4 lines_max=64 build={BID}",
+    "KAGE VITA IMAGE PRELOAD PIN: present name=gfx/BulletAtlas.png level=1 k=1/1 image=9a000040 strong=1 "
+    "flags=00000010 bytes=2097152 rec=0 own=0 key=resources/mods/x/gfx/BulletAtlas.png",
+    "KAGE VITA IMAGE PRELOAD: image name=gfx/BulletAtlas.png result=retained image=9a100000 bytes=2097152 "
+    f"dim=1024x512x4 flags=00000000 us=48211 hr_kb=11807..9705 live=12/30000000 key={IRP_KEY}",
+    "KAGE VITA IMAGE PRELOAD PIN: level=1 mode=on pins=1 pinned_bytes=2097152 share=16777216 released=0 "
+    "pinned=1 own=0 exact=0 alias=1 held=0",
+    "KAGE VITA IMAGE PRELOAD: level=1 n=1 loaded=1 retained=1 dropped=0 present=1 fail=0 skipped=0 "
+    "bytes=2097152 us=48530 hr_kb=11807..9705 need_kb=8192 fault=0",
+    "KAGE VITA IMAGE PRELOAD: totals levels=1 loaded=1 retained=1 dropped=0 present=1 fail=0 hit=0 miss=0 "
+    "evicted_unused=0 skip(s,l,t,v,h,k)=0,0,0,0,0,0 breach=0 bytes=2097152 us=48530 why=periodic",
+    "KAGE VITA IMAGE PRELOAD PIN: totals mode=on pinned=1 refused=0 used=0 floor=0 yield=0 stale=0 "
+    "dropped=0 skip=2 cskip=0 own=0 exact=0 alias=1 held=0 on_free=0 lost=0 twins=0 pins=1 "
+    "pinned_bytes=2097152 why=periodic",
+    "KAGE VITA IMAGE PRELOAD: hit name=gfx/BulletAtlas.png image=9a100000 hit=1 miss=0",
+    "KAGE VITA IMAGE PRELOAD PIN: miss name=gfx/BulletAtlas.png level=1 image=9a200000 flags=00000010 "
+    f"state=2 pinned=0 twins=2 key={IRP_KEY}",
+    "KAGE VITA IMAGE PRELOAD: miss name=gfx/BulletAtlas.png image=9a200000 state=2 flags=00000010 hit=1 miss=1",
+    "KAGE VITA IMAGE PRELOAD: level=2 n=1 loaded=0 retained=0 dropped=0 present=0 fail=0 skipped=1 "
+    "bytes=0 us=3 hr_kb=7484..7484 need_kb=8192 fault=0",
+    "KAGE VITA IMAGE PRELOAD PIN: level=2 mode=on pins=0 pinned_bytes=0 share=16777216 released=0 pinned=0 "
+    "own=0 exact=0 alias=0 held=0",
+    "KAGE VITA IMAGE PRELOAD PIN: lost name=gfx/BulletAtlas.png level=2 image=9a200000 flags=00000010 "
+    "lost=1 exit=ineligible",
+    "KAGE VITA IMAGE PRELOAD: totals levels=2 loaded=1 retained=1 dropped=0 present=1 fail=0 hit=1 miss=1 "
+    "evicted_unused=0 skip(s,l,t,v,h,k)=0,0,0,0,1,0 breach=0 bytes=2097152 us=48533 why=loading-complete",
+    "KAGE VITA IMAGE PRELOAD PIN: totals mode=on pinned=1 refused=0 used=1 floor=0 yield=0 stale=0 "
+    "dropped=0 skip=2 cskip=1 own=0 exact=0 alias=1 held=0 on_free=0 lost=1 twins=1 pins=0 pinned_bytes=0 "
+    "why=loading-complete",
+]
+
+
+def irp_native(lines: list[str], tail: list[str] = ()) -> str:
+    nat = good_native()
+    stamped = [f"[{40.0 + k:.3f} thr 0x40010003] {x}" for k, x in enumerate(lines)]
+    return "\n".join(nat[:3] + stamped + nat[3:] + list(tail)) + "\n"
+
+
+def leg_image_preload() -> None:
+    nonce = "0123456789ab"
+    game = "\n".join(good_game(nonce)) + "\n"
+    plain = b.diagnose("\n".join(good_native()) + "\n", game, nonce)
+    check("image preload: none in the log -> None, no report block",
+          plain.get("image_preload") is None and "image preload (" not in b.report(plain),
+          str(plain.get("image_preload")))
+    res = b.diagnose(irp_native(IRP_LINES), game, nonce)
+    irp = res.get("image_preload") or {}
+    check("image preload: run still ok", res["ok"], res["verdict"])
+    check("image preload: armed + pin armed",
+          (irp.get("armed") or {}).get("reserve_mb") == "4" and (irp.get("pin_armed") or {}).get("mode") == "on",
+          f"{irp.get('armed')} {irp.get('pin_armed')}")
+    check("image preload: two levels, two pin levels, keyed by level",
+          [x.get("level") for x in irp.get("levels", [])] == ["1", "2"]
+          and [x.get("level") for x in irp.get("pin_levels", [])] == ["1", "2"]
+          and irp["levels"][0].get("hr_kb") == "11807..9705" and irp["levels"][1].get("skipped") == "1"
+          and irp["pin_levels"][0].get("alias") == "1", str(irp.get("levels")))
+    check("image preload: the decode line",
+          len(irp.get("images", [])) == 1 and irp["images"][0].get("result") == "retained"
+          and irp["images"][0].get("key") == IRP_KEY and irp["images"][0].get("dim") == "1024x512x4",
+          str(irp.get("images")))
+    check("image preload: totals = the last report (cumulative), skip tuple kept",
+          (irp.get("totals") or {}).get("why") == "loading-complete" and irp["totals"].get("hit") == "1"
+          and irp["totals"].get("skip") == "0,0,0,0,1,0"
+          and (irp.get("pin_totals") or {}).get("used") == "1" and irp["pin_totals"].get("twins") == "1"
+          and irp["pin_totals"].get("cskip") == "1" and irp["pin_totals"].get("lost") == "1",
+          f"{irp.get('totals')} {irp.get('pin_totals')}")
+    check("image preload: hit / miss lines counted, pin present+miss+lost lines kept raw",
+          irp.get("hit_lines") == 1 and irp.get("miss_lines") == 1 and irp.get("pin_lines_n") == 3
+          and irp.get("pin_lines", [""])[0].startswith("present name=gfx/BulletAtlas.png level=1 k=1/1")
+          and irp["pin_lines"][1].startswith("miss name=gfx/BulletAtlas.png level=1")
+          and irp["pin_lines"][2] == "lost name=gfx/BulletAtlas.png level=2 image=9a200000 flags=00000010 "
+          "lost=1 exit=ineligible", str(irp.get("pin_lines")))
+    text = b.report(res)
+    check("image preload: report block",
+          "image preload (KAGE VITA IMAGE PRELOAD; list=gfx/BulletAtlas.png reserve_mb=4" in text
+          and "pin on;" in text
+          and "  level   1: loaded=1 retained=1 dropped=0 present=1 fail=0 skipped=0" in text
+          and "| pin pins=1 pinned_bytes=2097152 share=16777216 released=0 pinned=1 own=0 exact=0 alias=1" in text
+          and "  pin totals: mode=on pinned=1 refused=0 used=1 floor=0 yield=0 stale=0 dropped=0 skip=2 cskip=1 "
+          "own=0" in text
+          and f"  decode: name=gfx/BulletAtlas.png result=retained bytes=2097152 dim=1024x512x4" in text
+          and "(hit lines 1, miss lines 1, evicted-unused lines 0)" in text, text[:1500])
+    # A second boot of another build appended to the same log: its receipts are not this run's.
+    other = "[0.306 thr 0x40010003] build rel:another-build-0000000000000000; guest base=0x98000000; softfp ARMv7"
+    mixed = b.diagnose(irp_native(IRP_LINES, [other, IRP_LINES[0], IRP_LINES[5]]), game, nonce)
+    m = mixed.get("image_preload") or {}
+    check("image preload: lines after another build's banner are ignored",
+          len(m.get("levels", [])) == 2 and m.get("images") and len(m["images"]) == 1, str(m.get("levels")))
+    # PRELOAD without PIN: no pin block.
+    nopin = [x for x in IRP_LINES if "PRELOAD PIN:" not in x]
+    np_res = b.diagnose(irp_native(nopin), game, nonce)
+    np_text = b.report(np_res)
+    check("image preload: no PIN receipts -> 'pin not built', no pin totals line",
+          (np_res.get("image_preload") or {}).get("pin_totals") is None and "pin not built;" in np_text
+          and "pin totals:" not in np_text, np_text[:800])
+    # More present/miss/lost lines than the report keeps: counted, the first ones kept.
+    flood = IRP_LINES + [IRP_LINES[9]] * (b.IRP_PIN_LINES_KEEP + 5)
+    fl = b.diagnose(irp_native(flood), game, nonce).get("image_preload") or {}
+    check("image preload: pin line cap",
+          len(fl.get("pin_lines", [])) == b.IRP_PIN_LINES_KEEP and fl.get("pin_lines_n") == b.IRP_PIN_LINES_KEEP + 8,
+          f"{len(fl.get('pin_lines', []))} {fl.get('pin_lines_n')}")
+    print("bench image preload (+ pin) receipts: parsed and reported")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     env = os.environ.get("BENCH_SMOKE_ROOT")
@@ -2856,6 +3444,10 @@ def main(argv=None) -> int:
     leg_lua()
     leg_smoke(a.smoke_root)
     leg_phases()
+    leg_admit_wait()
+    leg_image_preload()
+    leg_admit_behind()
+    leg_draw_packet()
     leg_census()
     leg_floor_debt()
     leg_floor_debt_stuck()

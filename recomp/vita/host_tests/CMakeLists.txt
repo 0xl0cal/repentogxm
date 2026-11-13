@@ -311,6 +311,25 @@ endforeach()
 target_compile_definitions(kage_vita_frame_spike_seams_test PRIVATE
   ISAAC_VITA_FRAME_SPIKE_PROFILE=1)
 
+# ISAAC_VITA_UPDATE_HITCH_PROBE: the production records with every seam
+# stubbed (full) and with none (bare).  The scheduler/Lua-cost/sampler legs,
+# the OFF surface check, the log parser and the mutants are driven by
+# recomp/vita/test_kage_vita_update_hitch.py.
+foreach(hitch_leg IN ITEMS bare full)
+  add_executable(kage_vita_update_hitch_record_${hitch_leg}_test
+    kage_vita_update_hitch_record_test.c)
+  target_compile_features(kage_vita_update_hitch_record_${hitch_leg}_test PRIVATE c_std_11)
+  target_compile_options(kage_vita_update_hitch_record_${hitch_leg}_test PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -Werror>)
+  target_include_directories(kage_vita_update_hitch_record_${hitch_leg}_test PRIVATE
+    ../../runtime ..)
+  add_test(NAME kage_vita_update_hitch_record_${hitch_leg}_test
+    COMMAND kage_vita_update_hitch_record_${hitch_leg}_test)
+endforeach()
+target_compile_definitions(kage_vita_update_hitch_record_full_test PRIVATE
+  KVUH_TEST_FULL=1)
+
 add_executable(vita_fbo_rt_reuse_test
   vita_fbo_rt_reuse_test.c
   ../vitagl-stock-reference/isaac_fbo_rt_reuse.c)

@@ -354,6 +354,96 @@ if(ISAAC_VITA_IMAGE_RETAIN_GHOST AND
   message(FATAL_ERROR
     "ISAAC_VITA_IMAGE_RETAIN_GHOST requires IMAGE_RETAIN=ON, IMAGE_RETAIN_BUDGET_MB=0 and PHASE_PROFILE=ON")
 endif()
+option(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE
+       "Diagnostic: with IMAGE_RETAIN, one 'KAGE VITA IMAGE RETAIN BIG:' log line per decision the retention seam takes about a sheet of at least ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB KiB (new/reuse/inel-rt/inel-tex/inel-name/inel-bytes/absent/oversize/headroom-pass/pass-budget0/pass-table/reacquired/keep-held/keep-nested/evict-budget/evict-headroom/evict-table/stale/stale-reused) with the sheet's ImageManager name, and per-reason ineligible totals in every retain report; no clock reads, no guest writes, candidate path only (needs IMAGE_RETAIN)" OFF)
+set(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB "1024" CACHE STRING
+    "With ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE: name sheets of at least this many KiB of pw*ph*bpp (decimal, 1..65536; default 1024)")
+if(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE)
+  if(NOT ISAAC_VITA_IMAGE_RETAIN)
+    message(FATAL_ERROR
+      "ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE requires ISAAC_VITA_IMAGE_RETAIN=ON")
+  endif()
+  # Decimal only: a leading 0 would be octal in C.
+  if(NOT ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB MATCHES "^[1-9][0-9]*$" OR
+     ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB GREATER 65536)
+    message(FATAL_ERROR
+      "ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB must be a decimal integer 1..65536 "
+      "(got '${ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB}')")
+  endif()
+endif()
+set(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED "OFF" CACHE STRING
+    "With IMAGE_RETAIN: what the retention seam does with a sheet whose flags word has bit 0x10 (member of the batch renderer's TOUCHED vector: a flush drew it in the last 5 s) when its last user lets go.  OFF = refuse, the sheet is freed and decoded again on its next use (every object byte-identical).  OBSERVE = same decisions as OFF plus a 'KAGE VITA IMAGE RETAIN TOUCHED:' receipt counting what ON would keep.  ON = keep it when bit 0x04 (quads still queued) is clear, the TOUCHED vector holds it exactly once and no {batch, Image} pair of it is pending; a record whose Image is still on a flush list is never evicted (rule E), the byte budget stays a hard cap")
+set_property(CACHE ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED PROPERTY STRINGS OFF OBSERVE ON)
+if(NOT ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED MATCHES "^(OFF|OBSERVE|ON)$")
+  message(FATAL_ERROR
+    "ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED must be OFF, OBSERVE or ON "
+    "(got '${ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED}')")
+endif()
+if(NOT ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED STREQUAL "OFF" AND
+   NOT ISAAC_VITA_IMAGE_RETAIN)
+  message(FATAL_ERROR
+    "ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=${ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED} requires ISAAC_VITA_IMAGE_RETAIN=ON")
+endif()
+option(ISAAC_VITA_IMAGE_PRELOAD
+       "At every floor load (after Level::Init and the SFX floor preload), decode the sheets of ISAAC_VITA_IMAGE_PRELOAD_LIST that are not in the ImageManager yet by replaying the game's own Load call (0x565fad) and hand them to the retention seam, so a fight's first use is a manager hit instead of a PNG decode + upload.  Each sheet is skipped (and counted) when IMAGE_RETAIN cannot take MAX_KB, when guest heap headroom is below RESERVE_MB + 2 x MAX_KB, or under the manager lock.  Needs IMAGE_RETAIN and SFX_FLOOR_PRELOAD.  OFF keeps every object byte-identical" OFF)
+set(ISAAC_VITA_IMAGE_PRELOAD_LIST "gfx/BulletAtlas.png" CACHE STRING
+    "With ISAAC_VITA_IMAGE_PRELOAD: comma-separated resource names as the game passes them to Load (at most 8 names of at most 95 characters, 160 in all; letters, digits and _ . / - only)")
+set(ISAAC_VITA_IMAGE_PRELOAD_MAX_KB "2048" CACHE STRING
+    "With ISAAC_VITA_IMAGE_PRELOAD: the largest decoded sheet (pw*ph*bpp, KiB) the memory gates budget for per name (decimal, 1..16384; default 2048 = 1024x512 RGBA)")
+set(ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB "8" CACHE STRING
+    "With ISAAC_VITA_IMAGE_PRELOAD: guest heap headroom (MiB) that must remain beyond 2 x MAX_KB for a sheet to be preloaded (decimal, 0..64; default 8)")
+if(ISAAC_VITA_IMAGE_PRELOAD)
+  if(NOT ISAAC_VITA_IMAGE_RETAIN OR NOT ISAAC_VITA_SFX_FLOOR_PRELOAD)
+    message(FATAL_ERROR
+      "ISAAC_VITA_IMAGE_PRELOAD requires ISAAC_VITA_IMAGE_RETAIN=ON (it keeps the sheets) and ISAAC_VITA_SFX_FLOOR_PRELOAD=ON (its Level::Init seam calls it)")
+  endif()
+  string(LENGTH "${ISAAC_VITA_IMAGE_PRELOAD_LIST}" ISAAC_IMAGE_PRELOAD_LIST_LENGTH)
+  if(NOT ISAAC_VITA_IMAGE_PRELOAD_LIST MATCHES "^[A-Za-z0-9_./-]+(,[A-Za-z0-9_./-]+)*$" OR
+     ISAAC_IMAGE_PRELOAD_LIST_LENGTH GREATER 160)
+    message(FATAL_ERROR
+      "ISAAC_VITA_IMAGE_PRELOAD_LIST must be 1..160 characters of comma-separated names made of letters, digits and _ . / - "
+      "(got '${ISAAC_VITA_IMAGE_PRELOAD_LIST}')")
+  endif()
+  string(REPLACE "," ";" ISAAC_IMAGE_PRELOAD_NAMES "${ISAAC_VITA_IMAGE_PRELOAD_LIST}")
+  list(LENGTH ISAAC_IMAGE_PRELOAD_NAMES ISAAC_IMAGE_PRELOAD_COUNT)
+  if(ISAAC_IMAGE_PRELOAD_COUNT GREATER 8)
+    message(FATAL_ERROR
+      "ISAAC_VITA_IMAGE_PRELOAD_LIST holds ${ISAAC_IMAGE_PRELOAD_COUNT} names; the module takes at most 8")
+  endif()
+  foreach(ISAAC_IMAGE_PRELOAD_NAME IN LISTS ISAAC_IMAGE_PRELOAD_NAMES)
+    string(LENGTH "${ISAAC_IMAGE_PRELOAD_NAME}" ISAAC_IMAGE_PRELOAD_NAME_LENGTH)
+    if(ISAAC_IMAGE_PRELOAD_NAME_LENGTH GREATER 95)
+      message(FATAL_ERROR
+        "ISAAC_VITA_IMAGE_PRELOAD_LIST: '${ISAAC_IMAGE_PRELOAD_NAME}' is longer than 95 characters")
+    endif()
+  endforeach()
+  # Decimal only: a leading 0 would be octal in C.
+  if(NOT ISAAC_VITA_IMAGE_PRELOAD_MAX_KB MATCHES "^[1-9][0-9]*$" OR
+     ISAAC_VITA_IMAGE_PRELOAD_MAX_KB GREATER 16384)
+    message(FATAL_ERROR
+      "ISAAC_VITA_IMAGE_PRELOAD_MAX_KB must be a decimal integer 1..16384 "
+      "(got '${ISAAC_VITA_IMAGE_PRELOAD_MAX_KB}')")
+  endif()
+  if(NOT ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB MATCHES "^(0|[1-9][0-9]*)$" OR
+     ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB GREATER 64)
+    message(FATAL_ERROR
+      "ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB must be a decimal integer 0..64 "
+      "(got '${ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB}')")
+  endif()
+endif()
+set(ISAAC_VITA_IMAGE_PRELOAD_PIN "OFF" CACHE STRING
+    "With IMAGE_PRELOAD: what happens to a preloaded sheet between the floor load and its first use.  OFF = nothing, it is an ordinary retained record that LRU eviction may take before the fight asks for it (every object byte-identical).  OBSERVE = same decisions as OFF plus 'KAGE VITA IMAGE PRELOAD PIN' receipts naming, per name, why a sheet was skipped as 'present' (exact record, mods/ alias, held by a live user) and whether the first use hit, missed, or found it evicted.  ON = also pin it: the eviction walker skips a pinned record (at most budget/2 bytes of pins, yielding when the headroom gate needs the bytes), a sheet the game still holds is pinned when its last user lets go, and every pin is released at its first use or at the next floor load.  The byte budget stays a hard cap")
+set_property(CACHE ISAAC_VITA_IMAGE_PRELOAD_PIN PROPERTY STRINGS OFF OBSERVE ON)
+if(NOT ISAAC_VITA_IMAGE_PRELOAD_PIN MATCHES "^(OFF|OBSERVE|ON)$")
+  message(FATAL_ERROR
+    "ISAAC_VITA_IMAGE_PRELOAD_PIN must be OFF, OBSERVE or ON "
+    "(got '${ISAAC_VITA_IMAGE_PRELOAD_PIN}')")
+endif()
+if(NOT ISAAC_VITA_IMAGE_PRELOAD_PIN STREQUAL "OFF" AND
+   NOT ISAAC_VITA_IMAGE_PRELOAD)
+  message(FATAL_ERROR
+    "ISAAC_VITA_IMAGE_PRELOAD_PIN=${ISAAC_VITA_IMAGE_PRELOAD_PIN} requires ISAAC_VITA_IMAGE_PRELOAD=ON")
+endif()
 option(ISAAC_VITA_LUA
        "Enable the experimental pinned Lua 5.3.3 runtime bridge" OFF)
 set(ISAAC_LUA53_SOURCE_DIR "" CACHE PATH
@@ -484,10 +574,19 @@ endif()
 if(ISAAC_VITA_LUA_GC_PROFILE AND NOT ISAAC_VITA_LUA)
   message(FATAL_ERROR "ISAAC_VITA_LUA_GC_PROFILE requires ISAAC_VITA_LUA=ON")
 endif()
+option(ISAAC_VITA_LUA_GC_STATE_PROFILE
+       "Measurement only, with ISAAC_VITA_LUA_GC_PROFILE and ISAAC_VITA_LUA_GC_FINALIZER_PACE: split every luaC_step by collector state (pause, propagate, atomic and its five sub-phases, sweep, sweep end, callfin, tail finalizers) and by origin (LuaEngine::Update's paced step, another lua_gc, an allocation-driven step) through three hooks the lgc.c derivation adds (--state-profile); four more log lines per gc window: [isaac-lua] gc state / gc cls / gc asub / gc worst.  The collector's decisions are unchanged (recomp/test_vita_lua_gc_state_idle.py)" OFF)
+option(ISAAC_VITA_LUA_GC_IDLE_STEP
+       "LuaEngine::Update's paced lua_gc step (return word 0x4023c6, the last guest work of a main-loop iteration) is carried one loop tail when the full-speed scheduler reports that the tick ran Game::Update and no wait follows (the interpolated render is next) AND the step cannot run atomic() there: the collector is in a sweep or callfin state, or in propagate with a gray list proven longer than the step's budget (a bounded walk, 512 objects); a pause, atomic or unproven propagate step runs in place.  The carried step runs whole, with its own budget, after that render, inside the next LuaEngine::Update's lua_gc(GCCOUNT) import (return word 0x4022ec), i.e. before the guest controller reads the heap.  At most one step is carried; outside the scheduler's control the call is today's.  Logs [isaac-lua] gc idle / gc idle us / gc idle why per 120 steps.  Requires ISAAC_VITA_FULLSPEED_SCHEDULER; exclusive with ISAAC_VITA_FULLSPEED_HEAD_ADVANCE" OFF)
 option(ISAAC_VITA_LUA_CORE_ARM
        "Compile the pristine Lua 5.3.3 archive (VM, GC, API) in ARM instead of Thumb-2 mode; same C, codegen only.  The bridge logs the mode it observes at state creation ([isaac-lua] core isa=)" OFF)
 if(ISAAC_VITA_LUA_CORE_ARM AND NOT ISAAC_VITA_LUA)
   message(FATAL_ERROR "ISAAC_VITA_LUA_CORE_ARM requires ISAAC_VITA_LUA=ON")
+endif()
+option(ISAAC_VITA_LUA_VM_COMPUTED_GOTO
+       "Compile the Lua 5.3.3 VM (lvm.c) from a derivation whose dispatch is computed goto (GCC labels as values, the Lua 5.4 ljumptab.h spelling) instead of the pristine switch: each instruction ends with its own fetch and indirect branch through a 64-entry table; no opcode body changes, line numbers kept (recomp/vita/lua53_vm_computed_goto.py).  The bridge logs the mode the linked lvm.c defines at state creation ([isaac-lua] vm dispatch=)" OFF)
+if(ISAAC_VITA_LUA_VM_COMPUTED_GOTO AND NOT ISAAC_VITA_LUA)
+  message(FATAL_ERROR "ISAAC_VITA_LUA_VM_COMPUTED_GOTO requires ISAAC_VITA_LUA=ON")
 endif()
 option(ISAAC_VITA_LUA_COST_PROFILE
        "Profiling: per ~2 s window log the time of top-level lua_pcallk imports, the translated LuaBridge callbacks they reach (top 8 targets), automatic GC steps (--wrap=luaC_step) and Lua allocator calls (--wrap=luaM_realloc_); two bounded [isaac-lua] cost lines" OFF)
@@ -498,40 +597,93 @@ endif()
 # step (lgc.c:841-850 doubles gcfinnum without bound; lgc.c:45 charges a
 # finalizer 5 work units): with EID ~1,400-1,700 LuaBridge callbacks, 13-18 ms
 # in one LuaEngine::Update step every 3-4 s.  ON compiles isaac_lua53 from a
-# derived lgc.c (recomp/vita/lua53_gc_finalizer_pace.py: exactly two lines,
-# line count preserved) in which one runafewfinalizers call runs at most MAX
-# finalizers and each costs COST work units, so a K KB step runs at most
-# ~K*1024/COST + 2*MAX of them.  Which objects are finalized, their order,
-# error propagation, luaC_fullgc and lua_close are unchanged; only when a
-# pending finalizer runs moves later (the Lua 5.4 policy, rescaled).
-# ISAAC_VITA_LUA_GC_SWEEP_COST (same derived file, third line lgc.c:39)
-# charges SWEEP work units per swept object instead of the pristine 5, so a
-# K KB step sweeps ~K*1024/SWEEP objects: the console frees/flips one object
-# in ~0.3-0.6 us, and pristine 5 lets one 128 KB step sweep ~26,000 of them
-# (the 11-15 ms GC steps without finalizers in the device GC profile).  The
-# default 5 leaves lgc.c:39 pristine.  OFF compiles the pristine 33-source
-# closure byte-identically; the sub-knobs refuse a non-default value then.
+# derived lgc.c and lbaselib.c (recomp/vita/lua53_gc_finalizer_pace.py:
+# lgc.c 17 lines, 16 without a sweep quota, lbaselib.c 2 lines, line counts
+# preserved; its docstring lists them).  A paced luaC_step charges a
+# finalizer (budget + GCSTEPSIZE) / FINALIZER_STEP work units, so it runs
+# ~FINALIZER_STEP finalizers whatever its budget (at most 5*STEP/4 + 2*MAX);
+# after the atomic phase one runafewfinalizers call runs at most
+# FINALIZER_MAX (elsewhere -- the backlog an emergency collection leaves --
+# it doubles as pristine); a step that ends in GCScallfin keeps at most
+# GCSTEPSIZE bytes of credit; and the pause after a cycle that ended late is
+# shortened by the lateness.  The pacer serves the engine's own schedule
+# only (review r5): the first time a Lua script calls collectgarbage with an
+# option other than "count" or "isrunning" (the derived lbaselib.c tells the
+# derived lgc.c; the engine's lua_gc import never passes there), that Lua
+# state runs pristine 5.3.3's collector for the rest of its life, from
+# whatever state the cycle is in.  Four review rounds found script-driven
+# schedules the pacer handled worse than pristine (review r2 B3: on the
+# review-r2 host harness eaec5e2's quotas put the peak at 8.1-9.7x pristine's
+# under "stop" and 8.5-10.8x at setstepmul 40; review r3 B-R1 "restart",
+# review r4 B-R2 a "step" or "restart" during the sweep and B-R4 setstepmul
+# toggled every loop); the latch closes that class instead of a fifth rule
+# (a state latched before its first paced step is pristine bit for bit; one
+# latched later runs pristine's code from the heap the pacer left, and how
+# close it then stays to pristine is a host measurement per leg,
+# LUA-GC-R5-round2.md; before a script's first control call the pacer
+# runs).  A paced step's debt is restored after its tail finalizers, so a
+# __gc that allocates neither holds off the paced drain nor chains steps
+# into one loop (review r5 B1/B2).  This bounds one step,
+# not the heap: the heap against pristine is a host measurement at the
+# engine's schedule, 10..1000 finalizers per step (LUA-GC-R5.md).
+# ISAAC_VITA_LUA_GC_SWEEP_STEP (> 0: line lgc.c:39) paces the sweep the same
+# way, ~SWEEP_STEP objects per step instead of ~K*205 (the 11-15 ms GC steps
+# without finalizers in the device GC profile); 0 leaves lgc.c:39 pristine.
+# Which objects are finalized, their
+# order, the error a raising __gc raises, emergency collections, luaC_fullgc
+# and lua_close are unchanged; when a pending finalizer runs moves later, and
+# with it the call a raising __gc surfaces from.  OFF compiles
+# the pristine 33-source closure byte-identically; the sub-knobs refuse a
+# non-default value then.  The review-r0 knobs ISAAC_VITA_LUA_GC_FINALIZER_COST
+# and ISAAC_VITA_LUA_GC_SWEEP_COST are retired: a non-default value is refused,
+# a cached default is dropped.
 option(ISAAC_VITA_LUA_GC_FINALIZER_PACE
-       "Pace Lua __gc finalizers: compile isaac_lua53 from a derived lgc.c (two lines) that runs at most ISAAC_VITA_LUA_GC_FINALIZER_MAX finalizers per runafewfinalizers call and charges each ISAAC_VITA_LUA_GC_FINALIZER_COST work units; OFF keeps the pristine Lua closure byte-identical" OFF)
+       "Pace Lua __gc finalizers: compile isaac_lua53 from a derived lgc.c and lbaselib.c in which a GC step runs about ISAAC_VITA_LUA_GC_FINALIZER_STEP finalizers (at most ISAAC_VITA_LUA_GC_FINALIZER_MAX per runafewfinalizers call) and a Lua state whose scripts call collectgarbage with any option but count/isrunning runs pristine 5.3.3 from then on; OFF keeps the pristine Lua closure byte-identical" OFF)
 set(ISAAC_VITA_LUA_GC_FINALIZER_MAX 8 CACHE STRING
     "ISAAC_VITA_LUA_GC_FINALIZER_PACE: most finalizers one runafewfinalizers call runs (1..4096; pristine doubles without bound)")
-set(ISAAC_VITA_LUA_GC_FINALIZER_COST 512 CACHE STRING
-    "ISAAC_VITA_LUA_GC_FINALIZER_PACE: GC work units charged per finalizer (1..65536; pristine 5; 1 unit ~ 1 byte marked, ~9 ns on the console)")
-set(ISAAC_VITA_LUA_GC_SWEEP_COST 5 CACHE STRING
-    "ISAAC_VITA_LUA_GC_FINALIZER_PACE: GC work units charged per swept object (1..400; 5 = pristine, line untouched)")
+set(ISAAC_VITA_LUA_GC_FINALIZER_STEP 192 CACHE STRING
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE: finalizers one paced GC step runs, whatever its budget (72..320; a paced step runs at most 5*STEP/4 + 2*MAX)")
+set(ISAAC_VITA_LUA_GC_SWEEP_STEP 6144 CACHE STRING
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE: objects one GC step sweeps (0 = pristine line, or 400..65536)")
+# Review round 2 B3 (finalizers that allocate more than ~200-300 KB per loop
+# make the paced collector mark 1.35-3.0x pristine's work; the same shape
+# drives B1 and B2).  With a budget A > 0 the derived lgc.c (lines 61, 821,
+# 958) sums what the finalizers of one GC cycle allocate and, once a cycle
+# passes A bytes, latches the Lua state to pristine 5.3.3 through the script
+# latch.  0 (default) derives the same bytes as before the knob existed.
+# Host proof: recomp/test_vita_lua_gc_finalizer_alloc_latch.py at A = 65536.
+set(ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES 0 CACHE STRING
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE: bytes the __gc finalizers of one GC cycle may allocate before the Lua state is latched to the pristine 5.3.3 collector for good (0 = no guard, the derivation is unchanged; or 16000..1073741824; host-proven at 65536 only, and a budget under about 40000 may latch on ordinary Lua-function finalizers -- an estimate from the Lua 5.3.3 sources, not measured); the runtime logs '[isaac-lua] finalizer pace: on=1 alloc_latch_bytes=N gcstep_clamp_kb=K' once and '[isaac-lua] finalizer alloc latch: LATCHED ... state_latched=0|1' on every latch")
+foreach(_isaac_retired IN ITEMS
+        "ISAAC_VITA_LUA_GC_FINALIZER_COST;512"
+        "ISAAC_VITA_LUA_GC_SWEEP_COST;5")
+  list(GET _isaac_retired 0 _isaac_retired_name)
+  list(GET _isaac_retired 1 _isaac_retired_default)
+  if(DEFINED ${_isaac_retired_name})
+    if(NOT "${${_isaac_retired_name}}" STREQUAL "${_isaac_retired_default}")
+      message(FATAL_ERROR
+        "${_isaac_retired_name} is retired (review r1 B1: a constant charge "
+        "diverges at high finalizer rates); use ISAAC_VITA_LUA_GC_FINALIZER_STEP "
+        "/ ISAAC_VITA_LUA_GC_SWEEP_STEP and remove it "
+        "(-U${_isaac_retired_name}): got ${${_isaac_retired_name}}")
+    endif()
+    unset(${_isaac_retired_name} CACHE)
+    unset(${_isaac_retired_name})
+  endif()
+endforeach()
 if(ISAAC_VITA_LUA_GC_FINALIZER_PACE AND NOT ISAAC_VITA_LUA)
   message(FATAL_ERROR
     "ISAAC_VITA_LUA_GC_FINALIZER_PACE requires ISAAC_VITA_LUA=ON")
 endif()
 if(NOT ISAAC_VITA_LUA_GC_FINALIZER_PACE AND
    (NOT ISAAC_VITA_LUA_GC_FINALIZER_MAX STREQUAL "8" OR
-    NOT ISAAC_VITA_LUA_GC_FINALIZER_COST STREQUAL "512" OR
-    NOT ISAAC_VITA_LUA_GC_SWEEP_COST STREQUAL "5"))
+    NOT ISAAC_VITA_LUA_GC_FINALIZER_STEP STREQUAL "192" OR
+    NOT ISAAC_VITA_LUA_GC_SWEEP_STEP STREQUAL "6144"))
   message(FATAL_ERROR
-    "ISAAC_VITA_LUA_GC_FINALIZER_MAX/_COST and ISAAC_VITA_LUA_GC_SWEEP_COST "
+    "ISAAC_VITA_LUA_GC_FINALIZER_MAX/_STEP and ISAAC_VITA_LUA_GC_SWEEP_STEP "
     "take effect only with ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON (got MAX="
-    "${ISAAC_VITA_LUA_GC_FINALIZER_MAX} COST=${ISAAC_VITA_LUA_GC_FINALIZER_COST} "
-    "SWEEP_COST=${ISAAC_VITA_LUA_GC_SWEEP_COST} with PACE OFF)")
+    "${ISAAC_VITA_LUA_GC_FINALIZER_MAX} STEP=${ISAAC_VITA_LUA_GC_FINALIZER_STEP} "
+    "SWEEP_STEP=${ISAAC_VITA_LUA_GC_SWEEP_STEP} with PACE OFF)")
 endif()
 if(NOT ISAAC_VITA_LUA_GC_FINALIZER_MAX MATCHES "^[0-9]+$" OR
    ISAAC_VITA_LUA_GC_FINALIZER_MAX LESS 1 OR
@@ -540,21 +692,79 @@ if(NOT ISAAC_VITA_LUA_GC_FINALIZER_MAX MATCHES "^[0-9]+$" OR
     "ISAAC_VITA_LUA_GC_FINALIZER_MAX must be an integer in 1..4096: "
     "${ISAAC_VITA_LUA_GC_FINALIZER_MAX}")
 endif()
-if(NOT ISAAC_VITA_LUA_GC_FINALIZER_COST MATCHES "^[0-9]+$" OR
-   ISAAC_VITA_LUA_GC_FINALIZER_COST LESS 1 OR
-   ISAAC_VITA_LUA_GC_FINALIZER_COST GREATER 65536)
+# 72: at most (GCSTEPSIZE + 24) / 24 = 67 finalizable objects (24 bytes =
+# sizeof(UUdata) on 32-bit ARM) are made between two allocation-driven steps,
+# and 72 stays above that; a margin, not a heap guarantee, and only 192 is
+# measured (LUA-GC-R3.md).  320: GCSTEPSIZE / 320 = 5, the pristine floor
+# never binds and the 5*STEP/4 bound holds.
+if(NOT ISAAC_VITA_LUA_GC_FINALIZER_STEP MATCHES "^[0-9]+$" OR
+   ISAAC_VITA_LUA_GC_FINALIZER_STEP LESS 72 OR
+   ISAAC_VITA_LUA_GC_FINALIZER_STEP GREATER 320)
   message(FATAL_ERROR
-    "ISAAC_VITA_LUA_GC_FINALIZER_COST must be an integer in 1..65536: "
-    "${ISAAC_VITA_LUA_GC_FINALIZER_COST}")
+    "ISAAC_VITA_LUA_GC_FINALIZER_STEP must be an integer in 72..320: "
+    "${ISAAC_VITA_LUA_GC_FINALIZER_STEP}")
 endif()
-# lgc.c:42 GCSWEEPMAX = (GCSTEPSIZE / SWEEP) / 4 must stay >= 1: above 400 a
-# sweep singlestep does nothing, charges nothing, and luaC_step spins.
-if(NOT ISAAC_VITA_LUA_GC_SWEEP_COST MATCHES "^[0-9]+$" OR
-   ISAAC_VITA_LUA_GC_SWEEP_COST LESS 1 OR
-   ISAAC_VITA_LUA_GC_SWEEP_COST GREATER 400)
+# lgc.c:42 GCSWEEPMAX = (GCSTEPSIZE / cost) / 4 must stay >= 1 (the derived
+# charge is capped at 400); 400: a step with a budget of up to 400 units
+# still sweeps as pristine does.
+if(NOT ISAAC_VITA_LUA_GC_SWEEP_STEP MATCHES "^[0-9]+$" OR
+   (NOT ISAAC_VITA_LUA_GC_SWEEP_STEP EQUAL 0 AND
+    (ISAAC_VITA_LUA_GC_SWEEP_STEP LESS 400 OR
+     ISAAC_VITA_LUA_GC_SWEEP_STEP GREATER 65536)))
   message(FATAL_ERROR
-    "ISAAC_VITA_LUA_GC_SWEEP_COST must be an integer in 1..400: "
-    "${ISAAC_VITA_LUA_GC_SWEEP_COST}")
+    "ISAAC_VITA_LUA_GC_SWEEP_STEP must be 0 or an integer in 400..65536: "
+    "${ISAAC_VITA_LUA_GC_SWEEP_STEP}")
+endif()
+# The branch test's matrix (recomp/test_vita_lua_gc_finalizer_pace.py) runs
+# CLAMP_KB=128 only; recomp/test_vita_lua_gc_finalizer_alloc_latch.py adds
+# CLAMP_KB=64 at 100 / 120 / 200 finalizers per loop, with and without the
+# allocation latch (R60 lever 6).  At 40 the review-r2 harness put r3's peak at 1.023x
+# pristine's (200 finalizers per step) and 0.959x (the same under
+# collectgarbage("stop")), two legs (LUA-GC-R3.md); under eaec5e2 a host
+# Lua run of tools/isaac_vita_lua_gc_stress at 40 swung to 28 MB against
+# pristine's 16 MB.
+if(ISAAC_VITA_LUA_GC_FINALIZER_PACE AND
+   NOT ISAAC_VITA_LUA_GCSTEP_CLAMP_KB STREQUAL "128" AND
+   NOT ISAAC_VITA_LUA_GCSTEP_CLAMP_KB STREQUAL "64")
+  message(WARNING
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE is validated with "
+    "ISAAC_VITA_LUA_GCSTEP_CLAMP_KB=128 (the pace test's matrix) and 64 "
+    "(the allocation-latch test's 100/120/200 finalizers-per-loop legs) "
+    "only; ${ISAAC_VITA_LUA_GCSTEP_CLAMP_KB} is untested (LUA-GC.md)")
+endif()
+# F-GCSWEEP (lane r60-020-w1-20261112, gcsweep.report.md): a sweep quota
+# below 3072 is host-validated with CLAMP_KB=64 only.  With the larger
+# per-frame step of CLAMP_KB=128 the host oracle hit the catch-up cliff at
+# quota 2048 (one marking step of 14.9-23.8 ms projected on r100/r120/r200,
+# every run of spike8328); 3072 was clean there.  0 is the game's unclamped
+# step, larger still.  Configure-time only: no definition, no object changes.
+if(ISAAC_VITA_LUA_GC_FINALIZER_PACE AND
+   ISAAC_VITA_LUA_GC_SWEEP_STEP GREATER 0 AND
+   ISAAC_VITA_LUA_GC_SWEEP_STEP LESS 3072 AND
+   (ISAAC_VITA_LUA_GCSTEP_CLAMP_KB EQUAL 0 OR
+    ISAAC_VITA_LUA_GCSTEP_CLAMP_KB GREATER 64))
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_SWEEP_STEP=${ISAAC_VITA_LUA_GC_SWEEP_STEP} is below "
+    "3072 and needs ISAAC_VITA_LUA_GCSTEP_CLAMP_KB in 1..64 (got "
+    "${ISAAC_VITA_LUA_GCSTEP_CLAMP_KB}): with a larger step the host oracle "
+    "hits the catch-up cliff (F-GCSWEEP)")
+endif()
+# (after the seven blocks above: recomp/test_vita_lua_gc_finalizer_pace.py
+# runs exactly those as its CMake leg)
+if(NOT ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES MATCHES "^[0-9]+$" OR
+   (NOT ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES STREQUAL "0" AND
+    (ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES LESS 16000 OR
+     ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES GREATER 1073741824)))
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES must be 0 or an integer "
+    "in 16000..1073741824: ${ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES}")
+endif()
+if(NOT ISAAC_VITA_LUA_GC_FINALIZER_PACE AND
+   NOT ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES STREQUAL "0")
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES takes effect only with "
+    "ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON (got "
+    "${ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES} with PACE OFF)")
 endif()
 if(NOT ISAAC_VITA_LUA_GCCOLLECT_STEP_KB MATCHES "^[0-9]+$" OR
    ISAAC_VITA_LUA_GCCOLLECT_STEP_KB GREATER 10000)
@@ -975,6 +1185,29 @@ option(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_VERIFY
 if(ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_STANDALONE AND NOT ISAAC_VITA_GL_THREAD_WORKER)
   message(FATAL_ERROR "GL_RECORD_ADMISSION_CACHE_STANDALONE requires GL_THREAD_WORKER")
 endif()
+# R60-EXT-SYNTH T2 (R60-EXT-SYNTH.md): the
+# GL render thread (the record ring's consumer) sleeps on its semaphore with a
+# 2000-us timeout, and in dry rooms 1.6-1.9 sleeps per present run to it with
+# records already published but not kicked (ph120.rw sl(n,t)).  Set, the
+# consumer's timeout is this many us; the game thread's (producer's) waits keep
+# 2000 us.  Empty = unset: no definition anywhere, every object byte-identical.
+# Set: only gl_record_ring.c gets the definition (and the receipt).
+set(ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US "" CACHE STRING
+    "GL render-thread idle-wait timeout in us, 100..2000 (empty = stock 2000 us, no definition; needs GL_THREAD_WORKER)")
+if(NOT "${ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US}" STREQUAL "")
+  # Decimal only: a leading 0 would be octal in C.
+  if(NOT ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US MATCHES "^[1-9][0-9]*$" OR
+     ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US LESS 100 OR
+     ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US GREATER 2000)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US must be empty or a decimal integer 100..2000 "
+      "(got '${ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US}')")
+  endif()
+  if(NOT ISAAC_VITA_GL_THREAD_WORKER)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US requires ISAAC_VITA_GL_THREAD_WORKER=ON")
+  endif()
+endif()
 # Sites that call vitaGL or read its state from the game thread and are not
 # routed through the render thread yet are refused.
 # PHASE_PROFILE reads vitaGL only after a render-thread take at the window
@@ -1219,6 +1452,10 @@ option(ISAAC_VITA_GL_TIME_SDK_SPARSE
        "GL_TIME SDK-sparse mode: paired canonical 1/32, complete clear/queue/scene API wall times; no broad shim clocks" OFF)
 option(ISAAC_VITA_FRAME_SPIKE_PROFILE
        "Correlated worst whole/update/render loop samples using existing clocks (ph120.sp)" OFF)
+option(ISAAC_VITA_UPDATE_HITCH_PROBE
+       "Diagnostic: one ph120.uh/uhs record per Game::Update lasting at least ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US, with that update's GL/file-lookup/PNG/static-SFX/Lua counter deltas and the guest sampler's top functions; no added clock reads (needs PHASE_PROFILE and FULLSPEED_SCHEDULER)" OFF)
+set(ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US "30000" CACHE STRING
+    "With ISAAC_VITA_UPDATE_HITCH_PROBE: report a Game::Update lasting at least this many microseconds (decimal, 1000..10000000; default 30000)")
 option(ISAAC_VITA_DEEP_PROFILE
        "Bounded per-loop nested room/resource/native wall-time attribution; diagnostic only" OFF)
 option(ISAAC_VITA_NATIVE_RESOURCE_PROFILE
@@ -1519,6 +1756,31 @@ if(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE AND
   message(FATAL_ERROR
     "ISAAC_VITA_FULLSPEED_HEAD_ADVANCE requires FULLSPEED_SCHEDULER=ON and FULLSPEED_SERVICE_RESERVE=ON")
 endif()
+# ISAAC_VITA_LUA_GC_STATE_PROFILE / ISAAC_VITA_LUA_GC_IDLE_STEP (options
+# next to ISAAC_VITA_LUA_GC_PROFILE): refused here, after the last option
+# they depend on.
+if((ISAAC_VITA_LUA_GC_STATE_PROFILE OR ISAAC_VITA_LUA_GC_IDLE_STEP) AND
+   NOT ISAAC_VITA_LUA)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_STATE_PROFILE and ISAAC_VITA_LUA_GC_IDLE_STEP require ISAAC_VITA_LUA=ON")
+endif()
+if(ISAAC_VITA_LUA_GC_STATE_PROFILE AND NOT ISAAC_VITA_LUA_GC_PROFILE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_STATE_PROFILE requires ISAAC_VITA_LUA_GC_PROFILE=ON (its lines close with the gc window)")
+endif()
+if(ISAAC_VITA_LUA_GC_STATE_PROFILE AND
+   NOT ISAAC_VITA_LUA_GC_FINALIZER_PACE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_STATE_PROFILE requires ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON (the hooks are lines of the derived lgc.c; the pristine archive is never edited)")
+endif()
+if(ISAAC_VITA_LUA_GC_IDLE_STEP AND NOT ISAAC_VITA_FULLSPEED_SCHEDULER)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_IDLE_STEP requires ISAAC_VITA_FULLSPEED_SCHEDULER=ON (it asks the scheduler what follows the loop tail)")
+endif()
+if(ISAAC_VITA_LUA_GC_IDLE_STEP AND ISAAC_VITA_FULLSPEED_HEAD_ADVANCE)
+  message(FATAL_ERROR
+    "ISAAC_VITA_LUA_GC_IDLE_STEP and ISAAC_VITA_FULLSPEED_HEAD_ADVANCE are exclusive (the head then sleeps to an earlier target than the grid the query reads)")
+endif()
 option(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT
        "Experimental: admit interpolated frames on the Render body plus the recurring part of the Present wait; can trade exact 30 UPS for FPS" OFF)
 if(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT AND
@@ -1592,6 +1854,104 @@ if(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US GREATER 0 AND
   message(FATAL_ERROR
     "ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US must be below ISAAC_VITA_FULLSPEED_FLOOR_DEBT_CAP_US")
 endif()
+# R60-DRYADMIT-SPEC-20261028.md: with the GL render thread a frame behind at an
+# interpolated gate, OBSERVE counts what a bounded wait would admit (ph120.aw);
+# ON waits for that present closure, never past the instant the stock time test
+# still admits the frame, then runs the stock tests on the fresh clock.  Here
+# and not next to GL_THREAD_RENDER_ADMISSION: FLOOR_DEBT_MODE is computed just
+# above and HEAD_ADVANCE / RENDER_COST_EXCLUDES_PRESENT before it.
+set(ISAAC_VITA_GL_THREAD_ADMIT_WAIT OFF CACHE STRING
+    "GL admit wait at the interpolated-frame gate: OFF, OBSERVE (ph120.aw only) or ON (needs GL_THREAD_RENDER_ADMISSION)")
+set_property(CACHE ISAAC_VITA_GL_THREAD_ADMIT_WAIT PROPERTY STRINGS OFF OBSERVE ON)
+string(TOUPPER "${ISAAC_VITA_GL_THREAD_ADMIT_WAIT}" ISAAC_VITA_GL_THREAD_ADMIT_WAIT_UPPER)
+if(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_UPPER STREQUAL "ON")
+  set(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE 2)
+elseif(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_UPPER STREQUAL "OBSERVE")
+  set(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE 1)
+elseif(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_UPPER MATCHES
+       "^(OFF|NO|FALSE|N|IGNORE|NOTFOUND|.*-NOTFOUND)?$")
+  # As FLOOR_DEBT: 0/1/2 and other text are rejected.
+  set(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE 0)
+else()
+  message(FATAL_ERROR
+    "ISAAC_VITA_GL_THREAD_ADMIT_WAIT must be OFF, OBSERVE or ON "
+    "(got '${ISAAC_VITA_GL_THREAD_ADMIT_WAIT}')")
+endif()
+if(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE AND
+   NOT ISAAC_VITA_GL_THREAD_RENDER_ADMISSION)
+  message(FATAL_ERROR
+    "ISAAC_VITA_GL_THREAD_ADMIT_WAIT requires ISAAC_VITA_GL_THREAD_RENDER_ADMISSION=ON")
+endif()
+if(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE AND
+   (ISAAC_VITA_FULLSPEED_HEAD_ADVANCE OR
+    ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT OR
+    ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE EQUAL 2))
+  message(FATAL_ERROR
+    "ISAAC_VITA_GL_THREAD_ADMIT_WAIT is proven only with stock render cost, no head advance and FLOOR_DEBT OFF or OBSERVE")
+endif()
+# R60-FABLE-PLAN.md lane B: with the GL render thread a frame behind at an
+# interpolated gate, ON still renders the frame when the record ring holds at
+# most ADMIT_BEHIND_BYTES bytes the render thread has not replayed (the stock
+# time test still decides; nothing waits on the game thread); OBSERVE keeps
+# the stock refusal and counts what ON would do (ph120.ab / ph120.abp).  Here
+# for the same reason as ADMIT_WAIT above, whose mode it also reads.
+set(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND OFF CACHE STRING
+    "GL admit behind at the interpolated-frame gate: OFF, OBSERVE (ph120.ab only) or ON (render while behind when outstanding ring bytes <= ADMIT_BEHIND_BYTES; needs GL_THREAD_RENDER_ADMISSION, OBSERVE also PHASE_PROFILE)")
+set_property(CACHE ISAAC_VITA_GL_THREAD_ADMIT_BEHIND PROPERTY STRINGS OFF OBSERVE ON)
+set(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES 65536 CACHE STRING
+    "GL admit behind: most outstanding record-ring bytes a behind gate still admits (decimal, 1..524288 = the ring)")
+string(TOUPPER "${ISAAC_VITA_GL_THREAD_ADMIT_BEHIND}" ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_UPPER)
+if(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_UPPER STREQUAL "ON")
+  set(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE 2)
+elseif(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_UPPER STREQUAL "OBSERVE")
+  set(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE 1)
+elseif(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_UPPER MATCHES
+       "^(OFF|NO|FALSE|N|IGNORE|NOTFOUND|.*-NOTFOUND)?$")
+  # As ADMIT_WAIT: 0/1/2 and other text are rejected.
+  set(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE 0)
+else()
+  message(FATAL_ERROR
+    "ISAAC_VITA_GL_THREAD_ADMIT_BEHIND must be OFF, OBSERVE or ON "
+    "(got '${ISAAC_VITA_GL_THREAD_ADMIT_BEHIND}')")
+endif()
+if(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE)
+  # At most six digits before the numeric compare: no 1e20, no 0x, no sign.
+  if(NOT "${ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES}" MATCHES
+         "^[1-9][0-9]?[0-9]?[0-9]?[0-9]?[0-9]?$" OR
+     ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES GREATER 524288)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES must be a decimal 1..524288 "
+      "(got '${ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES}')")
+  endif()
+  if(NOT ISAAC_VITA_GL_THREAD_RENDER_ADMISSION)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_THREAD_ADMIT_BEHIND requires ISAAC_VITA_GL_THREAD_RENDER_ADMISSION=ON")
+  endif()
+  # ph120.ab / ph120.abp are phase-profile records: without them OBSERVE
+  # measures nothing, so OBSERVE needs PHASE_PROFILE.  ON decides from the
+  # scheduler's and backend's own statics (back-off, body units, the hold
+  # take); the s_admit_behind / s_ab counters the profile takes are
+  # saturating stats no decision reads.  So a release build
+  # (PHASE_PROFILE=OFF) keeps ON's behaviour and loses only the records.
+  if(ISAAC_VITA_PHASE_PROFILE)
+    set(_isaac_vita_admit_behind_records "ph120.ab + ph120.abp")
+  elseif(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE EQUAL 1)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_THREAD_ADMIT_BEHIND=OBSERVE requires ISAAC_VITA_PHASE_PROFILE=ON (its ph120.ab / ph120.abp records are its only output)")
+  else()
+    set(_isaac_vita_admit_behind_records "no ph120.ab / ph120.abp records: PHASE_PROFILE=OFF")
+  endif()
+  if(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_THREAD_ADMIT_BEHIND and ISAAC_VITA_GL_THREAD_ADMIT_WAIT each own the behind arm of the gate: enable one")
+  endif()
+  if(ISAAC_VITA_FULLSPEED_HEAD_ADVANCE OR
+     ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT OR
+     ISAAC_VITA_FULLSPEED_FLOOR_DEBT_MODE EQUAL 2)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_THREAD_ADMIT_BEHIND is proven only with stock render cost, no head advance and FLOOR_DEBT OFF or OBSERVE")
+  endif()
+endif()
 option(ISAAC_VITA_STABLE_30_PRESENTATION
        "Present only completed 30-Hz game phases and suppress interpolation" OFF)
 if(ISAAC_VITA_STABLE_30_PRESENTATION AND NOT ISAAC_VITA_KAGE)
@@ -1605,6 +1965,52 @@ endif()
 if(ISAAC_VITA_STABLE_30_PRESENTATION AND ISAAC_VITA_FULLSPEED_SCHEDULER)
   message(FATAL_ERROR
     "stable 30-Hz presentation and the fullspeed scheduler are exclusive")
+endif()
+# RENDER60 lane C (ROAD60-SYNTHESIS.md row 1): the game thread stages the
+# per-draw state records - glBlendFuncSeparate, W-pkt Shader::Bind (81), S4
+# attribute enable/disable (79/80) - and publishes them with the next draw as
+# ONE record (opcode 82) instead of ~6 per draw; anything else, a closure, a
+# drain or an outstanding-bytes query publishes them first.  The render
+# thread runs each staged call with its own arguments and return RVA, in
+# order.  VERIFY also publishes every call as its own record (those run) and
+# compares each packet with them on the render thread (ph120.dp mm/late).
+set(ISAAC_VITA_GL_DRAW_PACKET OFF CACHE STRING
+    "GL recorder draw packet: OFF, VERIFY (separate records run, packets compared, ph120.dp) or ON (one record per draw and its state calls; needs GL_THREAD_WORKER + KAGE_BIND_PACKET + GL_RECORD_ATTRIB_BATCH, VERIFY also PHASE_PROFILE)")
+set_property(CACHE ISAAC_VITA_GL_DRAW_PACKET PROPERTY STRINGS OFF VERIFY ON)
+string(TOUPPER "${ISAAC_VITA_GL_DRAW_PACKET}" ISAAC_VITA_GL_DRAW_PACKET_UPPER)
+if(ISAAC_VITA_GL_DRAW_PACKET_UPPER STREQUAL "ON")
+  set(ISAAC_VITA_GL_DRAW_PACKET_MODE 2)
+elseif(ISAAC_VITA_GL_DRAW_PACKET_UPPER STREQUAL "VERIFY")
+  set(ISAAC_VITA_GL_DRAW_PACKET_MODE 1)
+elseif(ISAAC_VITA_GL_DRAW_PACKET_UPPER MATCHES
+       "^(OFF|NO|FALSE|N|IGNORE|NOTFOUND|.*-NOTFOUND)?$")
+  # As ADMIT_BEHIND: 0/1/2 and other text are rejected.
+  set(ISAAC_VITA_GL_DRAW_PACKET_MODE 0)
+else()
+  message(FATAL_ERROR
+    "ISAAC_VITA_GL_DRAW_PACKET must be OFF, VERIFY or ON "
+    "(got '${ISAAC_VITA_GL_DRAW_PACKET}')")
+endif()
+if(ISAAC_VITA_GL_DRAW_PACKET_MODE)
+  if(NOT ISAAC_VITA_GL_THREAD_WORKER OR NOT ISAAC_VITA_KAGE_BIND_PACKET OR
+     NOT ISAAC_VITA_GL_RECORD_ATTRIB_BATCH)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_DRAW_PACKET requires ISAAC_VITA_GL_THREAD_WORKER, "
+      "ISAAC_VITA_KAGE_BIND_PACKET and ISAAC_VITA_GL_RECORD_ATTRIB_BATCH (it stages their records)")
+  endif()
+  # ph120.dp is the lever's receipt and VERIFY's verdict: VERIFY needs the
+  # phase profile.  ON decides from s_dp.used / s_dp.subs (the staged bytes
+  # and calls) only; s_dp.count and s_dp_window are window stats that only
+  # kage_vita_phase_profile.c takes, no decision reads them.  So a release
+  # build (PHASE_PROFILE=OFF) keeps ON's behaviour and loses only ph120.dp.
+  if(ISAAC_VITA_PHASE_PROFILE)
+    set(_isaac_vita_draw_packet_records "ph120.dp")
+  elseif(ISAAC_VITA_GL_DRAW_PACKET_MODE EQUAL 1)
+    message(FATAL_ERROR
+      "ISAAC_VITA_GL_DRAW_PACKET=VERIFY requires ISAAC_VITA_PHASE_PROFILE=ON (its ph120.dp records are its verdict)")
+  else()
+    set(_isaac_vita_draw_packet_records "no ph120.dp records: PHASE_PROFILE=OFF")
+  endif()
 endif()
 option(ISAAC_VITA_RUNTIME_SETTINGS
        "Read ux0:/data/isaacr001/port.ini once at boot (fps_lock duty on the fullspeed scheduler; remap keys parsed and reported) and log the ISAAC VITA SETTINGS receipt" OFF)
@@ -2082,6 +2488,36 @@ option(ISAAC_VITA_FBO_CLEAR_ELISION_DEPTH_DROP
 # one, so that read can return unwritten (zero) texels: a black hole.
 option(ISAAC_VITA_FBO_READBACK_FIX
        "Serve an offscreen glReadPixels from the attached RGBA8 texture's memory at the rows the game drew (stock vitaGL applies the display's row flip to framebuffer textures it renders already flipped and reads padding), after draining the GXM context when that texture was drawn or cleared since the last drain" OFF)
+# Lane TXR (2026-11-12): FBO_READBACK_FIX logs its first eight offscreen reads
+# in detail, and each detail line walks the whole attached texture (a census
+# of its non-zero texels) through uncached memory: 85-111 ms per walk on the
+# device, about 0.73-0.88 s per boot with the game thread waiting in the read
+# (44 bench runs of 2026-11-12).  The game's read is served before the detail
+# line and does not depend on the census.  OBSERVE times each walk (census_us
+# on the fbo-readback-mem line and the receipt); ON skips it (the descriptor
+# and the texels at the read position and its flipped row stay logged).
+set(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP OFF CACHE STRING
+    "Readback detail census: OFF, OBSERVE (time the whole-texture walk) or ON (skip it); needs FBO_READBACK_FIX")
+set_property(CACHE ISAAC_VITA_FBO_READBACK_CENSUS_SKIP PROPERTY STRINGS OFF OBSERVE ON)
+string(TOUPPER "${ISAAC_VITA_FBO_READBACK_CENSUS_SKIP}" ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_UPPER)
+if(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_UPPER STREQUAL "ON")
+  set(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_MODE 2)
+elseif(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_UPPER STREQUAL "OBSERVE")
+  set(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_MODE 1)
+elseif(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_UPPER MATCHES
+       "^(OFF|NO|FALSE|N|IGNORE|NOTFOUND|.*-NOTFOUND)?$")
+  # As GL_THREAD_ADMIT_WAIT: 0/1/2 and other text are rejected.
+  set(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_MODE 0)
+else()
+  message(FATAL_ERROR
+    "ISAAC_VITA_FBO_READBACK_CENSUS_SKIP must be OFF, OBSERVE or ON "
+    "(got '${ISAAC_VITA_FBO_READBACK_CENSUS_SKIP}')")
+endif()
+if(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_MODE AND NOT ISAAC_VITA_FBO_READBACK_FIX)
+  message(FATAL_ERROR
+    "ISAAC_VITA_FBO_READBACK_CENSUS_SKIP=${ISAAC_VITA_FBO_READBACK_CENSUS_SKIP} "
+    "needs ISAAC_VITA_FBO_READBACK_FIX=ON (the census belongs to its detail lines)")
+endif()
 # GitHub issue #15: Wavy Cap and the Downpour Mirror World composite their
 # capture surface into the outer surface right after a pop, with no clear,
 # relying on desktop GL's persistent FBO depth (cleared to 0 by the pass end,
@@ -2089,6 +2525,22 @@ option(ISAAC_VITA_FBO_READBACK_FIX
 # the composite is rejected and the world goes black.
 option(ISAAC_VITA_FBO_DEPTH_CARRY
        "Replay an offscreen framebuffer's last depth clear into the new vitaGL scene before its first draw, while that clear is still the last depth write the desktop contract knows (issue #15)" OFF)
+# FABLE A0-1 (spawn-room stalls, dry-room GL worker time): the game's
+# GetTexel attaches a 784x472 surface to the manager framebuffer, reads one
+# texel that the backend serves from texture memory, and the next pass
+# re-attaches a 480x272 surface.  Stock vitaGL retires the render target and
+# the depth surface at each size change, and the next draw recreates them.
+# An attach no vitaGL call consumes before the same framebuffer is attached
+# again is not forwarded; the last attach always is, before the first native
+# draw, clear, read, present, texture re-specify or delete.
+option(ISAAC_VITA_FBO_DEFERRED_ATTACH
+       "Hold a colour attach (COLOR_ATTACHMENT0, GL_TEXTURE_2D level 0, non-zero texture) back until a native call consumes it and drop it when the same framebuffer is re-attached first; glCheckFramebufferStatus is answered from the pending attach; receipt ph120.da" OFF)
+# Measurement only.  With the GL render thread no receipt reports render-target
+# creates: ph120.gx rt(c,x,z) needs ISAAC_VITA_GL_TIME_PROFILE, which the
+# ISAAC_GL_WORKER_CONFLICT list above refuses.  This one counts the GXM calls
+# themselves at link time (--wrap), so vitaGL's archive does not change.
+option(ISAAC_VITA_GXM_RT_CREATE_CENSUS
+       "Measurement only: count and time every sceGxmCreateRenderTarget / sceGxmDestroyRenderTarget call (GNU ld --wrap, libvitaGL.a untouched) and print them per ph120 window as ph120.gr create(c,x,us,max) destroy(n,us), after a one-time KAGE VITA GXM RT CREATE CENSUS receipt; works with ISAAC_VITA_GL_THREAD_WORKER; needs ISAAC_VITA_PHASE_PROFILE" OFF)
 option(ISAAC_VITA_VITAGL_CACHED_MEM
        "Call vglUseCachedMem(GL_TRUE) before vglInit so vitaGL pools are cacheable" OFF)
 option(ISAAC_VITA_VITAGL_GPU_DRAW_OPTIMIZATIONS
@@ -2341,6 +2793,20 @@ if(ISAAC_VITA_HEAP_LEAN_IMPORT AND
     ISAAC_VITA_STAGE_MEMORY_DIAGNOSTICS))
   message(FATAL_ERROR
     "ISAAC_VITA_HEAP_LEAN_IMPORT requires translated runtime and HEAP_OVERFLOW_MSPACE, and excludes STAGE_MEMORY_DIAGNOSTICS (its floor records would be empty)")
+endif()
+option(ISAAC_VITA_HEAP_IMPORT_LEAN2
+       "Guest malloc/free import: exact cuts on top of HEAP_LEAN_IMPORT (no sidecar moves on ledger removal, ledger home-slot prefetch, relaxed terminal latch reads, skip the ANM2/texel scratch calls whose owner cannot match, no second ledger reserve on insert, inline slab fast reject); newlib calls, routes, results and faults unchanged; boot banner 'guest heap lean2 import:'" OFF)
+option(ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY
+       "HEAP_IMPORT_LEAN2 proof build: keep every skipped step as a check and log 'guest heap lean2 verify:' counts of checks and disagreements" OFF)
+if(ISAAC_VITA_HEAP_IMPORT_LEAN2 AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_HEAP_OVERFLOW_MSPACE OR
+    NOT ISAAC_VITA_HEAP_LEAN_IMPORT))
+  message(FATAL_ERROR
+    "ISAAC_VITA_HEAP_IMPORT_LEAN2 requires translated runtime, HEAP_OVERFLOW_MSPACE and HEAP_LEAN_IMPORT (its sidecar cut relies on lean never writing a floor token)")
+endif()
+if(ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY AND NOT ISAAC_VITA_HEAP_IMPORT_LEAN2)
+  message(FATAL_ERROR
+    "ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY requires ISAAC_VITA_HEAP_IMPORT_LEAN2")
 endif()
 option(ISAAC_VITA_HEAP_STAGE_PROFILE
        "Profiling: count guest malloc/free import routes and time each stage 1-in-64 (ph120.hc/hf/hm)" OFF)
@@ -2685,6 +3151,22 @@ if(ISAAC_VITA_FRAME_SPIKE_PROFILE AND NOT ISAAC_VITA_PHASE_PROFILE)
   message(FATAL_ERROR
     "ISAAC_VITA_FRAME_SPIKE_PROFILE requires ISAAC_VITA_PHASE_PROFILE=ON")
 endif()
+if(ISAAC_VITA_UPDATE_HITCH_PROBE)
+  # The scheduler owns the two clock values, the phase profile the records.
+  if(NOT ISAAC_VITA_PHASE_PROFILE OR NOT ISAAC_VITA_FULLSPEED_SCHEDULER OR
+     NOT ISAAC_VITA_KAGE OR ISAAC_VITA_SCAFFOLD_ONLY)
+    message(FATAL_ERROR
+      "ISAAC_VITA_UPDATE_HITCH_PROBE requires translated KAGE, ISAAC_VITA_PHASE_PROFILE=ON and ISAAC_VITA_FULLSPEED_SCHEDULER=ON")
+  endif()
+  # Decimal only: a leading 0 would be octal in C.
+  if(NOT ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US MATCHES "^[1-9][0-9]*$" OR
+     ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US LESS 1000 OR
+     ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US GREATER 10000000)
+    message(FATAL_ERROR
+      "ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US must be a decimal integer 1000..10000000 "
+      "(got '${ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US}')")
+  endif()
+endif()
 if(ISAAC_VITA_DEEP_PROFILE AND
    (NOT ISAAC_VITA_PHASE_PROFILE OR NOT ISAAC_VITA_KAGE OR ISAAC_VITA_SCAFFOLD_ONLY OR
     NOT ISAAC_VITA_PNG_WINDOW_PROFILE OR NOT ISAAC_VITA_ANM2_WINDOW_PROFILE OR
@@ -2931,6 +3413,41 @@ if(ISAAC_VITA_DISPLAY_CENTER_Y AND
    (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
   message(FATAL_ERROR
     "ISAAC_VITA_DISPLAY_CENTER_Y requires the translated KAGE runtime")
+endif()
+if(ISAAC_VITA_FBO_DEFERRED_ATTACH AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_FBO_DEFERRED_ATTACH requires the translated KAGE runtime")
+endif()
+if(ISAAC_VITA_FBO_DEFERRED_ATTACH AND
+   (NOT ISAAC_VITA_VITAGL_STOCK_REFERENCE OR NOT ISAAC_VITA_STOCK_FBO_RT_REUSE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_FBO_DEFERRED_ATTACH requires ISAAC_VITA_VITAGL_STOCK_REFERENCE=ON and "
+    "ISAAC_VITA_STOCK_FBO_RT_REUSE=ON (the exactness argument is read against "
+    "that tree's _glFramebufferTexture2D, scene_reset and render-target reuse)")
+endif()
+if(ISAAC_VITA_FBO_DEFERRED_ATTACH AND
+   (ISAAC_VITA_FIRST_FRAME_PROBE OR ISAAC_VITA_KNOWN_COLOR_PROBE OR
+    ISAAC_VITA_SCREENSHOT_PROBE OR ISAAC_VITA_RAW_GXM_PROBE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_FBO_DEFERRED_ATTACH requires FIRST_FRAME, KNOWN_COLOR, SCREENSHOT "
+    "and RAW_GXM probes to be OFF; those diagnostics call vitaGL outside the "
+    "guest GL boundary, where a pending attach is not flushed")
+endif()
+if(ISAAC_VITA_FBO_DEFERRED_ATTACH AND
+   (ISAAC_VITA_FBO_RASTER_SCALE OR ISAAC_VITA_DISPLAY_RASTER_720))
+  message(FATAL_ERROR
+    "ISAAC_VITA_FBO_DEFERRED_ATTACH requires ISAAC_VITA_FBO_RASTER_SCALE=OFF and "
+    "ISAAC_VITA_DISPLAY_RASTER_720=OFF; the scaled paths issue native viewports "
+    "and texture re-specifies the exactness argument was not read against")
+endif()
+if(ISAAC_VITA_GXM_RT_CREATE_CENSUS AND
+   (ISAAC_VITA_SCAFFOLD_ONLY OR NOT ISAAC_VITA_KAGE OR
+    NOT ISAAC_VITA_PHASE_PROFILE))
+  message(FATAL_ERROR
+    "ISAAC_VITA_GXM_RT_CREATE_CENSUS requires the translated KAGE runtime and "
+    "ISAAC_VITA_PHASE_PROFILE=ON (its record ph120.gr is a phase-profile "
+    "window record)")
 endif()
 if(ISAAC_VITA_FBO_RASTER_SCALE)
   if(NOT ISAAC_VITA_FBO_RASTER_SCALE_NUM MATCHES "^[1-9][0-9]*$" OR
@@ -4022,7 +4539,7 @@ endif()
 
 set(ISAAC_TITLE_ID "ISAACR001")
 set(ISAAC_APP_NAME "The Binding of Isaac: Repentance")
-set(ISAAC_APP_VERSION "01.01")
+set(ISAAC_APP_VERSION "02.00")
 set(ISAAC_VPK_NAME "the-binding-of-isaac-repentance")
 set(ISAAC_VITA_PACKAGE_ASSETS_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/assets/sce_sys")
@@ -4289,10 +4806,13 @@ if(ISAAC_VITA_LUA)
     "${ISAAC_LUA53_SOURCE_DIR}" "ISAAC_LUA53_SOURCE_DIR")
   include("${CMAKE_CURRENT_SOURCE_DIR}/lua53_vanilla.cmake")
   if(ISAAC_VITA_LUA_GC_FINALIZER_PACE)
-    # The derived lgc.c takes the pristine one's place in the source list (the
-    # archive member order is part of the raw allocator gate's closure); the
-    # gate re-derives it from the manifest-verified pristine file and refuses
-    # any other bytes.  Includes still resolve through the pristine src dir.
+    # The derived lgc.c and lbaselib.c take the pristine files' places in the
+    # source list (the archive member order is part of the raw allocator
+    # gate's closure); the gate re-derives both from the manifest-verified
+    # pristine files and refuses any other bytes.  Includes still resolve
+    # through the pristine src dir.  The two are one knob: the derived
+    # lbaselib.c calls the latch the derived lgc.c defines (review r5), so
+    # neither is swapped alone.
     if(NOT Python3_EXECUTABLE)
       find_package(Python3 COMPONENTS Interpreter REQUIRED)
     endif()
@@ -4300,43 +4820,86 @@ if(ISAAC_VITA_LUA)
       "${CMAKE_CURRENT_SOURCE_DIR}/lua53_gc_finalizer_pace.py")
     set(ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE
       "${ISAAC_LUA53_SOURCE_DIR}/src/lgc.c")
+    set(ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE_BASELIB
+      "${ISAAC_LUA53_SOURCE_DIR}/src/lbaselib.c")
     set(ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC
       "${CMAKE_BINARY_DIR}/lua53-gc-finalizer-pace/lgc.c")
+    set(ISAAC_VITA_LUA_GC_FINALIZER_PACE_BASELIB
+      "${CMAKE_BINARY_DIR}/lua53-gc-finalizer-pace/lbaselib.c")
+    set(ISAAC_VITA_LUA_GC_FINALIZER_PACE_ARGS
+      --input "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}"
+      --output "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC}"
+      --baselib-input "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE_BASELIB}"
+      --baselib-output "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_BASELIB}"
+      --max "${ISAAC_VITA_LUA_GC_FINALIZER_MAX}"
+      --fin-step "${ISAAC_VITA_LUA_GC_FINALIZER_STEP}"
+      --sweep-step "${ISAAC_VITA_LUA_GC_SWEEP_STEP}")
+    if(ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES GREATER 0)
+      # only when set: without it the command line, and so the derived
+      # bytes and the generator's output line, are those of the knob-less
+      # derivation
+      list(APPEND ISAAC_VITA_LUA_GC_FINALIZER_PACE_ARGS
+        --alloc-latch "${ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES}")
+    endif()
+    if(ISAAC_VITA_LUA_GC_STATE_PROFILE)
+      # only when set, as the latch above: OFF keeps the command line and
+      # the derived bytes
+      list(APPEND ISAAC_VITA_LUA_GC_FINALIZER_PACE_ARGS --state-profile)
+    endif()
     execute_process(
       COMMAND "${Python3_EXECUTABLE}"
         "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_SCRIPT}"
-        --input "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}"
-        --output "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC}"
-        --max "${ISAAC_VITA_LUA_GC_FINALIZER_MAX}"
-        --cost "${ISAAC_VITA_LUA_GC_FINALIZER_COST}"
-        --sweep-cost "${ISAAC_VITA_LUA_GC_SWEEP_COST}"
+        ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_ARGS}
       RESULT_VARIABLE ISAAC_VITA_LUA_GC_FINALIZER_PACE_RESULT
       OUTPUT_VARIABLE ISAAC_VITA_LUA_GC_FINALIZER_PACE_OUTPUT
       ERROR_VARIABLE ISAAC_VITA_LUA_GC_FINALIZER_PACE_ERROR
       OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(NOT ISAAC_VITA_LUA_GC_FINALIZER_PACE_RESULT EQUAL 0)
       message(FATAL_ERROR
-        "ISAAC_VITA_LUA_GC_FINALIZER_PACE: deriving lgc.c failed: "
-        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_ERROR}")
+        "ISAAC_VITA_LUA_GC_FINALIZER_PACE: deriving lgc.c and lbaselib.c "
+        "failed: ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_ERROR}")
     endif()
-    list(FIND ISAAC_LUA53_C_SOURCES
-      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}"
-      ISAAC_VITA_LUA_GC_FINALIZER_PACE_INDEX)
-    if(ISAAC_VITA_LUA_GC_FINALIZER_PACE_INDEX LESS 0)
-      message(FATAL_ERROR
-        "ISAAC_VITA_LUA_GC_FINALIZER_PACE: lgc.c is not in the Lua source list")
-    endif()
-    list(REMOVE_AT ISAAC_LUA53_C_SOURCES
-      ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_INDEX})
-    list(INSERT ISAAC_LUA53_C_SOURCES
-      ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_INDEX}
-      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC}")
+    foreach(_isaac_pace_pair IN ITEMS
+            "lgc.c;PRISTINE;LGC" "lbaselib.c;PRISTINE_BASELIB;BASELIB")
+      list(GET _isaac_pace_pair 0 _isaac_pace_name)
+      list(GET _isaac_pace_pair 1 _isaac_pace_from)
+      list(GET _isaac_pace_pair 2 _isaac_pace_to)
+      list(FIND ISAAC_LUA53_C_SOURCES
+        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_${_isaac_pace_from}}"
+        _isaac_pace_index)
+      if(_isaac_pace_index LESS 0)
+        message(FATAL_ERROR
+          "ISAAC_VITA_LUA_GC_FINALIZER_PACE: ${_isaac_pace_name} is not in "
+          "the Lua source list")
+      endif()
+      list(REMOVE_AT ISAAC_LUA53_C_SOURCES ${_isaac_pace_index})
+      list(INSERT ISAAC_LUA53_C_SOURCES ${_isaac_pace_index}
+        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_${_isaac_pace_to}}")
+    endforeach()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
       "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_SCRIPT}"
-      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}")
+      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}"
+      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE_BASELIB}")
+    # The same derivation as a build rule (review r1): a deleted or stale
+    # derived file is rewritten by the build, not only by a reconfigure.  The
+    # script rewrites an output when its bytes differ or it is older than the
+    # script or its pristine file, so the rule converges after one run.
+    add_custom_command(
+      OUTPUT "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC}"
+             "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_BASELIB}"
+      COMMAND "${Python3_EXECUTABLE}"
+        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_SCRIPT}"
+        ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_ARGS}
+      DEPENDS
+        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_SCRIPT}"
+        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE}"
+        "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_PRISTINE_BASELIB}"
+      COMMENT "Deriving the finalizer-paced Lua 5.3.3 lgc.c and lbaselib.c"
+      VERBATIM)
     message(STATUS
       "Isaac Lua: __gc finalizers paced (${ISAAC_VITA_LUA_GC_FINALIZER_PACE_OUTPUT}); "
-      "isaac_lua53 compiles ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC}")
+      "isaac_lua53 compiles ${ISAAC_VITA_LUA_GC_FINALIZER_PACE_LGC} and "
+      "${ISAAC_VITA_LUA_GC_FINALIZER_PACE_BASELIB}")
   endif()
   if(ISAAC_VITA_LUA_INTEGER2STR)
     # Same contract as the paced lgc.c above: the derived lobject.c takes the
@@ -4398,6 +4961,84 @@ if(ISAAC_VITA_LUA)
       "Isaac Lua: luaO_tostring integers by digit loop "
       "(${ISAAC_VITA_LUA_INTEGER2STR_OUTPUT}); "
       "isaac_lua53 compiles ${ISAAC_VITA_LUA_INTEGER2STR_LOBJECT}")
+  endif()
+  if(ISAAC_VITA_LUA_VM_COMPUTED_GOTO)
+    # Same contract as the derivations above: the derived lvm.c takes the
+    # pristine one's slot in the source list, the raw allocator gate
+    # re-derives it (lua_vm_computed_goto_sources) and refuses any other
+    # bytes, and includes still resolve through the pristine src dir.  The
+    # derivation also reads the pristine lopcodes.h (the opcode enum the jump
+    # table is written from), so it is an input of the rule as well.
+    if(NOT Python3_EXECUTABLE)
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    endif()
+    set(ISAAC_VITA_LUA_VM_COMPUTED_GOTO_SCRIPT
+      "${CMAKE_CURRENT_SOURCE_DIR}/lua53_vm_computed_goto.py")
+    set(ISAAC_VITA_LUA_VM_COMPUTED_GOTO_PRISTINE
+      "${ISAAC_LUA53_SOURCE_DIR}/src/lvm.c")
+    set(ISAAC_VITA_LUA_VM_COMPUTED_GOTO_OPCODES
+      "${ISAAC_LUA53_SOURCE_DIR}/src/lopcodes.h")
+    set(ISAAC_VITA_LUA_VM_COMPUTED_GOTO_LVM
+      "${CMAKE_BINARY_DIR}/lua53-vm-computed-goto/lvm.c")
+    set(ISAAC_VITA_LUA_VM_COMPUTED_GOTO_ARGS
+      --input "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_PRISTINE}"
+      --opcodes "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_OPCODES}"
+      --output "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_LVM}")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}"
+        "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_SCRIPT}"
+        ${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_ARGS}
+      RESULT_VARIABLE ISAAC_VITA_LUA_VM_COMPUTED_GOTO_RESULT
+      OUTPUT_VARIABLE ISAAC_VITA_LUA_VM_COMPUTED_GOTO_OUTPUT
+      ERROR_VARIABLE ISAAC_VITA_LUA_VM_COMPUTED_GOTO_ERROR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT ISAAC_VITA_LUA_VM_COMPUTED_GOTO_RESULT EQUAL 0)
+      message(FATAL_ERROR
+        "ISAAC_VITA_LUA_VM_COMPUTED_GOTO: deriving lvm.c failed: "
+        "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_ERROR}")
+    endif()
+    list(FIND ISAAC_LUA53_C_SOURCES
+      "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_PRISTINE}"
+      ISAAC_VITA_LUA_VM_COMPUTED_GOTO_INDEX)
+    if(ISAAC_VITA_LUA_VM_COMPUTED_GOTO_INDEX LESS 0)
+      message(FATAL_ERROR
+        "ISAAC_VITA_LUA_VM_COMPUTED_GOTO: lvm.c is not in the Lua source list")
+    endif()
+    list(REMOVE_AT ISAAC_LUA53_C_SOURCES ${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_INDEX})
+    list(INSERT ISAAC_LUA53_C_SOURCES ${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_INDEX}
+      "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_LVM}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_SCRIPT}"
+      "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_PRISTINE}"
+      "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_OPCODES}")
+    # A deleted or stale derived file is rewritten by the build, not only by
+    # a reconfigure (the script rewrites its output when the bytes differ or
+    # it is older than the script or an input, so the rule converges).
+    add_custom_command(
+      OUTPUT "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_LVM}"
+      COMMAND "${Python3_EXECUTABLE}"
+        "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_SCRIPT}"
+        ${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_ARGS}
+      DEPENDS
+        "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_SCRIPT}"
+        "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_PRISTINE}"
+        "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_OPCODES}"
+      COMMENT "Deriving the computed-goto Lua 5.3.3 lvm.c"
+      VERBATIM)
+    # Without this the -O2 cross-jumping pass merges the identical
+    # fetch-and-dispatch tails of the case bodies back into one block, and
+    # luaV_execute keeps a single indirect branch exactly like the pristine
+    # switch (measured, arm-none-eabi-gcc 10.3.1 with the archive's flags:
+    # 1 indirect branch without it, 47 with it, in Thumb and in ARM mode).
+    # Appended after the archive's own options for this one source; the raw
+    # allocator gate accepts it on the derived lvm.c only
+    # (LUA_VM_COMPUTED_GOTO_COMPILE_OPTIONS).
+    set_property(SOURCE "${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_LVM}"
+      APPEND PROPERTY COMPILE_OPTIONS -fno-crossjumping)
+    message(STATUS
+      "Isaac Lua: VM dispatch by computed goto "
+      "(${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_OUTPUT}); "
+      "isaac_lua53 compiles ${ISAAC_VITA_LUA_VM_COMPUTED_GOTO_LVM}")
   endif()
   # Keep pristine upstream sources in a separate archive.  The production
   # bridge creates both default and guest-allocator states through lua_newstate;
@@ -4696,11 +5337,51 @@ else()
       message(STATUS
         "Isaac Lua: LuaEngine::Update GC step clamped at ${ISAAC_VITA_LUA_GCSTEP_CLAMP_KB} KB per frame")
     endif()
-    if(ISAAC_VITA_LUA_GCCOLLECT_CLAMP OR ISAAC_VITA_LUA_GC_PROFILE)
-      # Both lua_gc policies live in one owner TU behind the import; the
+    if(ISAAC_VITA_LUA_GC_FINALIZER_PACE)
+      # the runtime receipt of the resolved pacer state (first lua_gc
+      # import); set with the knob only, so the OFF object is untouched
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_LUA_GC_FINALIZER_PACE=1)
+    endif()
+    if(ISAAC_VITA_LUA_GC_FINALIZER_PACE AND
+       ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES GREATER 0)
+      # the latch receipt: the bridge reads the derived lgc.c's latch count
+      # and the calling state's latch after every lua_gc import
+      # (isaac_lua_gc_alloc_latches / isaac_lua_gc_state_latched exist only
+      # in that derivation, hence the definition is set with the knob only)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES=${ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES})
+      message(STATUS
+        "Isaac Lua: finalizer pacer latches to pristine after ${ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES} bytes of __gc allocation in one GC cycle")
+    elseif(ISAAC_VITA_LUA_GC_FINALIZER_PACE)
+      message(WARNING
+        "Isaac Lua: finalizer pacer has NO allocation latch (ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES=0): review round 2 B1-B3 are unbounded")
+    endif()
+    if(ISAAC_VITA_LUA_GCCOLLECT_CLAMP OR ISAAC_VITA_LUA_GC_PROFILE OR
+       ISAAC_VITA_LUA_GC_IDLE_STEP)
+      # The lua_gc policies live in one owner TU behind the import; the
       # bridge gains only the delimited hook calls (host_vita_lua_gc.c).
       list(APPEND ISAAC_VITA_RUNTIME_SOURCES
         "${ISAAC_RUNTIME}/host_vita_lua_gc.c")
+      if(ISAAC_VITA_LUA_GC_STATE_PROFILE)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_lua_gc.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_LUA_GC_STATE_PROFILE=1)
+        message(STATUS
+          "Isaac Lua: GC state profile ([isaac-lua] gc state/cls/asub/worst per gc window; lgc.c derived with --state-profile)")
+      endif()
+      if(ISAAC_VITA_LUA_GC_IDLE_STEP)
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_lua.c"
+          "${ISAAC_RUNTIME}/host_vita_lua_gc.c"
+          "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_GC_IDLE_STEP=1)
+        message(STATUS
+          "Isaac Lua: LuaEngine::Update GC step (site 0x4023c6) carried one loop tail in front of an interpolated render when it cannot run atomic(); settled at the GCCOUNT import 0x4022ec ([isaac-lua] gc idle / gc idle us / gc idle why per 120 steps)")
+      endif()
       if(ISAAC_VITA_LUA_GCCOLLECT_CLAMP)
         set_property(SOURCE
           "${ISAAC_RUNTIME}/host_vita_lua.c"
@@ -4724,6 +5405,12 @@ else()
       set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
         APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_CORE_ARM=1)
       message(STATUS "Isaac Lua: Lua 5.3.3 archive compiled in ARM mode")
+    endif()
+    if(ISAAC_VITA_LUA_VM_COMPUTED_GOTO)
+      # The state-creation log reads the mode from symbols only the derived
+      # lvm.c defines, so the line states what was linked, not this flag.
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_VM_COMPUTED_GOTO=1)
     endif()
     if(ISAAC_VITA_LUA_COST_PROFILE)
       # Bridge hooks at the pcall import and the callback trampoline; the GC
@@ -5892,6 +6579,55 @@ else()
         APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_GL_THREAD_RENDER_ADMISSION=1)
       message(STATUS "Isaac Vita GL render admission: interpolated Render declined while the render thread is a frame behind")
     endif()
+    if(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE)
+      # OFF appends nothing: every object stays byte-identical.  OBSERVE changes
+      # the scheduler, backend and phase profile objects; ON also the record
+      # backend and ring (the timed producer wait, == 2 only).
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+        "${ISAAC_RUNTIME}/kage_vita_backend.c"
+        "${ISAAC_RUNTIME}/gl_record_backend.c"
+        "${ISAAC_RUNTIME}/gl_record_ring.c"
+        "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_GL_THREAD_ADMIT_WAIT=${ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE})
+      message(STATUS "Isaac Vita GL admit wait: ${ISAAC_VITA_GL_THREAD_ADMIT_WAIT_UPPER} (bound = stock time test, back-off 30 non-full phases, ph120.aw)")
+    endif()
+    if(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE)
+      # OFF appends nothing: every object stays byte-identical.  OBSERVE and
+      # ON change the scheduler, backend, record backend (the outstanding-
+      # bytes accessor) and phase profile objects; gl_record_ring.c is not
+      # touched in any mode.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+        "${ISAAC_RUNTIME}/kage_vita_backend.c"
+        "${ISAAC_RUNTIME}/gl_record_backend.c"
+        "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_GL_THREAD_ADMIT_BEHIND=${ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE}
+          ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES=${ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES})
+      message(STATUS "Isaac Vita GL admit behind: ${ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_UPPER} (bound ${ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES} outstanding ring bytes, back-off 30 non-full phases, ${_isaac_vita_admit_behind_records})")
+    endif()
+    if(ISAAC_VITA_GL_DRAW_PACKET_MODE)
+      # OFF appends nothing: every object stays byte-identical.  VERIFY and ON
+      # change the recorder (staging, opcode 82, its replay) and the phase
+      # profile (ph120.dp, and the census slot count when the census is on).
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/gl_record_backend.c"
+        "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_GL_DRAW_PACKET=${ISAAC_VITA_GL_DRAW_PACKET_MODE})
+      message(STATUS "Isaac Vita GL draw packet: ${ISAAC_VITA_GL_DRAW_PACKET_UPPER} (per-draw blend/bind/attrib records staged and published with the draw as opcode 82, ${_isaac_vita_draw_packet_records})")
+    endif()
+    if(NOT "${ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US}" STREQUAL "")
+      # Unset appends nothing: every object stays byte-identical.  Set (value
+      # and GL_THREAD_WORKER checked above): this unit only.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/gl_record_ring.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US=${ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US})
+      message(STATUS "Isaac Vita GL record consumer timeout: ${ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US} us (render-thread idle wait; producer waits keep 2000 us; gl_record_ring.c only)")
+    endif()
     if(ISAAC_VITA_IMAGE_RETAIN OR ISAAC_VITA_HEAP_CENSUS)
       # Their readers link kage_vita_backend_vgl_mem(): no snapshot, no link.
       set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_backend.c"
@@ -6803,6 +7539,17 @@ else()
     set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
       APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_LEAN_IMPORT=1)
     message(STATUS "Isaac heap: lean import (measurement-only floor-lifetime sidecars off)")
+  endif()
+  if(ISAAC_VITA_HEAP_IMPORT_LEAN2)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_IMPORT_LEAN2=1)
+    if(ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY)
+      set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY=1)
+      message(STATUS "Isaac heap: import lean2 VERIFY (skipped steps kept as checks, 'guest heap lean2 verify:' lines)")
+    else()
+      message(STATUS "Isaac heap: import lean2 (exact malloc/free wrapper cuts, banner 'guest heap lean2 import:')")
+    endif()
   endif()
   # Keep generic Vita guest.c oracles on the established name-dispatch ABI.
   # Only the production target links the full validated dense-ID closure.
@@ -9700,6 +10447,58 @@ else()
           APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_IMAGE_RETAIN_HEADROOM_PHYCONT=1)
         message(STATUS "Isaac Vita image retain headroom: RAM+VRAM+PHYCONT")
       endif()
+      if(ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE)
+        # OFF appends nothing: the unit stays byte-identical.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE=1
+            ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB=${ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB})
+        message(STATUS "Isaac Vita image retain big trace: one line per decision for sheets >= ${ISAAC_VITA_IMAGE_RETAIN_BIG_TRACE_MIN_KB} KiB (no clocks)")
+      endif()
+      if(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED STREQUAL "OBSERVE")
+        # OFF appends nothing: the unit stays byte-identical.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=1)
+      elseif(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED STREQUAL "ON")
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED=2)
+      endif()
+      message(STATUS "Isaac Vita image retain admit touched (flag 0x10): ${ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED}")
+      if(ISAAC_VITA_IMAGE_PRELOAD)
+        # The retention unit owns the preload; the SFX floor preload unit
+        # owns the Level::Init seam that calls it and the heap headroom.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_IMAGE_PRELOAD=1
+            ISAAC_VITA_IMAGE_PRELOAD_LIST=\"${ISAAC_VITA_IMAGE_PRELOAD_LIST}\"
+            ISAAC_VITA_IMAGE_PRELOAD_MAX_KB=${ISAAC_VITA_IMAGE_PRELOAD_MAX_KB}
+            ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB=${ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB})
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/host_vita_sfx_floor_preload.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_IMAGE_PRELOAD=1)
+        message(STATUS "Isaac Vita image preload: ON, list '${ISAAC_VITA_IMAGE_PRELOAD_LIST}' (${ISAAC_IMAGE_PRELOAD_COUNT} names), max ${ISAAC_VITA_IMAGE_PRELOAD_MAX_KB} KiB each, guest heap reserve ${ISAAC_VITA_IMAGE_PRELOAD_RESERVE_MB} MiB")
+        if(ISAAC_VITA_IMAGE_PRELOAD_PIN STREQUAL "OBSERVE")
+          # OFF appends nothing: the unit stays byte-identical.
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_IMAGE_PRELOAD_PIN=1)
+        elseif(ISAAC_VITA_IMAGE_PRELOAD_PIN STREQUAL "ON")
+          set_property(SOURCE
+            "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS
+              ISAAC_VITA_IMAGE_PRELOAD_PIN=2)
+        endif()
+        message(STATUS "Isaac Vita image preload pin: ${ISAAC_VITA_IMAGE_PRELOAD_PIN}")
+      else()
+        message(STATUS "Isaac Vita image preload: OFF")
+      endif()
       target_link_options(isaac_first_arm_fault PRIVATE
         -Wl,--wrap=sub_0056d8c0)
       message(STATUS
@@ -9858,6 +10657,28 @@ else()
         set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
           APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_FRAME_SPIKE_PROFILE=1)
         message(STATUS "Isaac Vita correlated frame spikes: ph120.sp (no extra clocks)")
+      endif()
+      if(ISAAC_VITA_UPDATE_HITCH_PROBE)
+        # OFF appends nothing: every object stays byte-identical.  ON: the
+        # scheduler's two call sites, the records in the phase profile and a
+        # read-only accessor in each seam unit that is part of this build (a
+        # property on a source that is not compiled is inert).
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+          "${ISAAC_RUNTIME}/kage_vita_fullspeed_scheduler.c"
+          "${ISAAC_RUNTIME}/host_vita_static_sfx_profile.c"
+          "${ISAAC_RUNTIME}/host_vita_lua_cost.c"
+          "${ISAAC_RUNTIME}/kage_vita_guest_sampler.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_UPDATE_HITCH_PROBE=1)
+        set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US=${ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US})
+        if(ISAAC_VITA_LUA_COST_PROFILE)
+          # The phase profile has no Lua define of its own.
+          set_property(SOURCE "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS KAGE_VITA_UPDATE_HITCH_LUA_COST=1)
+        endif()
+        message(STATUS "Isaac Vita update hitch probe: ph120.uh/uhs per Game::Update >= ${ISAAC_VITA_UPDATE_HITCH_PROBE_THRESHOLD_US} us (no extra clocks); seams fh=${ISAAC_VITA_CRT_FILE_LOOKUP_HINT} pngi=${ISAAC_VITA_PNG_TEXEL_INIT_ELISION} png=${ISAAC_VITA_PNG_WINDOW_PROFILE} sfx=${ISAAC_VITA_STATIC_SFX_PROFILE} lua=${ISAAC_VITA_LUA_COST_PROFILE} smp=${ISAAC_VITA_GUEST_SAMPLER}")
       endif()
       if(ISAAC_VITA_DEEP_PROFILE)
         set(ISAAC_DEEP_GENERATED_OWNERS "")
@@ -11042,6 +11863,19 @@ else()
         "Isaac Vita offscreen readback sync: sceGxmFinish before a "
         "glReadPixels of a colour texture written since the last drain "
         "(issue #10)")
+      if(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_MODE)
+        # Same single object: the detail census (lane TXR), 1 = OBSERVE,
+        # 2 = ON.
+        set_property(SOURCE
+          "${ISAAC_RUNTIME}/gl_vita_backend.c"
+          APPEND PROPERTY COMPILE_DEFINITIONS
+            ISAAC_VITA_FBO_READBACK_CENSUS_SKIP=${ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_MODE})
+        message(STATUS
+          "Isaac Vita readback detail census: "
+          "mode=${ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_UPPER} "
+          "(${ISAAC_VITA_FBO_READBACK_CENSUS_SKIP_MODE}; OBSERVE times the "
+          "whole-texture walk, ON skips it)")
+      endif()
     endif()
     if(ISAAC_VITA_FBO_DEPTH_CARRY)
       # Lives entirely in the GL boundary object (issue #15).
@@ -11052,6 +11886,40 @@ else()
       message(STATUS
         "Isaac Vita offscreen depth carry: last depth clear replayed into a "
         "re-attached vitaGL scene before its first draw (issue #15)")
+    endif()
+    if(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+      # The GL boundary object owns the pending attach; the swap owners
+      # (frame present, loading screen, continue overlay) flush it before
+      # vglSwapBuffers, the manager render-target destroy flushes it before
+      # its native framebuffer delete, and the phase profiler prints its
+      # window counters (ph120.da).
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/gl_vita_backend.c"
+        "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+        "${ISAAC_RUNTIME}/kage_vita_backend.c"
+        "${ISAAC_RUNTIME}/kage_vita_continue_profile.c"
+        "${ISAAC_RUNTIME}/kage_vita_loading.c"
+        "${ISAAC_RUNTIME}/manual_kage_vita.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_FBO_DEFERRED_ATTACH=1)
+      message(STATUS
+        "Isaac Vita deferred colour attach: an attach superseded before any "
+        "native consumer is not forwarded (ph120.da)")
+    endif()
+    if(ISAAC_VITA_GXM_RT_CREATE_CENSUS)
+      # The phase profiler defines the two wrappers and prints their window
+      # counters (ph120.gr); GNU ld routes every reference to the two GXM
+      # imports, vitaGL's included, through them.
+      set_property(SOURCE
+        "${ISAAC_RUNTIME}/kage_vita_phase_profile.c"
+        APPEND PROPERTY COMPILE_DEFINITIONS
+          ISAAC_VITA_GXM_RT_CREATE_CENSUS=1)
+      target_link_options(isaac_first_arm_fault PRIVATE
+        -Wl,--wrap=sceGxmCreateRenderTarget
+        -Wl,--wrap=sceGxmDestroyRenderTarget)
+      message(STATUS
+        "Isaac Vita GXM render-target census: sceGxmCreateRenderTarget / "
+        "sceGxmDestroyRenderTarget wrapped at link time (ph120.gr)")
     endif()
     if(ISAAC_VITA_VITAGL_STOCK_REFERENCE)
       # Only the vitaGL lifecycle owner selects the stock initialization and

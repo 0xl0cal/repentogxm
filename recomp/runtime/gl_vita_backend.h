@@ -1016,4 +1016,48 @@ void gl_vita_backend_first_frame_snapshot(
  * A second writer (MEMO_VERIFY together with GL_LOCATION_CACHE_VERIFY on the
  * shared loc(...,m) counter) is refused by CMake. */
 
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+/* ISAAC_VITA_FBO_DEFERRED_ATTACH: a tracked colour attach (COLOR_ATTACHMENT0,
+ * GL_TEXTURE_2D level 0, non-zero texture, non-zero draw framebuffer) is held
+ * back until a call that makes vitaGL consume the attachment, and is dropped
+ * when the guest re-attaches the same framebuffer first.  Counters are owned
+ * by the thread that runs the typed backend (the GL render worker with
+ * ISAAC_VITA_GL_THREAD_WORKER): read them only through the take below. */
+enum {
+    ISAAC_VITA_FBO_DEFER_FLUSH_DRAW = 0,    /* glDrawElements */
+    ISAAC_VITA_FBO_DEFER_FLUSH_CLEAR,       /* a glClear that reaches vitaGL */
+    ISAAC_VITA_FBO_DEFER_FLUSH_OWED,        /* owed depth/stencil clear replay */
+    ISAAC_VITA_FBO_DEFER_FLUSH_READ,        /* glReadPixels served by vitaGL */
+    ISAAC_VITA_FBO_DEFER_FLUSH_PRESENT,     /* vglSwapBuffers owner */
+    ISAAC_VITA_FBO_DEFER_FLUSH_TEXTURE,     /* glTexImage2D/glTexSubImage2D/glDeleteTextures */
+    ISAAC_VITA_FBO_DEFER_FLUSH_OTHER,       /* other attach shape or framebuffer, renderbuffer
+                                             * attach, framebuffer delete, glGetIntegerv,
+                                             * READ_FRAMEBUFFER status, install/uninstall,
+                                             * native manager-framebuffer destroy */
+    ISAAC_VITA_FBO_DEFER_FLUSH_CLASSES
+};
+typedef struct IsaacVitaFboDeferredAttachCounters {
+    uint32_t deferred;      /* attaches held back */
+    uint32_t dropped;       /* of those, superseded before any consumer */
+    uint32_t status_local;  /* glCheckFramebufferStatus answered from the pending attach */
+    uint32_t flushed[ISAAC_VITA_FBO_DEFER_FLUSH_CLASSES];
+} IsaacVitaFboDeferredAttachCounters;
+/* Call immediately before a vglSwapBuffers, on the thread that owns the
+ * typed backend, so vitaGL's render-target purge buckets see each surviving
+ * attach in its own frame.  Hooked: the frame present (worker closure and
+ * inline path), the loading-screen swap and both continue-overlay swaps.
+ * Not hooked: the trophy setup pump (kage_vita_backend.c
+ * kage_vita_trophy_present), which only runs inside
+ * kage_vita_backend_initialize, before gl_vita_backend_install, when nothing
+ * can be pending. */
+void gl_vita_backend_fbo_deferred_attach_present(void);
+/* Forward the pending attach before vitaGL calls made outside the typed
+ * boundary that read or delete a framebuffer (manual_kage_vita.c
+ * destroy_render_targets deletes the manager framebuffer natively).  Same
+ * thread rule; closure-shaped for isaac_gl_record_worker_call. */
+void gl_vita_backend_fbo_deferred_attach_external(void *unused);
+/* Copy (context = IsaacVitaFboDeferredAttachCounters *, may be NULL) and zero
+ * the window counters.  Closure-shaped for isaac_gl_record_worker_call. */
+void gl_vita_backend_fbo_deferred_attach_take(void *context);
+#endif
 #endif

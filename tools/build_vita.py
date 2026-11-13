@@ -1455,6 +1455,7 @@ def _verify_raw_allocator_lua_archive(
     core_arm: bool = False,
     finalizer_pace: bool = False,
     integer2str: bool = False,
+    vm_computed_goto: bool = False,
 ) -> int:
     dead_relocations = (
         LUA53_DEAD_RAW_RELOCATIONS_ARM if core_arm else LUA53_DEAD_RAW_RELOCATIONS
@@ -1467,9 +1468,15 @@ def _verify_raw_allocator_lua_archive(
     # (<build>/lua53-integer2str/lobject.c); each knob owns its one member.
     derived_names: set[str] = set()
     if finalizer_pace:
-        derived_names.add("lgc.c")
+        # the r5 pacer derives two members: lgc.c and lbaselib.c (the script
+        # latch in collectgarbage)
+        derived_names.update(("lgc.c", "lbaselib.c"))
     if integer2str:
         derived_names.add("lobject.c")
+    # ISAAC_VITA_LUA_VM_COMPUTED_GOTO=ON: lvm.c
+    # (<build>/lua53-vm-computed-goto/lvm.c).
+    if vm_computed_goto:
+        derived_names.add("lvm.c")
     member_keys = {
         "source", "source_sha256", "object", "member", "size",
         "sha256", "raw_relocations",
@@ -1709,6 +1716,8 @@ def verify_raw_allocator_gate(
             core_arm=_cache_bool(cache, "ISAAC_VITA_LUA_CORE_ARM"),
             finalizer_pace=_cache_bool(cache, "ISAAC_VITA_LUA_GC_FINALIZER_PACE"),
             integer2str=_cache_bool(cache, "ISAAC_VITA_LUA_INTEGER2STR"),
+            vm_computed_goto=_cache_bool(
+                cache, "ISAAC_VITA_LUA_VM_COMPUTED_GOTO"),
         )
     if (
         receipt.get("source_count") != len(sources) + lua_object_count

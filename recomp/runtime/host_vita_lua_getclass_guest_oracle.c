@@ -43,6 +43,14 @@
  *     and a class table; the GC-point records, finalizer order and results
  *     must agree, and with ISAAC_VITA_LUA_GETCLASS_DIRECT the API path and
  *     the direct path must leave byte-identical arenas;
+ *   - GC-point positions: a collector step leaves the debt negative, so the
+ *     transcripts above step only at the FIRST luaC_checkGC of a call.  The
+ *     position transcripts number the GC points of each call (1, 2, 3 ...),
+ *     hold the positive debt back at every point before position N (the
+ *     hook returns without stepping) and step at point N, for N = 1 .. 4;
+ *     visits and steps are counted per (probe configuration, position) and
+ *     must equal the table the translated body implies, so a GC point that
+ *     is dropped, added or moved anywhere in a call changes the transcript;
  *   - ISAAC_VITA_LUA_GETCLASS_DIRECT: the node memo's hit, miss and stale
  *     paths, including a hit on a key whose value was removed. */
 #include <stdarg.h>
@@ -385,14 +393,24 @@ typedef struct gc_record {
     int32_t stacksize;
     int32_t ci_depth;
     uint32_t moved;         /* the step reallocated the Lua stack */
+    uint32_t position;      /* n-th top-level GC point of this seam call (0: outside) */
+    uint32_t deferred;      /* position transcript: debt held back, no step here */
     uint64_t live;          /* meaning of [stack, top) */
     uint64_t image;         /* meaning of the whole stack, dead slots included */
 } gc_record;
 
 #define GC_KEEP 2048U
+#define GC_POSITIONS 8U         /* positions counted per call (the bodies have at most 3) */
+#define PROBE_CONFIGS 7U
 
 typedef struct gc_transcript {
     uint32_t points, in_seam, moved, moved_in_seam;
+    uint32_t deferred;      /* GC points visited with the debt held back (not in points) */
+    /* per (probe configuration, GC-point position - 1), top-level points of a seam call */
+    uint32_t visited[PROBE_CONFIGS][GC_POSITIONS];
+    uint32_t stepped[PROBE_CONFIGS][GC_POSITIONS];
+    uint32_t calls[PROBE_CONFIGS];
+    uint32_t beyond;        /* a position past GC_POSITIONS */
     uint64_t meaning;       /* every record except its image */
     uint64_t image;         /* every record's image */
     uint32_t kept;
@@ -602,6 +620,11 @@ static uint64_t heap_digest(lua_State *L, uint32_t *objects)
 static gc_transcript *s_gc_record;       /* recording GC points (NULL: count only) */
 static transcript *s_tr;                 /* recording finalizers and results */
 static uint32_t s_gc_points_in_seam, s_gc_moves_in_seam;
+/* GC-point positions (position transcripts; see luaC_step below) */
+static uint32_t s_gc_force_position;     /* 0: step wherever the debt is positive */
+static uint32_t s_gc_position;           /* top-level GC points seen in this seam call */
+static uint32_t s_gc_step_depth;         /* inside isaac_oracle_luaC_step_real */
+static uint32_t s_probe_config;          /* probe_set(k) */
 
 int isaac_vita_startup_map_path(CPU *__restrict c, uint32_t guest_path,
                                 char *native_path, uint32_t capacity)
@@ -883,6 +906,7 @@ static int native_probe_set(lua_State *L)
     s_probe_key = s_probe_configs[k].key;
     s_probe_cbc = s_probe_configs[k].can_be_const;
     s_probe_index = 1;
+    s_probe_config = (uint32_t)k;
     return 0;
 }
 
@@ -1076,6 +1100,7 @@ static void call_variant(CPU *c, int fn, int variant)
 {
     snapshot_entry(c);
     s_in_seam = 1;
+    s_gc_position = 0U;
     if (variant == VARIANT_API) {
         call_api(c, fn);
     } else if (fn == FN_GETCLASS) {
@@ -1114,6 +1139,8 @@ static void guest_probe(CPU *__restrict c)
     uint32_t adjust;
     c->ecx = L;
     adjust = push_call(c, s_probe_fn, s_probe_key, s_probe_cbc, s_probe_index);
+    if (s_gc_record != NULL && s_probe_config < PROBE_CONFIGS)
+        ++s_gc_record->calls[s_probe_config];
     call_variant(c, s_probe_fn, s_probe_variant);
     if (c->fault)
         return;
@@ -1204,12 +1231,26 @@ void luaC_step(lua_State *L)
     gc_transcript *t = s_gc_record;
     const TValue *before = L->stack;
     gc_record r;
-    uint32_t moved;
+    uint32_t moved, position = 0U, deferred = 0U;
     memset(&r, 0, sizeof r);
+    /* A GC point of the seam call itself (not one a finalizer reaches while a
+     * collector step is already running: lgc.c GCTM stops the collector, the
+     * nested luaC_step only resets the debt). */
+    if (s_in_seam && s_gc_step_depth == 0U) {
+        position = ++s_gc_position;
+        /* position transcript: hold the positive debt back until point N.
+         * Returning without a step leaves GCdebt > 0, so the call's next
+         * luaC_checkGC lands here again -- or, when the call has fewer than
+         * N points, the first one after it, outside the seam. */
+        deferred = t != NULL && s_gc_force_position != 0U &&
+                   position < s_gc_force_position;
+    }
     if (t != NULL) {
         const CallInfo *ci;
         const TValue *o;
-        r.seq = t->points;
+        r.seq = t->points + t->deferred;
+        r.position = position;
+        r.deferred = deferred;
         r.in_seam = (uint32_t)s_in_seam;
         r.gcstate = G(L)->gcstate;
         r.debt = (int32_t)G(L)->GCdebt;
@@ -1227,18 +1268,35 @@ void luaC_step(lua_State *L)
         for (o = L->stack; o < L->stack + L->stacksize; ++o)
             r.image = fnv_slot_meaning(r.image, o);
     }
-    isaac_oracle_luaC_step_real(L);
+    if (!deferred) {
+        ++s_gc_step_depth;
+        isaac_oracle_luaC_step_real(L);   /* a raising __gc leaves by longjmp:
+                                           * run_transcript resets the depth */
+        --s_gc_step_depth;
+    }
     moved = L->stack != before;
-    if (s_in_seam) {
+    if (s_in_seam && !deferred) {
         ++s_gc_points_in_seam;
         s_gc_moves_in_seam += moved;
     }
     if (t != NULL) {
         r.moved = moved;
-        ++t->points;
-        t->in_seam += r.in_seam != 0U;
-        t->moved += moved;
-        t->moved_in_seam += moved && r.in_seam;
+        if (position != 0U && s_probe_config < PROBE_CONFIGS) {
+            if (position <= GC_POSITIONS) {
+                ++t->visited[s_probe_config][position - 1U];
+                t->stepped[s_probe_config][position - 1U] += !deferred;
+            } else {
+                ++t->beyond;
+            }
+        }
+        if (deferred) {
+            ++t->deferred;
+        } else {
+            ++t->points;
+            t->in_seam += r.in_seam != 0U;
+            t->moved += moved;
+            t->moved_in_seam += moved && r.in_seam;
+        }
         t->meaning = fnv_bytes(t->meaning, &r, offsetof(gc_record, image));
         t->image = fnv_bytes(t->image, &r.image, sizeof r.image);
         if (t->kept < GC_KEEP)
@@ -2208,12 +2266,27 @@ static const char s_transcript_chunk[] =
     "return true";
 
 static transcript s_transcripts[4];
+static transcript s_position_transcripts[3];
+
+/* GC points of one handled call per probe configuration (s_probe_configs,
+ * list[k + 1] of the chunk), READ off the seam's direct path
+ * (host_vita_lua_getclass.c isaac_vita_lua_getclass_direct_try /
+ * _getexact_direct_try) and off the translated bodies' lua_pushstring sites:
+ *   0 getClass A  as A        "__const" probe                              1
+ *   1 getClass B  as A        "__const" probe, "__parent" hop              2
+ *   2 getClass C  as A        "__const" probe, two "__parent" hops         3
+ *   3 getClass Ac as A const  "__const" probe, class "__const"             2
+ *   4 getClass Bc as A const  "__const" probe, class "__const", one hop    3
+ *   5 getExact A  as A        the metatable is the class: no push          0
+ *   6 getExact Ac as A        class "__const"                              1 */
+static const uint32_t s_probe_gc_points[PROBE_CONFIGS] = { 1U, 2U, 3U, 2U, 3U, 0U, 1U };
+#define GC_POSITION_MAX 3U      /* the largest entry above */
 
 /* The script on a fresh state in the reset arena, every probe through
  * `variant`.  Called from one place, so the C stack address lstate.c's
  * makeseed mixes into the string-hash seed is the same in every run (the test
  * compiles Lua with a constant luai_makeseed). */
-static int run_transcript(int variant, transcript *out)
+static int run_transcript(int variant, uint32_t force_position, transcript *out)
 {
     const isaac_vita_lua_getclass_stats *st = isaac_vita_lua_getclass_stats_get();
     lua_State *saved_L = s_L;
@@ -2241,11 +2314,14 @@ static int run_transcript(int variant, transcript *out)
     CHECK(arena_owns(s_L));
     s_probe_variant = variant;
     s_tr = out;
+    s_gc_step_depth = 0U;
+    s_gc_force_position = force_position;
     s_gc_record = &out->gc;
     CHECK(run_chunk(&s_cpu, s_transcript_chunk, 1));
     CHECK(lua_toboolean(s_L, -1));
     lua_settop(s_L, 0);
     s_gc_record = NULL;
+    s_gc_force_position = 0U;
     s_tr = NULL;
     out->debt = (int32_t)G(s_L)->GCdebt;
     out->total = (uint32_t)gettotalbytes(G(s_L));
@@ -2276,6 +2352,10 @@ static int same_meaning(const transcript *a, const transcript *b)
 {
     return a->gc.points == b->gc.points && a->gc.in_seam == b->gc.in_seam &&
            a->gc.moved == b->gc.moved && a->gc.moved_in_seam == b->gc.moved_in_seam &&
+           a->gc.deferred == b->gc.deferred && a->gc.beyond == b->gc.beyond &&
+           memcmp(a->gc.visited, b->gc.visited, sizeof a->gc.visited) == 0 &&
+           memcmp(a->gc.stepped, b->gc.stepped, sizeof a->gc.stepped) == 0 &&
+           memcmp(a->gc.calls, b->gc.calls, sizeof a->gc.calls) == 0 &&
            a->gc.meaning == b->gc.meaning && a->fin == b->fin &&
            a->fin_calls == b->fin_calls && a->results == b->results &&
            a->result_count == b->result_count && a->result_bad == b->result_bad &&
@@ -2292,9 +2372,10 @@ static int same_state(const transcript *a, const transcript *b)
 
 static void print_gc_record(const char *tag, const gc_record *r)
 {
-    printf("      %-10s seq=%u seam=%u state=%d debt=%d total=%u top=%d size=%d ci=%d "
-           "moved=%u live=%016llx image=%016llx\n", tag, (unsigned)r->seq,
-           (unsigned)r->in_seam, (int)r->gcstate, (int)r->debt, (unsigned)r->total,
+    printf("      %-10s seq=%u seam=%u pos=%u deferred=%u state=%d debt=%d total=%u top=%d "
+           "size=%d ci=%d moved=%u live=%016llx image=%016llx\n", tag, (unsigned)r->seq,
+           (unsigned)r->in_seam, (unsigned)r->position, (unsigned)r->deferred,
+           (int)r->gcstate, (int)r->debt, (unsigned)r->total,
            (int)r->top, (int)r->stacksize, (int)r->ci_depth, (unsigned)r->moved,
            (unsigned long long)r->live, (unsigned long long)r->image);
 }
@@ -2309,6 +2390,17 @@ static void first_difference(const transcript *a, const char *an,
             print_gc_record(an, &a->gc.first[i]);
             print_gc_record(bn, &b->gc.first[i]);
             return;
+        }
+    }
+    for (i = 0U; i < PROBE_CONFIGS; ++i) {
+        uint32_t p;
+        for (p = 0U; p < GC_POSITIONS; ++p) {
+            if (a->gc.visited[i][p] != b->gc.visited[i][p] ||
+                a->gc.stepped[i][p] != b->gc.stepped[i][p])
+                printf("    probe configuration %u, GC-point position %u: visited %u/%u "
+                       "stepped %u/%u\n", (unsigned)i, (unsigned)(p + 1U),
+                       (unsigned)a->gc.visited[i][p], (unsigned)b->gc.visited[i][p],
+                       (unsigned)a->gc.stepped[i][p], (unsigned)b->gc.stepped[i][p]);
         }
     }
     printf("    the first %u GC points agree; points %u/%u fin %u/%u results %u/%u "
@@ -2331,7 +2423,7 @@ static int run_transcripts(void)
 
     for (i = 0; i < 4; ++i) {
         const transcript *r = &s_transcripts[i];
-        CHECK(run_transcript(order[i], &s_transcripts[i]) == 0);
+        CHECK(run_transcript(order[i], 0U, &s_transcripts[i]) == 0);
         printf("  trans : %-10s points=%u in_seam=%u moved=%u moved_in_seam=%u fin=%u "
                "results=%u bad=%u handled=%u fallbacks=%u arena=%u KiB\n", names[i],
                (unsigned)r->gc.points, (unsigned)r->gc.in_seam, (unsigned)r->gc.moved,
@@ -2390,6 +2482,105 @@ static int run_transcripts(void)
            "same");
     return 0;
 }
+
+/* The table every position transcript must show.  With the debt held back
+ * until point N, a call of configuration k (n = s_probe_gc_points[k] points)
+ * visits positions 1 .. min(n, N), each exactly once per call, and steps at
+ * position N only (every visit there is a step; none before, and none after:
+ * the step at N leaves the debt negative for the rest of the call).  N = 0 is
+ * the classic transcript: gc_debt() arms the first point, so it must look
+ * like N = 1. */
+static int check_gc_positions(const char *name, const gc_transcript *g, uint32_t force)
+{
+    uint32_t n_force = force == 0U ? 1U : force;
+    uint32_t k, p;
+    CHECK(g->beyond == 0U);
+    CHECK(force != 0U || g->deferred == 0U);
+    for (k = 0U; k < PROBE_CONFIGS; ++k) {
+        uint32_t points = s_probe_gc_points[k];
+        uint32_t reach = points < n_force ? points : n_force;
+        CHECK(g->calls[k] >= TRANSCRIPT_ITERATIONS / PROBE_CONFIGS);
+        for (p = 0U; p < GC_POSITIONS; ++p) {
+            uint32_t want_visits = p < reach ? g->calls[k] : 0U;
+            uint32_t want_steps = p + 1U == n_force ? want_visits : 0U;
+            if (g->visited[k][p] != want_visits || g->stepped[k][p] != want_steps)
+                printf("  pos   : %s N=%u configuration %u position %u: visited %u "
+                       "(want %u) stepped %u (want %u)\n", name, (unsigned)force,
+                       (unsigned)k, (unsigned)(p + 1U), (unsigned)g->visited[k][p],
+                       (unsigned)want_visits, (unsigned)g->stepped[k][p],
+                       (unsigned)want_steps);
+            CHECK(g->visited[k][p] == want_visits);
+            CHECK(g->stepped[k][p] == want_steps);
+        }
+    }
+    return 0;
+}
+
+/* A collector step at every GC-point position of a call in turn. */
+static int run_position_transcripts(void)
+{
+#if defined(ISAAC_VITA_LUA_GETCLASS_DIRECT)
+    static const char *const names[3] = { "translated", "api", "direct" };
+#else
+    static const char *const names[3] = { "translated", "wrap", "wrap-again" };
+#endif
+    static const int order[3] = { VARIANT_TRANSLATED, VARIANT_API, VARIANT_WRAP };
+    const transcript *t = s_position_transcripts;
+    uint32_t force, k;
+    int i;
+
+    for (i = 0; i < 4; ++i)
+        CHECK(check_gc_positions("classic", &s_transcripts[i].gc, 0U) == 0);
+    /* N = GC_POSITION_MAX + 1 proves there is no later point: nothing steps
+     * inside the seam, every call leaves with the debt still positive. */
+    for (force = 1U; force <= GC_POSITION_MAX + 1U; ++force) {
+        uint32_t steps_here = 0U;
+        for (i = 0; i < 3; ++i) {
+            const transcript *r = &s_position_transcripts[i];
+            CHECK(run_transcript(order[i], force, &s_position_transcripts[i]) == 0);
+            printf("  pos   : N=%u %-10s points=%u in_seam=%u deferred=%u moved_in_seam=%u "
+                   "fin=%u results=%u bad=%u handled=%u fallbacks=%u meaning=%016llx "
+                   "image=%016llx heap=%016llx\n", (unsigned)force, names[i],
+                   (unsigned)r->gc.points, (unsigned)r->gc.in_seam, (unsigned)r->gc.deferred,
+                   (unsigned)r->gc.moved_in_seam, (unsigned)r->fin_calls,
+                   (unsigned)r->result_count, (unsigned)r->result_bad, (unsigned)r->handled,
+                   (unsigned)r->fallbacks, (unsigned long long)r->gc.meaning,
+                   (unsigned long long)r->gc.image, (unsigned long long)r->heap);
+            CHECK(r->result_count == TRANSCRIPT_ITERATIONS && r->result_bad == 0U);
+            CHECK(r->arena_live_after_close == 0U && r->arena_failed == 0U);
+            CHECK(r->fin_calls > 0U);
+            CHECK(s_fault_calls == 0U && s_real_contract_failures == 0U);
+            CHECK(check_gc_positions(names[i], &r->gc, force) == 0);
+        }
+        if (!same_state(&t[1], &t[2]))
+            first_difference(&t[1], names[1], &t[2], names[2]);
+        CHECK(same_state(&t[1], &t[2]));
+        if (!same_meaning(&t[0], &t[1]))
+            first_difference(&t[0], names[0], &t[1], names[1]);
+        CHECK(same_meaning(&t[0], &t[1]));
+        CHECK(t[0].heap == t[1].heap && t[0].heap_objects == t[1].heap_objects);
+        CHECK(t[2].handled == TRANSCRIPT_ITERATIONS && t[2].fallbacks == 0U);
+        for (k = 0U; k < PROBE_CONFIGS; ++k)
+            steps_here += t[2].gc.stepped[k][force - 1U];
+        if (force <= GC_POSITION_MAX) {
+            CHECK(steps_here > 0U && t[2].gc.in_seam >= steps_here);
+            CHECK(t[2].gc.moved_in_seam > 0U);
+        } else {
+            CHECK(steps_here == 0U && t[2].gc.in_seam == 0U);
+        }
+        printf("  pos   : N=%u %s == %s (every GC point incl. held-back ones, whole stack, heap) "
+               "and translated == %s by meaning; steps at position %u inside the seam=%u "
+               "[configurations 0..6: %u/%u/%u/%u/%u/%u/%u]\n", (unsigned)force, names[2],
+               names[1], names[1], (unsigned)force, (unsigned)steps_here,
+               (unsigned)t[2].gc.stepped[0][force - 1U], (unsigned)t[2].gc.stepped[1][force - 1U],
+               (unsigned)t[2].gc.stepped[2][force - 1U], (unsigned)t[2].gc.stepped[3][force - 1U],
+               (unsigned)t[2].gc.stepped[4][force - 1U], (unsigned)t[2].gc.stepped[5][force - 1U],
+               (unsigned)t[2].gc.stepped[6][force - 1U]);
+    }
+    printf("  pos   : GC-point positions 1..%u each stepped in turn, position %u never "
+           "reached: PASS\n", (unsigned)GC_POSITION_MAX, (unsigned)(GC_POSITION_MAX + 1U));
+    return 0;
+}
 #endif /* !ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY */
 
 int main(void)
@@ -2444,6 +2635,7 @@ int main(void)
 #endif
 #if !defined(ISAAC_VITA_LUA_NATIVE_GETCLASS_VERIFY)
     CHECK(run_transcripts() == 0);
+    CHECK(run_position_transcripts() == 0);
 #endif
     printf("gc points: inside a getClass/getExact call=%u, of which moved the Lua stack=%u\n",
            (unsigned)s_gc_points_in_seam, (unsigned)s_gc_moves_in_seam);

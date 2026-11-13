@@ -183,4 +183,22 @@ int isaac_vita_static_sfx_profile_take_window(
     atomic_flag_clear_explicit(&s_scope_lock, memory_order_release);
     return 1;
 }
+
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+/* Update hitch probe: the open window as it stands.  Unlike take_window it
+ * resets nothing and leaves the skipped count alone.  It does hold the
+ * scope lock for the copy, and sfx_scope does not wait on that lock: a
+ * load or play entering on ANOTHER thread during the copy runs unprofiled
+ * and adds one to ph120.sfx skipped.  Nothing else in ph120.sfx can move. */
+int isaac_vita_static_sfx_profile_peek_window(
+    isaac_vita_static_sfx_window *out)
+{
+    if (out == NULL || atomic_flag_test_and_set_explicit(
+            &s_scope_lock, memory_order_acquire))
+        return 0;
+    *out = s_window;
+    atomic_flag_clear_explicit(&s_scope_lock, memory_order_release);
+    return 1;
+}
+#endif
 #endif

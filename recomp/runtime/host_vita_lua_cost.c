@@ -72,6 +72,28 @@ typedef struct cost_state {
 enum { GC_VM = 0, GC_CB = 1, GC_EXT = 2 };
 
 static cost_state s_cost;
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+/* Totals of every closed window; the open window is added on read. */
+static uint32_t s_cost_hitch_base[6];
+
+static void cost_hitch_window(uint32_t out[6])
+{
+    out[0] = s_cost.pc_n;
+    out[1] = s_cost.pc_us;
+    out[2] = s_cost.cb_n;
+    out[3] = s_cost.cb_us;
+    out[4] = s_cost.gc_n[0] + s_cost.gc_n[1] + s_cost.gc_n[2];
+    out[5] = s_cost.gc_us[0] + s_cost.gc_us[1] + s_cost.gc_us[2];
+}
+
+void isaac_vita_lua_cost_hitch_peek(uint32_t out[6])
+{
+    uint32_t i;
+    cost_hitch_window(out);
+    for (i = 0U; i < 6U; ++i)
+        out[i] += s_cost_hitch_base[i];
+}
+#endif
 
 void isaac_vita_log(const char *format, ...);
 
@@ -194,6 +216,14 @@ static void cost_emit(uint64_t now)
                    (unsigned)s_cost.win, list);
     cost_sink(line);
 
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+    {
+        uint32_t closing[6];
+        cost_hitch_window(closing);
+        for (i = 0U; i < 6U; ++i)
+            s_cost_hitch_base[i] += closing[i];
+    }
+#endif
     /* New window: totals and tables only; open activations stay open and
      * are charged to the window in which they close. */
     s_cost.pc_n = s_cost.pc_us = s_cost.cb_n = s_cost.cb_us = 0U;

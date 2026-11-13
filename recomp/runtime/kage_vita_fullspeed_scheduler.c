@@ -21,6 +21,9 @@
 #include "kage_vita_fullspeed_scheduler.h"
 #include "kage_vita_guest_sampler.h"
 #include "vita_host_services.h"
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+# include "kage_vita_update_hitch.h"
+#endif
 
 #include <limits.h>
 #include <stddef.h>
@@ -89,6 +92,87 @@ static uint32_t s_floor_debt_head_stale;
 # define KAGE_VITA_ADMIT_DEADLINE_UNITS admit_deadline_units
 #else
 # define KAGE_VITA_ADMIT_DEADLINE_UNITS s_next_game_due_units
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+# if !defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) || !ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+#  error "GL admit wait refines GL render admission: never build it alone"
+# endif
+# if ISAAC_VITA_GL_THREAD_ADMIT_WAIT != 1 && ISAAC_VITA_GL_THREAD_ADMIT_WAIT != 2
+#  error "ISAAC_VITA_GL_THREAD_ADMIT_WAIT must be 1 (OBSERVE) or 2 (ON)"
+# endif
+# if defined(KAGE_VITA_HEAD_ADVANCE) || \
+     defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT) || \
+     (defined(KAGE_VITA_FLOOR_DEBT_MODE) && KAGE_VITA_FLOOR_DEBT_MODE == 2)
+#  error "GL admit wait is proven with stock render cost, no head advance, floor debt OFF or OBSERVE"
+# endif
+# define KAGE_VITA_GL_ADMIT_WAIT ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+# define KAGE_VITA_GL_ADMIT_WAIT_BACKOFF 30u
+/* Two full and two interpolated renders.  4 is a design choice, not a
+ * measured constant: on the host model's +-3 ms render jitter (ldc-t16-rjit)
+ * it cut the lateness the waited frames add from 6147 to 2255 us per 600
+ * updates for 1085 -> 1057 presents (R60-DRYADMIT-20261028.md "Review"). */
+# define KAGE_VITA_GL_ADMIT_WAIT_COST_SAMPLES 4u
+static KageVitaFullspeedGlAdmitWaitSnapshot s_admit_wait;
+/* Review round 2 finding 2: the waited frame is admitted when the closure
+ * finishes, so its margin is latest - done, not latest - gate; its cost
+ * prediction is the largest of the last renders, not the last one. */
+static uint64_t s_admit_wait_cost[KAGE_VITA_GL_ADMIT_WAIT_COST_SAMPLES];
+static uint32_t s_admit_wait_cost_count, s_admit_wait_cost_next;
+# if KAGE_VITA_GL_ADMIT_WAIT == 2
+/* 2 at a behind-admitted render, one less per loop head: the pace of the
+ * following full tick sees 1 and attributes its lateness (lt). */
+static uint32_t s_admit_wait_pending;
+/* The loop head right after that render arrived at or past its due time
+ * (did not sleep): only then is a late Game::Update start the render's
+ * doing (review round 1 finding 2). */
+static uint32_t s_admit_wait_head_late;
+/* Non-full phases left in which a behind gate takes the stock refusal. */
+static uint32_t s_admit_wait_backoff;
+# endif
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+/* GL admit behind (R60-FABLE-PLAN.md lane B).  At an interpolated gate that
+ * finds the GL render thread a frame behind, ON still lets the frame reach
+ * the stock time test when the ring's outstanding bytes are within the
+ * bound; nothing waits on the game thread.  OBSERVE keeps the stock refusal
+ * and only counts (ph120.ab / ph120.abp). */
+# if !defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) || !ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+#  error "GL admit behind refines GL render admission: never build it alone"
+# endif
+# if ISAAC_VITA_GL_THREAD_ADMIT_BEHIND != 1 && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND != 2
+#  error "ISAAC_VITA_GL_THREAD_ADMIT_BEHIND must be 1 (OBSERVE) or 2 (ON)"
+# endif
+# if defined(KAGE_VITA_GL_ADMIT_WAIT)
+#  error "GL admit behind and GL admit wait each own the behind arm of the gate: build one"
+# endif
+# if defined(KAGE_VITA_HEAD_ADVANCE) || \
+     defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT) || \
+     (defined(KAGE_VITA_FLOOR_DEBT_MODE) && KAGE_VITA_FLOOR_DEBT_MODE == 2)
+#  error "GL admit behind is proven with stock render cost, no head advance, floor debt OFF or OBSERVE"
+# endif
+/* 524288 = ISAAC_GL_RECORD_RING_BYTES (gl_record_ring.h, 512u * 1024u);
+ * gl_record_backend.c holds the _Static_assert against the ring itself. */
+# if !defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES) || \
+     ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES < 1 || \
+     ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES > 524288
+#  error "ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES must be 1..524288"
+# endif
+# define KAGE_VITA_GL_ADMIT_BEHIND ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+# define KAGE_VITA_GL_ADMIT_BEHIND_STR2(x) #x
+# define KAGE_VITA_GL_ADMIT_BEHIND_STR(x) KAGE_VITA_GL_ADMIT_BEHIND_STR2(x)
+static KageVitaFullspeedGlAdmitBehindSnapshot s_admit_behind;
+/* Render entry to the Present seam of the last Render that presented: where
+ * a refused frame's Present would have been (gate + body), for the closure
+ * check at the next Present. */
+static uint64_t s_admit_behind_body_units;
+static uint32_t s_have_admit_behind_body;
+# if KAGE_VITA_GL_ADMIT_BEHIND == 2
+/* Non-full phases left that keep the stock refusal at a behind gate.  Armed
+ * (KAGE_VITA_GL_ADMIT_BEHIND_BACKOFF) only by a loop head that did not sleep
+ * right after a Present that held on a behind-admitted frame: the admit
+ * wait's hl condition. */
+static uint32_t s_admit_behind_backoff;
+# endif
 #endif
 
 enum KageVitaFullspeedTickFlag {
@@ -723,6 +807,28 @@ static void kage_vita_fullspeed_pace_game_update(void)
         kage_vita_fullspeed_disable();
         return;
     }
+#if defined(KAGE_VITA_GL_ADMIT_WAIT) && KAGE_VITA_GL_ADMIT_WAIT == 2
+    /* The full tick right after a behind-admitted interpolated render: a
+     * start at least 1 us past a live floor is attributed to that render
+     * and the stock refusal returns for 30 non-full phases. */
+    if (s_admit_wait_pending) {
+        uint32_t head_late = s_admit_wait_head_late;
+
+        s_admit_wait_pending = 0u;
+        s_admit_wait_head_late = 0u;
+        /* The head slept to its grid: this start is grid + this tick's own
+         * service, which the stock refusal would have had too. */
+        if (head_late &&
+                s_have_game_due && s_next_game_due_units <= UINT64_MAX - 3u &&
+                now_units >= s_next_game_due_units + 3u) {
+            kage_vita_fullspeed_add_u32(&s_admit_wait.late, 1u);
+            kage_vita_fullspeed_add_u32(&s_admit_wait.late_us,
+                kage_vita_fullspeed_units_to_us(
+                    now_units - s_next_game_due_units));
+            s_admit_wait_backoff = KAGE_VITA_GL_ADMIT_WAIT_BACKOFF;
+        }
+    }
+#endif
 #if defined(KAGE_VITA_HEAD_ADVANCE)
     /* The original floor may recover a clock retreat by waiting. Do not let
      * that successful wait make credit from the old head clock epoch live
@@ -831,6 +937,11 @@ static void kage_vita_fullspeed_pace_game_update(void)
         floor_anchor_units + KAGE_VITA_FULLSPEED_GAME_TICK_UNITS;
     s_have_game_due = 1u;
     s_update_begin_us = now_us;
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+    /* Diagnostic: baseline of the seam counters for this Game::Update.  Uses
+     * the clock value above; reads no clock of its own. */
+    kage_vita_update_hitch_begin(now_us);
+#endif
 
     /* The floor wait above happens after the loop head has already committed
      * this tick's wrapper deadline.  Whatever was slept is therefore counted
@@ -941,6 +1052,26 @@ static void kage_vita_fullspeed_scheduler_clear(uint32_t runtime_enabled)
     s_slack_admit_pending = 0u;
     s_floor_debt_head_stale = 0u;
 #endif
+#if defined(KAGE_VITA_GL_ADMIT_WAIT)
+    memset(&s_admit_wait, 0, sizeof s_admit_wait);
+    memset(s_admit_wait_cost, 0, sizeof s_admit_wait_cost);
+    s_admit_wait_cost_count = s_admit_wait_cost_next = 0u;
+# if KAGE_VITA_GL_ADMIT_WAIT == 2
+    s_admit_wait_pending = 0u;
+    s_admit_wait_head_late = 0u;
+    s_admit_wait_backoff = 0u;
+    (void)kage_vita_backend_admit_hold_take();
+# endif
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND)
+    memset(&s_admit_behind, 0, sizeof s_admit_behind);
+    s_admit_behind_body_units = 0u;
+    s_have_admit_behind_body = 0u;
+# if KAGE_VITA_GL_ADMIT_BEHIND == 2
+    s_admit_behind_backoff = 0u;
+    (void)kage_vita_backend_admit_behind_hold_take();
+# endif
+#endif
     s_tick_flags = 0u;
     s_render_decision = 1u;
     s_manager_pointer = 0u;
@@ -1008,6 +1139,52 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
 #endif
     }
 
+#if defined(KAGE_VITA_GL_ADMIT_WAIT) && KAGE_VITA_GL_ADMIT_WAIT == 2
+    {
+        /* A head that arrives at or past its due time does not sleep: the
+         * work before it ran past the grid.  After a behind-admitted render
+         * that marks the render (lt above); after a Present that held on such
+         * a render's closure (hd) it is the hold's doing: hl, and the stock
+         * refusal returns for the back-off (review round 2 finding 1). */
+        uint32_t head_late = s_runtime_enabled && s_have_last_due &&
+            now_us >= s_last_clock_us && now_units >= s_next_due_units;
+        uint32_t hold_us = kage_vita_backend_admit_hold_take();
+
+        if (s_admit_wait_pending == 2u)
+            s_admit_wait_head_late = head_late;
+        if (hold_us && head_late) {
+            kage_vita_fullspeed_add_u32(&s_admit_wait.hold_late, 1u);
+            kage_vita_fullspeed_add_u32(&s_admit_wait.hold_late_us,
+                kage_vita_fullspeed_units_to_us(now_units - s_next_due_units));
+            s_admit_wait_backoff = KAGE_VITA_GL_ADMIT_WAIT_BACKOFF;
+        }
+    }
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND) && KAGE_VITA_GL_ADMIT_BEHIND == 2
+    {
+        /* The admit wait's hl test, word for word (above): a head that
+         * arrives at or past its due time does not sleep.  Only when the
+         * Present before it held on a behind-admitted frame (hd) is that the
+         * admission's doing; a hold the loop absorbed arms nothing. */
+        uint32_t head_late = s_runtime_enabled && s_have_last_due &&
+            now_us >= s_last_clock_us && now_units >= s_next_due_units;
+        uint32_t hold_us = kage_vita_backend_admit_behind_hold_take();
+
+# if defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_ANY_HOLD) /* oracle self-test */
+        if (hold_us) {
+# elif defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_NO_BACKOFF) /* oracle self-test */
+        if (hold_us && head_late && !hold_us) {
+# else
+        if (hold_us && head_late) {
+# endif
+            kage_vita_fullspeed_add_u32(&s_admit_behind.hold_late, 1u);
+            kage_vita_fullspeed_add_u32(&s_admit_behind.hold_late_us,
+                head_late ? kage_vita_fullspeed_units_to_us(
+                    now_units - s_next_due_units) : 0u);
+            s_admit_behind_backoff = KAGE_VITA_GL_ADMIT_BEHIND_BACKOFF;
+        }
+    }
+#endif
 #if defined(KAGE_VITA_HEAD_ADVANCE)
     head_target = pre_game_clock_ok ?
         kage_vita_fullspeed_head_target(now_units) : s_next_due_units;
@@ -1116,6 +1293,10 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
 #if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
     s_previous_tick_had_game = (s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) != 0u;
 #endif
+#if defined(KAGE_VITA_GL_ADMIT_WAIT) && KAGE_VITA_GL_ADMIT_WAIT == 2
+    if (s_admit_wait_pending)
+        --s_admit_wait_pending;
+#endif
     s_tick_flags = 0u;
     s_render_decision = 1u;
     s_manager_pointer = 0u;
@@ -1153,6 +1334,22 @@ void kage_vita_fullspeed_scheduler_note_loop_head(void)
 # if defined(KAGE_VITA_ADMIT_SLACK_UNITS)
             " admit-slack=" KAGE_VITA_STR(ISAAC_VITA_FULLSPEED_ADMIT_SLACK_US) "us"
 # endif
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_WAIT)
+# if KAGE_VITA_GL_ADMIT_WAIT == 2
+            " gl-admit-wait=on backoff=30"
+# else
+            " gl-admit-wait=observe"
+# endif
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND)
+# if KAGE_VITA_GL_ADMIT_BEHIND == 2
+            " gl-admit-behind=on"
+# else
+            " gl-admit-behind=observe"
+# endif
+            " bytes=" KAGE_VITA_GL_ADMIT_BEHIND_STR(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES)
+            " backoff=" KAGE_VITA_GL_ADMIT_BEHIND_STR(KAGE_VITA_GL_ADMIT_BEHIND_BACKOFF)
 #endif
 #if defined(ISAAC_VITA_RUNTIME_SETTINGS)
             " fps_lock=%u"
@@ -1381,6 +1578,13 @@ void kage_vita_fullspeed_scheduler_note_game_update_end(
                 end_us >= s_last_clock_us;
 #endif
         }
+#if defined(ISAAC_VITA_UPDATE_HITCH_PROBE)
+        /* Diagnostic: same two clock values as the duration above.  The
+         * probe itself drops an end whose begin was not this update's. */
+        if ((s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) != 0u)
+            kage_vita_update_hitch_end(s_update_begin_us, end_us,
+                                       s_game_frame_before, game_frame);
+#endif
     }
     s_game_frame_after = game_frame;
 #if defined(ISAAC_VITA_FULLSPEED_SERVICE_RESERVE)
@@ -1568,6 +1772,24 @@ int kage_vita_fullspeed_scheduler_plan_render(
         kage_vita_fullspeed_add_u32(&s_counters.full_phases, 1u);
     } else {
         kage_vita_fullspeed_add_u32(&s_counters.nonfull_phases, 1u);
+#if defined(KAGE_VITA_GL_ADMIT_WAIT) && KAGE_VITA_GL_ADMIT_WAIT == 2
+        if (s_admit_wait_backoff)
+            --s_admit_wait_backoff;
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND) && KAGE_VITA_GL_ADMIT_BEHIND == 2
+        /* Read before the decrement: exactly BACKOFF non-full phases after
+         * the arming head keep the stock refusal. */
+# if defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_BACKOFF_SHORT) /* oracle self-test */
+        if (s_admit_behind_backoff)
+            --s_admit_behind_backoff;
+# endif
+        uint32_t admit_behind_backoff = s_admit_behind_backoff != 0u;
+
+# if !defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_BACKOFF_SHORT)
+        if (s_admit_behind_backoff)
+            --s_admit_behind_backoff;
+# endif
+#endif
         if (interpolation_enabled)
             kage_vita_fullspeed_add_u32(
                 &s_counters.interpolation_phases, 1u);
@@ -1596,7 +1818,8 @@ int kage_vita_fullspeed_scheduler_plan_render(
             kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
             return 0;
         }
-#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION
+#if defined(ISAAC_VITA_GL_THREAD_RENDER_ADMISSION) && ISAAC_VITA_GL_THREAD_RENDER_ADMISSION && \
+    !defined(KAGE_VITA_GL_ADMIT_WAIT) && !defined(KAGE_VITA_GL_ADMIT_BEHIND)
         /* GL render thread one frame behind: the same interpolated-frame skip
          * (same counters, same return), so Present never waits for it and the
          * next Game::Update keeps its cadence.  Full phases always render. */
@@ -1619,6 +1842,244 @@ int kage_vita_fullspeed_scheduler_plan_render(
                 s_pre_game_game == game_pointer &&
                 s_manager_counter_before == s_pre_game_counter + 1u)
             next_start_reserve_units = s_pre_game_units;
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_WAIT)
+        /* GL admit wait (R60-DRYADMIT-SPEC-20261028.md).  Same predicate
+         * as kage_vita_backend_render_admit, moved below the reserve, which
+         * reads no state the admission changes.  latest is the last instant
+         * the stock time test below still admits this frame at the last
+         * Render's cost: now + cost + reserve <= floor. */
+# if KAGE_VITA_GL_ADMIT_WAIT == 2
+        uint32_t admit_waited = 0u;
+        uint64_t admit_latest_units = 0u;
+# endif
+        if (kage_vita_backend_render_behind()) {
+            uint32_t refuse_behind = 1u;
+            uint64_t latest_units = 0u;
+            uint64_t cost_units = s_last_render_units;
+            uint32_t i;
+
+            kage_vita_fullspeed_add_u32(&s_admit_wait.gates, 1u);
+            for (i = 0u; i < s_admit_wait_cost_count; ++i)
+                if (s_admit_wait_cost[i] > cost_units)
+                    cost_units = s_admit_wait_cost[i];
+            if (s_have_game_due && s_have_last_render && s_have_last_update &&
+                    s_next_game_due_units > now_units &&
+                    cost_units <= UINT64_MAX - next_start_reserve_units &&
+                    cost_units + next_start_reserve_units <
+                        s_next_game_due_units)
+                latest_units = s_next_game_due_units -
+                    (cost_units + next_start_reserve_units);
+            if (latest_units <= now_units) {
+                latest_units = 0u;
+                kage_vita_fullspeed_add_u32(&s_admit_wait.no_window, 1u);
+            }
+# if KAGE_VITA_GL_ADMIT_WAIT == 2
+            else if (s_admit_wait_backoff) {
+                kage_vita_fullspeed_add_u32(&s_admit_wait.backoff, 1u);
+            } else {
+                uint64_t after_us, after_units;
+                /* Review round 1 finding 1: past the next wrapper due the
+                 * re-check below refuses anyway (another_tick_due), so the
+                 * wait ends there; video priority ignores that skip, so it
+                 * waits to latest. */
+                uint64_t deadline_units = latest_units;
+                int done;
+#  if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+                if (!video_priority && s_next_due_units < deadline_units)
+#  else
+                if (s_next_due_units < deadline_units)
+#  endif
+                    deadline_units = s_next_due_units;
+#  if defined(ISAAC_VITA_GUEST_SAMPLER)
+                /* Idle time the loop head would otherwise sleep: the
+                 * sampler's pace bucket, as the Game::Update floor wait. */
+                uint32_t sampler_phase = g_kage_vita_guest_sampler_phase;
+
+                KAGE_VITA_GUEST_SAMPLER_PHASE(KAGE_VITA_GUEST_SAMPLER_PACE);
+#  endif
+                done = kage_vita_backend_render_wait_until(deadline_units / 3u);
+#  if defined(ISAAC_VITA_GUEST_SAMPLER)
+                KAGE_VITA_GUEST_SAMPLER_PHASE(sampler_phase);
+#  endif
+                after_us = isaac_vita_get_process_time();
+                if (after_us < now_us ||
+                        !kage_vita_fullspeed_clock_units(after_us, &after_units)) {
+                    /* Clock anomaly: refuse, leave the reset to the head. */
+                    refuse_behind = 0u;
+                    kage_vita_fullspeed_add_u32(&s_admit_wait.time_test, 1u);
+                    s_render_decision = 0u;
+                    kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);
+                    kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
+                    return 0;
+                }
+                kage_vita_fullspeed_add_u32(&s_admit_wait.wait_us,
+                                            after_us - now_us);
+                if (after_us - now_us > s_admit_wait.wait_max_us)
+                    s_admit_wait.wait_max_us =
+                        (uint32_t)(after_us - now_us > UINT32_MAX ?
+                                   UINT32_MAX : after_us - now_us);
+                now_us = after_us;
+                now_units = after_units;
+                s_last_clock_us = now_us;
+                if (!done) {
+                    kage_vita_fullspeed_add_u32(&s_admit_wait.timeouts, 1u);
+                    /* ov: how far past its deadline the timed wait woke. */
+                    if (now_us > deadline_units / 3u &&
+                            now_us - deadline_units / 3u >
+                                s_admit_wait.timeout_over_max_us)
+                        s_admit_wait.timeout_over_max_us =
+                            now_us - deadline_units / 3u > UINT32_MAX ?
+                                UINT32_MAX :
+                                (uint32_t)(now_us - deadline_units / 3u);
+                } else {
+                    refuse_behind = 0u;
+                    admit_waited = 1u;
+                    admit_latest_units = latest_units;
+                }
+            }
+# endif
+            if (refuse_behind) {
+                /* ph120.rw rs as stock; latest (0 = none) arms the fit check
+                 * at the next Present. */
+                kage_vita_backend_render_refused(latest_units / 3u);
+                s_render_decision = 0u;
+                kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);
+                kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
+                return 0;
+            }
+        }
+# if KAGE_VITA_GL_ADMIT_WAIT == 2
+        if (admit_waited) {
+            /* The wait spent idle time: re-take the tick-due skip on the
+             * fresh clock (:1549 / :1568), then the stock time test runs on
+             * it below. */
+            another_tick_due = now_units >= s_next_due_units;
+#  if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
+            if (video_priority)
+                another_tick_due = 0u;
+#  endif
+            /* Review round 1 finding 1: the stock time test below switches
+             * itself off once now reaches the floor; past latest the frame
+             * no longer fits before it, so refuse here whatever that test
+             * says. */
+            if (another_tick_due || now_units > admit_latest_units) {
+                kage_vita_fullspeed_add_u32(&s_admit_wait.time_test, 1u);
+                s_render_decision = 0u;
+                kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);
+                kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
+                return 0;
+            }
+        }
+# endif
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND)
+        /* GL admit behind (R60-FABLE-PLAN.md lane B).  The stock admission
+         * predicate (kage_vita_backend_render_admit), moved below the
+         * reserve, which reads no state the admission changes.  Per behind
+         * gate: the stock time test's verdict at the stock last-Render cost
+         * (the non-EXCLUDES test below, operand for operand; the knob
+         * refuses the builds that change it), the ring's outstanding bytes,
+         * and the instants the closure check at the next Present needs.
+         * OBSERVE then takes the stock refusal.  ON takes it inside a
+         * back-off (bo) or over the bound (ov); otherwise the frame goes on
+         * to the stock time test, which still decides (tt / ok).  Nothing
+         * waits here. */
+# if KAGE_VITA_GL_ADMIT_BEHIND == 2
+        uint32_t admit_behind = 0u;
+# endif
+        uint64_t admit_behind_present_us = 0u, admit_behind_return_us = 0u;
+        {
+            uint32_t outstanding = 0u;
+
+            if (kage_vita_backend_admit_behind_gate(&outstanding)) {
+                uint32_t test_live =
+                    s_have_game_due && s_have_last_render && s_have_last_update &&
+                    s_next_game_due_units > now_units &&
+                    s_last_render_units <= UINT64_MAX - next_start_reserve_units &&
+                    now_units <= UINT64_MAX -
+                        (s_last_render_units + next_start_reserve_units);
+# if defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_TEST_FAIL_ZERO) /* oracle self-test */
+                uint32_t test_fail = 0u;
+# elif defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_COST_DOUBLE) /* oracle self-test */
+                uint32_t test_fail = test_live &&
+                    now_units + 2u * s_last_render_units + next_start_reserve_units >
+                        KAGE_VITA_ADMIT_DEADLINE_UNITS;
+# else
+                uint32_t test_fail = test_live &&
+                    now_units + s_last_render_units + next_start_reserve_units >
+                        KAGE_VITA_ADMIT_DEADLINE_UNITS;
+# endif
+# if defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_NO_BOUND) /* oracle self-test */
+                uint32_t within = 1u;
+# elif defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_BOUND_EXCLUSIVE) /* oracle self-test */
+                uint32_t within = outstanding <
+                    (uint32_t)ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES;
+# else
+                uint32_t within = outstanding <=
+                    (uint32_t)ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES;
+# endif
+                uint32_t refuse_behind = 1u;
+                uint64_t cost_units = s_have_last_render ? s_last_render_units : 0u;
+                uint64_t body_units = s_have_admit_behind_body ?
+                    s_admit_behind_body_units : cost_units;
+
+                kage_vita_fullspeed_add_u32(&s_admit_behind.gates, 1u);
+                kage_vita_fullspeed_add_u32(
+                    test_fail ? &s_admit_behind.test_fail :
+                    test_live ? &s_admit_behind.test_pass :
+                                &s_admit_behind.test_off, 1u);
+                if (s_admit_behind.out_count < KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES)
+                    s_admit_behind.out[s_admit_behind.out_count++] = outstanding;
+                if (outstanding > s_admit_behind.out_max)
+                    s_admit_behind.out_max = outstanding;
+                if (!within)
+                    kage_vita_fullspeed_add_u32(&s_admit_behind.over, 1u);
+                else if (!test_fail)
+                    kage_vita_fullspeed_add_u32(&s_admit_behind.would, 1u);
+# if defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_CLOSURE_AT_RETURN) /* oracle self-test */
+                body_units = cost_units;
+# endif
+                admit_behind_present_us =
+                    (body_units <= UINT64_MAX - now_units ?
+                        now_units + body_units : UINT64_MAX) / 3u;
+                admit_behind_return_us =
+                    (cost_units <= UINT64_MAX - now_units ?
+                        now_units + cost_units : UINT64_MAX) / 3u;
+# if KAGE_VITA_GL_ADMIT_BEHIND == 2
+                if (within && admit_behind_backoff) {
+                    kage_vita_fullspeed_add_u32(&s_admit_behind.backoff, 1u);
+                } else if (within) {
+                    refuse_behind = 0u;
+                    admit_behind = 1u;
+                }
+# endif
+                if (refuse_behind) {
+                    /* ph120.rw rs as stock; arms the closure check. */
+                    kage_vita_backend_admit_behind_refused(
+                        admit_behind_present_us, admit_behind_return_us,
+                        s_next_due_units / 3u, within && !test_fail);
+                    s_render_decision = 0u;
+                    kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);
+                    kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
+                    return 0;
+                }
+            }
+        }
+# if KAGE_VITA_GL_ADMIT_BEHIND != 2
+        (void)admit_behind_present_us;
+        (void)admit_behind_return_us;
+# elif defined(KAGE_VITA_GL_ADMIT_BEHIND_ORACLE_MUTATE_TIME_TEST_SKIP) /* oracle self-test */
+        /* The defect the tt leg exists for: a frame admitted while behind
+         * renders without the stock time test below. */
+        if (admit_behind) {
+            kage_vita_fullspeed_add_u32(&s_admit_behind.admitted, 1u);
+            kage_vita_backend_admit_behind_admitted();
+            s_consecutive_full_render_skips = 0u;
+            s_render_decision = 1u;
+            return 1;
+        }
+# endif
 #endif
         /* Admit the interpolated frame only if, at the measured cost of the
          * last Render, it finishes before the next Game::Update floor with
@@ -1689,11 +2150,38 @@ int kage_vita_fullspeed_scheduler_plan_render(
                 now_units + s_last_render_units + next_start_reserve_units >
                     KAGE_VITA_ADMIT_DEADLINE_UNITS) {
 #endif
+#if defined(KAGE_VITA_GL_ADMIT_WAIT) && KAGE_VITA_GL_ADMIT_WAIT == 2
+            if (admit_waited)
+                kage_vita_fullspeed_add_u32(&s_admit_wait.time_test, 1u);
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND) && KAGE_VITA_GL_ADMIT_BEHIND == 2
+            if (admit_behind) {
+                /* Behind and refused: rs counts it as stock would (rs = n -
+                 * ok in both modes); it was never a would-admit. */
+                kage_vita_fullspeed_add_u32(&s_admit_behind.time_test, 1u);
+                kage_vita_backend_admit_behind_refused(
+                    admit_behind_present_us, admit_behind_return_us,
+                    s_next_due_units / 3u, 0u);
+            }
+#endif
             s_render_decision = 0u;
             kage_vita_fullspeed_add_u32(&s_counters.render_skips, 1u);
             kage_vita_fullspeed_add_u32(&s_counters.nonfull_skips, 1u);
             return 0;
         }
+#if defined(KAGE_VITA_GL_ADMIT_WAIT) && KAGE_VITA_GL_ADMIT_WAIT == 2
+        if (admit_waited) {
+            kage_vita_fullspeed_add_u32(&s_admit_wait.admitted, 1u);
+            s_admit_wait_pending = 2u;
+            kage_vita_backend_render_admitted_after_wait();
+        }
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND) && KAGE_VITA_GL_ADMIT_BEHIND == 2
+        if (admit_behind) {
+            kage_vita_fullspeed_add_u32(&s_admit_behind.admitted, 1u);
+            kage_vita_backend_admit_behind_admitted();
+        }
+#endif
         s_consecutive_full_render_skips = 0u;
         s_render_decision = 1u;
 #if defined(ISAAC_VITA_THEORA_RENDER_PRIORITY) && ISAAC_VITA_THEORA_RENDER_PRIORITY
@@ -1796,6 +2284,13 @@ void kage_vita_fullspeed_scheduler_note_render_return(void)
                 now_us - s_render_entry_us, &elapsed_units)) {
         s_last_render_units = elapsed_units;
         s_have_last_render = 1u;
+#if defined(KAGE_VITA_GL_ADMIT_WAIT)
+        s_admit_wait_cost[s_admit_wait_cost_next] = elapsed_units;
+        s_admit_wait_cost_next =
+            (s_admit_wait_cost_next + 1u) % KAGE_VITA_GL_ADMIT_WAIT_COST_SAMPLES;
+        if (s_admit_wait_cost_count < KAGE_VITA_GL_ADMIT_WAIT_COST_SAMPLES)
+            ++s_admit_wait_cost_count;
+#endif
 #if defined(ISAAC_VITA_FULLSPEED_RENDER_COST_EXCLUDES_PRESENT)
         /* Present is nested inside Render.  Its seam is the first statement
          * of kage_pc_backend_present, a few calls before the profiler's swp
@@ -1835,6 +2330,22 @@ void kage_vita_fullspeed_scheduler_note_present(void)
     /* The one added clock read per Present; consumed at Render return. */
     s_present_entry_us = isaac_vita_get_process_time();
 #endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND)
+    {
+        /* One clock read per Present: the Render body up to this seam. */
+        uint64_t present_us = isaac_vita_get_process_time();
+        uint64_t body_units;
+
+        if ((s_tick_flags & KAGE_VITA_TICK_RENDER_ENTRY) != 0u &&
+                (s_tick_flags & KAGE_VITA_TICK_PRESENT) == 0u &&
+                present_us >= s_render_entry_us &&
+                kage_vita_fullspeed_clock_units(
+                    present_us - s_render_entry_us, &body_units)) {
+            s_admit_behind_body_units = body_units;
+            s_have_admit_behind_body = 1u;
+        }
+    }
+#endif
     if (kage_vita_fullspeed_note_once(
             KAGE_VITA_TICK_PRESENT, &s_counters.presents) &&
             (s_tick_flags & KAGE_VITA_TICK_RENDER_BODY) == 0u)
@@ -1871,6 +2382,29 @@ void kage_vita_fullspeed_scheduler_floor_debt_take(
 }
 #endif
 
+#if defined(KAGE_VITA_GL_ADMIT_WAIT)
+void kage_vita_fullspeed_scheduler_gl_admit_wait_take(
+    KageVitaFullspeedGlAdmitWaitSnapshot *snapshot)
+{
+    if (snapshot)
+        *snapshot = s_admit_wait;
+    memset(&s_admit_wait, 0, sizeof s_admit_wait);
+}
+#endif
+#if defined(KAGE_VITA_GL_ADMIT_BEHIND)
+void kage_vita_fullspeed_scheduler_gl_admit_behind_take(
+    KageVitaFullspeedGlAdmitBehindSnapshot *snapshot)
+{
+    if (snapshot)
+        *snapshot = s_admit_behind;
+    memset(&s_admit_behind, 0, sizeof s_admit_behind);
+}
+
+uint32_t kage_vita_fullspeed_scheduler_gl_admit_behind_bytes(void)
+{
+    return (uint32_t)ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES;
+}
+#endif
 #if defined(ISAAC_VITA_DEBUG_OVERLAY)
 void kage_vita_fullspeed_scheduler_debug_overlay_timings(
     uint32_t *update_us, uint32_t *render_us)
@@ -1881,5 +2415,40 @@ void kage_vita_fullspeed_scheduler_debug_overlay_timings(
     if (render_us)
         *render_us = s_have_last_render
             ? kage_vita_fullspeed_units_to_us(s_last_render_units) : 0u;
+}
+#endif
+
+#if defined(ISAAC_VITA_LUA_GC_IDLE_STEP)
+# if defined(KAGE_VITA_HEAD_ADVANCE)
+#  error "ISAAC_VITA_LUA_GC_IDLE_STEP is unavailable with ISAAC_VITA_FULLSPEED_HEAD_ADVANCE (the head then sleeps to an earlier target than the grid)"
+# endif
+int kage_vita_fullspeed_scheduler_gc_idle_query(uint32_t *slack_us)
+{
+    uint64_t now_us;
+    uint64_t now_units;
+
+    *slack_us = 0u;
+    if (!s_runtime_enabled || !s_initialized || !s_have_last_due ||
+            (s_tick_flags & KAGE_VITA_TICK_MANAGER_ENTRY) == 0u)
+        return KAGE_VITA_GC_IDLE_UNKNOWN;
+    now_us = isaac_vita_get_process_time();
+    if (now_us < s_last_clock_us ||
+            !kage_vita_fullspeed_clock_units(now_us, &now_units))
+        return KAGE_VITA_GC_IDLE_UNKNOWN;
+    if (now_units < s_next_due_units) {
+        /* note_loop_head sleeps to s_next_due_units next. */
+        *slack_us = kage_vita_fullspeed_units_to_us(
+            s_next_due_units - now_units);
+        return KAGE_VITA_GC_IDLE_FREE;
+    }
+    if ((s_tick_flags & KAGE_VITA_TICK_GAME_BEGIN) != 0u)
+        return KAGE_VITA_GC_IDLE_BUSY;
+    if (s_have_game_due && now_units < s_next_game_due_units) {
+        /* kage_vita_fullspeed_pace_game_update sleeps to the floor. */
+        *slack_us = kage_vita_fullspeed_units_to_us(
+            s_next_game_due_units - now_units);
+        return KAGE_VITA_GC_IDLE_FREE;
+    }
+    return KAGE_VITA_GC_IDLE_LATE;
 }
 #endif

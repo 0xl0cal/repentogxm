@@ -666,6 +666,13 @@ _Static_assert(sizeof(gl_vita_fxray_record) % 8u == 0u,
         !defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
 # define GL_VITA_DRAW_FRAMEBUFFER_SHADOW 1
 #endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+/* The deferred colour attach flushes against the guest's draw-framebuffer
+ * binding. */
+# if !defined(GL_VITA_DRAW_FRAMEBUFFER_SHADOW)
+#  define GL_VITA_DRAW_FRAMEBUFFER_SHADOW 1
+# endif
+#endif
 #if defined(GL_VITA_LOGICAL_VIEWPORT)
 typedef struct gl_vita_logical_viewport {
     guest_gl_int x;
@@ -3935,6 +3942,171 @@ static GUEST_NORETURN void gl_vita_rbo_fault(
     guest_gl_backend_fault(token, message);
 }
 
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+/* Deferred colour attach (FABLE-A0-1-STALL.md, V1-MECHANISM.md,
+ * V2-CONSUMERS.md).
+ *
+ * The game's GetTexel attaches a surface texture to the manager framebuffer,
+ * checks the status, reads one texel and leaves; the next pass re-attaches
+ * its own surface.  Stock vitaGL acts on every attach at the call
+ * (_glFramebufferTexture2D, shared.h): a size change retires the render
+ * target and the depth surface, which the following pass must recreate.  An
+ * attach that no vitaGL call consumes before the same framebuffer is attached
+ * again has no observable pixel effect, so it is not forwarded at all.
+ *
+ * One slot.  A tracked attach (the guest's draw framebuffer, non-zero;
+ * COLOR_ATTACHMENT0; GL_TEXTURE_2D level 0; non-zero texture) is stored here
+ * instead of reaching vitaGL.  It is forwarded, with the arguments the guest
+ * gave and with its framebuffer bound for the call, before every native call
+ * that reads the attachment or the per-attach vitaGL state (width, height,
+ * data pointer, render target, depth surface, dirty_framebuffer, texture
+ * reference count): see the ISAAC_VITA_FBO_DEFER_FLUSH_* classes.  The LAST
+ * attach of a framebuffer is always forwarded, even when it names the texture
+ * vitaGL already holds, because vitaGL's dirty_framebuffer scene split is a
+ * property of the call, not of a change.  A detach (texture 0), any other
+ * attachment point or shape and any other framebuffer forward natively, after
+ * the slot is flushed.  glBindFramebuffer never flushes (vitaGL: pointer
+ * stores) and glCheckFramebufferStatus is answered from the slot (vitaGL:
+ * COMPLETE iff a texture is attached; the slot's texture is non-zero).
+ *
+ * The backend's own bookkeeping (FBO table, clear elision notes, readback
+ * notes, depth carry, fill census, world-seam diagnostics) keeps running at
+ * the guest call; only the native call moves.  Everything here runs on the
+ * thread that runs the typed backend, like s_draw_framebuffer. */
+#define GL_VITA_DEFER_COLOR_ATTACHMENT0 0x8ce0u    /* = GL_VITA_FBO_COLOR_ATTACHMENT0 */
+#define GL_VITA_DEFER_FRAMEBUFFER_COMPLETE 0x8cd5u /* = GL_VITA_FF_FRAMEBUFFER_COMPLETE */
+
+typedef struct gl_vita_defer_attach_slot {
+    int valid;
+    guest_gl_uint framebuffer;
+    guest_gl_enum target;
+    guest_gl_enum attachment;
+    guest_gl_enum texture_target;
+    guest_gl_uint texture;
+    guest_gl_int level;
+} gl_vita_defer_attach_slot;
+
+static gl_vita_defer_attach_slot s_defer_attach;
+static IsaacVitaFboDeferredAttachCounters s_defer_attach_counters;
+static int s_defer_attach_banner_logged;
+
+/* Forward the pending attach now.  A framebuffer bound away from is rebound
+ * for the call exactly as gl_vita_fbo_owed_materialize does for its quad:
+ * vitaGL's glBindFramebuffer is a pointer store, and _glFramebufferTexture2D
+ * resolves both FRAMEBUFFER and DRAW_FRAMEBUFFER to active_write_fb. */
+static void gl_vita_defer_attach_flush(unsigned consumer)
+{
+    int rebind;
+
+    if (!s_defer_attach.valid)
+        return;
+    s_defer_attach.valid = 0;
+    rebind = s_defer_attach.framebuffer != s_draw_framebuffer;
+    if (rebind) {
+        glBindFramebuffer(
+            (GLenum)GL_VITA_DRAW_FRAMEBUFFER,
+            (GLuint)s_defer_attach.framebuffer);
+    }
+    {
+        GL_VITA_TIME_BEGIN();
+        glFramebufferTexture2D(
+            (GLenum)s_defer_attach.target,
+            (GLenum)s_defer_attach.attachment,
+            (GLenum)s_defer_attach.texture_target,
+            (GLuint)s_defer_attach.texture,
+            (GLint)s_defer_attach.level);
+        GL_VITA_TIME_END(bind_fb);
+    }
+    if (rebind) {
+        glBindFramebuffer(
+            (GLenum)GL_VITA_DRAW_FRAMEBUFFER, (GLuint)s_draw_framebuffer);
+    }
+    ++s_defer_attach_counters.flushed[consumer];
+}
+
+/* 1: the attach is now pending and must not reach vitaGL here. */
+static int gl_vita_defer_attach_request(
+    guest_gl_enum target, guest_gl_enum attachment,
+    guest_gl_enum texture_target, guest_gl_uint texture, guest_gl_int level)
+{
+    if ((target != GL_VITA_FRAMEBUFFER &&
+            target != GL_VITA_DRAW_FRAMEBUFFER) ||
+            attachment != GL_VITA_DEFER_COLOR_ATTACHMENT0 ||
+            texture_target != GL_VITA_TEXTURE_2D || level != 0 ||
+            texture == 0u || s_draw_framebuffer == 0u) {
+        /* Detach, another attachment point or shape, or the default
+         * framebuffer: vitaGL sees it now, after what it was told before. */
+        gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
+        return 0;
+    }
+    if (s_defer_attach.valid) {
+        if (s_defer_attach.framebuffer != s_draw_framebuffer)
+            gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
+        else
+            ++s_defer_attach_counters.dropped; /* superseded, never consumed */
+    }
+    s_defer_attach.valid = 1;
+    s_defer_attach.framebuffer = s_draw_framebuffer;
+    s_defer_attach.target = target;
+    s_defer_attach.attachment = attachment;
+    s_defer_attach.texture_target = texture_target;
+    s_defer_attach.texture = texture;
+    s_defer_attach.level = level;
+    ++s_defer_attach_counters.deferred;
+    return 1;
+}
+
+/* 1: *status is what vitaGL would answer once the pending attach landed. */
+static int gl_vita_defer_attach_status(
+    guest_gl_enum target, guest_gl_enum *status)
+{
+    if (!s_defer_attach.valid)
+        return 0;
+    if (target != GL_VITA_FRAMEBUFFER && target != GL_VITA_DRAW_FRAMEBUFFER) {
+        /* The read binding is not shadowed: let vitaGL answer, attached. */
+        gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
+        return 0;
+    }
+    if (s_defer_attach.framebuffer != s_draw_framebuffer)
+        return 0; /* another framebuffer's status: vitaGL's state is current */
+    ++s_defer_attach_counters.status_local;
+    *status = (guest_gl_enum)GL_VITA_DEFER_FRAMEBUFFER_COMPLETE;
+    return 1;
+}
+
+void isaac_vita_log(const char *format, ...);
+
+static void gl_vita_defer_attach_banner(void)
+{
+    if (s_defer_attach_banner_logged)
+        return;
+    s_defer_attach_banner_logged = 1;
+    isaac_vita_log(
+        "KAGE VITA FBO DEFERRED ATTACH: on slot=1 shape=color0,tex2d,level0 "
+        "flush=draw,clear,owed,read,present,texture,other status=local "
+        "bind=noflush receipt=ph120.da");
+}
+
+void gl_vita_backend_fbo_deferred_attach_present(void)
+{
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_PRESENT);
+}
+
+void gl_vita_backend_fbo_deferred_attach_external(void *unused)
+{
+    (void)unused;
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
+}
+
+void gl_vita_backend_fbo_deferred_attach_take(void *context)
+{
+    if (context) {
+        memcpy(context, &s_defer_attach_counters,
+               sizeof s_defer_attach_counters);
+    }
+    memset(&s_defer_attach_counters, 0, sizeof s_defer_attach_counters);
+}
+#endif
 #if defined(GL_VITA_FBO_TABLE)
 /* Offscreen render-target table.
  *
@@ -4379,6 +4551,11 @@ static void gl_vita_fbo_owed_materialize(void)
 
     if (!s_fbo_owed_mask)
         return;
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* The quad is a native clear: vitaGL must hold the attachment the guest
+     * gave last.  Only reached when something is owed. */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OWED);
+#endif
     rebind = s_fbo_owed_framebuffer != s_draw_framebuffer;
     if (rebind) {
         glBindFramebuffer(
@@ -4458,6 +4635,11 @@ static void gl_vita_fbo_clear_native(guest_gl_bitfield mask)
     guest_gl_bitfield merged = mask;
     uint64_t depth_bits = s_fbo_clear_depth_bits;
 
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* Every path below reaches a native glClear (scene_reset consumes the
+     * attachment); an absorbed clear never gets here. */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_CLEAR);
+#endif
     if (mask & ~(GL_VITA_FBO_COLOR_BUFFER_BIT |
                  GL_VITA_FBO_DEPTH_BUFFER_BIT |
                  GL_VITA_FBO_STENCIL_BUFFER_BIT)) {
@@ -4635,6 +4817,22 @@ static void gl_vita_fbo_shadow_reset(void)
 # define GL_VITA_READBACK_NOTES         32u
 # define GL_VITA_READBACK_RECEIPT_EVERY 256u
 # define GL_VITA_READBACK_DETAIL_LINES  8u
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+/* ISAAC_VITA_FBO_READBACK_CENSUS_SKIP (lane TXR, 2026-11-12): the census of
+ * gl_vita_readback_detail_texture walks every texel of the attached texture
+ * through uncached memory for each of the first GL_VITA_READBACK_DETAIL_LINES
+ * offscreen reads after install.  Device, 44 bench runs of 12.11: 8 walks per
+ * boot, 85 ms (664x432) or 108-111 ms (784x472) each, about 297 ns a texel,
+ * 0.73-0.88 s per run with the game thread waiting in the read.  1 = OBSERVE
+ * (the walk is timed: census_us on the -mem line and in the receipt), 2 = ON
+ * (the walk is skipped; the descriptor line and the texel at the read
+ * position and at its flipped row are still logged).  The game's read is
+ * served by gl_vita_readback_copy before any detail line, in every mode. */
+#  if ISAAC_VITA_FBO_READBACK_CENSUS_SKIP != 1 && \
+    ISAAC_VITA_FBO_READBACK_CENSUS_SKIP != 2
+#   error "ISAAC_VITA_FBO_READBACK_CENSUS_SKIP must be 1 (OBSERVE) or 2 (ON)"
+#  endif
+# endif
 
 typedef struct gl_vita_readback_note {
     guest_gl_uint texture;      /* 0 = free slot */
@@ -4658,6 +4856,12 @@ typedef struct gl_vita_readback_state {
     uint32_t detail;            /* detail lines logged so far */
     uint32_t wait_us;           /* saturating sum of the finish waits */
     uint32_t max_us;
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    uint32_t census_walks;      /* OBSERVE: censuses run and timed */
+    uint32_t census_skips;      /* ON: censuses not run */
+    uint32_t census_us;         /* OBSERVE: saturating sum of the walks */
+    uint32_t census_max_us;
+# endif
 } gl_vita_readback_state;
 
 static gl_vita_readback_state s_readback;
@@ -4870,22 +5074,44 @@ static void gl_vita_readback_detail_texture(
 {
     const gl_vita_readback_note *note = gl_vita_readback_find(texture);
     gl_vita_readback_view view;
+# if !defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP) || \
+    ISAAC_VITA_FBO_READBACK_CENSUS_SKIP != 2
     uint32_t nonzero = 0u;
     uint32_t nonzero_rows = 0u;
     uint32_t first_row = 0u;
     uint32_t first_col = 0u;
     uint32_t last_row = 0u;
+# endif
     uint32_t at_texel = 0u;
     uint32_t flip_texel = 0u;
+# if !defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP) || \
+    ISAAC_VITA_FBO_READBACK_CENSUS_SKIP != 2
     int census = 0;
     int seen = 0;
+# endif
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP) && \
+    ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 1
+    uint32_t census_us = 0u;
+# elif defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    int skipped = 0;            /* ON: 1 = a walkable view's census skipped */
+# endif
 
     gl_vita_readback_texture_view(texture, &view);
     if (view.data && view.width && view.height &&
             view.width <= GL_VITA_READBACK_CENSUS_MAX_EDGE &&
             view.height <= GL_VITA_READBACK_CENSUS_MAX_EDGE &&
             view.stride >= view.width * 4u) {
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP) && \
+    ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 2
+        /* ON: no walk; only the two texels below are loaded. */
+        ++s_readback.census_skips;
+        skipped = 1;
+# else
         uint32_t row;
+#  if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+        const uint64_t census_began = sceKernelGetProcessTimeWide();
+        uint64_t census_took;
+#  endif
 
         census = 1;
         for (row = 0u; row < view.height; ++row) {
@@ -4912,6 +5138,18 @@ static void gl_vita_readback_detail_texture(
                 last_row = row;
             }
         }
+#  if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+        /* OBSERVE: the walk alone, between the two clock reads. */
+        census_took = sceKernelGetProcessTimeWide() - census_began;
+        census_us = census_took > UINT32_MAX ?
+            UINT32_MAX : (uint32_t)census_took;
+        ++s_readback.census_walks;
+        s_readback.census_us = s_readback.census_us > UINT32_MAX - census_us ?
+            UINT32_MAX : s_readback.census_us + census_us;
+        if (census_us > s_readback.census_max_us)
+            s_readback.census_max_us = census_us;
+#  endif
+# endif
         if (x >= 0 && (uint32_t)x < view.width &&
                 y >= 0 && (uint32_t)y < view.height) {
             memcpy(&at_texel,
@@ -4933,6 +5171,24 @@ static void gl_vita_readback_detail_texture(
         (unsigned)(note ? note->framebuffer : 0u),
         (unsigned)(note ? note->writes : 0u),
         (unsigned)(note ? s_readback.generation - note->generation : 0u));
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP) && \
+    ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 2
+    /* ON: a line no census-reading tool can take for an empty texture.
+     * census=skip exactly where stock would have walked (census=1), so the
+     * skip lines count the receipt's census_skips; census=0 where stock
+     * prints census=0 too (no view, edge over the cap, short stride). */
+    isaac_vita_log(
+        "[kage-vita] fbo-readback-mem: census=%s at=%08x flip=%08x",
+        skipped ? "skip" : "0", (unsigned)at_texel, (unsigned)flip_texel);
+# elif defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    isaac_vita_log(
+        "[kage-vita] fbo-readback-mem: census=%d nonzero=%u/%u rows=%u/%u "
+        "first=%u,%u last_row=%u at=%08x flip=%08x census_us=%u",
+        census, (unsigned)nonzero, (unsigned)(view.width * view.height),
+        (unsigned)nonzero_rows, (unsigned)view.height,
+        (unsigned)first_col, (unsigned)first_row, (unsigned)last_row,
+        (unsigned)at_texel, (unsigned)flip_texel, (unsigned)census_us);
+# else
     isaac_vita_log(
         "[kage-vita] fbo-readback-mem: census=%d nonzero=%u/%u rows=%u/%u "
         "first=%u,%u last_row=%u at=%08x flip=%08x",
@@ -4940,10 +5196,27 @@ static void gl_vita_readback_detail_texture(
         (unsigned)nonzero_rows, (unsigned)view.height,
         (unsigned)first_col, (unsigned)first_row, (unsigned)last_row,
         (unsigned)at_texel, (unsigned)flip_texel);
+# endif
 }
 
 static void gl_vita_readback_receipt(void)
 {
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    /* The stock fields, then the census mode and its counters (OBSERVE:
+     * walks timed; ON: walks skipped). */
+    isaac_vita_log(
+        "KAGE VITA FBO READBACK: reads=%u display=%u finishes=%u unknown=%u "
+        "settled=%u skipped=%u copied=%u wait_us=%u max_us=%u "
+        "census=%s walks=%u census_skips=%u census_us=%u census_max_us=%u",
+        (unsigned)s_readback.reads, (unsigned)s_readback.display_reads,
+        (unsigned)s_readback.finishes, (unsigned)s_readback.unknown,
+        (unsigned)s_readback.settled, (unsigned)s_readback.skipped,
+        (unsigned)s_readback.copied,
+        (unsigned)s_readback.wait_us, (unsigned)s_readback.max_us,
+        ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 2 ? "skip" : "observe",
+        (unsigned)s_readback.census_walks, (unsigned)s_readback.census_skips,
+        (unsigned)s_readback.census_us, (unsigned)s_readback.census_max_us);
+# else
     isaac_vita_log(
         "KAGE VITA FBO READBACK: reads=%u display=%u finishes=%u unknown=%u "
         "settled=%u skipped=%u copied=%u wait_us=%u max_us=%u",
@@ -4952,8 +5225,26 @@ static void gl_vita_readback_receipt(void)
         (unsigned)s_readback.settled, (unsigned)s_readback.skipped,
         (unsigned)s_readback.copied,
         (unsigned)s_readback.wait_us, (unsigned)s_readback.max_us);
+# endif
 }
 
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+static int s_readback_census_banner_logged;
+
+/* Once per process, at the first install: the build's census mode. */
+static void gl_vita_readback_census_banner(void)
+{
+    if (s_readback_census_banner_logged)
+        return;
+    s_readback_census_banner_logged = 1;
+    isaac_vita_log(
+        "KAGE VITA FBO READBACK CENSUS: mode=%s detail_lines=%u "
+        "receipt=fbo-readback-mem",
+        ISAAC_VITA_FBO_READBACK_CENSUS_SKIP == 2 ? "skip" : "observe",
+        (unsigned)GL_VITA_READBACK_DETAIL_LINES);
+}
+
+# endif
 static int gl_vita_readback_before(uint32_t *waited_us)
 {
     *waited_us = 0u;
@@ -5008,6 +5299,11 @@ static void gl_vita_readback_after(
     if (s_readback.reads % GL_VITA_READBACK_RECEIPT_EVERY == 0u)
         gl_vita_readback_receipt();
 }
+#elif defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+/* The census belongs to the readback fix's detail lines: without the fix the
+ * knob would compile to nothing.  CMake refuses the pair; this stops a direct
+ * -D or another build route. */
+# error "ISAAC_VITA_FBO_READBACK_CENSUS_SKIP needs ISAAC_VITA_FBO_READBACK_FIX"
 #endif
 
 #if defined(ISAAC_VITA_DISPLAY_RASTER_720)
@@ -5262,6 +5558,11 @@ static void gl_vita_fxray_deopt(
 
     if (!record || !record->name)
         return;
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* The native re-specify below can run vitaGL's out-of-memory glFinish
+     * (utils/gpu_utils.c), a scene reset: the attachment must be current. */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_TEXTURE);
+#endif
     gl_vita_fxray_log_fallback(record->name, reason);
     glGetIntegerv(GL_VITA_TEXTURE_BINDING_2D, &previous);
     if ((guest_gl_uint)(GLuint)previous != record->name)
@@ -5757,6 +6058,14 @@ static void vita_glBlendFuncSeparate(
 
 static guest_gl_enum vita_glCheckFramebufferStatus(guest_gl_enum target)
 {
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    {
+        guest_gl_enum pending_status;
+
+        if (gl_vita_defer_attach_status(target, &pending_status))
+            return pending_status;
+    }
+#endif
     return (guest_gl_enum)glCheckFramebufferStatus((GLenum)target);
 }
 
@@ -5773,6 +6082,10 @@ static void vita_glClear(guest_gl_bitfield mask)
         s_first_frame.current_guest_fbo ?
             &s_first_frame.clear_offscreen :
             &s_first_frame.clear_default);
+#endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH) && \
+        !defined(ISAAC_VITA_FBO_CLEAR_ELISION)
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_CLEAR);
 #endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     if (gl_vita_fbo_clear_defer(mask)) {
@@ -5922,6 +6235,11 @@ static void vita_glDeleteFramebuffers(
 #if defined(ISAAC_VITA_GL_FILL_CENSUS)
     gl_vita_fill_note_delete_framebuffers(count, framebuffers);
 #endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* vitaGL drops the attached texture's reference and retires the target
+     * of the deleted framebuffer: the attach must have happened first. */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
+#endif
     glDeleteFramebuffers(
         (GLsizei)count, (const GLuint *)(uintptr_t)framebuffers);
 #if defined(ISAAC_VITA_WORLD_SEAM_DIAG)
@@ -6011,6 +6329,11 @@ static void vita_glDeleteShader(guest_gl_uint shader)
 static void vita_glDeleteTextures(
     guest_gl_sizei count, guest_gl_addr textures)
 {
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* glDeleteTextures inspects the active framebuffers' attachment and the
+     * texture reference count the attach moves. */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_TEXTURE);
+#endif
 #if defined(ISAAC_VITA_TEXTURE_CHURN_PROFILE)
     uint64_t native_started_at;
     uint64_t native_ended_at;
@@ -6201,6 +6524,10 @@ static void vita_glDrawElements(
 # endif
 #endif
     GL_VITA_DRAW_SPLIT_MARK(CENSUS);
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* Before the owed replay, the depth carry and the draw itself. */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_DRAW);
+#endif
 #if defined(ISAAC_VITA_FBO_CLEAR_ELISION)
     gl_vita_fbo_note_draw();
 #endif
@@ -6488,6 +6815,20 @@ static void vita_glFramebufferTexture2D(
      * anything still owed must land in the current one first. */
     gl_vita_fbo_owed_materialize();
 #endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    if (gl_vita_defer_attach_request(
+            target, attachment, texture_target, texture, level)) {
+        /* Not forwarded yet; the guest-time notes below run unchanged. */
+# if defined(GL_VITA_FBO_TABLE)
+        gl_vita_fbo_note_texture_attachment(
+            target, attachment, texture_target, texture, level);
+# endif
+# if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
+        gl_vita_depth_carry_note_attach(target, texture);
+# endif
+        return;
+    }
+#endif
     GL_VITA_TIME_BEGIN();
     glFramebufferTexture2D(
         (GLenum)target, (GLenum)attachment, (GLenum)texture_target,
@@ -6579,6 +6920,10 @@ static void vita_glGetIntegerv(guest_gl_enum name, guest_gl_addr value)
         st32(value + 12u, (uint32_t)s_logical_viewport.height);
         return;
     }
+#endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* GL_ALPHA_BITS and friends read the bound framebuffer's attachment. */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
 #endif
     glGetIntegerv((GLenum)name, (GLint *)(uintptr_t)value);
 }
@@ -6846,10 +7191,20 @@ static void vita_glReadPixels(
             (unsigned)s_draw_framebuffer);
     }
 #endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH) && \
+        !defined(ISAAC_VITA_FBO_READBACK_FIX)
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_READ);
+#endif
 #if defined(ISAAC_VITA_FBO_READBACK_FIX)
     readback_synced = gl_vita_readback_before(&readback_wait_us);
     readback_copied = gl_vita_readback_copy(
         x, y, width, height, format, type, pixels);
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* Only the read vitaGL serves needs the attachment; the copy above reads
+     * the texture the guest attached, from the FBO table. */
+    if (!readback_copied)
+        gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_READ);
+#endif
     if (!readback_copied)
 #endif
     glReadPixels((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height,
@@ -6888,6 +7243,9 @@ static void vita_glFramebufferRenderbuffer(
     guest_gl_enum target, guest_gl_enum attachment,
     guest_gl_enum renderbuffer_target, guest_gl_uint renderbuffer)
 {
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
+#endif
     glFramebufferRenderbuffer(
         (GLenum)target, (GLenum)attachment,
         (GLenum)renderbuffer_target, (GLuint)renderbuffer);
@@ -6947,6 +7305,11 @@ static void vita_glTexImage2D(
     guest_gl_enum type, guest_gl_addr pixels)
 {
     KAGE_VITA_DEEP_SCOPE(KVD_TEX_UPLOAD);
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* A re-specify can move the texture's data pointer, which vitaGL copies
+     * into the framebuffer at the attach: keep the stock order. */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_TEXTURE);
+#endif
     kage_vita_world_seam_diag_note_tex_image(
         target, level, width, height);
     guest_gl_sizei native_width = width;
@@ -7121,6 +7484,10 @@ static void vita_glTexSubImage2D(
     guest_gl_addr pixels)
 {
     KAGE_VITA_DEEP_SCOPE(KVD_TEX_SUBUPLOAD);
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* Stricter than needed (covers the scaled-target re-specify below). */
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_TEXTURE);
+#endif
 #if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)
     if (target == GL_VITA_TEXTURE_2D && gl_vita_fxray_has_live_record()) {
         gl_vita_fxray_record *record =
@@ -7812,6 +8179,10 @@ int gl_vita_backend_install(void)
 #if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
     isaac_gl_record_stop();
 #endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
+    gl_vita_defer_attach_banner();
+#endif
     gl_vita_backend_attrib_sync();
     gl_vita_texture_profile_reset_all();
     gl_vita_texture_profile_calibrate_clock();
@@ -7841,6 +8212,9 @@ int gl_vita_backend_install(void)
 #endif
 #if defined(ISAAC_VITA_FBO_READBACK_FIX)
     gl_vita_readback_reset();
+# if defined(ISAAC_VITA_FBO_READBACK_CENSUS_SKIP)
+    gl_vita_readback_census_banner();
+# endif
 #endif
 #if defined(ISAAC_VITA_FBO_DEPTH_CARRY)
     gl_vita_depth_carry_reset();
@@ -7937,6 +8311,9 @@ void gl_vita_backend_uninstall(void)
 #endif
 #if defined(ISAAC_VITA_GL_THREAD_RECORD) && ISAAC_VITA_GL_THREAD_RECORD
     isaac_gl_record_stop();
+#endif
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    gl_vita_defer_attach_flush(ISAAC_VITA_FBO_DEFER_FLUSH_OTHER);
 #endif
     gl_vita_backend_attrib_sync();
 #if defined(ISAAC_VITA_FXRAY_ALPHA_MASK)

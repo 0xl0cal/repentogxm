@@ -26,7 +26,7 @@ development line. Steps for a release:
    eight issue fixes, the GL recorder admission cache and the five fixes of
    2026-11-06) ON, and no entry
    that differs from the cache. A draft recipe that is not yet a cache copy
-   says so in its header (`v0.1.2-alpha.cmake` until it ships).
+   says so in its header (`v0.1.2-alpha.cmake`, never shipped).
 
    After its tag a recipe is a living file, not a frozen copy. A line that
    adds a knob pins it in the release profile, and host tests check those

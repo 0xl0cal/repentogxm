@@ -42,7 +42,7 @@
  * the manager through dispatch.
  *
  * MODEL.  When armed and the observer would Unregister an *eligible* image
- * (ImagePng/Pcx/Pic vtable, uploaded, not a render target, present in the
+ * (ImagePng/Pcx/Pic vtable, uploaded, not on a batch-flush list, present in the
  * manager as {image, ctrl}, strong == 1), the wrapper reproduces the
  * observer's Enter(-1)/Leave on the control block's lock with the observer's
  * own return words and then -- instead of Unregistering -- leaves the
@@ -83,7 +83,7 @@
  * and re-reads strong, so a foreign Unregister/Clear (floor exit, mod reload,
  * shutdown) that ran behind its back can never reach a dangling pointer.
  * Anything unexpected (misaligned pair/image/ctrl, foreign Image or ctrl
- * vtable, render-target flags, tex0 unset, strong != 1, off the pinned CPU,
+ * vtable, batch-flush flags, tex0 unset, strong != 1, off the pinned CPU,
  * table full and unevictable, budget 0) falls closed to __real_sub_0056d8c0,
  * which then does exactly what the OFF build does.
  *
@@ -154,7 +154,7 @@
 #define ISAAC_IR_CTRL_VT_RVA          0x00608360U /* control block: +4 TryAddRef +8 AddRef +c Release */
 
 /* Image and control-block field offsets. */
-#define ISAAC_IR_IMG_FLAGS            0x10U /* & 0x14 -> in a render-target list (Unregister 0x56d278/0x56d2b6) */
+#define ISAAC_IR_IMG_FLAGS            0x10U /* & 0x14 -> on a batch-flush list (Unregister 0x56d278/0x56d2b6), see below */
 #define ISAAC_IR_IMG_NAME             0x3cU /* char* (Load's strcmp key) */
 #define ISAAC_IR_IMG_TEX0             0x78U /* GL name; 0xffffffff from the base ctor (0x5b080b) until glGenTextures */
 #define ISAAC_IR_IMG_TEX1             0x7cU /* second GL name (palette upload for colour type 3) */
@@ -166,6 +166,50 @@
 #define ISAAC_IR_LOCK_VT_ENTER        0x0cU /* thiscall Enter(-1), ret 4 */
 #define ISAAC_IR_LOCK_VT_LEAVE        0x10U /* thiscall Leave(), ret */
 #define ISAAC_IR_TEX_UNSET            0xffffffffU
+
+/* The batch renderer's bookkeeping an Image's flags word mirrors (frozen PE;
+ * these are NOT render-target lists -- the names in the older comments and in
+ * the trace reason "inel-rt" are historical):
+ *   0x04  the Image is in the DIRTY vector [0x7e7d10, 0x7e7d14) of Image*:
+ *         it has queued quads the next flush (sub_0056d500) will draw.  Set
+ *         only at 0x5601f6, cleared by sub_0056d4a0 after every flush.
+ *         Unregister erases the entry without drawing it (0x56d280..0x56d2af).
+ *   0x10  the Image is in the TOUCHED vector [0x7e7d1c, 0x7e7d20) of Image*:
+ *         it was drawn by a flush and its batch buffers are still allocated.
+ *         Set only by the flush (0x56d5cf / 0x56d7f5 / 0x56d80f), cleared only
+ *         by the idle sweep (0x561f81 / 0x564fec) once timeGetTime() -
+ *         [image+0x74] exceeds 5000 ms, which frees the batch buffers
+ *         (vt+0x74) and erases the entry.  Unregister erases the entry
+ *         (0x56d2c1..0x56d2ef).
+ * PAIRS [0x7e7d28, 0x7e7d2c) holds {batch*, Image*} draws pending for the next
+ * flush; Unregister drops an Image's pairs undrawn (0x56d2f6..).  The word at
+ * 0x7e7d38 is the Image of the most recent pair (0x5608f6). */
+#define ISAAC_IR_IMG_FLAG_DIRTY       0x04U
+#define ISAAC_IR_IMG_FLAG_TOUCHED     0x10U
+#define ISAAC_IR_DIRTY_BEGIN_RVA      0x007e7d10U
+#define ISAAC_IR_DIRTY_END_RVA        0x007e7d14U
+#define ISAAC_IR_TOUCHED_BEGIN_RVA    0x007e7d1cU
+#define ISAAC_IR_TOUCHED_END_RVA      0x007e7d20U
+#define ISAAC_IR_PAIRS_BEGIN_RVA      0x007e7d28U
+#define ISAAC_IR_PAIRS_END_RVA        0x007e7d2cU
+#define ISAAC_IR_LAST_PAIR_IMAGE_RVA  0x007e7d38U
+#define ISAAC_IR_TOUCHED_IDLE_MS      0x1388U     /* the sweep's 5000 ms (0x564fdb) */
+#define ISAAC_IR_FLUSH_VEC_MAX        4096U       /* scan ceiling per vector (entries) */
+
+/* ImageManager::Load = sub_0056c7e0, stdcall(SmartPointer<Image>* out,
+ * const char* name, const void* vertex_desc, bool), `ret 0x10` at 0x56cc82,
+ * and the anm2 sprite-sheet loader's call site the preload replays:
+ *   0x565fad push 0 / 0x565faf push 0xbbf948 / push name / push &out /
+ *   0x565fc3 call Load (return word 0x565fc8); then the SmartPointer<Image>
+ *   destructor at 0x565fee: ecx = out.ctrl, call [vt+0xc] Release (return
+ *   word 0x565fff), and when it returns al != 0 the observer through
+ *   [0x7fd62c] with &out (return word 0x566015), add esp,4. */
+#define ISAAC_IR_LOAD_RVA             0x0056c7e0U
+#define ISAAC_IR_LOAD_SITE_RVA        0x00565fc8U
+#define ISAAC_IR_LOAD_VERTEX_DESC_RVA 0x007bf948U
+#define ISAAC_IR_LOAD_RELEASE_SITE_RVA  0x00565fffU
+#define ISAAC_IR_LOAD_OBSERVER_SITE_RVA 0x00566015U
+#define ISAAC_IR_CTRL_VT_RELEASE      0x0cU /* thiscall Release(), ret; al = still referenced */
 
 /* Bounds. */
 #define ISAAC_IR_RECORDS              1024U /* LRU capacity */
@@ -240,6 +284,15 @@ void isaac_vita_image_retain_ghost_sample(void);
 void isaac_vita_image_retain_ghost_take(isaac_irg_stats *st, isaac_irg_mem *mem);
 #endif
 
+#if defined(ISAAC_VITA_IMAGE_PRELOAD)
+/* Floor-load sheet preload (see the module).  Called by the Level::Init seam
+ * (host_vita_sfx_floor_preload.c, --wrap=sub_00311e60) after the real
+ * Level::Init returned, on the game CPU, with the guest registers saved by
+ * the caller.  The seam's unit also supplies the guest-heap headroom. */
+void isaac_vita_image_preload_level_init(CPU *__restrict c);
+uint32_t isaac_vita_image_preload_heap_headroom(void);
+#endif
+
 #if defined(ISAAC_VITA_IMAGE_RETAIN_WRAP)
 void __wrap_sub_0056d8c0(CPU *__restrict c);
 void __real_sub_0056d8c0(CPU *__restrict c);
@@ -270,6 +323,46 @@ int      isaac_ir_oracle_armed(void);
 /* Saturate every counter/byte field (u32 max) so the oracle can measure the
  * worst-case receipt line lengths against isaac_vita_log's body. */
 void     isaac_ir_oracle_saturate_stats(void);
+# if defined(ISAAC_VITA_IMAGE_RETAIN_ADMIT_TOUCHED)
+/* The `KAGE VITA IMAGE RETAIN TOUCHED:` counters, in receipt order. */
+enum {
+    ISAAC_IRT_F_OFFERS = 0, ISAAC_IRT_F_ADMIT, ISAAC_IRT_F_ADMIT_BYTES,
+    ISAAC_IRT_F_DIRTY, ISAAC_IRT_F_VEC, ISAAC_IRT_F_PAIR,
+    ISAAC_IRT_F_PINNED_SKIP, ISAAC_IRT_F_EVICT_BLOCKED,
+    ISAAC_IRT_F_BUDGET_REFUSE, ISAAC_IRT_F_PAIR_UNTOUCHED
+};
+uint32_t isaac_ir_oracle_touched(unsigned field);
+# endif
+# if defined(ISAAC_VITA_IMAGE_PRELOAD)
+enum {
+    ISAAC_IRP_F_LEVELS = 0, ISAAC_IRP_F_LOADED, ISAAC_IRP_F_LOADED_BYTES,
+    ISAAC_IRP_F_RETAINED, ISAAC_IRP_F_DROPPED, ISAAC_IRP_F_PRESENT,
+    ISAAC_IRP_F_FAIL, ISAAC_IRP_F_HIT, ISAAC_IRP_F_MISS,
+    ISAAC_IRP_F_EVICTED_UNUSED, ISAAC_IRP_F_BREACH,
+    ISAAC_IRP_F_SKIP_STATE, ISAAC_IRP_F_SKIP_LOCK, ISAAC_IRP_F_SKIP_TERMINAL,
+    ISAAC_IRP_F_SKIP_VMEM, ISAAC_IRP_F_SKIP_HEAP, ISAAC_IRP_F_SKIP_STACK,
+    ISAAC_IRP_F_ENTRIES
+};
+uint32_t isaac_ir_oracle_preload(unsigned field);
+#  if defined(ISAAC_VITA_IMAGE_PRELOAD_PIN)
+/* The `KAGE VITA IMAGE PRELOAD PIN:` totals in receipt order, then the live
+ * pin and state of list entries 0 and 1. */
+enum {
+    ISAAC_IRPP_F_PINNED = 0, ISAAC_IRPP_F_REFUSED, ISAAC_IRPP_F_USED,
+    ISAAC_IRPP_F_FLOOR, ISAAC_IRPP_F_YIELD, ISAAC_IRPP_F_STALE,
+    ISAAC_IRPP_F_DROPPED, ISAAC_IRPP_F_SKIP, ISAAC_IRPP_F_CAND_SKIP, ISAAC_IRPP_F_OWN,
+    ISAAC_IRPP_F_EXACT, ISAAC_IRPP_F_ALIAS, ISAAC_IRPP_F_HELD,
+    ISAAC_IRPP_F_ON_FREE, ISAAC_IRPP_F_LOST, ISAAC_IRPP_F_TWINS,
+    ISAAC_IRPP_F_PINS, ISAAC_IRPP_F_PINNED_BYTES,
+    ISAAC_IRPP_F_PIN0, ISAAC_IRPP_F_PIN1, ISAAC_IRPP_F_STATE0,
+    ISAAC_IRPP_F_STATE1, ISAAC_IRPP_F_ENTRIES
+};
+uint32_t isaac_ir_oracle_preload_pin(unsigned field);
+#  endif
+/* The oracle supplies the clock of the preload receipts and the allocator's
+ * terminal flag (production: host_vita_heap.c). */
+extern uint64_t isaac_irp_oracle_now_us(void);
+# endif
 /* The oracle supplies the free-memory model (RAM, VRAM). */
 extern uint32_t isaac_ir_oracle_free_ram(void);
 extern uint32_t isaac_ir_oracle_free_vram(void);

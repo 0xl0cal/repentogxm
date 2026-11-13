@@ -350,6 +350,82 @@ def s4_sites(text: str) -> int:
     return len(found)
 
 
+# R60-DRYADMIT-SPEC-20261028.md 2.2 names gl_record_backend.c once more,
+# inside the simulated recorder slice but under
+# if(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE), which no shape here sets (the
+# knob's default OFF appends nothing).  Only this exact statement is excused;
+# any other new site still fails the count.
+ADMIT_WAIT_STATEMENT = re.compile(
+    r'^      set_property\(SOURCE\n'
+    r'        "\$\{ISAAC_RUNTIME\}/kage_vita_fullspeed_scheduler\.c"\n'
+    r'        "\$\{ISAAC_RUNTIME\}/kage_vita_backend\.c"\n'
+    r'        "\$\{ISAAC_RUNTIME\}/gl_record_backend\.c"\n'
+    r'        "\$\{ISAAC_RUNTIME\}/gl_record_ring\.c"\n'
+    r'        "\$\{ISAAC_RUNTIME\}/kage_vita_phase_profile\.c"\n'
+    r'        APPEND PROPERTY COMPILE_DEFINITIONS\n'
+    r'          ISAAC_VITA_GL_THREAD_ADMIT_WAIT=\$\{ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE\}\)\n', re.M)
+
+
+def admit_wait_sites(text: str) -> int:
+    found = list(ADMIT_WAIT_STATEMENT.finditer(text))
+    need(len(found) <= 1, f"cmake: the GL admit wait statement appears {len(found)} times")
+    for m in found:
+        head = "    if(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE)\n"
+        start = text.rfind(head, 0, m.start())
+        need(start >= 0 and endif_after(text, start, "    ") > m.end(),
+             "cmake: the GL admit wait statement is outside if(ISAAC_VITA_GL_THREAD_ADMIT_WAIT_MODE)")
+    return len(found)
+
+
+# R60-FABLE-PLAN.md lane B names gl_record_backend.c once more, under
+# if(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE), which no shape here sets (the
+# knob's default OFF appends nothing).  Only this exact statement is excused.
+ADMIT_BEHIND_STATEMENT = re.compile(
+    r'^      set_property\(SOURCE\n'
+    r'        "\$\{ISAAC_RUNTIME\}/kage_vita_fullspeed_scheduler\.c"\n'
+    r'        "\$\{ISAAC_RUNTIME\}/kage_vita_backend\.c"\n'
+    r'        "\$\{ISAAC_RUNTIME\}/gl_record_backend\.c"\n'
+    r'        "\$\{ISAAC_RUNTIME\}/kage_vita_phase_profile\.c"\n'
+    r'        APPEND PROPERTY COMPILE_DEFINITIONS\n'
+    r'          ISAAC_VITA_GL_THREAD_ADMIT_BEHIND=\$\{ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE\}\n'
+    r'          ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES=\$\{ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_BYTES\}\)\n',
+    re.M)
+
+
+def admit_behind_sites(text: str) -> int:
+    found = list(ADMIT_BEHIND_STATEMENT.finditer(text))
+    need(len(found) <= 1, f"cmake: the GL admit behind statement appears {len(found)} times")
+    for m in found:
+        head = "    if(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE)\n"
+        start = text.rfind(head, 0, m.start())
+        need(start >= 0 and endif_after(text, start, "    ") > m.end(),
+             "cmake: the GL admit behind statement is outside if(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND_MODE)")
+    return len(found)
+
+
+# ROAD60-SYNTHESIS.md lane C (draw packet) names gl_record_backend.c once
+# more, under if(ISAAC_VITA_GL_DRAW_PACKET_MODE), which no shape here sets
+# (the knob's default OFF appends nothing).  Only this exact statement is
+# excused; its own proofs are vita/test_gl_draw_packet.py.
+DRAW_PACKET_STATEMENT = re.compile(
+    r'^      set_property\(SOURCE\n'
+    r'        "\$\{ISAAC_RUNTIME\}/gl_record_backend\.c"\n'
+    r'        "\$\{ISAAC_RUNTIME\}/kage_vita_phase_profile\.c"\n'
+    r'        APPEND PROPERTY COMPILE_DEFINITIONS\n'
+    r'          ISAAC_VITA_GL_DRAW_PACKET=\$\{ISAAC_VITA_GL_DRAW_PACKET_MODE\}\)\n', re.M)
+
+
+def draw_packet_sites(text: str) -> int:
+    found = list(DRAW_PACKET_STATEMENT.finditer(text))
+    need(len(found) <= 1, f"cmake: the GL draw packet statement appears {len(found)} times")
+    for m in found:
+        head = "    if(ISAAC_VITA_GL_DRAW_PACKET_MODE)\n"
+        start = text.rfind(head, 0, m.start())
+        need(start >= 0 and endif_after(text, start, "    ") > m.end(),
+             "cmake: the GL draw packet statement is outside if(ISAAC_VITA_GL_DRAW_PACKET_MODE)")
+    return len(found)
+
+
 def run_shape(cmake: str, script: Path, name: str):
     shape, extra = RUNS[name]
     values = dict(SHAPES[shape], **extra)
@@ -371,10 +447,13 @@ def leg_cmake(cmake_text: str, out: Path) -> dict:
     # The opcode census block (GL_RECORD_OPCODE_CENSUS, a measurement knob
     # OFF here) sits inside the simulated recorder slice; its own test is
     # test_gl_record_opcode_census.py.
-    sites = gl_record_backend_sites(cmake_text) - s4_sites(cmake_text) - pkt_sites(cmake_text)
+    sites = (gl_record_backend_sites(cmake_text) - s4_sites(cmake_text) - pkt_sites(cmake_text)
+             - admit_wait_sites(cmake_text) - admit_behind_sites(cmake_text)
+             - draw_packet_sites(cmake_text))
     need(sites == 7, f"cmake: gl_record_backend.c named {sites} times (expected 7: sources, RECORD, "
-         "WORKER, OPCODE_CENSUS, OWNER_CHECK, CACHE, VERIFY; plus the S4 attribute-batch and the "
-         "W-pkt bind-packet statements, excused); extend this simulation")
+         "WORKER, OPCODE_CENSUS, OWNER_CHECK, CACHE, VERIFY; plus the S4 attribute-batch, the "
+         "W-pkt bind-packet, the GL admit wait, the GL admit behind and the GL draw packet "
+         "statements, excused); extend this simulation")
     out.mkdir(parents=True, exist_ok=True)
     script = out / "s1_cmake_sim.cmake"
     script.write_text(cmake_blocks(cmake_text), encoding="utf-8")

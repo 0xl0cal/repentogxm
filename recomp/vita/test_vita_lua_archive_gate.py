@@ -266,36 +266,41 @@ def compile_tests(root: Path) -> None:
 
 
 def derived_compile_tests(root: Path) -> None:
-    """ISAAC_VITA_LUA_GC_FINALIZER_PACE: one source compiled from the build tree."""
+    """ISAAC_VITA_LUA_GC_FINALIZER_PACE: two sources compiled from the build
+    tree (lgc.c and, since review r5, lbaselib.c)."""
 
     (root / "derived").mkdir()
     lua_source, commands, records = compile_fixture(root / "derived")
     build = commands.parent
     source_dir = (lua_source / "src").resolve()
-    replaced_name = records[5][0]
-    pristine = source_dir / replaced_name
-    derived = build / gate.LUA_GC_FINALIZER_PACE_DIR / replaced_name
-    derived.parent.mkdir()
-    derived.write_bytes(b"derived " + replaced_name.encode("ascii"))
     entries = json.loads(commands.read_text(encoding="utf-8"))
     pristine_entries = json.loads(json.dumps(entries))
-    output = (f"CMakeFiles/{gate.LUA_TARGET}.dir/"
-              f"{gate.LUA_GC_FINALIZER_PACE_DIR}/{replaced_name}.obj")
-    arguments = entries[5]["arguments"]
-    arguments[arguments.index("-o") + 1] = output
-    arguments[-1] = str(derived)
-    entries[5]["file"] = str(derived)
-    entries[5]["output"] = output
+    replaced: dict[Path, Path] = {}
+    (build / gate.LUA_GC_FINALIZER_PACE_DIR).mkdir()
+    for index in (5, 6):
+        replaced_name = records[index][0]
+        pristine = source_dir / replaced_name
+        derived = build / gate.LUA_GC_FINALIZER_PACE_DIR / replaced_name
+        derived.write_bytes(b"derived " + replaced_name.encode("ascii"))
+        output = (f"CMakeFiles/{gate.LUA_TARGET}.dir/"
+                  f"{gate.LUA_GC_FINALIZER_PACE_DIR}/{replaced_name}.obj")
+        arguments = entries[index]["arguments"]
+        arguments[arguments.index("-o") + 1] = output
+        arguments[-1] = str(derived)
+        entries[index]["file"] = str(derived)
+        entries[index]["output"] = output
+        replaced[pristine] = derived
     commands.write_text(json.dumps(entries), encoding="utf-8")
     compiled = gate.lua_compile_closure(
         commands, lua_source, records, require_objects=False,
-        derived_sources={pristine: derived},
+        derived_sources=replaced,
     )
     assert len(compiled) == gate.LUA_C_SOURCE_COUNT
-    record = compiled[pristine.resolve()]
-    assert record["derived_source"] == derived.resolve()
-    assert record["source"] == derived.resolve()
-    assert record["derived_sha256"] == gate._sha256(derived)
+    for pristine, derived in replaced.items():
+        record = compiled[pristine.resolve()]
+        assert record["derived_source"] == derived.resolve()
+        assert record["source"] == derived.resolve()
+        assert record["derived_sha256"] == gate._sha256(derived)
     must_fail(
         "derived compile without the knob",
         lambda: gate.lua_compile_closure(
@@ -303,12 +308,32 @@ def derived_compile_tests(root: Path) -> None:
         ),
         "Lua compile-source closure changed",
     )
-    commands.write_text(json.dumps(pristine_entries), encoding="utf-8")
+    first, second = list(replaced.items())
     must_fail(
-        "knob ON but the pristine source compiled",
+        "knob proves one derived source, two compiled",
         lambda: gate.lua_compile_closure(
             commands, lua_source, records, require_objects=False,
-            derived_sources={pristine: derived},
+            derived_sources=dict([first]),
+        ),
+        "Lua compile-source closure changed",
+    )
+    one = json.loads(json.dumps(entries))
+    one[6] = pristine_entries[6]
+    commands.write_text(json.dumps(one), encoding="utf-8")
+    must_fail(
+        "knob ON but one pristine source still compiled",
+        lambda: gate.lua_compile_closure(
+            commands, lua_source, records, require_objects=False,
+            derived_sources=replaced,
+        ),
+        "Lua compile-source closure changed",
+    )
+    commands.write_text(json.dumps(pristine_entries), encoding="utf-8")
+    must_fail(
+        "knob ON but the pristine sources compiled",
+        lambda: gate.lua_compile_closure(
+            commands, lua_source, records, require_objects=False,
+            derived_sources=replaced,
         ),
         "Lua compile-source closure changed",
     )
@@ -316,7 +341,8 @@ def derived_compile_tests(root: Path) -> None:
         "derived source renamed",
         lambda: gate.lua_compile_closure(
             commands, lua_source, records, require_objects=False,
-            derived_sources={pristine: derived.with_name("other.c")},
+            derived_sources={first[0]: first[1].with_name("other.c"),
+                             second[0]: second[1]},
         ),
         "renames",
     )
@@ -324,7 +350,7 @@ def derived_compile_tests(root: Path) -> None:
         "derived source outside the closure",
         lambda: gate.lua_compile_closure(
             commands, lua_source, records, require_objects=False,
-            derived_sources={source_dir / "lgc_extra.c": derived},
+            derived_sources={source_dir / "lgc_extra.c": first[1]},
         ),
         "outside the closure",
     )
@@ -339,15 +365,16 @@ def derived_compile_tests(root: Path) -> None:
     commands.write_text(json.dumps(arm), encoding="utf-8")
     compiled = gate.lua_compile_closure(
         commands, lua_source, records, require_objects=False, core_arm=True,
-        derived_sources={pristine: derived},
+        derived_sources=replaced,
     )
     assert len(compiled) == gate.LUA_C_SOURCE_COUNT
-    assert compiled[pristine.resolve()]["derived_sha256"] == gate._sha256(derived)
+    for p_, d_ in replaced.items():
+        assert compiled[p_.resolve()]["derived_sha256"] == gate._sha256(d_)
     must_fail(
         "ARM pace archive certified as Thumb",
         lambda: gate.lua_compile_closure(
             commands, lua_source, records, require_objects=False,
-            derived_sources={pristine: derived},
+            derived_sources=replaced,
         ),
         "option sequence changed",
     )
@@ -359,7 +386,7 @@ def derived_compile_tests(root: Path) -> None:
         "Thumb derived lgc.c inside an ARM archive",
         lambda: gate.lua_compile_closure(
             commands, lua_source, records, require_objects=False,
-            core_arm=True, derived_sources={pristine: derived},
+            core_arm=True, derived_sources=replaced,
         ),
         "option sequence changed",
     )
@@ -372,96 +399,244 @@ def derived_source_tests(root: Path) -> None:
     (lua_source / "src").mkdir(parents=True)
     pristine = lua_source / "src" / gate.LUA_GC_FINALIZER_PACE_SOURCE
     pristine.write_bytes(b"pristine lgc\n")
+    pristine_bl = lua_source / "src" / gate.LUA_GC_FINALIZER_PACE_BASELIB_SOURCE
+    pristine_bl.write_bytes(b"pristine lbaselib\n")
     derived = build / gate.LUA_GC_FINALIZER_PACE_DIR / gate.LUA_GC_FINALIZER_PACE_SOURCE
+    derived_bl = (build / gate.LUA_GC_FINALIZER_PACE_DIR /
+                  gate.LUA_GC_FINALIZER_PACE_BASELIB_SOURCE)
     calls: list[tuple[bytes, int, int, int]] = []
+    bl_calls: list[bytes] = []
 
-    def fake_derive(data: bytes, max_per_call: int, cost: int,
-                    sweep_cost: int) -> bytes:
-        calls.append((data, max_per_call, cost, sweep_cost))
-        return data + (f"max={max_per_call} cost={cost} "
-                       f"sweep={sweep_cost}\n").encode("ascii")
+    def fake_derive(data: bytes, max_per_call: int, fin_step: int,
+                    sweep_step: int) -> bytes:
+        calls.append((data, max_per_call, fin_step, sweep_step))
+        return data + (f"max={max_per_call} step={fin_step} "
+                       f"sweep={sweep_step}\n").encode("ascii")
+
+    def fake_derive_baselib(data: bytes) -> bytes:
+        bl_calls.append(data)
+        return data + b"latch\n"
+
+    def run(cache, **kw):
+        kw.setdefault("derive", fake_derive)
+        kw.setdefault("derive_baselib", fake_derive_baselib)
+        return gate.lua_derived_sources(
+            cache, build_dir=build, lua_source=lua_source, **kw)
 
     on = {
         gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "ON",
         gate.LUA_GC_FINALIZER_MAX_CACHE_KEY: "8",
-        gate.LUA_GC_FINALIZER_COST_CACHE_KEY: "512",
-        gate.LUA_GC_SWEEP_COST_CACHE_KEY: "32",
+        gate.LUA_GC_FINALIZER_STEP_CACHE_KEY: "192",
+        gate.LUA_GC_SWEEP_STEP_CACHE_KEY: "6144",
     }
     off = {**on, gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "OFF"}
-    assert gate.lua_derived_sources(
-        off, build_dir=build, lua_source=lua_source, derive=fake_derive) == {}
-    assert not calls
+    assert run(off) == {}
+    assert not calls and not bl_calls
     must_fail(
-        "knob ON without the derived file",
-        lambda: gate.lua_derived_sources(
-            on, build_dir=build, lua_source=lua_source, derive=fake_derive),
+        "knob ON without the derived files",
+        lambda: run(on),
         "not a regular non-symlink file",
     )
     derived.parent.mkdir(parents=True)
-    derived.write_bytes(b"pristine lgc\nmax=8 cost=512 sweep=32\n")
-    assert gate.lua_derived_sources(
-        on, build_dir=build, lua_source=lua_source, derive=fake_derive
-    ) == {pristine.resolve(): derived.resolve()}
-    assert calls[-1] == (b"pristine lgc\n", 8, 512, 32)
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144\n")
+    must_fail(
+        "knob ON without the derived lbaselib.c",
+        lambda: run(on),
+        "not a regular non-symlink file",
+    )
+    derived_bl.write_bytes(b"pristine lbaselib\nlatch\n")
+    assert run(on) == {pristine.resolve(): derived.resolve(),
+                       pristine_bl.resolve(): derived_bl.resolve()}
+    assert calls[-1] == (b"pristine lgc\n", 8, 192, 6144)
+    assert bl_calls[-1] == b"pristine lbaselib\n"
     must_fail(
         "derived bytes from other constants",
-        lambda: gate.lua_derived_sources(
-            {**on, gate.LUA_GC_FINALIZER_COST_CACHE_KEY: "1024"},
-            build_dir=build, lua_source=lua_source, derive=fake_derive),
-        "differs from the derivation",
+        lambda: run({**on, gate.LUA_GC_FINALIZER_STEP_CACHE_KEY: "128"}),
+        "derived lgc.c differs from the derivation",
     )
     must_fail(
-        "derived bytes from another sweep cost",
-        lambda: gate.lua_derived_sources(
-            {**on, gate.LUA_GC_SWEEP_COST_CACHE_KEY: "5"},
-            build_dir=build, lua_source=lua_source, derive=fake_derive),
-        "differs from the derivation",
+        "derived bytes from another sweep step",
+        lambda: run({**on, gate.LUA_GC_SWEEP_STEP_CACHE_KEY: "0"}),
+        "derived lgc.c differs from the derivation",
     )
+    # F-GCSWEEP: the gate takes the sweep quota from the cache, whatever it
+    # is (2048 is the 0.2.0 candidate), and a tree derived with one quota
+    # does not pass under a cache that names the other
+    sweep020 = {**on, gate.LUA_GC_SWEEP_STEP_CACHE_KEY: "2048"}
     must_fail(
-        "knob ON without SWEEP_COST in the cache",
-        lambda: gate.lua_derived_sources(
-            {key: value for key, value in on.items()
-             if key != gate.LUA_GC_SWEEP_COST_CACHE_KEY},
-            build_dir=build, lua_source=lua_source, derive=fake_derive),
-        "missing ISAAC_VITA_LUA_GC_SWEEP_COST",
+        "default-quota bytes, cache with sweep step 2048",
+        lambda: run(sweep020),
+        "derived lgc.c differs from the derivation",
     )
-    derived.write_bytes(b"pristine lgc\nmax=8 cost=512 sweep=32 tampered\n")
+    assert calls[-1] == (b"pristine lgc\n", 8, 192, 2048)
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=2048\n")
+    assert run(sweep020) == {pristine.resolve(): derived.resolve(),
+                             pristine_bl.resolve(): derived_bl.resolve()}
+    assert calls[-1] == (b"pristine lgc\n", 8, 192, 2048)
     must_fail(
-        "tampered derived source",
-        lambda: gate.lua_derived_sources(
-            on, build_dir=build, lua_source=lua_source, derive=fake_derive),
-        "differs from the derivation",
+        "sweep step 2048 bytes, cache with the default quota",
+        lambda: run(on),
+        "derived lgc.c differs from the derivation",
     )
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144\n")
+    must_fail(
+        "knob ON without SWEEP_STEP in the cache",
+        lambda: run({key: value for key, value in on.items()
+                     if key != gate.LUA_GC_SWEEP_STEP_CACHE_KEY}),
+        "missing ISAAC_VITA_LUA_GC_SWEEP_STEP",
+    )
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144 tampered\n")
+    must_fail(
+        "tampered derived lgc.c",
+        lambda: run(on),
+        "derived lgc.c differs from the derivation",
+    )
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144\n")
+    derived_bl.write_bytes(b"pristine lbaselib\nlatch tampered\n")
+    must_fail(
+        "tampered derived lbaselib.c",
+        lambda: run(on),
+        "derived lbaselib.c differs from the derivation",
+    )
+    derived_bl.write_bytes(b"pristine lbaselib\n")
+    must_fail(
+        "pristine bytes in the derived lbaselib.c (no latch)",
+        lambda: run(on),
+        "derived lbaselib.c differs from the derivation",
+    )
+    derived_bl.write_bytes(b"pristine lbaselib\nlatch\n")
     must_fail(
         "knob ON without MAX in the cache",
-        lambda: gate.lua_derived_sources(
-            {gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "ON",
-             gate.LUA_GC_FINALIZER_COST_CACHE_KEY: "512",
-             gate.LUA_GC_SWEEP_COST_CACHE_KEY: "32"},
-            build_dir=build, lua_source=lua_source, derive=fake_derive),
+        lambda: run({gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "ON",
+                     gate.LUA_GC_FINALIZER_STEP_CACHE_KEY: "192",
+                     gate.LUA_GC_SWEEP_STEP_CACHE_KEY: "6144"}),
         "missing ISAAC_VITA_LUA_GC_FINALIZER_MAX",
     )
     must_fail(
-        "non-numeric COST",
-        lambda: gate.lua_derived_sources(
-            {**on, gate.LUA_GC_FINALIZER_COST_CACHE_KEY: "fast"},
-            build_dir=build, lua_source=lua_source, derive=fake_derive),
+        "non-numeric STEP",
+        lambda: run({**on, gate.LUA_GC_FINALIZER_STEP_CACHE_KEY: "fast"}),
         "not a whole number",
     )
     must_fail(
         "cache without the knob",
-        lambda: gate.lua_derived_sources(
-            {}, build_dir=build, lua_source=lua_source, derive=fake_derive),
+        lambda: run({}),
         "missing ISAAC_VITA_LUA_GC_FINALIZER_PACE",
     )
-    # The real derivation refuses a non-pristine input (it pins the manifest
-    # sha of lgc.c), and the gate reports that as a gate error.
+    # ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES: 0 (or a cache from
+    # before the knob) is the four-argument derivation above; a budget is
+    # passed on as the fifth argument, and derived bytes of the other
+    # setting are refused either way.
+    alloc_key = gate.LUA_GC_FINALIZER_ALLOC_LATCH_CACHE_KEY
+    alloc_calls: list[tuple] = []
+
+    def fake_derive_alloc(data: bytes, max_per_call: int, fin_step: int,
+                          sweep_step: int, alloc: int = 0) -> bytes:
+        alloc_calls.append((data, max_per_call, fin_step, sweep_step, alloc))
+        tail = f" alloc={alloc}" if alloc else ""
+        return data + (f"max={max_per_call} step={fin_step} "
+                       f"sweep={sweep_step}{tail}\n").encode("ascii")
+
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144\n")
+    run({**on, alloc_key: "0"})
+    assert calls[-1] == (b"pristine lgc\n", 8, 192, 6144)
+    must_fail(
+        "budget in the cache, derived lgc.c without it",
+        lambda: run({**on, alloc_key: "65536"}, derive=fake_derive_alloc),
+        "derived lgc.c differs from the derivation",
+    )
+    assert alloc_calls[-1] == (b"pristine lgc\n", 8, 192, 6144, 65536)
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144 alloc=65536\n")
+    assert run({**on, alloc_key: "65536"}, derive=fake_derive_alloc) == {
+        pristine.resolve(): derived.resolve(),
+        pristine_bl.resolve(): derived_bl.resolve()}
+    must_fail(
+        "derived lgc.c with a budget, cache without it",
+        lambda: run(on, derive=fake_derive_alloc),
+        "derived lgc.c differs from the derivation",
+    )
+    must_fail(
+        "non-numeric budget",
+        lambda: run({**on, alloc_key: "lots"}, derive=fake_derive_alloc),
+        "not a whole number",
+    )
+    # ISAAC_VITA_LUA_GC_STATE_PROFILE: OFF (or a cache from before the
+    # option) keeps the call without the keyword, so the fakes above still
+    # fit; ON passes state_profile=True and the derived lgc.c must carry the
+    # hooks.  This is the box failure of 12.11 (own-gs0-cda): CMake derived
+    # with --state-profile and the gate compared against the plain derivation.
+    profile_key = gate.LUA_GC_STATE_PROFILE_CACHE_KEY
+    profile_calls: list[tuple] = []
+
+    def fake_derive_profile(data: bytes, max_per_call: int, fin_step: int,
+                            sweep_step: int, alloc: int = 0, *,
+                            state_profile: bool = False) -> bytes:
+        profile_calls.append((data, max_per_call, fin_step, sweep_step, alloc,
+                              state_profile))
+        tail = f" alloc={alloc}" if alloc else ""
+        tail += " profile" if state_profile else ""
+        return data + (f"max={max_per_call} step={fin_step} "
+                       f"sweep={sweep_step}{tail}\n").encode("ascii")
+
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144\n")
+    run({**on, profile_key: "OFF"})
+    assert calls[-1] == (b"pristine lgc\n", 8, 192, 6144)
+    run({**on, profile_key: "OFF"}, derive=fake_derive_profile)
+    assert profile_calls[-1] == (b"pristine lgc\n", 8, 192, 6144, 0, False)
+    must_fail(
+        "profile ON, derived lgc.c without the hooks",
+        lambda: run({**on, profile_key: "ON"}, derive=fake_derive_profile),
+        "derived lgc.c differs from the derivation",
+    )
+    assert profile_calls[-1] == (b"pristine lgc\n", 8, 192, 6144, 0, True)
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144 profile\n")
+    assert run({**on, profile_key: "ON"}, derive=fake_derive_profile) == {
+        pristine.resolve(): derived.resolve(),
+        pristine_bl.resolve(): derived_bl.resolve()}
+    must_fail(
+        "derived lgc.c with the hooks, profile OFF",
+        lambda: run({**on, profile_key: "OFF"}, derive=fake_derive_profile),
+        "derived lgc.c differs from the derivation",
+    )
+    must_fail(
+        "derived lgc.c with the hooks, cache from before the option",
+        lambda: run(on, derive=fake_derive_profile),
+        "derived lgc.c differs from the derivation",
+    )
+    derived.write_bytes(
+        b"pristine lgc\nmax=8 step=192 sweep=6144 alloc=65536 profile\n")
+    assert run({**on, alloc_key: "65536", profile_key: "ON"},
+               derive=fake_derive_profile) == {
+        pristine.resolve(): derived.resolve(),
+        pristine_bl.resolve(): derived_bl.resolve()}
+    assert profile_calls[-1] == (b"pristine lgc\n", 8, 192, 6144, 65536, True)
+    must_fail(
+        "profile not ON/OFF",
+        lambda: run({**on, profile_key: "yes"}, derive=fake_derive_profile),
+        "is not ON/OFF",
+    )
+    # the default derive forwards the keyword to the real derivation, which
+    # refuses a non-pristine input whatever the flag
+    must_fail(
+        "real derivation with the profile flag, non-pristine lgc.c",
+        lambda: gate.lua_derived_sources(
+            {**on, profile_key: "ON"}, build_dir=build, lua_source=lua_source),
+        "not pristine Lua 5.3.3 lgc.c",
+    )
+    # The real derivations refuse a non-pristine input (they pin the manifest
+    # shas of lgc.c and lbaselib.c), and the gate reports that as a gate error.
     derived.write_bytes(b"anything\n")
     must_fail(
         "real derivation of a non-pristine lgc.c",
         lambda: gate.lua_derived_sources(
             on, build_dir=build, lua_source=lua_source),
         "not pristine Lua 5.3.3 lgc.c",
+    )
+    derived.write_bytes(b"pristine lgc\nmax=8 step=192 sweep=6144\n")
+    must_fail(
+        "real derivation of a non-pristine lbaselib.c",
+        lambda: gate.lua_derived_sources(
+            on, build_dir=build, lua_source=lua_source, derive=fake_derive),
+        "not pristine Lua 5.3.3 lbaselib.c",
     )
 
 
@@ -626,19 +801,227 @@ def derived_source_map_tests(root: Path) -> None:
             derivations=rows[1:] + (("OTHER", same_derived),)),
         "both claim",
     )
-    # The production registry names both knobs, and an all-OFF cache selects
-    # nothing (the pristine 33-source closure).
+    # The production registry names the three knobs, and an all-OFF cache
+    # selects nothing (the pristine 33-source closure).
     assert [name for name, unused in gate.LUA_DERIVATIONS] == [
-        gate.LUA_GC_FINALIZER_PACE_CACHE_KEY, gate.LUA_INTEGER2STR_CACHE_KEY]
+        gate.LUA_GC_FINALIZER_PACE_CACHE_KEY, gate.LUA_INTEGER2STR_CACHE_KEY,
+        gate.LUA_VM_COMPUTED_GOTO_CACHE_KEY]
+    vm_off = {gate.LUA_VM_COMPUTED_GOTO_CACHE_KEY: "OFF"}
     assert gate.lua_derived_source_map(
-        {gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "OFF", **off},
+        {gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "OFF", **off, **vm_off},
         build_dir=build, lua_source=lua_source) == {}
     must_fail(
         "registry with the integer2str knob missing from the cache",
         lambda: gate.lua_derived_source_map(
-            {gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "OFF"},
+            {gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "OFF", **vm_off},
             build_dir=build, lua_source=lua_source),
         "missing ISAAC_VITA_LUA_INTEGER2STR",
+    )
+    must_fail(
+        "registry with the vm computed-goto knob missing from the cache",
+        lambda: gate.lua_derived_source_map(
+            {gate.LUA_GC_FINALIZER_PACE_CACHE_KEY: "OFF", **off},
+            build_dir=build, lua_source=lua_source),
+        "missing ISAAC_VITA_LUA_VM_COMPUTED_GOTO",
+    )
+
+
+def vm_goto_source_tests(root: Path) -> None:
+    """ISAAC_VITA_LUA_VM_COMPUTED_GOTO: the derived lvm.c is re-derived from
+    the pristine lvm.c AND the pristine lopcodes.h, and any other bytes fail."""
+
+    build = root / "vm-goto-build"
+    lua_source = root / "vm-goto-lua"
+    (lua_source / "src").mkdir(parents=True)
+    lvm = lua_source / "src" / gate.LUA_VM_COMPUTED_GOTO_SOURCE
+    lvm.write_bytes(b"pristine lvm\n")
+    lopcodes = lua_source / "src" / gate.LUA_VM_COMPUTED_GOTO_OPCODES
+    derived = (build / gate.LUA_VM_COMPUTED_GOTO_DIR /
+               gate.LUA_VM_COMPUTED_GOTO_SOURCE)
+    calls: list[tuple[bytes, bytes]] = []
+
+    def fake_derive(data: bytes, opcodes: bytes) -> bytes:
+        calls.append((data, opcodes))
+        return data + opcodes + b"goto\n"
+
+    on = {gate.LUA_VM_COMPUTED_GOTO_CACHE_KEY: "ON"}
+    off = {gate.LUA_VM_COMPUTED_GOTO_CACHE_KEY: "OFF"}
+    assert gate.lua_vm_computed_goto_sources(
+        off, build_dir=build, lua_source=lua_source, derive=fake_derive) == {}
+    assert not calls
+    must_fail(
+        "vm goto knob missing from the cache",
+        lambda: gate.lua_vm_computed_goto_sources(
+            {}, build_dir=build, lua_source=lua_source, derive=fake_derive),
+        "missing ISAAC_VITA_LUA_VM_COMPUTED_GOTO",
+    )
+    must_fail(
+        "vm goto ON without lopcodes.h",
+        lambda: gate.lua_vm_computed_goto_sources(
+            on, build_dir=build, lua_source=lua_source, derive=fake_derive),
+        "cannot read",
+    )
+    lopcodes.write_bytes(b"pristine lopcodes\n")
+    must_fail(
+        "vm goto ON without the derived file",
+        lambda: gate.lua_vm_computed_goto_sources(
+            on, build_dir=build, lua_source=lua_source, derive=fake_derive),
+        "not a regular non-symlink file",
+    )
+    derived.parent.mkdir(parents=True)
+    derived.write_bytes(b"pristine lvm\npristine lopcodes\ngoto\n")
+    assert gate.lua_vm_computed_goto_sources(
+        on, build_dir=build, lua_source=lua_source, derive=fake_derive
+    ) == {lvm.resolve(): derived.resolve()}
+    assert calls[-1] == (b"pristine lvm\n", b"pristine lopcodes\n")
+    # a changed lopcodes.h changes the expected bytes: the old file fails
+    lopcodes.write_bytes(b"other lopcodes\n")
+    must_fail(
+        "derived lvm.c of another lopcodes.h",
+        lambda: gate.lua_vm_computed_goto_sources(
+            on, build_dir=build, lua_source=lua_source, derive=fake_derive),
+        "derived lvm.c differs from the derivation",
+    )
+    lopcodes.write_bytes(b"pristine lopcodes\n")
+    derived.write_bytes(b"pristine lvm\npristine lopcodes\ngoto tampered\n")
+    must_fail(
+        "tampered derived lvm.c",
+        lambda: gate.lua_vm_computed_goto_sources(
+            on, build_dir=build, lua_source=lua_source, derive=fake_derive),
+        "derived lvm.c differs from the derivation",
+    )
+    # The real derivation pins the manifest sha of lvm.c (and of lopcodes.h).
+    must_fail(
+        "real derivation of a non-pristine lvm.c",
+        lambda: gate.lua_vm_computed_goto_sources(
+            on, build_dir=build, lua_source=lua_source),
+        "not pristine Lua 5.3.3 lvm.c",
+    )
+
+
+def vm_goto_compile_tests(root: Path) -> None:
+    """ISAAC_VITA_LUA_VM_COMPUTED_GOTO: the derived lvm.c compile carries the
+    archive sequence plus -fno-crossjumping (CMake appends source
+    COMPILE_OPTIONS after the target's, before -o); every other member keeps
+    the exact sequence, and the flag is accepted on the derived lvm.c only."""
+
+    (root / "vm-goto-compile").mkdir()
+    lua_source, commands, records = compile_fixture(root / "vm-goto-compile")
+    build = commands.parent
+    source_dir = (lua_source / "src").resolve()
+    entries = json.loads(commands.read_text(encoding="utf-8"))
+    index = 7
+    name = records[index][0]
+    pristine = source_dir / name
+    derived_dir = build / gate.LUA_VM_COMPUTED_GOTO_DIR
+    derived_dir.mkdir()
+    derived = derived_dir / name
+    derived.write_bytes(b"derived " + name.encode("ascii"))
+    output = (f"CMakeFiles/{gate.LUA_TARGET}.dir/"
+              f"{gate.LUA_VM_COMPUTED_GOTO_DIR}/{name}.obj")
+    arguments = entries[index]["arguments"]
+    arguments[arguments.index("-o") + 1] = output
+    arguments[-1] = str(derived)
+    entries[index]["file"] = str(derived)
+    entries[index]["output"] = output
+    plain = json.loads(json.dumps(entries))
+    arguments.insert(arguments.index("-o"),
+                     *gate.LUA_VM_COMPUTED_GOTO_COMPILE_OPTIONS)
+    commands.write_text(json.dumps(entries), encoding="utf-8")
+    replaced = {pristine: derived}
+    extra = {derived: gate.LUA_VM_COMPUTED_GOTO_COMPILE_OPTIONS}
+    assert gate.LUA_VM_COMPUTED_GOTO_COMPILE_OPTIONS == ("-fno-crossjumping",)
+
+    compiled = gate.lua_compile_closure(
+        commands, lua_source, records, require_objects=False,
+        derived_sources=replaced, extra_options=extra,
+    )
+    assert len(compiled) == gate.LUA_C_SOURCE_COUNT
+    assert compiled[pristine.resolve()]["derived_sha256"] == gate._sha256(derived)
+    must_fail(
+        "derived lvm.c with -fno-crossjumping, extra options not granted",
+        lambda: gate.lua_compile_closure(
+            commands, lua_source, records, require_objects=False,
+            derived_sources=replaced,
+        ),
+        "option sequence changed",
+    )
+    must_fail(
+        "extra options granted to a pristine source",
+        lambda: gate.lua_compile_closure(
+            commands, lua_source, records, require_objects=False,
+            derived_sources=replaced,
+            extra_options={pristine: gate.LUA_VM_COMPUTED_GOTO_COMPILE_OPTIONS},
+        ),
+        "not a derived one",
+    )
+    commands.write_text(json.dumps(plain), encoding="utf-8")
+    must_fail(
+        "knob ON but the derived lvm.c compiled without -fno-crossjumping",
+        lambda: gate.lua_compile_closure(
+            commands, lua_source, records, require_objects=False,
+            derived_sources=replaced, extra_options=extra,
+        ),
+        "option sequence changed",
+    )
+    leaked = json.loads(json.dumps(entries))
+    other = leaked[3]["arguments"]
+    other.insert(other.index("-o"), "-fno-crossjumping")
+    commands.write_text(json.dumps(leaked), encoding="utf-8")
+    must_fail(
+        "-fno-crossjumping on another (pristine) member",
+        lambda: gate.lua_compile_closure(
+            commands, lua_source, records, require_objects=False,
+            derived_sources=replaced, extra_options=extra,
+        ),
+        "option sequence changed",
+    )
+    early = json.loads(json.dumps(plain))
+    moved = early[index]["arguments"]
+    moved.insert(moved.index("-O2"), "-fno-crossjumping")
+    commands.write_text(json.dumps(early), encoding="utf-8")
+    must_fail(
+        "-fno-crossjumping before -O2 (not where CMake appends it)",
+        lambda: gate.lua_compile_closure(
+            commands, lua_source, records, require_objects=False,
+            derived_sources=replaced, extra_options=extra,
+        ),
+        "option sequence changed",
+    )
+
+    # ISAAC_VITA_LUA_CORE_ARM with the knob: -marm everywhere, the flag kept
+    arm = json.loads(json.dumps(entries))
+    for entry in arm:
+        args = entry["arguments"]
+        args[args.index("-mthumb")] = "-marm"
+    commands.write_text(json.dumps(arm), encoding="utf-8")
+    compiled = gate.lua_compile_closure(
+        commands, lua_source, records, require_objects=False, core_arm=True,
+        derived_sources=replaced, extra_options=extra,
+    )
+    assert len(compiled) == gate.LUA_C_SOURCE_COUNT
+    must_fail(
+        "ARM vm-goto archive certified as Thumb",
+        lambda: gate.lua_compile_closure(
+            commands, lua_source, records, require_objects=False,
+            derived_sources=replaced, extra_options=extra,
+        ),
+        "option sequence changed",
+    )
+    commands.write_text(json.dumps(entries), encoding="utf-8")
+
+    # the cache decides: OFF grants nothing, ON grants the derived lvm.c only
+    assert gate.lua_vm_computed_goto_compile_options(
+        {gate.LUA_VM_COMPUTED_GOTO_CACHE_KEY: "OFF"}, build_dir=build) == {}
+    assert gate.lua_vm_computed_goto_compile_options(
+        {gate.LUA_VM_COMPUTED_GOTO_CACHE_KEY: "ON"}, build_dir=build
+    ) == {(build / gate.LUA_VM_COMPUTED_GOTO_DIR /
+           gate.LUA_VM_COMPUTED_GOTO_SOURCE).resolve():
+          ("-fno-crossjumping",)}
+    must_fail(
+        "vm goto compile options without the knob in the cache",
+        lambda: gate.lua_vm_computed_goto_compile_options({}, build_dir=build),
+        "missing ISAAC_VITA_LUA_VM_COMPUTED_GOTO",
     )
 
 
@@ -744,13 +1127,16 @@ def build_vita_receipt_tests() -> None:
 
     count = gate.LUA_C_SOURCE_COUNT
     assert verify(record()) == count
-    assert verify(record(("lgc.c",)), finalizer_pace=True) == count
-    assert verify(record(("lgc.c",), core_arm=True), core_arm=True,
+    assert verify(record(("lgc.c", "lbaselib.c")), finalizer_pace=True) == count
+    assert verify(record(("lgc.c", "lbaselib.c"), core_arm=True), core_arm=True,
                   finalizer_pace=True) == count
     must_reject("derived row without the knob",
                 lambda: verify(record(("lgc.c",))), "member row is malformed")
     must_reject("knob without the derived row",
                 lambda: verify(record(), finalizer_pace=True),
+                "member row is malformed")
+    must_reject("knob with review r4's shape (derived lgc.c only)",
+                lambda: verify(record(("lgc.c",)), finalizer_pace=True),
                 "member row is malformed")
     must_reject("derived key on a second member",
                 lambda: verify(record(("lapi.c", "lgc.c")), finalizer_pace=True),
@@ -765,10 +1151,17 @@ def build_vita_receipt_tests() -> None:
     # ISAAC_VITA_LUA_INTEGER2STR: the same contract on lobject.c, alone and
     # together with the finalizer pace (two derived rows, one per knob).
     assert verify(record(("lobject.c",)), integer2str=True) == count
-    assert verify(record(("lgc.c", "lobject.c")), finalizer_pace=True,
+    # (merge of the r5 pacer: the pace knob owns two rows, lgc.c and
+    # lbaselib.c, so both knobs make three)
+    both = ("lgc.c", "lbaselib.c", "lobject.c")
+    assert verify(record(both), finalizer_pace=True,
                   integer2str=True) == count
-    assert verify(record(("lgc.c", "lobject.c"), core_arm=True), core_arm=True,
+    assert verify(record(both, core_arm=True), core_arm=True,
                   finalizer_pace=True, integer2str=True) == count
+    must_reject("both knobs, the pacer's r4 shape (no lbaselib.c row)",
+                lambda: verify(record(("lgc.c", "lobject.c")),
+                               finalizer_pace=True, integer2str=True),
+                "member row is malformed")
     must_reject("lobject.c derived row without the knob",
                 lambda: verify(record(("lobject.c",))),
                 "member row is malformed")
@@ -786,6 +1179,31 @@ def build_vita_receipt_tests() -> None:
                 lambda: verify(record(("lobject.c",), derived_value="lobj"),
                                integer2str=True),
                 "derived lobject.c identity is malformed")
+    # ISAAC_VITA_LUA_VM_COMPUTED_GOTO: the same contract on lvm.c, alone and
+    # with the other two knobs (four derived rows, each knob owning its own).
+    assert verify(record(("lvm.c",)), vm_computed_goto=True) == count
+    assert verify(record(("lvm.c",), core_arm=True), core_arm=True,
+                  vm_computed_goto=True) == count
+    all3 = ("lgc.c", "lbaselib.c", "lobject.c", "lvm.c")
+    assert verify(record(all3), finalizer_pace=True, integer2str=True,
+                  vm_computed_goto=True) == count
+    must_reject("lvm.c derived row without the knob",
+                lambda: verify(record(("lvm.c",))),
+                "member row is malformed")
+    must_reject("vm goto knob without the derived row",
+                lambda: verify(record(), vm_computed_goto=True),
+                "member row is malformed")
+    must_reject("vm goto knob, derived row on lobject.c",
+                lambda: verify(record(("lobject.c",)), vm_computed_goto=True),
+                "member row is malformed")
+    must_reject("all three knobs, no lvm.c row",
+                lambda: verify(record(both), finalizer_pace=True,
+                               integer2str=True, vm_computed_goto=True),
+                "member row is malformed")
+    must_reject("derived lvm.c identity not a sha256",
+                lambda: verify(record(("lvm.c",), derived_value="lvm"),
+                               vm_computed_goto=True),
+                "derived lvm.c identity is malformed")
 
 
 def link_tests(root: Path) -> None:
@@ -902,12 +1320,14 @@ def main() -> int:
         derived_source_tests(root)
         multi_derived_compile_tests(root)
         derived_source_map_tests(root)
+        vm_goto_source_tests(root)
+        vm_goto_compile_tests(root)
         member_tests()
         build_vita_receipt_tests()
         link_tests(root)
         relocation_tests()
     print(
-        "Vita Lua exact cache/source/33-compile/derived-lgc+lobject/archive-member/"
+        "Vita Lua exact cache/source/33-compile/derived-lgc+lbaselib+lobject+lvm/archive-member/"
         "link/allocator-relocation hostile gate: PASS"
     )
     return 0

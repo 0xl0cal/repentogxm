@@ -71,7 +71,9 @@ def strip_profile_blocks(text: str) -> str:
         # blocks (issue #10, plain defined() guards, OFF surface untouched).
         if not depth and (any(line.startswith(f"#if defined({knob}) && {knob}")
                 for knob in (KNOB, "ISAAC_VITA_THEORA_RENDER_PRIORITY", "ISAAC_VITA_VITAGL_RGB_SUBUPLOAD"))
-                or line.startswith("#if defined(ISAAC_VITA_FBO_READBACK_FIX)")):
+                or line.startswith("#if defined(ISAAC_VITA_FBO_READBACK_FIX)")
+                # ISAAC_VITA_FBO_DEFERRED_ATTACH: additive, plain defined() guards.
+                or line.startswith("#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)")):
             depth = 1
             continue
         if depth:

@@ -107,6 +107,18 @@ int isaac_gl_record_ring_append_client2(IsaacGlRecordRing *ring, uint32_t opcode
     return 1;
 }
 
+#if defined(ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US)
+/* R60-EXT-SYNTH T2: the render thread's (consumer's) idle wait times out
+ * after this many us instead of 2000; every producer wait keeps 2000 us.
+ * CMake defines it on this unit only, from a decimal 100..2000. */
+# if !defined(__vita__) || !defined(ISAAC_VITA_GL_THREAD_WORKER) || !ISAAC_VITA_GL_THREAD_WORKER
+#  error "ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US needs the Vita GL render thread (ISAAC_VITA_GL_THREAD_WORKER)"
+# endif
+# if ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US < 100 || ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US > 2000
+#  error "ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US must be 100..2000"
+# endif
+
+#endif
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
 /* Positions are monotonic uint32 byte counts; compare by difference.  Both
  * sides sleep on a semaphore behind a flag (Dekker: flag, re-check, sleep),
@@ -149,6 +161,16 @@ static int spsc_sleep_os(intptr_t sema)
     SceUInt timeout = 2000u;
     return sceKernelWaitSema((int)sema, 1, &timeout) >= 0;
 }
+#if defined(ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US)
+/* The consumer's sleep only (isaac_gl_record_spsc_wait_work); the producer
+ * keeps spsc_sleep_os above. */
+static int spsc_sleep_os_consumer(intptr_t sema)
+{
+    SceUInt timeout = (SceUInt)ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US;
+    return sceKernelWaitSema((int)sema, 1, &timeout) >= 0;
+}
+void isaac_vita_log(const char *format, ...);
+#endif
 static void spsc_signal_os(intptr_t sema) { (void)sceKernelSignalSema((int)sema, 1); }
 #else
 #error "GL record worker: no platform primitives for this target"
@@ -170,13 +192,27 @@ void isaac_gl_record_spsc_kick(IsaacGlRecordRing *ring)
 
 void isaac_gl_record_spsc_wait_work(IsaacGlRecordRing *ring)
 {
+#if defined(ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US)
+    /* Boot receipt, once, from the thread that waits: the render thread is
+     * the only caller, and its first idle wait follows its start. */
+    static int consumer_timeout_logged;
+    if (!consumer_timeout_logged) {
+        consumer_timeout_logged = 1;
+        isaac_vita_log("KAGE VITA GL RING: consumer_timeout_us=%u producer_timeout_us=2000 record=ph120.rw",
+                       (unsigned)ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US);
+    }
+#endif
     spsc_store(&ring->consumer_sleeping, 1u);
     if (spsc_load(&ring->read_pos) != spsc_load(&ring->write_pos)) {
         spsc_store(&ring->consumer_sleeping, 0u);
         return;
     }
     ++ring->consumer_sleeps;
+#if defined(ISAAC_VITA_GL_RECORD_CONSUMER_TIMEOUT_US)
+    if (!spsc_sleep_os_consumer(ring->consumer_sema) &&
+#else
     if (!spsc_sleep_os(ring->consumer_sema) &&
+#endif
             spsc_load(&ring->read_pos) != spsc_load(&ring->write_pos))
         ++ring->consumer_timeouts;  /* work arrived without a kick */
     spsc_store(&ring->consumer_sleeping, 0u);
@@ -272,4 +308,36 @@ void isaac_gl_record_spsc_wait_done(IsaacGlRecordRing *ring, uint32_t position)
         spsc_store(&ring->producer_sleeping, 0u);
     }
 }
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT == 2
+
+/* One bounded producer sleep (GL admit wait, R60-DRYADMIT-SPEC-20261028.md):
+ * wait_done's Dekker steps with a caller timeout; 1 = position reached.  A
+ * consumer signal that lands after the timeout leaves one count on
+ * producer_sema; every producer wait loops on done_pos, so it costs at most
+ * one spurious wake-up. */
+static int spsc_sleep_os_for(intptr_t sema, uint32_t timeout_us)
+{
+# if defined(_WIN32)
+    return WaitForSingleObject((HANDLE)sema, (DWORD)((timeout_us + 999u) / 1000u)) == WAIT_OBJECT_0;
+# else
+    SceUInt timeout = timeout_us;
+    return sceKernelWaitSema((int)sema, 1, &timeout) >= 0;
+# endif
+}
+
+int isaac_gl_record_spsc_wait_done_for(IsaacGlRecordRing *ring, uint32_t position,
+                                       uint32_t timeout_us)
+{
+    if (isaac_gl_record_spsc_reached(ring, position))
+        return 1;
+# if !defined(ISAAC_GL_RECORD_ORACLE_MUTATE_NO_KICK) /* oracle self-test: lost wake-up */
+    isaac_gl_record_spsc_kick(ring);
+# endif
+    spsc_store(&ring->producer_sleeping, 1u);
+    if (!isaac_gl_record_spsc_reached(ring, position))
+        (void)spsc_sleep_os_for(ring->producer_sema, timeout_us);
+    spsc_store(&ring->producer_sleeping, 0u);
+    return isaac_gl_record_spsc_reached(ring, position);
+}
+# endif
 #endif

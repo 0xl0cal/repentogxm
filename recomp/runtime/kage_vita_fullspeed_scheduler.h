@@ -123,6 +123,32 @@ int kage_vita_fullspeed_scheduler_bypass_limiter(void);
 void kage_vita_fullspeed_scheduler_snapshot(
     KageVitaFullspeedSnapshot *snapshot);
 
+#if defined(ISAAC_VITA_LUA_GC_IDLE_STEP)
+/* ISAAC_VITA_LUA_GC_IDLE_STEP (host_vita_lua_gc.c): what follows the loop
+ * tail the caller stands on -- LuaEngine::Update's paced lua_gc step, the
+ * last guest work of a main-loop iteration (sub_0048bc50: call at 0x48be08,
+ * then the jump back to the loop head L_0048bd40).  A pure query: one clock
+ * read, no scheduler state is written and nothing is disabled on failure.
+ *   UNKNOWN  the scheduler does not own this tick (menu, video, disabled,
+ *            first tick, clock retreat): the caller must act as without the
+ *            knob;
+ *   FREE     the next blocking wait is ahead and *slack_us is the time to
+ *            its target: the loop head's grid wait, or -- a non-full tick
+ *            ends late for the grid -- the 30-Hz floor wait of the full tick
+ *            that follows;
+ *   BUSY     this tick ran Game::Update and the head will not sleep: the
+ *            next tick is the non-full one, whose render gate measures the
+ *            time left to the floor.  Work done now is taken from it (the
+ *            caller carries its step past that render only when the step
+ *            cannot run atomic(): host_vita_lua_gc_idle_rule.h);
+ *   LATE     no wait is ahead at all (the floor is already due). */
+#define KAGE_VITA_GC_IDLE_UNKNOWN 0
+#define KAGE_VITA_GC_IDLE_FREE 1
+#define KAGE_VITA_GC_IDLE_BUSY 2
+#define KAGE_VITA_GC_IDLE_LATE 3
+int kage_vita_fullspeed_scheduler_gc_idle_query(uint32_t *slack_us);
+#endif
+
 #if defined(ISAAC_VITA_RUNTIME_SETTINGS)
 /* port.ini fps_lock (port.ini design section 2):
  * admission duty on the non-full (interpolated) phase.  k = 1 admits every
@@ -272,6 +298,57 @@ typedef struct KageVitaFullspeedFloorDebtSnapshot {
 } KageVitaFullspeedFloorDebtSnapshot;
 void kage_vita_fullspeed_scheduler_floor_debt_take(
     KageVitaFullspeedFloorDebtSnapshot *snapshot);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_WAIT) && ISAAC_VITA_GL_THREAD_ADMIT_WAIT
+typedef struct KageVitaFullspeedGlAdmitWaitSnapshot {
+    uint32_t gates;       /* n: non-full gates that found the render thread behind */
+    uint32_t admitted;    /* ok: of which rendered (ON) */
+    uint32_t timeouts;    /* to: closure still running at latest (ON) */
+    uint32_t no_window;   /* nw: no live floor, or latest <= now */
+    uint32_t backoff;     /* bo: refused inside a back-off (ON) */
+    uint32_t time_test;   /* tt: closure done, then refused by the tick-due or time test (ON) */
+    uint32_t wait_us;     /* summed gate wait (ON) */
+    uint32_t wait_max_us; /* window maximum */
+    uint32_t late;        /* lt: late Game::Update starts right after a behind-admitted render
+                           * whose loop head did not sleep (ON) */
+    uint32_t late_us;     /* their summed lateness */
+    uint32_t hold_late;   /* hl: loop heads that did not sleep after a Present held on a
+                           * closure admitted after a wait (ON) */
+    uint32_t hold_late_us; /* their summed lateness past the head's due time */
+    uint32_t timeout_over_max_us; /* ov: largest wake past a timed-out wait's deadline (ON) */
+} KageVitaFullspeedGlAdmitWaitSnapshot;
+void kage_vita_fullspeed_scheduler_gl_admit_wait_take(
+    KageVitaFullspeedGlAdmitWaitSnapshot *snapshot);
+#endif
+#if defined(ISAAC_VITA_GL_THREAD_ADMIT_BEHIND) && ISAAC_VITA_GL_THREAD_ADMIT_BEHIND
+/* GL admit behind (R60-FABLE-PLAN.md lane B).  BACKOFF: non-full phases of
+ * stock refusals after a loop head that did not sleep behind a Present hold
+ * on a behind-admitted frame.  SAMPLES: outstanding-byte readings kept per
+ * take for the median (a 120-loop window has at most 60 non-full gates;
+ * gates beyond the cap still count in n and in the maximum). */
+#define KAGE_VITA_GL_ADMIT_BEHIND_BACKOFF 30
+#define KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES 64u
+typedef struct KageVitaFullspeedGlAdmitBehindSnapshot {
+    uint32_t gates;        /* n: non-full gates that found the render thread behind */
+    uint32_t test_pass;    /* st p: stock time test live and passing at the last Render cost */
+    uint32_t test_fail;    /* st f: live and failing (stock would refuse this frame anyway) */
+    uint32_t test_off;     /* st x: not live (no floor ahead, or no samples): stock admits */
+    uint32_t over;         /* ov: outstanding bytes over the bound */
+    uint32_t would;        /* wa: within the bound and st not f */
+    uint32_t admitted;     /* ok: rendered while behind (ON) */
+    uint32_t backoff;      /* bo: within the bound, refused inside a back-off (ON) */
+    uint32_t time_test;    /* tt: within the bound, refused by the stock time test (ON) */
+    uint32_t hold_late;    /* hl: loop heads that did not sleep after a Present hold on a
+                            * behind-admitted frame (ON); each arms the back-off */
+    uint32_t hold_late_us; /* by how far past their due time */
+    uint32_t out_max;      /* ob max: largest outstanding-byte reading */
+    uint32_t out_count;    /* readings stored in out[] */
+    uint32_t out[KAGE_VITA_GL_ADMIT_BEHIND_SAMPLES];
+} KageVitaFullspeedGlAdmitBehindSnapshot;
+void kage_vita_fullspeed_scheduler_gl_admit_behind_take(
+    KageVitaFullspeedGlAdmitBehindSnapshot *snapshot);
+/* The bound the gate compares with, as compiled into the scheduler. */
+uint32_t kage_vita_fullspeed_scheduler_gl_admit_behind_bytes(void);
 #endif
 
 #endif

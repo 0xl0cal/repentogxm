@@ -32,6 +32,10 @@ ARCHIVE_VALIDATION_SIDECAR_CACHE_KEY = (
     "ISAAC_VITA_ARCHIVE_VALIDATION_SIDECAR"
 )
 ARCHIVE_READ_TRAIL_CACHE_KEY = "ISAAC_VITA_ARCHIVE_READ_TRAIL"
+PNG_WINDOW_PROFILE_CACHE_KEY = "ISAAC_VITA_PNG_WINDOW_PROFILE"
+PNG_WINDOW_PROFILE_SOURCE = "host_vita_png_outer_profile.c"
+ANM2_WINDOW_PROFILE_CACHE_KEY = "ISAAC_VITA_ANM2_WINDOW_PROFILE"
+ANM2_WINDOW_PROFILE_SOURCE = "host_vita_anm2_outer_profile.c"
 UNIFORM_SET_RECEIPT_CACHE_KEY = "ISAAC_VITA_UNIFORM_SET_RECEIPT"
 SHADER_SAMPLER_FASTPATH_CACHE_KEY = "ISAAC_VITA_SHADER_SAMPLER_FASTPATH"
 SHADER_SAMPLER_FASTPATH_SOURCE = "host_vita_shader_sampler_fastpath.c"
@@ -63,6 +67,10 @@ GL_OWNER_CHECK_SOURCE = "gl_owner_check.c"
 GL_ADMISSION_STANDALONE_CACHE_KEY = "ISAAC_VITA_GL_RECORD_ADMISSION_CACHE_STANDALONE"
 GL_RECORD_FREE_WRAP_SOURCE = "gl_record_free_wrap.c"
 HEAP_LEAN_IMPORT_CACHE_KEY = "ISAAC_VITA_HEAP_LEAN_IMPORT"
+# Import lean2 (exact malloc/free wrapper cuts) and its VERIFY proof build:
+# definitions on host_vita_heap.c only, no unit added.
+HEAP_IMPORT_LEAN2_CACHE_KEY = "ISAAC_VITA_HEAP_IMPORT_LEAN2"
+HEAP_IMPORT_LEAN2_VERIFY_CACHE_KEY = "ISAAC_VITA_HEAP_IMPORT_LEAN2_VERIFY"
 RENDERFRAME_FASTPATH_CACHE_KEY = "ISAAC_VITA_RENDERFRAME_FASTPATH"
 CONTINUE_PROFILE_CACHE_KEY = "ISAAC_VITA_CONTINUE_PROFILE"
 EXIT_MENU_PROFILE_CACHE_KEY = "ISAAC_VITA_EXIT_MENU_PROFILE"
@@ -135,14 +143,23 @@ LUA_REQUIRED_COMPILE_OPTIONS = (
     "-Wall", "-Wextra",
 )
 LUA_REQUIRED_FINAL_SYMBOL = "lua_newstate"
-# ISAAC_VITA_LUA_GC_FINALIZER_PACE: isaac_lua53 compiles a derived lgc.c from
-# the build tree in place of the pristine one (lua53_gc_finalizer_pace.py).
+# ISAAC_VITA_LUA_GC_FINALIZER_PACE: isaac_lua53 compiles a derived lgc.c and
+# lbaselib.c from the build tree in place of the pristine ones
+# (lua53_gc_finalizer_pace.py; review r5 added lbaselib.c, the script latch).
 LUA_GC_FINALIZER_PACE_CACHE_KEY = "ISAAC_VITA_LUA_GC_FINALIZER_PACE"
 LUA_GC_FINALIZER_MAX_CACHE_KEY = "ISAAC_VITA_LUA_GC_FINALIZER_MAX"
-LUA_GC_FINALIZER_COST_CACHE_KEY = "ISAAC_VITA_LUA_GC_FINALIZER_COST"
-LUA_GC_SWEEP_COST_CACHE_KEY = "ISAAC_VITA_LUA_GC_SWEEP_COST"
+LUA_GC_FINALIZER_STEP_CACHE_KEY = "ISAAC_VITA_LUA_GC_FINALIZER_STEP"
+LUA_GC_SWEEP_STEP_CACHE_KEY = "ISAAC_VITA_LUA_GC_SWEEP_STEP"
+# 0 or absent (a cache from before the knob): the four-argument derivation
+LUA_GC_FINALIZER_ALLOC_LATCH_CACHE_KEY = (
+    "ISAAC_VITA_LUA_GC_FINALIZER_ALLOC_LATCH_BYTES")
+# ON adds --state-profile to the lgc.c derivation (CMakeLists.txt, the
+# ISAAC_VITA_LUA_GC_FINALIZER_PACE_ARGS block); OFF or absent keeps the
+# derivation without it
+LUA_GC_STATE_PROFILE_CACHE_KEY = "ISAAC_VITA_LUA_GC_STATE_PROFILE"
 LUA_GC_FINALIZER_PACE_DIR = "lua53-gc-finalizer-pace"
 LUA_GC_FINALIZER_PACE_SOURCE = "lgc.c"
+LUA_GC_FINALIZER_PACE_BASELIB_SOURCE = "lbaselib.c"
 LUA_DISCARDED_ALLOCATOR_SYMBOLS = frozenset(("l_alloc", "luaL_newstate"))
 SAVE_CHECKSUM_FASTPATH_CACHE_KEY = "ISAAC_VITA_SAVE_CHECKSUM_FASTPATH"
 SAVE_READER_FASTPATH_CACHE_KEY = "ISAAC_VITA_SAVE_READER_FASTPATH"
@@ -666,62 +683,102 @@ def lua_derived_sources(
     build_dir: Path,
     lua_source: Path,
     derive=None,
+    derive_baselib=None,
 ) -> dict[Path, Path]:
     """Pristine Lua sources an ON knob replaces, after proving the bytes.
 
     ISAAC_VITA_LUA_GC_FINALIZER_PACE=ON: the build-owned
     <build>/lua53-gc-finalizer-pace/lgc.c must be exactly
-    lua53_gc_finalizer_pace.derive(pristine lgc.c, MAX, COST, SWEEP_COST) for
-    the cached constants; the pristine file itself was already authenticated
-    against the manifest by lua_source_records.  OFF returns {} and the
-    closure stays the pristine 33 sources.
+    lua53_gc_finalizer_pace.derive(pristine lgc.c, MAX, STEP, SWEEP_STEP) for
+    the cached constants, and <build>/lua53-gc-finalizer-pace/lbaselib.c
+    exactly lua53_gc_finalizer_pace.derive_baselib(pristine lbaselib.c); the
+    pristine files themselves were already authenticated against the manifest
+    by lua_source_records.  Both are required: the derived lbaselib.c calls
+    the latch the derived lgc.c defines.  OFF returns {} and the closure
+    stays the pristine 33 sources.
     """
 
     if not _feature(cache, LUA_GC_FINALIZER_PACE_CACHE_KEY):
         return {}
     values: dict[str, int] = {}
-    for key in (LUA_GC_FINALIZER_MAX_CACHE_KEY, LUA_GC_FINALIZER_COST_CACHE_KEY,
-                LUA_GC_SWEEP_COST_CACHE_KEY):
+    for key in (LUA_GC_FINALIZER_MAX_CACHE_KEY, LUA_GC_FINALIZER_STEP_CACHE_KEY,
+                LUA_GC_SWEEP_STEP_CACHE_KEY):
         text = cache.get(key)
         if text is None:
             raise GateError(f"CMake cache is missing {key}")
         if not text.strip().isdigit():
             raise GateError(f"CMake cache {key} is not a whole number: {text!r}")
         values[key] = int(text.strip())
-    if derive is None:
+    alloc_text = cache.get(LUA_GC_FINALIZER_ALLOC_LATCH_CACHE_KEY, "0")
+    if not alloc_text.strip().isdigit():
+        raise GateError(
+            f"CMake cache {LUA_GC_FINALIZER_ALLOC_LATCH_CACHE_KEY} is not a "
+            f"whole number: {alloc_text!r}")
+    alloc_latch = int(alloc_text.strip())
+    # absent = OFF, as the latch's absent = 0 above (a cache from before the
+    # option); present must still be exactly ON or OFF
+    state_profile = (LUA_GC_STATE_PROFILE_CACHE_KEY in cache
+                     and _feature(cache, LUA_GC_STATE_PROFILE_CACHE_KEY))
+    if derive is None or derive_baselib is None:
         import lua53_gc_finalizer_pace as pace  # same directory as this gate
 
-        def derive(pristine: bytes, max_per_call: int, cost: int,
-                   sweep_cost: int) -> bytes:
-            try:
-                return pace.derive(pristine, max_per_call, cost, sweep_cost)
-            except pace.DeriveError as exc:
-                raise GateError(f"cannot derive the paced lgc.c: {exc}") from exc
-    pristine = (lua_source.resolve() / "src" / LUA_GC_FINALIZER_PACE_SOURCE).resolve()
-    derived_path = build_dir.resolve() / LUA_GC_FINALIZER_PACE_DIR / LUA_GC_FINALIZER_PACE_SOURCE
-    if derived_path.is_symlink() or not derived_path.is_file():
-        raise GateError(
-            f"derived Lua source is not a regular non-symlink file: {derived_path}"
-        )
-    derived_path = derived_path.resolve()
-    try:
-        pristine_bytes = pristine.read_bytes()
-        derived_bytes = derived_path.read_bytes()
-    except OSError as exc:
-        raise GateError(f"cannot read the paced lgc.c inputs: {exc}") from exc
-    expected = derive(
-        pristine_bytes,
-        values[LUA_GC_FINALIZER_MAX_CACHE_KEY],
-        values[LUA_GC_FINALIZER_COST_CACHE_KEY],
-        values[LUA_GC_SWEEP_COST_CACHE_KEY],
-    )
-    if derived_bytes != expected:
-        raise GateError(
-            "derived lgc.c differs from the derivation of the pristine source: "
-            f"{hashlib.sha256(derived_bytes).hexdigest()} != "
-            f"{hashlib.sha256(expected).hexdigest()}"
-        )
-    return {pristine: derived_path}
+        if derive is None:
+            def derive(pristine: bytes, max_per_call: int, fin_step: int,
+                       sweep_step: int, alloc: int = 0, *,
+                       state_profile: bool = False) -> bytes:
+                try:
+                    return pace.derive(pristine, max_per_call, fin_step,
+                                       sweep_step, alloc,
+                                       state_profile=state_profile)
+                except pace.DeriveError as exc:
+                    raise GateError(
+                        f"cannot derive the paced lgc.c: {exc}") from exc
+        if derive_baselib is None:
+            def derive_baselib(pristine: bytes) -> bytes:
+                try:
+                    return pace.derive_baselib(pristine)
+                except pace.DeriveError as exc:
+                    raise GateError(
+                        f"cannot derive the paced lbaselib.c: {exc}") from exc
+    expected_of = {
+        LUA_GC_FINALIZER_PACE_SOURCE: lambda data: derive(
+            data,
+            values[LUA_GC_FINALIZER_MAX_CACHE_KEY],
+            values[LUA_GC_FINALIZER_STEP_CACHE_KEY],
+            values[LUA_GC_SWEEP_STEP_CACHE_KEY],
+            # passed only when set: a derive injected by a test keeps its
+            # four-argument shape while the knob is 0
+            *((alloc_latch,) if alloc_latch else ()),
+            # the same rule: a keyword only when ON, so an injected derive
+            # without the parameter still sees the cache it was written for
+            **({"state_profile": True} if state_profile else {}),
+        ),
+        LUA_GC_FINALIZER_PACE_BASELIB_SOURCE: derive_baselib,
+    }
+    replaced: dict[Path, Path] = {}
+    for name, expected_for in expected_of.items():
+        pristine = (lua_source.resolve() / "src" / name).resolve()
+        derived_path = build_dir.resolve() / LUA_GC_FINALIZER_PACE_DIR / name
+        if derived_path.is_symlink() or not derived_path.is_file():
+            raise GateError(
+                "derived Lua source is not a regular non-symlink file: "
+                f"{derived_path}"
+            )
+        derived_path = derived_path.resolve()
+        try:
+            pristine_bytes = pristine.read_bytes()
+            derived_bytes = derived_path.read_bytes()
+        except OSError as exc:
+            raise GateError(f"cannot read the paced {name} inputs: {exc}") from exc
+        expected = expected_for(pristine_bytes)
+        if derived_bytes != expected:
+            raise GateError(
+                f"derived {name} differs from the derivation of the pristine "
+                f"source: {hashlib.sha256(derived_bytes).hexdigest()} != "
+                f"{hashlib.sha256(expected).hexdigest()}"
+            )
+        replaced[pristine] = derived_path
+    return replaced
 
 
 # ISAAC_VITA_LUA_INTEGER2STR: isaac_lua53 compiles a derived lobject.c from the
@@ -800,6 +857,75 @@ def lua_integer2str_sources(
     return {pristine: derived_path}
 
 
+# ISAAC_VITA_LUA_VM_COMPUTED_GOTO: isaac_lua53 compiles a derived lvm.c from
+# the build tree in place of the pristine one (lua53_vm_computed_goto.py):
+# luaV_execute dispatches by computed goto instead of the pristine switch.
+# The derivation also reads the pristine lopcodes.h (the opcode enum).
+LUA_VM_COMPUTED_GOTO_CACHE_KEY = "ISAAC_VITA_LUA_VM_COMPUTED_GOTO"
+LUA_VM_COMPUTED_GOTO_DIR = "lua53-vm-computed-goto"
+LUA_VM_COMPUTED_GOTO_SOURCE = "lvm.c"
+LUA_VM_COMPUTED_GOTO_OPCODES = "lopcodes.h"
+# The one compile option the derived lvm.c adds to the archive's sequence
+# (CMakeLists.txt appends it to that source only).  Measured with
+# arm-none-eabi-gcc 10.3.1 and the archive flags: without it the -O2
+# cross-jumping pass merges the identical fetch-and-dispatch tails of all
+# case bodies back into one, and luaV_execute keeps a single indirect branch,
+# as pristine does (47 with it, -mthumb and -marm alike).
+LUA_VM_COMPUTED_GOTO_COMPILE_OPTIONS = ("-fno-crossjumping",)
+
+
+def lua_vm_computed_goto_sources(
+    cache: Mapping[str, str],
+    *,
+    build_dir: Path,
+    lua_source: Path,
+    derive=None,
+) -> dict[Path, Path]:
+    """ISAAC_VITA_LUA_VM_COMPUTED_GOTO=ON: the build-owned
+    <build>/lua53-vm-computed-goto/lvm.c must be exactly
+    lua53_vm_computed_goto.derive(pristine lvm.c, pristine lopcodes.h).
+    OFF returns {}."""
+
+    if not _feature(cache, LUA_VM_COMPUTED_GOTO_CACHE_KEY):
+        return {}
+    opcodes_path = (lua_source.resolve() / "src" /
+                    LUA_VM_COMPUTED_GOTO_OPCODES)
+    try:
+        opcodes = opcodes_path.read_bytes()
+    except OSError as exc:
+        raise GateError(f"cannot read {opcodes_path}: {exc}") from exc
+    if derive is None:
+        import lua53_vm_computed_goto as vm_goto  # same directory as this gate
+
+        def derive(pristine: bytes, opcodes: bytes) -> bytes:
+            try:
+                return vm_goto.derive(pristine, opcodes)
+            except vm_goto.DeriveError as exc:
+                raise GateError(
+                    f"cannot derive the computed-goto lvm.c: {exc}"
+                ) from exc
+    pristine, derived_path = lua_derived_source_pair(
+        build_dir=build_dir, lua_source=lua_source,
+        directory=LUA_VM_COMPUTED_GOTO_DIR, source=LUA_VM_COMPUTED_GOTO_SOURCE,
+        expected_of=lambda pristine_bytes: derive(pristine_bytes, opcodes),
+    )
+    return {pristine: derived_path}
+
+
+def lua_vm_computed_goto_compile_options(
+    cache: Mapping[str, str], *, build_dir: Path
+) -> dict[Path, tuple[str, ...]]:
+    """ISAAC_VITA_LUA_VM_COMPUTED_GOTO=ON: the derived lvm.c's compile carries
+    LUA_VM_COMPUTED_GOTO_COMPILE_OPTIONS after the archive's sequence; OFF
+    returns {} (every member keeps the exact archive sequence)."""
+
+    if not _feature(cache, LUA_VM_COMPUTED_GOTO_CACHE_KEY):
+        return {}
+    derived = (build_dir / LUA_VM_COMPUTED_GOTO_DIR /
+               LUA_VM_COMPUTED_GOTO_SOURCE).resolve()
+    return {derived: LUA_VM_COMPUTED_GOTO_COMPILE_OPTIONS}
+
+
 # Every knob that swaps pristine Lua sources for derived ones, with the
 # function that verifies its pairs.  lua_derived_sources is the
 # ISAAC_VITA_LUA_GC_FINALIZER_PACE one (it predates the registry and keeps
@@ -807,6 +933,7 @@ def lua_integer2str_sources(
 LUA_DERIVATIONS = (
     (LUA_GC_FINALIZER_PACE_CACHE_KEY, lua_derived_sources),
     (LUA_INTEGER2STR_CACHE_KEY, lua_integer2str_sources),
+    (LUA_VM_COMPUTED_GOTO_CACHE_KEY, lua_vm_computed_goto_sources),
 )
 
 
@@ -1009,7 +1136,8 @@ def expected_sources(
     if _feature(cache, LUA_CACHE_KEY):
         # CMakeLists.txt, inside if(ISAAC_VITA_LUA)
         if (_feature(cache, "ISAAC_VITA_LUA_GCCOLLECT_CLAMP") or
-                _feature(cache, "ISAAC_VITA_LUA_GC_PROFILE")):
+                _feature(cache, "ISAAC_VITA_LUA_GC_PROFILE") or
+                _feature(cache, "ISAAC_VITA_LUA_GC_IDLE_STEP")):
             runtime.add("host_vita_lua_gc.c")
         if _feature(cache, "ISAAC_VITA_LUA_NATIVE_GETCLASS"):
             runtime.add("host_vita_lua_getclass.c")
@@ -1113,6 +1241,15 @@ def expected_sources(
     if _feature(cache, HEAP_LEAN_IMPORT_CACHE_KEY) and \
             not _feature(cache, "ISAAC_VITA_HEAP_OVERFLOW_MSPACE"):
         raise GateError(f"{HEAP_LEAN_IMPORT_CACHE_KEY} requires HEAP_OVERFLOW_MSPACE")
+    if _feature(cache, HEAP_IMPORT_LEAN2_CACHE_KEY) and (
+            not _feature(cache, "ISAAC_VITA_HEAP_OVERFLOW_MSPACE") or
+            not _feature(cache, HEAP_LEAN_IMPORT_CACHE_KEY)):
+        raise GateError(
+            f"{HEAP_IMPORT_LEAN2_CACHE_KEY} requires HEAP_OVERFLOW_MSPACE and HEAP_LEAN_IMPORT")
+    if _feature(cache, HEAP_IMPORT_LEAN2_VERIFY_CACHE_KEY) and \
+            not _feature(cache, HEAP_IMPORT_LEAN2_CACHE_KEY):
+        raise GateError(
+            f"{HEAP_IMPORT_LEAN2_VERIFY_CACHE_KEY} requires HEAP_IMPORT_LEAN2")
     audio = _feature(cache, "ISAAC_VITA_AUDIO")
     audio_stream_receipt = _feature(cache, AUDIO_STREAM_RECEIPT_CACHE_KEY)
     coloroffset_gpu = _feature(cache, COLOROFFSET_GPU_CACHE_KEY)
@@ -1318,6 +1455,18 @@ def expected_sources(
     # if(ISAAC_VITA_KAGE), FATAL without the phase profiler ("Room
     # diagnostics") and without ISAAC_VITA_AUDIO (it wraps the OpenAL
     # upload/create path).
+    # The PNG and ANM2 window profiles sit directly under if(ISAAC_VITA_KAGE)
+    # too.  PNG has no FATAL (outside KAGE CMake silently adds nothing);
+    # ANM2 is FATAL without translated KAGE or the phase profiler.  Each adds
+    # one TU of fixed static accumulators (no allocator calls).
+    png_window_profile = _feature(cache, PNG_WINDOW_PROFILE_CACHE_KEY)
+    anm2_window_profile = _feature(cache, ANM2_WINDOW_PROFILE_CACHE_KEY)
+    if anm2_window_profile and (
+            not kage or not _feature(cache, "ISAAC_VITA_PHASE_PROFILE")):
+        raise GateError(
+            f"{ANM2_WINDOW_PROFILE_CACHE_KEY} requires translated KAGE and "
+            "PHASE_PROFILE=ON"
+        )
     if static_sfx_profile and not kage:
         raise GateError(
             f"{STATIC_SFX_PROFILE_CACHE_KEY} requires ISAAC_VITA_KAGE=ON"
@@ -1497,6 +1646,10 @@ def expected_sources(
                     runtime.add("host_vita_ogg_readahead.c")
         if _feature(cache, "ISAAC_VITA_IO_PROFILE"):
             runtime.add("kage_vita_io_profile.c")
+        if png_window_profile:
+            runtime.add(PNG_WINDOW_PROFILE_SOURCE)
+        if anm2_window_profile:
+            runtime.add(ANM2_WINDOW_PROFILE_SOURCE)
         if _feature(cache, "ISAAC_VITA_STALL_PROBE"):
             runtime.update(
                 ("kage_vita_stall_probe.c", "kage_vita_preloop_phase.c")
@@ -2395,13 +2548,26 @@ def verify_png_decode_profile_compile_scope(
                 f"build ID: {guest_link_id!r}"
             )
         expected_build_id_value = f'"{guest_link_id}"'
+    # CMake enters the owner block on PNG_DECODE_PROFILE OR PNG_WINDOW_PROFILE.
+    # WINDOW alone resolves only the two ImagePng wrapper roots and puts
+    # ISAAC_VITA_PNG_DECODE_PROFILE=1 on their (frozen) owner, without the
+    # sampled profiler TU; WINDOW with DECODE also puts it on the outer
+    # profile TU.  A cache without the WINDOW key reads as OFF here; the
+    # closure check reads the same key strictly.
+    window = (PNG_WINDOW_PROFILE_CACHE_KEY in cache and
+              _feature(cache, PNG_WINDOW_PROFILE_CACHE_KEY))
     actual: set[str] = set()
     build_id_actual: set[str] = set()
     expected: set[str] = set()
-    roots = (
-        "sub_005a0c50", "sub_005a0cd0", "sub_005b1500",
-        "sub_005c5fb0", "sub_005c6fa0", "sub_005d6d80",
-    )
+    if active:
+        roots: tuple[str, ...] = (
+            "sub_005a0c50", "sub_005a0cd0", "sub_005b1500",
+            "sub_005c5fb0", "sub_005c6fa0", "sub_005d6d80",
+        )
+    elif window:
+        roots = ("sub_005a0c50", "sub_005a0cd0")
+    else:
+        roots = ()
     definition_count = 0
     for record in records.values():
         definitions = record.get("definitions")
@@ -2436,7 +2602,7 @@ def verify_png_decode_profile_compile_scope(
                     f"{[expected_build_id_value]}"
                 )
             build_id_actual.add(source.name)
-        if active and source.name.startswith("guest_") and source.suffix == ".c":
+        if roots and source.name.startswith("guest_") and source.suffix == ".c":
             try:
                 text = source.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as exc:
@@ -2454,6 +2620,9 @@ def verify_png_decode_profile_compile_scope(
         expected.add("kage_vita_png_decode_profile.c")
         if _feature(cache, PNG_NATIVE_UNFILTER_CACHE_KEY):
             expected.add("host_vita_png_unfilter_guest.c")
+        if window:
+            expected.add(PNG_WINDOW_PROFILE_SOURCE)
+    if roots:
         if definition_count != len(roots):
             raise GateError(
                 "PNG profile generated definition census changed: "
@@ -4051,7 +4220,8 @@ def lua_required_compile_options(core_arm: bool) -> tuple[str, ...]:
 
 
 def verify_lua_compile_options(tokens: Sequence[str],
-                               core_arm: bool = False) -> None:
+                               core_arm: bool = False,
+                               extra: Sequence[str] = ()) -> None:
     if not tokens:
         raise GateError("Lua compile command is empty")
     options: list[str] = []
@@ -4069,7 +4239,7 @@ def verify_lua_compile_options(tokens: Sequence[str],
             continue
         options.append(token)
         index += 1
-    required = lua_required_compile_options(core_arm)
+    required = lua_required_compile_options(core_arm) + tuple(extra)
     if tuple(options) != required:
         raise GateError(
             "Lua compile option sequence changed: "
@@ -4109,6 +4279,7 @@ def lua_compile_closure(
     require_objects: bool = True,
     core_arm: bool = False,
     derived_sources: Mapping[Path, Path] | None = None,
+    extra_options: Mapping[Path, Sequence[str]] | None = None,
 ) -> dict[Path, dict[str, object]]:
     """Certify all and only the 33 pristine sources compiled into Lua.
 
@@ -4116,7 +4287,10 @@ def lua_compile_closure(
     verified derived file compiled in its place; the derived compile must
     carry the identical option/definition/include policy and object basename,
     and its record is returned under the pristine key with derived_source and
-    derived_sha256 added.
+    derived_sha256 added.  extra_options maps a derived source to the options
+    its compile appends after the archive sequence
+    (lua_vm_computed_goto_compile_options); every other compile, pristine or
+    derived, carries the exact sequence.
     """
 
     try:
@@ -4138,6 +4312,15 @@ def lua_compile_closure(
         Path(pristine).resolve(): Path(derived).resolve()
         for pristine, derived in (derived_sources or {}).items()
     }
+    appended = {
+        Path(source).resolve(): tuple(options)
+        for source, options in (extra_options or {}).items()
+    }
+    if not set(appended) <= set(replaced.values()):
+        raise GateError(
+            "extra Lua compile options name a source that is not a derived "
+            f"one: {sorted(str(item) for item in set(appended) - set(replaced.values()))}"
+        )
     if not set(replaced) <= set(pristine_order):
         raise GateError(
             "derived Lua source replaces a file outside the closure: "
@@ -4197,7 +4380,7 @@ def lua_compile_closure(
                 f"Lua compile preprocessor policy changed for {source.name}: "
                 f"definitions={definitions}, undefinitions={undefinitions}"
             )
-        verify_lua_compile_options(tokens, core_arm)
+        verify_lua_compile_options(tokens, core_arm, appended.get(source, ()))
         verify_lua_compile_io(
             tokens, directory, source, object_path
         )
@@ -5013,6 +5196,9 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
             derived_sources=lua_derived_source_map(
                 cache, build_dir=compile_commands.parent, lua_source=lua_source
             ),
+            extra_options=lua_vm_computed_goto_compile_options(
+                cache, build_dir=compile_commands.parent
+            ),
         )
     generated_overrides = direct_default_overrides(
         cache, args.generated_source_override, compile_commands.parent
@@ -5037,6 +5223,10 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     verify_heap_free_cost_profile_compile_scope(records, cache)
     _verify_heap_define_scope(records, cache, HEAP_LEAN_IMPORT_CACHE_KEY,
                               "heap lean import", {"host_vita_heap.c"})
+    _verify_heap_define_scope(records, cache, HEAP_IMPORT_LEAN2_CACHE_KEY,
+                              "heap import lean2", {"host_vita_heap.c"})
+    _verify_heap_define_scope(records, cache, HEAP_IMPORT_LEAN2_VERIFY_CACHE_KEY,
+                              "heap import lean2 verify", {"host_vita_heap.c"})
     verify_manager_settings_ui_compile_scope(records, cache)
     verify_manager_ui2_game_skin_compile_scope(records, cache)
     verify_manager_trophy_import_compile_scope(records, cache)

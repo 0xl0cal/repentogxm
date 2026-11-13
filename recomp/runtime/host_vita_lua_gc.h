@@ -10,8 +10,15 @@
  *   ISAAC_VITA_LUA_GCCOLLECT_CLAMP  floor-transition GCCOLLECT -> bounded step
  *   ISAAC_VITA_LUA_GC_PROFILE       one bounded "[isaac-lua] gc window" line
  *                                   per 120 LuaEngine::Update GC steps
+ *   ISAAC_VITA_LUA_GC_STATE_PROFILE with the profile: "gc state" / "gc cls" / "gc asub" /
+ *                                   "gc worst" lines, the luaC_step time
+ *                                   split by gcstate class and by origin
+ *   ISAAC_VITA_LUA_GC_IDLE_STEP     the Update step is carried one loop tail
+ *                                   when an interpolated render is next and
+ *                                   the step cannot run atomic(); it runs
+ *                                   in the next GCCOUNT import
  * The bridge (host_vita_lua.c) calls isaac_vita_lua_gc_call in place of
- * lua_gc while either option is on.  `requested` is the guest's own data
+ * lua_gc while any of them is on.  `requested` is the guest's own data
  * argument; `data` is the value after the LuaEngine::Update GCSTEP clamp
  * (ISAAC_VITA_LUA_GCSTEP_CLAMP_KB), i.e. what lua_gc actually receives. */
 int isaac_vita_lua_gc_call(CPU *__restrict c, lua_State *state, int what,

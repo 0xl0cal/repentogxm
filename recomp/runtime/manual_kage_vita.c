@@ -191,6 +191,17 @@ static void destroy_render_targets(uint32_t manager)
     GLuint framebuffer = (GLuint)ld32(manager + KAGE_FRAMEBUFFER_OFFSET);
     GLuint renderbuffer = (GLuint)ld32(manager + KAGE_RENDERBUFFER_OFFSET);
 
+#if defined(ISAAC_VITA_FBO_DEFERRED_ATTACH)
+    /* The calls below unbind and delete the manager framebuffer in vitaGL
+     * directly: a colour attach still held for it must land first, as it did
+     * at the guest call without the knob. */
+# if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
+    isaac_gl_record_worker_call(
+        gl_vita_backend_fbo_deferred_attach_external, NULL);
+# else
+    gl_vita_backend_fbo_deferred_attach_external(NULL);
+# endif
+#endif
 #if defined(ISAAC_VITA_GL_THREAD_WORKER) && ISAAC_VITA_GL_THREAD_WORKER
     mk_gl(MK_BIND_FB, 0u, NULL, 0, 0);
 #else

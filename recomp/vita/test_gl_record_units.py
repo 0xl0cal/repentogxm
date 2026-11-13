@@ -69,7 +69,10 @@ static void glDeleteRenderbuffers(GLsizei, const GLuint *);
 static void glGenRenderbuffers(GLsizei, GLuint *);
 '''
     (out / 'gl_record_original_renderbuffers.inc').write_text(
-        prelude + constants + '\n' + declarations + helpers + '\n'.join(bodies))
+        # helpers may end in a preprocessor line (a knob block now sits right
+        # before GL_VITA_FBO_TABLE): keep that line on its own.
+        prelude + constants + '\n' + declarations + helpers + '\n'
+        + '\n'.join(bodies))
 
 
 def main():
